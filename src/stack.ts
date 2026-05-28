@@ -1,19 +1,30 @@
 /**
  * Stack model.
  *
- * Loads a `devtrees.yaml` (inline form for this slice) and normalizes it into a
- * `ResolvedStack`: services with a `tier`, a list of verbatim named-port env-var
- * names, `depends_on`, command, and environment. The only addition to the
- * process-compose schema is the per-service `tier` field (CONTEXT.md, ADR-0003).
- * Cross-service validation (tier values, `shared → isolated` rejection, dangling
- * deps) is deepened in a later slice; this one establishes the normalized shape.
+ * Loads a `devtrees.yaml` and normalizes it into a `ResolvedStack`: services
+ * with a `tier`, a list of verbatim named-port env-var names, `depends_on`,
+ * command, and environment. The only addition to the process-compose schema is
+ * the per-service `tier` field (CONTEXT.md, ADR-0003).
  *
- * Pure: it parses already-read YAML text and never touches the filesystem, so it
- * stays unit-testable. `loadStack(dir)` is the thin I/O seam layered on top.
+ * Two authoring modes are supported and may be mixed in one file:
+ *  - **inline**: services defined entirely under `services:` in `devtrees.yaml`.
+ *  - **extend**: `extends: ./process-compose.yaml` points at a hand-authored
+ *    base config; the base's `processes` contribute the service body and the
+ *    `services:` overlay attaches devtrees metadata or overrides per-service
+ *    fields. The base file is read-only — devtrees never edits it, and the
+ *    base remains a valid, independently-runnable process-compose file.
+ *
+ * Cross-service validation (tier values, `shared → isolated` rejection,
+ * dangling deps) is deepened in a later slice; this one establishes the
+ * normalized shape every other module consumes.
+ *
+ * Pure: `parseStack` parses already-read YAML text and never touches the
+ * filesystem, so it stays unit-testable. `loadStack(dir)` is the thin I/O
+ * seam layered on top and is the only place that opens the base file.
  */
 
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { parse as parseYaml } from "yaml";
 
 /** A service's tier: where devtrees runs it. Defaults to `isolated`. */
@@ -66,28 +77,78 @@ function asStringArray(value: unknown): string[] {
   return value.map(asString);
 }
 
-/**
- * Parse and normalize already-read `devtrees.yaml` text (inline form) into a
- * `ResolvedStack`. Pure — no I/O. Validation lands in a later slice; this slice
- * establishes the normalized shape every other module consumes.
- */
-export function parseStack(yamlText: string): ResolvedStack {
-  const doc = (parseYaml(yamlText) ?? {}) as { services?: Record<string, RawService> };
-  const rawServices = doc.services ?? {};
+/** Optional inputs to `parseStack`, currently the extend-mode base config. */
+export interface ParseStackOptions {
+  /**
+   * Raw YAML of the `process-compose.yaml` referenced by `extends:` in
+   * `devtrees.yaml`. Read by the I/O seam (`loadStack`) and passed in; the
+   * parser itself never touches the filesystem so the base file stays
+   * read-only.
+   */
+  readonly baseYaml?: string;
+}
 
-  const services: ResolvedService[] = Object.entries(rawServices).map(([name, raw]) => ({
-    name,
-    tier: (raw.tier as Tier | undefined) ?? DEFAULT_TIER,
-    command: asString(raw.command),
-    ports: asStringArray(raw.ports),
-    dependsOn: asStringArray(raw.depends_on),
-    environment: asStringArray(raw.environment),
-  }));
+/**
+ * Parse and normalize already-read `devtrees.yaml` text into a `ResolvedStack`.
+ * Supports two authoring modes that may be mixed in one file:
+ *
+ *  - **inline**: services defined entirely under `services:` in `devtrees.yaml`.
+ *  - **extend**: `extends: ./process-compose.yaml` points at a hand-authored
+ *    base config; the base's `processes` block contributes the service body
+ *    (command, environment, depends_on, ...) and the `services:` overlay
+ *    attaches devtrees metadata (`tier`, named `ports`, ...).
+ *
+ * Pure — no I/O. The caller hands the base YAML in via `options.baseYaml`,
+ * leaving the base file untouched on disk.
+ */
+export function parseStack(yamlText: string, options: ParseStackOptions = {}): ResolvedStack {
+  const doc = (parseYaml(yamlText) ?? {}) as { services?: Record<string, RawService> };
+  const overlay = doc.services ?? {};
+
+  const baseProcesses: Record<string, RawService> = options.baseYaml
+    ? (((parseYaml(options.baseYaml) ?? {}) as { processes?: Record<string, RawService> })
+        .processes ?? {})
+    : {};
+
+  // Union of names: base contributes the process body, overlay contributes
+  // devtrees metadata and may override individual fields.
+  const names = Array.from(new Set([...Object.keys(baseProcesses), ...Object.keys(overlay)]));
+
+  const services: ResolvedService[] = names.map((name) => {
+    const base = baseProcesses[name] ?? {};
+    const over = overlay[name] ?? {};
+    return {
+      name,
+      tier: ((over.tier ?? base.tier) as Tier | undefined) ?? DEFAULT_TIER,
+      command: asString(over.command ?? base.command),
+      ports: asStringArray(over.ports ?? base.ports),
+      dependsOn: asStringArray(over.depends_on ?? base.depends_on),
+      environment: asStringArray(over.environment ?? base.environment),
+    };
+  });
 
   return { services };
 }
 
-/** I/O seam: read `devtrees.yaml` from a directory and normalize it. */
+/**
+ * I/O seam: read `devtrees.yaml` from a directory and normalize it. If the
+ * file declares `extends: <path>`, the base process-compose file is read
+ * (relative to the devtrees.yaml directory, or absolute) and passed through to
+ * the pure parser. The base file is opened read-only — devtrees never edits it.
+ */
 export function loadStack(dir: string): ResolvedStack {
-  return parseStack(readFileSync(join(dir, "devtrees.yaml"), "utf8"));
+  const path = join(dir, "devtrees.yaml");
+  const text = readFileSync(path, "utf8");
+  const extendsPath = readExtendsPath(text);
+  const baseYaml =
+    extendsPath !== undefined
+      ? readFileSync(isAbsolute(extendsPath) ? extendsPath : join(dir, extendsPath), "utf8")
+      : undefined;
+  return parseStack(text, { baseYaml });
+}
+
+/** Peek at `extends:` without committing to a full parse contract. */
+function readExtendsPath(yamlText: string): string | undefined {
+  const doc = (parseYaml(yamlText) ?? {}) as { extends?: unknown };
+  return typeof doc.extends === "string" ? doc.extends : undefined;
 }
