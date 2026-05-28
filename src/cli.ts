@@ -87,6 +87,20 @@ export interface ExecuteDeps {
     sharedStarted?: boolean;
   }>;
   down: (options: { shared: boolean }) => Promise<void>;
+  /**
+   * Emit the derived process-compose config(s) to disk without starting
+   * anything. Optional on the deps so existing call sites (and tests that
+   * only exercise `up`/`down`) keep working; routing through `execute` for
+   * `generate` requires it.
+   */
+  generate?: () => Promise<{
+    worktreeId: string;
+    worktreeRoot: string;
+    worktreePath: string;
+    sharedPath?: string;
+    env: Record<string, string>;
+    sharedEnv?: Record<string, string>;
+  }>;
 }
 
 /**
@@ -125,6 +139,15 @@ export async function execute(argv: ReadonlyArray<string>, deps: ExecuteDeps): P
         stderr: "",
       };
     }
+    if (first === "generate" && deps.generate) {
+      const result = await deps.generate();
+      const lines = [
+        `devtrees generate: wrote ${result.worktreePath}`,
+        ...(result.sharedPath ? [`devtrees generate: wrote ${result.sharedPath}`] : []),
+        "",
+      ];
+      return { code: 0, stdout: lines.join("\n"), stderr: "" };
+    }
   } catch (err) {
     return { code: 1, stdout: "", stderr: `devtrees: ${(err as Error).message}\n` };
   }
@@ -134,10 +157,11 @@ export async function execute(argv: ReadonlyArray<string>, deps: ExecuteDeps): P
 
 // Run only when invoked as the program, not when imported by a test.
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const { runUp, runDown } = await import("./commands.js");
+  const { runUp, runDown, runGenerate } = await import("./commands.js");
   const result = await execute(process.argv.slice(2), {
     up: () => runUp(),
     down: ({ shared }) => runDown({}, { shared }),
+    generate: () => runGenerate(),
   });
   if (result.stdout) process.stdout.write(result.stdout);
   if (result.stderr) process.stderr.write(result.stderr);

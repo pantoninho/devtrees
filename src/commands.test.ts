@@ -557,8 +557,7 @@ describe("runGenerate — emit derived configs to disk", () => {
     const expected = deriveWorktreeConfig(stack, {
       worktreeId: "login",
       worktreeRoot: result.worktreeRoot,
-      portFor: (name) =>
-        result.env[name] !== undefined ? Number(result.env[name]) : undefined,
+      portFor: (name) => (result.env[name] !== undefined ? Number(result.env[name]) : undefined),
     });
     const onDisk = parseYaml(readFileSync(result.worktreePath, "utf8"));
     expect(onDisk).toEqual(expected.config);
