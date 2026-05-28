@@ -684,3 +684,49 @@ describe("findUnmanagedPortBinds — heuristic", () => {
     expect(findUnmanagedPortBinds(s, 20000, 32)).toEqual([]);
   });
 });
+
+describe("runLs — instance enumeration", () => {
+  it("resolves the anchor from cwd and returns the discovered instances", async () => {
+    const tmp = tmpAnchor();
+    // No instances written yet — discovery should return an empty list.
+    const git: CommandDeps["git"] = (args) => {
+      const flag = args[1];
+      if (flag === "--git-common-dir") return tmp.anchor;
+      if (flag === "--show-toplevel") return join(tmp.worktreeRoot, "login");
+      if (flag === "--is-bare-repository") return "false";
+      throw new Error("unexpected");
+    };
+    const { runLs } = await import("./commands.js");
+    const result = await runLs({ cwd: join(tmp.worktreeRoot, "login"), git });
+    expect(result.anchor).toBe(tmp.anchor);
+    expect(result.instances).toEqual([]);
+  });
+
+  it("delegates enumeration to an injected discoverer for testability", async () => {
+    const tmp = tmpAnchor();
+    const git: CommandDeps["git"] = (args) => {
+      const flag = args[1];
+      if (flag === "--git-common-dir") return tmp.anchor;
+      if (flag === "--show-toplevel") return join(tmp.worktreeRoot, "login");
+      if (flag === "--is-bare-repository") return "false";
+      throw new Error("unexpected");
+    };
+    const stub = [
+      {
+        id: "login",
+        kind: "worktree" as const,
+        status: "running" as const,
+        socketPath: "/x/login.sock",
+        ports: { WEB_PORT: 20512 },
+        blockBase: 20512,
+      },
+    ];
+    const { runLs } = await import("./commands.js");
+    const result = await runLs({
+      cwd: join(tmp.worktreeRoot, "login"),
+      git,
+      discover: async () => stub,
+    });
+    expect(result.instances).toEqual(stub);
+  });
+});

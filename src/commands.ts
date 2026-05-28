@@ -11,6 +11,7 @@
 import { allocateBlock, type AllocatorOptions, type RegistrySnapshot } from "./allocator.js";
 import { resolveAnchor, type GitProbe } from "./anchor.js";
 import { deriveSharedConfig, deriveWorktreeConfig } from "./deriver.js";
+import { discoverInstances, type InstanceInfo } from "./instances.js";
 import { SHARED_REGISTRY_KEY, instancePaths, sharedInstancePaths } from "./paths.js";
 import { loadStack, type ResolvedService, type ResolvedStack } from "./stack.js";
 import { createDriver, type DriverDeps } from "./driver.js";
@@ -473,6 +474,40 @@ export async function runDown(deps: CommandDeps = {}, options: DownOptions = {})
 
   const paths = instancePaths(anchor.anchor, anchor.worktreeId);
   await driver.down({ configPath: paths.configPath, socketPath: paths.socketPath });
+}
+
+/** Inputs unique to `runLs` — same anchor resolution as the other commands. */
+export interface LsDeps {
+  /** Working directory to resolve the anchor from. Default: process.cwd(). */
+  readonly cwd?: string;
+  /** Inject git. Default: runs the real `git` in `cwd`. */
+  readonly git?: GitProbe;
+  /**
+   * Discover instances at the anchor. Default: real socket enumeration via
+   * `discoverInstances`. Injected so the command can be unit-tested without
+   * touching `<anchor>/devtrees/run/`.
+   */
+  readonly discover?: (anchor: string) => Promise<InstanceInfo[]>;
+}
+
+export interface LsResult {
+  /** The anchor instances were discovered from — useful for human-readable output. */
+  readonly anchor: string;
+  readonly instances: ReadonlyArray<InstanceInfo>;
+}
+
+/**
+ * List every devtrees instance across the repo. Resolves the anchor from `cwd`
+ * the same way `up`/`down` do, then defers to the discovery primitive — no
+ * domain logic here, just wiring. The result is structured (not pre-formatted)
+ * so the CLI shell, JSON output, and future callers (e.g. #9 prune) can
+ * consume the same data.
+ */
+export async function runLs(deps: LsDeps = {}): Promise<LsResult> {
+  const { anchor } = resolve(deps);
+  const discover = deps.discover ?? discoverInstances;
+  const instances = await discover(anchor.anchor);
+  return { anchor: anchor.anchor, instances };
 }
 
 // --- default I/O implementations -------------------------------------------

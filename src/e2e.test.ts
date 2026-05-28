@@ -12,7 +12,7 @@ import {
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
-import { runDown, runUp } from "./commands.js";
+import { runDown, runLs, runUp } from "./commands.js";
 
 // Unix domain socket paths are capped (~104 bytes on macOS, ~108 on Linux). The
 // control socket lives at `<git-common-dir>/devtrees/run/<id>.sock`, so the temp
@@ -317,6 +317,77 @@ describe("e2e — shared instance lifecycle across two worktrees", () => {
     await runDown(billingDeps as never, { shared: true });
     expect(await waitForGone(Number(billing.env.DB_PORT))).toBe(true);
     expect(existsSync(sharedSocket)).toBe(false);
+  }, 30000);
+});
+
+/**
+ * `devtrees ls` end-to-end: two worktrees with one shared service between
+ * them. After bringing both up, enumeration must report all three instances —
+ * the two worktrees plus the shared one — purely by walking control sockets
+ * under the anchor's run dir. No central daemon, no PID tracking (#8).
+ */
+describe("e2e — devtrees ls discovers worktree instances + the shared instance", () => {
+  it("lists both worktrees and the shared instance with their allocated ports", async () => {
+    const repo = makeRepo("dt-ls-", ["login", "billing"]);
+    cleanups.push(() => rmSync(repo.root, { recursive: true, force: true }));
+
+    const loginWt = repo.worktrees.login;
+    const billingWt = repo.worktrees.billing;
+    if (loginWt === undefined || billingWt === undefined) {
+      throw new Error("expected login and billing worktrees");
+    }
+    writeMixedTierStack(loginWt);
+    writeMixedTierStack(billingWt);
+
+    const loginDeps = stubDriverDeps(loginWt);
+    const billingDeps = stubDriverDeps(billingWt);
+
+    const login = await runUp(loginDeps as never);
+    cleanups.push(() => {
+      void runDown(loginDeps as never).catch(() => {});
+    });
+    const billing = await runUp(billingDeps as never);
+    cleanups.push(() => {
+      void runDown(billingDeps as never).catch(() => {});
+      void runDown(billingDeps as never, { shared: true }).catch(() => {});
+    });
+
+    // The stub `process-compose` creates its control socket from a detached
+    // child, so a freshly-returned `runUp` may have written the derived YAML
+    // before the socket exists on disk. Wait until both worktree services are
+    // reachable on their ports — that's our liveness gate before enumeration.
+    expect(await waitForHttp(Number(login.env.WEB_PORT))).toBe(true);
+    expect(await waitForHttp(Number(billing.env.WEB_PORT))).toBe(true);
+    expect(await waitForTcp(Number(login.env.DB_PORT))).toBe(true);
+
+    // Discovery is anchored at the shared git common dir — call from either
+    // worktree and the answer is the same.
+    const lsFromLogin = await runLs({ cwd: loginWt });
+    const ids = lsFromLogin.instances.map((i) => i.id).sort();
+    expect(ids).toEqual(["billing", "login", "shared"]);
+
+    // Acceptance: every entry shows status + allocated ports.
+    for (const inst of lsFromLogin.instances) {
+      expect(inst.status).toBe("running");
+    }
+    const loginEntry = lsFromLogin.instances.find((i) => i.id === "login");
+    const billingEntry = lsFromLogin.instances.find((i) => i.id === "billing");
+    const sharedEntry = lsFromLogin.instances.find((i) => i.id === "shared");
+    expect(loginEntry?.kind).toBe("worktree");
+    expect(billingEntry?.kind).toBe("worktree");
+    expect(sharedEntry?.kind).toBe("shared");
+
+    // The worktree instances expose the same WEB_PORT names but with the
+    // numbers that were injected at up-time.
+    expect(loginEntry?.ports.WEB_PORT).toBe(Number(login.env.WEB_PORT));
+    expect(billingEntry?.ports.WEB_PORT).toBe(Number(billing.env.WEB_PORT));
+    // The shared instance carries the repo-wide DB_PORT, identical to what
+    // both worktrees got injected.
+    expect(sharedEntry?.ports.DB_PORT).toBe(Number(login.env.DB_PORT));
+
+    // Acceptance: ls from the other worktree returns the same set.
+    const lsFromBilling = await runLs({ cwd: billingWt });
+    expect(lsFromBilling.instances.map((i) => i.id).sort()).toEqual(ids);
   }, 30000);
 });
 

@@ -78,6 +78,15 @@ export function run(argv: ReadonlyArray<string>): RunResult {
   };
 }
 
+/** One row in the `ls` table — kept loose so it doesn't pin the CLI to `InstanceInfo`. */
+export interface LsInstanceRow {
+  readonly id: string;
+  readonly kind: "worktree" | "shared";
+  readonly status: "running" | "stale";
+  readonly ports: Readonly<Record<string, number>>;
+  readonly blockBase?: number;
+}
+
 /** The effectful commands, injected so `execute` stays unit-testable. */
 export interface ExecuteDeps {
   up: () => Promise<{
@@ -101,12 +110,51 @@ export interface ExecuteDeps {
     env: Record<string, string>;
     sharedEnv?: Record<string, string>;
   }>;
+  /**
+   * List every devtrees instance across the repo. Optional so existing callers
+   * (e.g. the up/down-only tests) don't have to pass a stub; defaults to
+   * exiting with "not implemented" if a caller dispatches `ls` without it.
+   */
+  ls?: () => Promise<{ anchor: string; instances: ReadonlyArray<LsInstanceRow> }>;
 }
 
 /**
- * Resolve a command line, performing effects for `up`/`down` and delegating
- * everything else to the pure `run`. Errors (e.g. a missing process-compose
- * binary) become a clear, non-zero result rather than an unhandled rejection.
+ * Render the `ls` result as a small fixed-column table — id, kind, status, and
+ * one named-port=value pair per cell. Sized off the longest id/kind/status so
+ * the columns stay aligned without pulling in a formatter dependency.
+ */
+function formatLs(instances: ReadonlyArray<LsInstanceRow>): string {
+  if (instances.length === 0) {
+    return "devtrees ls: no devtrees instances running.\n";
+  }
+
+  const idWidth = Math.max(2, ...instances.map((i) => i.id.length));
+  const kindWidth = Math.max(4, ...instances.map((i) => i.kind.length));
+  const statusWidth = Math.max(6, ...instances.map((i) => i.status.length));
+
+  const formatPorts = (ports: Readonly<Record<string, number>>): string =>
+    Object.entries(ports)
+      .map(([k, v]) => `${k}=${v}`)
+      .join(" ");
+
+  const header = `${"ID".padEnd(idWidth)}  ${"KIND".padEnd(kindWidth)}  ${"STATUS".padEnd(
+    statusWidth,
+  )}  PORTS`;
+
+  const rows = instances.map((i) => {
+    const ports =
+      formatPorts(i.ports) || (i.blockBase !== undefined ? `(block ${i.blockBase})` : "-");
+    return `${i.id.padEnd(idWidth)}  ${i.kind.padEnd(kindWidth)}  ${i.status.padEnd(statusWidth)}  ${ports}`;
+  });
+
+  return `${[header, ...rows].join("\n")}\n`;
+}
+
+/**
+ * Resolve a command line, performing effects for `up`/`down`/`generate`/`ls`
+ * and delegating everything else to the pure `run`. Errors (e.g. a missing
+ * process-compose binary) become a clear, non-zero result rather than an
+ * unhandled rejection.
  *
  * `down --shared` tears down the shared instance (ADR-0001): an explicit,
  * opt-in flag because the shared instance is decoupled from any single
@@ -148,6 +196,10 @@ export async function execute(argv: ReadonlyArray<string>, deps: ExecuteDeps): P
       ];
       return { code: 0, stdout: lines.join("\n"), stderr: "" };
     }
+    if (first === "ls" && deps.ls !== undefined) {
+      const result = await deps.ls();
+      return { code: 0, stdout: formatLs(result.instances), stderr: "" };
+    }
   } catch (err) {
     return { code: 1, stdout: "", stderr: `devtrees: ${(err as Error).message}\n` };
   }
@@ -157,11 +209,12 @@ export async function execute(argv: ReadonlyArray<string>, deps: ExecuteDeps): P
 
 // Run only when invoked as the program, not when imported by a test.
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const { runUp, runDown, runGenerate } = await import("./commands.js");
+  const { runUp, runDown, runGenerate, runLs } = await import("./commands.js");
   const result = await execute(process.argv.slice(2), {
     up: () => runUp(),
     down: ({ shared }) => runDown({}, { shared }),
     generate: () => runGenerate(),
+    ls: () => runLs(),
   });
   if (result.stdout) process.stdout.write(result.stdout);
   if (result.stderr) process.stderr.write(result.stderr);
