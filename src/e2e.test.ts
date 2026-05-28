@@ -391,6 +391,134 @@ describe("e2e — devtrees ls discovers worktree instances + the shared instance
   }, 30000);
 });
 
+describe("e2e — cross-tier wiring: isolated waits for shared health (ADR-0003)", () => {
+  it("an isolated service that depends_on a shared service does not start until shared is healthy", async () => {
+    // Isolated `web` depends_on shared `pgstub`. The shared service stalls 500ms
+    // before listening on DB_PORT (a stand-in for an actual readiness gate).
+    // The worktree `web` records a timestamp at startup; if the cross-tier wait
+    // is honoured, that timestamp lands *after* the shared listener is up.
+    const repo = makeRepo("dt-xt-", ["login"]);
+    cleanups.push(() => rmSync(repo.root, { recursive: true, force: true }));
+    const worktree = repo.worktrees.login;
+    if (worktree === undefined) throw new Error("expected login worktree");
+
+    const webMjs = [
+      "import { writeFileSync } from 'node:fs';",
+      "import { createServer } from 'node:http';",
+      "writeFileSync('web-start.txt', String(Date.now()));",
+      "createServer((_, res) => res.end('ok')).listen(Number(process.env.WEB_PORT), '127.0.0.1');",
+    ].join("\n");
+    writeFileSync(join(worktree, "web.mjs"), webMjs);
+
+    // Shared `pgstub`: delay 500ms, then start TCP listener and touch a marker file.
+    const dbInline =
+      "setTimeout(()=>{" +
+      "import('node:fs').then(({writeFileSync})=>writeFileSync(process.env.DB_READY_FILE,String(Date.now())));" +
+      "import('node:net').then(({createServer})=>createServer((s)=>{s.on('error',()=>{});s.end('OK');})" +
+      ".listen(Number(process.env.DB_PORT),'127.0.0.1'));" +
+      "},500);";
+
+    // The shared service writes its readiness timestamp into a file under the
+    // anchor so the test can read it deterministically (no process-compose
+    // probe is hit in this e2e — the test stubs waitForSharedHealth to poll
+    // the same flag file).
+    const commonDir = git(worktree, "rev-parse", "--git-common-dir");
+    const absCommon = commonDir.startsWith("/") ? commonDir : join(worktree, commonDir);
+    const readyFile = join(absCommon, "db-ready.txt");
+
+    writeFileSync(
+      join(worktree, "devtrees.yaml"),
+      [
+        "services:",
+        "  web:",
+        "    tier: isolated",
+        '    command: "node web.mjs"',
+        "    ports: [WEB_PORT]",
+        "    depends_on: [pgstub]",
+        "  pgstub:",
+        "    tier: shared",
+        `    command: ${JSON.stringify(`node -e ${JSON.stringify(dbInline)}`)}`,
+        "    ports: [DB_PORT]",
+        `    environment: [${JSON.stringify(`DB_READY_FILE=${readyFile}`)}]`,
+        "",
+      ].join("\n"),
+    );
+
+    // Custom waitForSharedHealth: poll for the ready file. Mirrors what the
+    // real default does over process-compose's `process list` — exposes the
+    // same async hook in the test.
+    const waitForSharedHealth = async (): Promise<void> => {
+      const deadline = Date.now() + 4000;
+      while (Date.now() < deadline) {
+        if (existsSync(readyFile)) return;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      throw new Error("shared readiness file never appeared");
+    };
+
+    const deps = {
+      ...stubDriverDeps(worktree),
+      waitForSharedHealth,
+    };
+
+    const up = await runUp(deps as never);
+    cleanups.push(() => {
+      void runDown(deps as never).catch(() => {});
+      void runDown(deps as never, { shared: true }).catch(() => {});
+    });
+
+    // Acceptance: web is up and reaches the shared DB port via the injection.
+    expect(await waitForHttp(Number(up.env.WEB_PORT))).toBe(true);
+    expect(await waitForTcp(Number(up.env.DB_PORT))).toBe(true);
+
+    // Acceptance: the cross-tier `depends_on` was dropped — derived worktree
+    // config carries no reference to the shared service, so process-compose
+    // never sees an unknown-process error.
+    const derivedPath = join(absCommon, "devtrees", `${up.worktreeId}.yaml`);
+    const derived = parseYaml(readFileSync(derivedPath, "utf8")) as {
+      processes: Record<string, { depends_on?: Record<string, unknown> }>;
+    };
+    expect(derived.processes.web?.depends_on).toBeUndefined();
+
+    // Acceptance: the same-tier check — web has no isolated depends_on, but the
+    // depends_on key is omitted entirely (not an empty map).
+    expect("depends_on" in (derived.processes.web ?? {})).toBe(false);
+
+    // Acceptance: ordering — the web process started *after* the shared service's
+    // ready marker landed. Both write Date.now() at start; web's must be later.
+    const webStart = Number(readFileSync(join(worktree, "web-start.txt"), "utf8"));
+    const dbReady = Number(readFileSync(readyFile, "utf8"));
+    expect(webStart).toBeGreaterThanOrEqual(dbReady);
+  }, 30000);
+});
+
+describe("e2e — shared→isolated depends_on is rejected at load time (ADR-0003)", () => {
+  it("a shared service that depends_on an isolated service raises a clear config error", async () => {
+    const repo = makeRepo("dt-rej-", ["login"]);
+    cleanups.push(() => rmSync(repo.root, { recursive: true, force: true }));
+    const worktree = repo.worktrees.login;
+    if (worktree === undefined) throw new Error("expected login worktree");
+
+    writeFileSync(
+      join(worktree, "devtrees.yaml"),
+      [
+        "services:",
+        "  postgres:",
+        "    tier: shared",
+        '    command: "postgres"',
+        "    depends_on: [web]",
+        "  web:",
+        "    tier: isolated",
+        '    command: "node server.js"',
+        "",
+      ].join("\n"),
+    );
+
+    const deps = stubDriverDeps(worktree);
+    await expect(runUp(deps as never)).rejects.toThrow(/shared.*depends_on.*isolated/i);
+  });
+});
+
 describe("e2e smoke — extend an existing process-compose.yaml", () => {
   it("up runs the base-defined service; the base file is unmodified; derived config is tier-free", async () => {
     const repo = makeRepo("dt-ext-", ["login"]);
