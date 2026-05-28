@@ -55,6 +55,74 @@ npm run build    # bundle the CLI to dist/cli.mjs
 npm run check    # format, lint, and type-check
 ```
 
+Or drive Vite+ directly with the `vp` CLI (what CI runs):
+
+```bash
+vp install       # install dependencies
+vp check         # format + lint + type-check in one pass
+vp lint          # lint only
+vp fmt --check   # verify formatting without writing
+vp test run      # run the test suite once
+vp run build     # bundle the CLI (runs `vp pack`; `vp build` is the app build)
+```
+
+## CI/CD
+
+CI runs on every push to `main` and on every pull request via
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml), in two parts.
+
+### 1. Vite+ pipeline
+
+The [`voidzero-dev/setup-vp`](https://viteplus.dev/guide/ci) action installs
+Vite+, Node 22, and the package manager with dependency caching in a single
+step (replacing `setup-node` + manual cache steps). It then runs each stage of
+the Vite+ pipeline as its own step so a failure points at exactly which gate
+broke: `vp install` → `vp check` (format + lint + **type-check**) → `vp lint` →
+`vp fmt --check` → `vp test run` → `vp run build` (the project's `vp pack`
+library build; plain `vp build` is the frontend-app build and doesn't apply
+to a CLI).
+
+Type-checking is wired into `vp check` via `lint.options.typeCheck` in
+[`vite.config.ts`](vite.config.ts), so the check stage genuinely fails on type
+errors rather than silently skipping them.
+
+Run the same checks locally with `vp check` and `vp test` (see Development
+above).
+
+### 2. fallow code-quality gate
+
+On pull requests, [fallow](https://docs.fallow.tools/) runs as a code-quality
+gate covering dead code, duplication, circular dependencies, and a complexity
+**health** score. It gates on **regressions**, not absolute purity:
+
+- `fallow audit` compares the PR's changed files against committed baselines
+  ([`fallow-baselines/*.json`](fallow-baselines)) and fails on new issues with
+  `--fail-on-regression --tolerance 2%`.
+- `fallow health --min-score 80` enforces a health-score floor.
+- `fallow dupes --threshold 10` enforces a duplication ceiling (percent).
+
+Results are surfaced on the PR as a markdown comment and in the job summary.
+
+**All thresholds are starting points and tunable.** The tolerance,
+health-score floor, and duplication threshold live in
+[`.fallowrc.jsonc`](.fallowrc.jsonc) and the workflow; tighten them as the
+codebase matures. Regenerate the baselines on `main` when you intentionally
+pay down or accept debt:
+
+```bash
+npx fallow dead-code --save-baseline fallow-baselines/dead-code.json
+npx fallow health    --save-baseline fallow-baselines/health.json
+npx fallow dupes     --save-baseline fallow-baselines/dupes.json
+```
+
+Run fallow locally before pushing:
+
+```bash
+npx fallow audit            # dead code + dupes + health on changed files
+npx fallow health           # full-tree health score
+npx fallow dupes            # full-tree duplication report
+```
+
 ## License
 
 MIT

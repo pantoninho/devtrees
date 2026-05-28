@@ -5,27 +5,134 @@ on:
     branches: [main]
   pull_request:
 
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
-  build-and-test:
+  # ---------------------------------------------------------------------------
+  # Part 1 — Vite+ pipeline.
+  #
+  # `voidzero-dev/setup-vp` installs Vite+, the required Node version, and the
+  # project's package manager, with dependency caching — it replaces the old
+  # setup-node + manual cache steps. Every stage is its own step so a failure
+  # points at exactly which gate broke; no stage silently passes.
+  # ---------------------------------------------------------------------------
+  vp:
+    name: Vite+ build & test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Set up Vite+ (Node + package manager + cache)
+        uses: voidzero-dev/setup-vp@v1
         with:
-          node-version: 22
-          cache: npm
+          node-version: "22"
+          cache: true
 
       - name: Install dependencies
-        run: npm ci
+        run: vp install
 
-      - name: Check (format, lint, types)
-        run: npm run check
+      # `vp check` runs format + lint + type-check in one pass (type-check is
+      # enabled via lint.options.typeCheck in vite.config.ts). The explicit
+      # lint and format-check steps below make each gate individually visible.
+      - name: Check (format + lint + type-check)
+        run: vp check
 
-      - name: Build
-        run: npm run build
+      - name: Lint
+        run: vp lint
+
+      - name: Format (check mode)
+        run: vp fmt --check
 
       - name: Test
-        run: npm test
+        run: vp test run
+
+      # devtrees is a CLI library, so its build is `vp pack` (bundles to
+      # dist/cli.mjs) — exposed as the `build` npm script. `vp build` is the
+      # frontend-app build and would fail looking for an index.html, so we run
+      # the project's build script instead.
+      - name: Build
+        run: vp run build
+
+  # ---------------------------------------------------------------------------
+  # Part 2 — fallow code-quality gate (pull requests only).
+  #
+  # Gates on REGRESSIONS rather than absolute purity: `fallow audit` compares
+  # changed files against committed baselines (fallow-baselines/*.json) and a
+  # small tolerance, plus a health-score floor and a duplication threshold.
+  # All thresholds are starting points and tunable — see .fallowrc.jsonc and
+  # the README. Results are surfaced as a markdown PR comment + job summary.
+  # ---------------------------------------------------------------------------
+  fallow:
+    name: fallow code-quality gate
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: write # post the markdown summary as a PR comment
+    steps:
+      - name: Checkout (full history for base-branch diff)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Vite+ (Node + package manager + cache)
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version: "22"
+          cache: true
+
+      - name: Install dependencies
+        run: vp install
+
+      # Audit only the changes in this PR against the saved baselines, so
+      # pre-existing debt does not block the PR while new dead code, new
+      # duplication, and new complexity do. --fail-on-regression with a small
+      # --tolerance turns a genuine increase into a red check.
+      - name: fallow audit (dead-code + dupes + health, regression-gated)
+        run: |
+          npx --yes fallow@2 audit \
+            --base "origin/${{ github.base_ref }}" \
+            --dead-code-baseline fallow-baselines/dead-code.json \
+            --health-baseline    fallow-baselines/health.json \
+            --dupes-baseline     fallow-baselines/dupes.json \
+            --fail-on-regression \
+            --tolerance 2% \
+            --format compact
+
+      # Absolute floors, independent of the diff. TUNABLE in .fallowrc.jsonc:
+      #   - health score must stay at or above the floor (currently 80/100)
+      #   - whole-tree duplication must stay at or below the threshold (10%)
+      - name: fallow health floor
+        run: npx --yes fallow@2 health --min-score 80 --format compact
+
+      - name: fallow duplication threshold
+        run: npx --yes fallow@2 dupes --threshold 10 --format compact
+
+      # Render a human-readable audit report into the GitHub job summary and,
+      # on PRs, into a sticky PR comment. This step never fails the build (the
+      # gates above own the verdict) — it only surfaces results.
+      - name: fallow PR summary (markdown)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "## fallow code-quality report"
+            echo
+            echo '```'
+            npx --yes fallow@2 audit --base "origin/${{ github.base_ref }}" --format markdown 2>&1 || true
+            echo '```'
+            echo
+            echo "_Thresholds are tunable — see \`.fallowrc.jsonc\` and the README._"
+          } > fallow-report.md
+          cat fallow-report.md >> "$GITHUB_STEP_SUMMARY"
+          # Sticky comment: edit our previous one, or create it the first time.
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --edit-last --create-if-none --body-file fallow-report.md

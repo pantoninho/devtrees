@@ -1,0 +1,35 @@
+{
+  "$schema": "https://raw.githubusercontent.com/fallow-rs/fallow/main/schema.json",
+
+  // devtrees code-quality gate (issue #12).
+  //
+  // All thresholds below are STARTING POINTS and explicitly tunable. They are
+  // deliberately lenient while the codebase is young — tighten them as the code
+  // grows and the team builds confidence. The CI workflow (.github/workflows/ci.yml)
+  // reads these values (and a couple of CLI overrides) to gate pull requests.
+
+  // Only consider production source for dead-code/health by default; the audit
+  // step scopes to changed files vs the base branch on PRs.
+  "entry": ["src/cli.ts"],
+  "ignorePatterns": ["dist/**", "node_modules/**", "**/*.d.ts"],
+
+  "duplicates": {
+    // Duplication percentage above which `fallow dupes --threshold` fails CI.
+    // TUNABLE: start lenient at 10%; lower it as the surface area grows.
+    "threshold": 10,
+    "minTokens": 50,
+    "minLines": 5,
+  },
+
+  "health": {
+    // Complexity ceilings feeding the health score. TUNABLE.
+    "maxCyclomatic": 20,
+    "maxCognitive": 15,
+  },
+
+  "audit": {
+    // Gate only on issues introduced by the changeset, not pre-existing debt.
+    // TUNABLE: switch to "all" once the codebase is clean enough to enforce it.
+    "gate": "new-only",
+  },
+}
