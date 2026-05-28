@@ -52,6 +52,11 @@ function lockFile(anchor: string): string {
   return join(devtreesDir(anchor), "registry.lock");
 }
 
+/** Path of the shared-instance lifecycle lock, sibling of registry.lock. */
+function sharedLockFile(anchor: string): string {
+  return join(devtreesDir(anchor), "shared.lock");
+}
+
 /** Read the persisted snapshot for this anchor; empty object if none exists yet. */
 export function readRegistry(anchor: string): RegistrySnapshot {
   const file = registryFile(anchor);
@@ -72,10 +77,8 @@ function sleepSync(ms: number): void {
   }
 }
 
-/** Try to acquire the lock; throws RegistryLockedError if it stays held past the retries. */
-function acquireLock(anchor: string, options: LockOptions): void {
-  mkdirSync(devtreesDir(anchor), { recursive: true });
-  const path = lockFile(anchor);
+/** Try to acquire a lockfile by `wx`-creating it; throws RegistryLockedError on timeout. */
+function acquireLockAt(path: string, options: LockOptions): void {
   const retries = options.retries ?? DEFAULT_RETRIES;
   const delay = options.retryDelayMs ?? DEFAULT_DELAY_MS;
   for (let attempt = 0; attempt <= retries; attempt++) {
@@ -91,13 +94,43 @@ function acquireLock(anchor: string, options: LockOptions): void {
   }
 }
 
-function releaseLock(anchor: string): void {
+/**
+ * Async variant of `acquireLockAt`. Uses `setTimeout` between retries so other
+ * tasks (including the current holder's `finally` release) can run. The sync
+ * variant's `Atomics.wait` would block the event loop and deadlock overlapping
+ * callers within one process.
+ */
+async function acquireLockAtAsync(path: string, options: LockOptions): Promise<void> {
+  const retries = options.retries ?? DEFAULT_RETRIES;
+  const delay = options.retryDelayMs ?? DEFAULT_DELAY_MS;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      writeFileSync(path, `${process.pid}\n`, { flag: "wx" });
+      return;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      if (attempt === retries) throw new RegistryLockedError(path);
+      await new Promise<void>((resolve) => setTimeout(resolve, delay));
+    }
+  }
+}
+
+function releaseLockAt(path: string): void {
   try {
-    unlinkSync(lockFile(anchor));
+    unlinkSync(path);
   } catch (err) {
     // Already gone is fine; anything else is a real problem.
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
   }
+}
+
+function acquireLock(anchor: string, options: LockOptions): void {
+  mkdirSync(devtreesDir(anchor), { recursive: true });
+  acquireLockAt(lockFile(anchor), options);
+}
+
+function releaseLock(anchor: string): void {
+  releaseLockAt(lockFile(anchor));
 }
 
 function writeSnapshot(anchor: string, snapshot: RegistrySnapshot): void {
@@ -125,5 +158,31 @@ export function withRegistryLock(
     return after;
   } finally {
     releaseLock(anchor);
+  }
+}
+
+/**
+ * Serialize shared-instance lifecycle operations (lazy start, teardown) across
+ * processes. Held over an async callback so the driver's binary probe + spawn
+ * can both run inside the critical section — two simultaneous `devtrees up`s
+ * therefore see a consistent "is it already running?" answer and at most one
+ * goes on to start the shared instance (PRD US-32 extended to shared).
+ *
+ * This is a separate lockfile from the allocation registry's: the registry
+ * lock is held for short, sync read-modify-writes, while the lifecycle lock
+ * may briefly cover spawning a child process.
+ */
+export async function withSharedLock<T>(
+  anchor: string,
+  fn: () => Promise<T>,
+  options: LockOptions = {},
+): Promise<T> {
+  mkdirSync(devtreesDir(anchor), { recursive: true });
+  const path = sharedLockFile(anchor);
+  await acquireLockAtAsync(path, options);
+  try {
+    return await fn();
+  } finally {
+    releaseLockAt(path);
   }
 }
