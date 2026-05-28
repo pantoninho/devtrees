@@ -15,7 +15,7 @@ for the full vision.
 
 ## Requirements
 
-- **Node.js** >= 20
+- **Node.js** >= 22
 - **`process-compose`** — devtrees shells out to the external `process-compose`
   binary; it does not embed it. You must have `process-compose` installed and on
   your `PATH`. See the [process-compose installation guide](https://f1bonacc1.github.io/process-compose/installation/).
