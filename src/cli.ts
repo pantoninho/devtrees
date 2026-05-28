@@ -20,6 +20,10 @@ export const COMMANDS: ReadonlyArray<{ name: string; summary: string }> = [
     summary: "Attach a TUI to this worktree's instance (--shared for the shared one)",
   },
   { name: "generate", summary: "Write the derived process-compose config to disk" },
+  {
+    name: "prune",
+    summary: "Reconcile against `git worktree list` and clean up orphaned instances",
+  },
 ];
 
 export interface RunResult {
@@ -123,6 +127,12 @@ export interface ExecuteDeps {
    * `execute` for `attach` requires it.
    */
   attach?: (options: { shared: boolean }) => Promise<void>;
+  /**
+   * Reconcile devtrees against `git worktree list` and clean up orphaned
+   * instances. Optional for the same reason as `ls`: existing tests only
+   * exercise `up`/`down` and don't have to stub `prune`.
+   */
+  prune?: () => Promise<{ anchor: string; pruned: ReadonlyArray<LsInstanceRow> }>;
 }
 
 /**
@@ -158,78 +168,140 @@ function formatLs(instances: ReadonlyArray<LsInstanceRow>): string {
 }
 
 /**
- * Resolve a command line, performing effects for `up`/`down`/`generate`/`ls`
- * and delegating everything else to the pure `run`. Errors (e.g. a missing
- * process-compose binary) become a clear, non-zero result rather than an
- * unhandled rejection.
+ * Render the `prune` result: one line per cleaned orphan with its id, kind,
+ * and the status it had at discovery time (so the operator can see whether
+ * the orphan was caught running or already stale).
+ */
+function formatPrune(pruned: ReadonlyArray<LsInstanceRow>): string {
+  if (pruned.length === 0) {
+    return "devtrees prune: no orphans to clean up.\n";
+  }
+  const lines = pruned.map((p) => `  ${p.id} (${p.kind}, was ${p.status})`);
+  return `devtrees prune: cleaned ${pruned.length} orphan${pruned.length === 1 ? "" : "s"}:\n${lines.join(
+    "\n",
+  )}\n`;
+}
+
+/**
+ * A single command's effectful behaviour. Returns the rendered `RunResult` on
+ * success, or `undefined` to defer to the stubbed `run` — used when the deps
+ * object lacks the optional collaborator for that command (e.g. an `up`/`down`-
+ * only test stub that doesn't pass a `prune`).
+ */
+type Handler = (rest: ReadonlyArray<string>, deps: ExecuteDeps) => Promise<RunResult | undefined>;
+
+async function handleUp(_rest: ReadonlyArray<string>, deps: ExecuteDeps): Promise<RunResult> {
+  const result = await deps.up();
+  const ports = Object.entries(result.env)
+    .map(([k, v]) => `  ${k}=${v}`)
+    .join("\n");
+  const sharedNote = result.sharedStarted ? "devtrees up: shared instance started.\n" : "";
+  return {
+    code: 0,
+    stdout: `${sharedNote}devtrees up: '${result.worktreeId}' is up.\n${ports}\n`,
+    stderr: "",
+  };
+}
+
+async function handleDown(rest: ReadonlyArray<string>, deps: ExecuteDeps): Promise<RunResult> {
+  const shared = rest.includes("--shared");
+  await deps.down({ shared });
+  return {
+    code: 0,
+    stdout: shared
+      ? "devtrees down: shared instance stopped.\n"
+      : "devtrees down: worktree instance stopped.\n",
+    stderr: "",
+  };
+}
+
+async function handleGenerate(
+  _rest: ReadonlyArray<string>,
+  deps: ExecuteDeps,
+): Promise<RunResult | undefined> {
+  if (!deps.generate) return undefined;
+  const result = await deps.generate();
+  const lines = [
+    `devtrees generate: wrote ${result.worktreePath}`,
+    ...(result.sharedPath ? [`devtrees generate: wrote ${result.sharedPath}`] : []),
+    "",
+  ];
+  return { code: 0, stdout: lines.join("\n"), stderr: "" };
+}
+
+async function handleLs(
+  _rest: ReadonlyArray<string>,
+  deps: ExecuteDeps,
+): Promise<RunResult | undefined> {
+  if (deps.ls === undefined) return undefined;
+  const result = await deps.ls();
+  return { code: 0, stdout: formatLs(result.instances), stderr: "" };
+}
+
+async function handleAttach(
+  rest: ReadonlyArray<string>,
+  deps: ExecuteDeps,
+): Promise<RunResult | undefined> {
+  if (!deps.attach) return undefined;
+  const shared = rest.includes("--shared");
+  await deps.attach({ shared });
+  // `attach` runs the TUI in-process; on a clean exit there is nothing to
+  // print (the TUI itself is the user-visible output).
+  return { code: 0, stdout: "", stderr: "" };
+}
+
+async function handlePrune(
+  _rest: ReadonlyArray<string>,
+  deps: ExecuteDeps,
+): Promise<RunResult | undefined> {
+  if (deps.prune === undefined) return undefined;
+  const result = await deps.prune();
+  return { code: 0, stdout: formatPrune(result.pruned), stderr: "" };
+}
+
+const HANDLERS: ReadonlyMap<string, Handler> = new Map([
+  ["up", handleUp],
+  ["down", handleDown],
+  ["generate", handleGenerate],
+  ["ls", handleLs],
+  ["attach", handleAttach],
+  ["prune", handlePrune],
+]);
+
+/**
+ * Resolve a command line, performing effects for the commands wired into
+ * `HANDLERS` and delegating everything else to the pure `run`. Errors (e.g. a
+ * missing process-compose binary) become a clear, non-zero result rather than
+ * an unhandled rejection.
  *
- * `down --shared` tears down the shared instance (ADR-0001): an explicit,
- * opt-in flag because the shared instance is decoupled from any single
- * worktree's lifecycle.
+ * `down --shared` and `attach --shared` target the shared instance (ADR-0001):
+ * explicit, opt-in flags because the shared instance is decoupled from any
+ * single worktree's lifecycle.
  */
 export async function execute(argv: ReadonlyArray<string>, deps: ExecuteDeps): Promise<RunResult> {
   const [first, ...rest] = argv;
-
-  try {
-    if (first === "up") {
-      const result = await deps.up();
-      const ports = Object.entries(result.env)
-        .map(([k, v]) => `  ${k}=${v}`)
-        .join("\n");
-      const sharedNote = result.sharedStarted ? "devtrees up: shared instance started.\n" : "";
-      return {
-        code: 0,
-        stdout: `${sharedNote}devtrees up: '${result.worktreeId}' is up.\n${ports}\n`,
-        stderr: "",
-      };
+  const handler = first !== undefined ? HANDLERS.get(first) : undefined;
+  if (handler !== undefined) {
+    try {
+      const result = await handler(rest, deps);
+      if (result !== undefined) return result;
+    } catch (err) {
+      return { code: 1, stdout: "", stderr: `devtrees: ${(err as Error).message}\n` };
     }
-    if (first === "down") {
-      const shared = rest.includes("--shared");
-      await deps.down({ shared });
-      return {
-        code: 0,
-        stdout: shared
-          ? "devtrees down: shared instance stopped.\n"
-          : "devtrees down: worktree instance stopped.\n",
-        stderr: "",
-      };
-    }
-    if (first === "generate" && deps.generate) {
-      const result = await deps.generate();
-      const lines = [
-        `devtrees generate: wrote ${result.worktreePath}`,
-        ...(result.sharedPath ? [`devtrees generate: wrote ${result.sharedPath}`] : []),
-        "",
-      ];
-      return { code: 0, stdout: lines.join("\n"), stderr: "" };
-    }
-    if (first === "ls" && deps.ls !== undefined) {
-      const result = await deps.ls();
-      return { code: 0, stdout: formatLs(result.instances), stderr: "" };
-    }
-    if (first === "attach" && deps.attach) {
-      const shared = rest.includes("--shared");
-      await deps.attach({ shared });
-      // `attach` runs the TUI in-process; on a clean exit there is nothing to
-      // print (the TUI itself is the user-visible output).
-      return { code: 0, stdout: "", stderr: "" };
-    }
-  } catch (err) {
-    return { code: 1, stdout: "", stderr: `devtrees: ${(err as Error).message}\n` };
   }
-
   return run(argv);
 }
 
 // Run only when invoked as the program, not when imported by a test.
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const { runUp, runDown, runGenerate, runLs, runAttach } = await import("./commands.js");
+  const { runUp, runDown, runGenerate, runLs, runAttach, runPrune } = await import("./commands.js");
   const result = await execute(process.argv.slice(2), {
     up: () => runUp(),
     down: ({ shared }) => runDown({}, { shared }),
     generate: () => runGenerate(),
     ls: () => runLs(),
     attach: ({ shared }) => runAttach({}, { shared }),
+    prune: () => runPrune(),
   });
   if (result.stdout) process.stdout.write(result.stdout);
   if (result.stderr) process.stderr.write(result.stderr);
