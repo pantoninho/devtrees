@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it } from "vite-plus/test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { withRegistryLock, readRegistry, RegistryLockedError } from "./registry.js";
+import { RegistryLockedError, readRegistry, withRegistryLock, withSharedLock } from "./registry.js";
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
@@ -72,5 +72,58 @@ describe("registry store — lock + persistence", () => {
     // A subsequent acquire must succeed — the lock did not leak.
     withRegistryLock(anchor, (s) => ({ ...s, login: 20512 }));
     expect(readRegistry(anchor)).toEqual({ login: 20512 });
+  });
+});
+
+describe("withSharedLock — async lifecycle lock", () => {
+  it("runs the callback under <anchor>/devtrees/shared.lock and releases on success", async () => {
+    const anchor = newAnchor();
+    const lockPath = join(anchor, "devtrees", "shared.lock");
+    await withSharedLock(anchor, async () => {
+      // While inside, the file exists — proving the lock is held.
+      expect(existsSync(lockPath)).toBe(true);
+    });
+    // And once out, it's gone.
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it("releases the lock even when the async callback throws", async () => {
+    const anchor = newAnchor();
+    await expect(
+      withSharedLock(anchor, async () => {
+        throw new Error("boom");
+      }),
+    ).rejects.toThrow("boom");
+    // A subsequent acquire must succeed — no leak.
+    await withSharedLock(anchor, async () => {});
+  });
+
+  it("refuses to acquire if another holder is there (retries exhausted)", async () => {
+    const anchor = newAnchor();
+    mkdirSync(join(anchor, "devtrees"), { recursive: true });
+    writeFileSync(join(anchor, "devtrees", "shared.lock"), `${process.pid}\n`, { flag: "wx" });
+    await expect(withSharedLock(anchor, async () => {}, { retries: 0 })).rejects.toThrow(
+      RegistryLockedError,
+    );
+  });
+
+  it("serialises overlapping callers — the second runs only after the first releases", async () => {
+    const anchor = newAnchor();
+    const order: string[] = [];
+
+    // First holder waits a tick before releasing; the second must not interleave.
+    const first = withSharedLock(anchor, async () => {
+      order.push("first:enter");
+      await new Promise((r) => setTimeout(r, 30));
+      order.push("first:exit");
+    });
+    // Briefly let `first` acquire before `second` starts probing.
+    await new Promise((r) => setTimeout(r, 5));
+    const second = withSharedLock(anchor, async () => {
+      order.push("second:enter");
+    });
+
+    await Promise.all([first, second]);
+    expect(order).toEqual(["first:enter", "first:exit", "second:enter"]);
   });
 });

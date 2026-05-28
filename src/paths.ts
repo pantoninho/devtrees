@@ -6,9 +6,26 @@
  * inside the git dir, it is never part of the working tree: no `.gitignore`
  * entry is needed and the same layout works for normal and bare repos
  * (CONTEXT.md "Anchor state", ADR-0001).
+ *
+ * The shared instance has a fixed identity at the anchor: its derived config
+ * lives at `<anchor>/devtrees/shared.yaml` and its control socket at
+ * `<anchor>/devtrees/run/shared.sock`. It is registered in the allocation
+ * registry under the well-known key `__shared__` (CONTEXT.md "Allocation
+ * registry") so a worktree can read the registry and discover the shared
+ * services' ports without any other coordination.
  */
 
 import { join } from "node:path";
+
+/** Well-known registry key for the shared instance's port block. */
+export const SHARED_REGISTRY_KEY = "__shared__";
+
+/**
+ * Filename stem used for the shared instance's derived config + control socket
+ * (`shared.yaml`, `shared.sock`). Distinct from the registry key so the
+ * on-disk filename stays human-readable.
+ */
+export const SHARED_INSTANCE_ID = "shared";
 
 /** The `devtrees/` state directory inside the anchor (git common dir). */
 export function stateDir(anchor: string): string {
@@ -35,4 +52,13 @@ export function instancePaths(anchor: string, worktreeId: string): InstancePaths
     configPath: join(stateDir(anchor), `${worktreeId}.yaml`),
     socketPath: join(runDir(anchor), `${worktreeId}.sock`),
   };
+}
+
+/**
+ * Paths for the shared instance — fixed at `<anchor>/devtrees/shared.yaml`
+ * and `<anchor>/devtrees/run/shared.sock`. There is only ever one shared
+ * instance per repo, so its filenames are constant rather than keyed.
+ */
+export function sharedInstancePaths(anchor: string): InstancePaths {
+  return instancePaths(anchor, SHARED_INSTANCE_ID);
 }

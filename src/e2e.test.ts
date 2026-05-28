@@ -32,6 +32,46 @@ function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
 }
 
+/**
+ * Build a fresh temp repo with `main/` initialised and committed, plus N linked
+ * worktrees. Returns `{ root, main, worktrees }`. The caller is responsible for
+ * registering an rm cleanup against `root`.
+ */
+function makeRepo(
+  prefix: string,
+  worktreeNames: ReadonlyArray<string>,
+): { root: string; main: string; worktrees: Record<string, string> } {
+  const root = mkdtempSync(join(SHORT_TMP, prefix));
+  const main = join(root, "main");
+  mkdirSync(main, { recursive: true });
+  git(main, "init", "-q");
+  git(main, "config", "user.email", "t@t");
+  git(main, "config", "user.name", "t");
+  writeFileSync(join(main, "README.md"), "x");
+  git(main, "add", ".");
+  git(main, "commit", "-qm", "init");
+  const worktrees: Record<string, string> = {};
+  for (const name of worktreeNames) {
+    const path = join(root, name);
+    git(main, "worktree", "add", "-q", path, "-b", name);
+    worktrees[name] = path;
+  }
+  return { root, main, worktrees };
+}
+
+/** The driver config that runs the stub instead of a real process-compose. */
+function stubDriverDeps(worktree: string): {
+  cwd: string;
+  driver: { binary: string; prefixArgs: string[] };
+  attach: false;
+} {
+  return {
+    cwd: worktree,
+    driver: { binary: process.execPath, prefixArgs: [STUB] },
+    attach: false,
+  };
+}
+
 async function waitForHttp(port: number, timeoutMs = 4000): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -85,28 +125,13 @@ function writeStackConfig(worktreeRoot: string): void {
 
 describe("e2e smoke — up then down a single isolated service", () => {
   it("up starts the service on its injected port; down stops it cleanly", async () => {
-    const root = mkdtempSync(join(SHORT_TMP, "dt-"));
-    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
-
-    // A normal repo with a linked worktree.
-    const main = join(root, "main");
-    mkdirSync(main, { recursive: true });
-    git(main, "init", "-q");
-    git(main, "config", "user.email", "t@t");
-    git(main, "config", "user.name", "t");
-    writeFileSync(join(main, "README.md"), "x");
-    git(main, "add", ".");
-    git(main, "commit", "-qm", "init");
-
-    const worktree = join(root, "login");
-    git(main, "worktree", "add", "-q", worktree, "-b", "login");
+    const repo = makeRepo("dt-", ["login"]);
+    cleanups.push(() => rmSync(repo.root, { recursive: true, force: true }));
+    const worktree = repo.worktrees.login;
+    if (worktree === undefined) throw new Error("expected login worktree");
     writeStackConfig(worktree);
 
-    const deps = {
-      cwd: worktree,
-      driver: { binary: process.execPath, prefixArgs: [STUB] } as never,
-      attach: false,
-    };
+    const deps = stubDriverDeps(worktree);
 
     const up = await runUp(deps as never);
     cleanups.push(() => {
@@ -167,33 +192,147 @@ function writeExtendConfig(worktreeRoot: string): void {
   );
 }
 
+/**
+ * Two worktrees sharing one shared service, exercised end-to-end against the
+ * stub `process-compose`. Asserts the full ADR-0001 lifecycle:
+ *
+ *  - one worktree `up` lazy-starts the shared instance
+ *  - a second worktree `up` reuses it (single shared socket, identical DB_PORT)
+ *  - per-worktree `down` leaves shared running for the other
+ *  - `down --shared` tears shared down explicitly
+ */
+function writeMixedTierStack(worktreeRoot: string): void {
+  // Two services: an HTTP server bound to ${WEB_PORT} (isolated per worktree)
+  // and a TCP echo bound to ${DB_PORT} that stands in for a shared DB. The
+  // isolated service runs a relative .mjs (worktree-local working_dir); the
+  // shared one runs an inline `node -e` because it executes from the anchor
+  // (the git common dir), not the worktree.
+  const server = [
+    "import { createServer } from 'node:http';",
+    "import { writeFileSync } from 'node:fs';",
+    "writeFileSync('served.txt', `wt=${process.env.DEVTREES_WORKTREE_ID}`);",
+    "createServer((_, res) => res.end(`db=${process.env.DB_PORT}`))",
+    "  .listen(Number(process.env.WEB_PORT), '127.0.0.1');",
+  ].join("\n");
+  // Inline single-line program; embedded in YAML as a JSON-quoted string so
+  // semicolons survive. `${DB_PORT}` is referenced verbatim — devtrees does
+  // not rewrite commands; process-compose expands it from the injected env.
+  // The on-connect handler swallows socket errors (an unhandled 'error' would
+  // crash the process — RST from a connect-then-close probe would otherwise
+  // kill the shared listener after the first ping).
+  const dbInline =
+    "import('node:net').then(({createServer})=>createServer((s)=>{s.on('error',()=>{});s.end('OK');})" +
+    ".listen(Number(process.env.DB_PORT),'127.0.0.1'));";
+  writeFileSync(join(worktreeRoot, "server.mjs"), server);
+  writeFileSync(
+    join(worktreeRoot, "devtrees.yaml"),
+    [
+      "services:",
+      "  web:",
+      "    tier: isolated",
+      '    command: "node server.mjs"',
+      "    ports: [WEB_PORT]",
+      "  pgstub:",
+      "    tier: shared",
+      `    command: ${JSON.stringify(`node -e ${JSON.stringify(dbInline)}`)}`,
+      "    ports: [DB_PORT]",
+      "",
+    ].join("\n"),
+  );
+}
+
+async function waitForTcp(port: number, timeoutMs = 4000): Promise<boolean> {
+  const { connect } = await import("node:net");
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const ok = await new Promise<boolean>((resolve) => {
+      const s = connect(port, "127.0.0.1");
+      s.once("connect", () => {
+        s.destroy();
+        resolve(true);
+      });
+      s.once("error", () => resolve(false));
+    });
+    if (ok) return true;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return false;
+}
+
+describe("e2e — shared instance lifecycle across two worktrees", () => {
+  it("lazy-starts shared on first up, reuses it on second, survives per-worktree down, dies on down --shared", async () => {
+    const repo = makeRepo("dt-sh-", ["login", "billing"]);
+    cleanups.push(() => rmSync(repo.root, { recursive: true, force: true }));
+
+    const loginWt = repo.worktrees.login;
+    const billingWt = repo.worktrees.billing;
+    if (loginWt === undefined || billingWt === undefined) {
+      throw new Error("expected login and billing worktrees");
+    }
+    writeMixedTierStack(loginWt);
+    writeMixedTierStack(billingWt);
+
+    const loginDeps = stubDriverDeps(loginWt);
+    const billingDeps = stubDriverDeps(billingWt);
+
+    // Acceptance: first up lazy-starts the shared instance.
+    const login = await runUp(loginDeps as never);
+    cleanups.push(() => {
+      void runDown(loginDeps as never).catch(() => {});
+    });
+    expect(login.sharedStarted).toBe(true);
+    expect(await waitForHttp(Number(login.env.WEB_PORT))).toBe(true);
+    expect(await waitForTcp(Number(login.env.DB_PORT))).toBe(true);
+
+    // The shared socket lives at <anchor>/devtrees/run/shared.sock.
+    const commonDir = git(loginWt, "rev-parse", "--git-common-dir");
+    const absCommon = commonDir.startsWith("/") ? commonDir : join(loginWt, commonDir);
+    const sharedSocket = join(absCommon, "devtrees", "run", "shared.sock");
+    expect(existsSync(sharedSocket)).toBe(true);
+
+    // Acceptance: a second worktree up reuses the running shared instance.
+    const billing = await runUp(billingDeps as never);
+    cleanups.push(() => {
+      void runDown(billingDeps as never).catch(() => {});
+    });
+    expect(billing.sharedStarted).toBe(false);
+    // Shared DB_PORT is identical in both worktrees (repo-wide injection).
+    expect(billing.env.DB_PORT).toBe(login.env.DB_PORT);
+    // Isolated WEB_PORTs differ.
+    expect(billing.env.WEB_PORT).not.toBe(login.env.WEB_PORT);
+    expect(await waitForHttp(Number(billing.env.WEB_PORT))).toBe(true);
+
+    // The isolated service reached the shared one via the injected value.
+    const httpRes = await fetch(`http://127.0.0.1:${Number(billing.env.WEB_PORT)}/`);
+    expect(await httpRes.text()).toContain(billing.env.DB_PORT);
+
+    // Acceptance: plain down in one worktree leaves shared up for the other.
+    await runDown(loginDeps as never);
+    expect(await waitForGone(Number(login.env.WEB_PORT))).toBe(true);
+    expect(existsSync(sharedSocket)).toBe(true);
+    expect(await waitForTcp(Number(billing.env.DB_PORT))).toBe(true);
+
+    // Acceptance: down --shared tears shared down explicitly.
+    await runDown(billingDeps as never);
+    await runDown(billingDeps as never, { shared: true });
+    expect(await waitForGone(Number(billing.env.DB_PORT))).toBe(true);
+    expect(existsSync(sharedSocket)).toBe(false);
+  }, 30000);
+});
+
 describe("e2e smoke — extend an existing process-compose.yaml", () => {
   it("up runs the base-defined service; the base file is unmodified; derived config is tier-free", async () => {
-    const root = mkdtempSync(join(SHORT_TMP, "dt-ext-"));
-    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
-
-    const main = join(root, "main");
-    mkdirSync(main, { recursive: true });
-    git(main, "init", "-q");
-    git(main, "config", "user.email", "t@t");
-    git(main, "config", "user.name", "t");
-    writeFileSync(join(main, "README.md"), "x");
-    git(main, "add", ".");
-    git(main, "commit", "-qm", "init");
-
-    const worktree = join(root, "login");
-    git(main, "worktree", "add", "-q", worktree, "-b", "login");
+    const repo = makeRepo("dt-ext-", ["login"]);
+    cleanups.push(() => rmSync(repo.root, { recursive: true, force: true }));
+    const worktree = repo.worktrees.login;
+    if (worktree === undefined) throw new Error("expected login worktree");
     writeExtendConfig(worktree);
 
     const basePath = join(worktree, "process-compose.yaml");
     const baseTextBefore = readFileSync(basePath, "utf8");
     const baseMtimeBefore = statSync(basePath).mtimeMs;
 
-    const deps = {
-      cwd: worktree,
-      driver: { binary: process.execPath, prefixArgs: [STUB] } as never,
-      attach: false,
-    };
+    const deps = stubDriverDeps(worktree);
 
     const up = await runUp(deps as never);
     cleanups.push(() => {

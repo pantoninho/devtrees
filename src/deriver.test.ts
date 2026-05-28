@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 import { stringify as stringifyYaml } from "yaml";
-import { deriveWorktreeConfig } from "./deriver.js";
+import { deriveSharedConfig, deriveWorktreeConfig } from "./deriver.js";
 import { parseStack, type ResolvedStack } from "./stack.js";
 
 const stack: ResolvedStack = {
@@ -110,5 +110,169 @@ processes:
       portFor: () => 20512,
     });
     expect(Object.keys(out.config.processes)).toEqual(["web"]);
+  });
+});
+
+describe("config deriver — shared-port injection into the worktree instance", () => {
+  const mixed: ResolvedStack = {
+    services: [
+      {
+        name: "web",
+        tier: "isolated",
+        command: "node server.js",
+        ports: ["WEB_PORT"],
+        dependsOn: [],
+        environment: [],
+      },
+      {
+        name: "postgres",
+        tier: "shared",
+        command: "postgres",
+        ports: ["DB_PORT"],
+        dependsOn: [],
+        environment: [],
+      },
+    ],
+  };
+
+  it("injects the shared service's named port into the worktree env (connection info)", () => {
+    const derived = deriveWorktreeConfig(mixed, {
+      worktreeId: "login",
+      worktreeRoot: "/home/me/wt/login",
+      portFor: (n) => (n === "WEB_PORT" ? 20512 : undefined),
+      sharedPortFor: (n) => (n === "DB_PORT" ? 19000 : undefined),
+    });
+    expect(derived.env.DB_PORT).toBe("19000");
+    expect(derived.env.WEB_PORT).toBe("20512");
+  });
+
+  it("carries the shared-service port into every isolated process's environment", () => {
+    const derived = deriveWorktreeConfig(mixed, {
+      worktreeId: "login",
+      worktreeRoot: "/home/me/wt/login",
+      portFor: () => 20512,
+      sharedPortFor: (n) => (n === "DB_PORT" ? 19000 : undefined),
+    });
+    const web = derived.config.processes.web;
+    if (web === undefined) throw new Error("expected 'web'");
+    expect(web.environment).toContain("DB_PORT=19000");
+  });
+
+  it("produces identical shared-port env in two worktrees (repo-wide injection)", () => {
+    const login = deriveWorktreeConfig(mixed, {
+      worktreeId: "login",
+      worktreeRoot: "/wt/login",
+      portFor: (n) => (n === "WEB_PORT" ? 20512 : undefined),
+      sharedPortFor: (n) => (n === "DB_PORT" ? 19000 : undefined),
+    });
+    const billing = deriveWorktreeConfig(mixed, {
+      worktreeId: "billing",
+      worktreeRoot: "/wt/billing",
+      portFor: (n) => (n === "WEB_PORT" ? 20544 : undefined),
+      sharedPortFor: (n) => (n === "DB_PORT" ? 19000 : undefined),
+    });
+    // Isolated ports differ; the shared port is identical.
+    expect(login.env.WEB_PORT).not.toBe(billing.env.WEB_PORT);
+    expect(login.env.DB_PORT).toBe(billing.env.DB_PORT);
+  });
+
+  it("omits the shared-port injection when no resolver is provided (degenerate context)", () => {
+    const derived = deriveWorktreeConfig(mixed, {
+      worktreeId: "login",
+      worktreeRoot: "/wt/login",
+      portFor: (n) => (n === "WEB_PORT" ? 20512 : undefined),
+    });
+    expect(derived.env.DB_PORT).toBeUndefined();
+  });
+});
+
+describe("config deriver — shared instance", () => {
+  const stack: ResolvedStack = {
+    services: [
+      {
+        name: "postgres",
+        tier: "shared",
+        command: "postgres -D ./pgdata",
+        ports: ["DB_PORT"],
+        dependsOn: [],
+        environment: ["LOG_LEVEL=info"],
+      },
+      {
+        name: "web",
+        tier: "isolated",
+        command: "node server.js",
+        ports: ["WEB_PORT"],
+        dependsOn: [],
+        environment: [],
+      },
+    ],
+  };
+
+  it("partitions in only shared services and strips the tier key", () => {
+    const out = deriveSharedConfig(stack, {
+      workingDir: "/anchor",
+      portFor: (n) => (n === "DB_PORT" ? 19000 : undefined),
+    });
+    expect(Object.keys(out.config.processes)).toEqual(["postgres"]);
+    const pg = out.config.processes.postgres;
+    if (pg === undefined) throw new Error("expected 'postgres'");
+    expect("tier" in pg).toBe(false);
+  });
+
+  it("injects each shared named port as its env-var name (no mangling)", () => {
+    const out = deriveSharedConfig(stack, {
+      workingDir: "/anchor",
+      portFor: (n) => (n === "DB_PORT" ? 19000 : undefined),
+    });
+    expect(out.env.DB_PORT).toBe("19000");
+    const pg = out.config.processes.postgres;
+    if (pg === undefined) throw new Error("expected 'postgres'");
+    expect(pg.environment).toContain("DB_PORT=19000");
+  });
+
+  it("pins working_dir to the anchor — shared services have no worktree of their own", () => {
+    const out = deriveSharedConfig(stack, {
+      workingDir: "/anchor",
+      portFor: () => 19000,
+    });
+    expect(out.config.processes.postgres?.working_dir).toBe("/anchor");
+  });
+
+  it("preserves author-declared environment alongside the injection", () => {
+    const out = deriveSharedConfig(stack, {
+      workingDir: "/anchor",
+      portFor: () => 19000,
+    });
+    expect(out.config.processes.postgres?.environment).toContain("LOG_LEVEL=info");
+  });
+
+  it("emits a tier-free shared config (strict-safe)", () => {
+    const out = deriveSharedConfig(stack, {
+      workingDir: "/anchor",
+      portFor: () => 19000,
+    });
+    const yaml = stringifyYaml(out.config);
+    expect(yaml).not.toMatch(/^\s*tier:/m);
+  });
+
+  it("returns an empty config when the stack has no shared services", () => {
+    const onlyIsolated: ResolvedStack = {
+      services: [
+        {
+          name: "web",
+          tier: "isolated",
+          command: "node x",
+          ports: [],
+          dependsOn: [],
+          environment: [],
+        },
+      ],
+    };
+    const out = deriveSharedConfig(onlyIsolated, {
+      workingDir: "/anchor",
+      portFor: () => undefined,
+    });
+    expect(out.config.processes).toEqual({});
+    expect(out.env).toEqual({});
   });
 });

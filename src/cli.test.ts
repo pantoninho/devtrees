@@ -54,11 +54,31 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
     expect(result.stdout).toContain("WEB_PORT");
   });
 
-  it("routes `down` to the down command", async () => {
+  it("routes `down` to the down command with shared=false by default", async () => {
     const down = vi.fn().mockResolvedValue(undefined);
     const result = await execute(["down"], { up: vi.fn(), down });
-    expect(down).toHaveBeenCalledOnce();
+    expect(down).toHaveBeenCalledWith({ shared: false });
     expect(result.code).toBe(0);
+    expect(result.stdout).toContain("worktree instance stopped");
+  });
+
+  it("passes shared=true through when --shared is given", async () => {
+    const down = vi.fn().mockResolvedValue(undefined);
+    const result = await execute(["down", "--shared"], { up: vi.fn(), down });
+    expect(down).toHaveBeenCalledWith({ shared: true });
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("shared instance stopped");
+  });
+
+  it("notes when up triggered a shared lazy start", async () => {
+    const up = vi.fn().mockResolvedValue({
+      worktreeId: "login",
+      socketPath: "/x.sock",
+      env: { WEB_PORT: "20512", DB_PORT: "19000" },
+      sharedStarted: true,
+    });
+    const result = await execute(["up"], { up, down: vi.fn() });
+    expect(result.stdout).toContain("shared instance started");
   });
 
   it("turns a missing process-compose binary into a clear, non-zero error", async () => {
