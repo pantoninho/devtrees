@@ -18,7 +18,7 @@ describe("devtrees CLI", () => {
     expect(result.stdout).toContain("devtrees");
     expect(result.stdout).toContain("Usage");
     // the stubbed command surface from the PRD
-    for (const cmd of ["up", "down", "ls", "attach", "generate"]) {
+    for (const cmd of ["up", "down", "ls", "attach", "generate", "prune"]) {
       expect(result.stdout).toContain(cmd);
     }
   });
@@ -165,6 +165,40 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
     const result = await execute(["ls"], { up: vi.fn(), down: vi.fn(), ls });
     expect(result.code).toBe(0);
     expect(result.stdout).toMatch(/no devtrees instances/i);
+  });
+
+  it("routes `prune` to the prune command and lists the cleaned orphans", async () => {
+    const prune = vi.fn().mockResolvedValue({
+      anchor: "/repo/.git",
+      pruned: [
+        {
+          id: "removed",
+          kind: "worktree",
+          status: "running",
+          socketPath: "/repo/.git/devtrees/run/removed.sock",
+          ports: {},
+          blockBase: 20032,
+        },
+      ],
+    });
+    const result = await execute(["prune"], { up: vi.fn(), down: vi.fn(), prune });
+    expect(prune).toHaveBeenCalledOnce();
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("removed");
+  });
+
+  it("`prune` says 'no orphans' when reconciliation finds nothing to clean", async () => {
+    const prune = vi.fn().mockResolvedValue({ anchor: "/repo/.git", pruned: [] });
+    const result = await execute(["prune"], { up: vi.fn(), down: vi.fn(), prune });
+    expect(result.code).toBe(0);
+    expect(result.stdout).toMatch(/no orphan|nothing to prune/i);
+  });
+
+  it("turns a prune failure into a clear, non-zero error", async () => {
+    const prune = vi.fn().mockRejectedValue(new Error("could not list worktrees"));
+    const result = await execute(["prune"], { up: vi.fn(), down: vi.fn(), prune });
+    expect(result.code).toBe(1);
+    expect(result.stderr).toMatch(/could not list worktrees/);
   });
 
   it("`ls` marks stale entries in its output so an operator can spot orphans", async () => {

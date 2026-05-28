@@ -20,6 +20,10 @@ export const COMMANDS: ReadonlyArray<{ name: string; summary: string }> = [
     summary: "Attach a TUI to this worktree's instance (--shared for the shared one)",
   },
   { name: "generate", summary: "Write the derived process-compose config to disk" },
+  {
+    name: "prune",
+    summary: "Reconcile against `git worktree list` and clean up orphaned instances",
+  },
 ];
 
 export interface RunResult {
@@ -123,6 +127,12 @@ export interface ExecuteDeps {
    * `execute` for `attach` requires it.
    */
   attach?: (options: { shared: boolean }) => Promise<void>;
+  /**
+   * Reconcile devtrees against `git worktree list` and clean up orphaned
+   * instances. Optional for the same reason as `ls`: existing tests only
+   * exercise `up`/`down` and don't have to stub `prune`.
+   */
+  prune?: () => Promise<{ anchor: string; pruned: ReadonlyArray<LsInstanceRow> }>;
 }
 
 /**
@@ -155,6 +165,21 @@ function formatLs(instances: ReadonlyArray<LsInstanceRow>): string {
   });
 
   return `${[header, ...rows].join("\n")}\n`;
+}
+
+/**
+ * Render the `prune` result: one line per cleaned orphan with its id, kind,
+ * and the status it had at discovery time (so the operator can see whether
+ * the orphan was caught running or already stale).
+ */
+function formatPrune(pruned: ReadonlyArray<LsInstanceRow>): string {
+  if (pruned.length === 0) {
+    return "devtrees prune: no orphans to clean up.\n";
+  }
+  const lines = pruned.map((p) => `  ${p.id} (${p.kind}, was ${p.status})`);
+  return `devtrees prune: cleaned ${pruned.length} orphan${pruned.length === 1 ? "" : "s"}:\n${lines.join(
+    "\n",
+  )}\n`;
 }
 
 /**
@@ -214,6 +239,10 @@ export async function execute(argv: ReadonlyArray<string>, deps: ExecuteDeps): P
       // print (the TUI itself is the user-visible output).
       return { code: 0, stdout: "", stderr: "" };
     }
+    if (first === "prune" && deps.prune !== undefined) {
+      const result = await deps.prune();
+      return { code: 0, stdout: formatPrune(result.pruned), stderr: "" };
+    }
   } catch (err) {
     return { code: 1, stdout: "", stderr: `devtrees: ${(err as Error).message}\n` };
   }
@@ -223,13 +252,16 @@ export async function execute(argv: ReadonlyArray<string>, deps: ExecuteDeps): P
 
 // Run only when invoked as the program, not when imported by a test.
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const { runUp, runDown, runGenerate, runLs, runAttach } = await import("./commands.js");
+  const { runUp, runDown, runGenerate, runLs, runAttach, runPrune } = await import(
+    "./commands.js"
+  );
   const result = await execute(process.argv.slice(2), {
     up: () => runUp(),
     down: ({ shared }) => runDown({}, { shared }),
     generate: () => runGenerate(),
     ls: () => runLs(),
     attach: ({ shared }) => runAttach({}, { shared }),
+    prune: () => runPrune(),
   });
   if (result.stdout) process.stdout.write(result.stdout);
   if (result.stderr) process.stderr.write(result.stderr);
