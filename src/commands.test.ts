@@ -480,6 +480,178 @@ describe("runUp — shared tier lazy start", () => {
   });
 });
 
+describe("runUp — cross-tier wiring (ADR-0003)", () => {
+  /** isolated `web` depends on shared `postgres` — the canonical cross-tier edge. */
+  const crossTierStack: ResolvedStack = {
+    services: [
+      {
+        name: "web",
+        tier: "isolated",
+        command: "node server.js",
+        ports: ["WEB_PORT"],
+        dependsOn: ["postgres"],
+        environment: [],
+      },
+      {
+        name: "postgres",
+        tier: "shared",
+        command: "postgres -D ./pgdata",
+        ports: ["DB_PORT"],
+        dependsOn: [],
+        environment: [],
+      },
+    ],
+  };
+
+  it("warns once for each dropped cross-tier depends_on edge", async () => {
+    // The dropped edges must be visible in output (ADR-0003 "Consequences") —
+    // otherwise the behavior is invisible from the source devtrees.yaml.
+    const warnings: string[] = [];
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const deps: CommandDeps = {
+      ...stubDeps({ stack: crossTierStack, track, warn: (m) => warnings.push(m) }),
+      waitForSharedHealth: () => Promise.resolve(),
+    };
+    await runUp(deps);
+
+    const droppedWarning = warnings.find(
+      (w) => /web/.test(w) && /postgres/.test(w) && /depends_on/i.test(w),
+    );
+    expect(droppedWarning).toBeDefined();
+  });
+
+  it("waits for shared services to be healthy before starting the worktree instance", async () => {
+    // The shared-health wait happens between the shared up-spawn and the worktree
+    // up-spawn — that's the orchestration layer's stand-in for the dropped
+    // cross-tier depends_on edge (ADR-0003).
+    const order: string[] = [];
+    let waitResolved = false;
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+
+    const waitForSharedHealth = (): Promise<void> =>
+      new Promise<void>((resolve) => {
+        order.push("wait:start");
+        setTimeout(() => {
+          waitResolved = true;
+          order.push("wait:resolve");
+          resolve();
+        }, 5);
+      });
+
+    const baseDeps = stubDeps({ stack: crossTierStack, track });
+    // Wrap the stub spawner so we can record the order of up-spawns relative
+    // to the wait.
+    const inner = baseDeps.driver?.spawner;
+    if (inner === undefined) throw new Error("expected stub spawner");
+    const deps: CommandDeps = {
+      ...baseDeps,
+      driver: {
+        ...baseDeps.driver,
+        spawner: (binary, args, options) => {
+          if (args[0] === "up") {
+            const si = args.indexOf("-u");
+            const sock = args[si + 1] ?? "";
+            order.push(sock.endsWith("/shared.sock") ? "up:shared" : "up:worktree");
+          }
+          return inner(binary, args, options);
+        },
+      },
+      waitForSharedHealth,
+    };
+
+    await runUp(deps);
+    // The wait must have run, and the worktree up must not have spawned before it resolved.
+    expect(waitResolved).toBe(true);
+    expect(order).toEqual(["up:shared", "wait:start", "wait:resolve", "up:worktree"]);
+  });
+
+  it("skips the shared-health wait when no isolated service depends on a shared one", async () => {
+    // Shared services exist but no cross-tier edge: no dropped edges, no need to gate.
+    const independent: ResolvedStack = {
+      services: [
+        isolated("web", "node server.js", ["WEB_PORT"]),
+        shared("postgres", "postgres", ["DB_PORT"]),
+      ],
+    };
+    let called = false;
+    const waitForSharedHealth = (): Promise<void> => {
+      called = true;
+      return Promise.resolve();
+    };
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const deps: CommandDeps = {
+      ...stubDeps({ stack: independent, track }),
+      waitForSharedHealth,
+    };
+    await runUp(deps);
+    expect(called).toBe(false);
+  });
+
+  it("logs a 'waiting for shared' message when the wait runs", async () => {
+    const warnings: string[] = [];
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const deps: CommandDeps = {
+      ...stubDeps({ stack: crossTierStack, track, warn: (m) => warnings.push(m) }),
+      waitForSharedHealth: () => Promise.resolve(),
+    };
+    await runUp(deps);
+    expect(warnings.some((w) => /waiting.*shared/i.test(w))).toBe(true);
+  });
+
+  it("emits same-tier depends_on into the derived worktree config (process-compose still gates it)", async () => {
+    // isolated → isolated edges must reach process-compose — they're within
+    // the worktree instance, so process-compose can enforce them as usual.
+    const sameTier: ResolvedStack = {
+      services: [
+        {
+          name: "api",
+          tier: "isolated",
+          command: "node api.js",
+          ports: ["API_PORT"],
+          dependsOn: [],
+          environment: [],
+        },
+        {
+          name: "web",
+          tier: "isolated",
+          command: "node web.js",
+          ports: ["WEB_PORT"],
+          dependsOn: ["api"],
+          environment: [],
+        },
+      ],
+    };
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const deps = stubDeps({ stack: sameTier, track });
+    await runUp(deps);
+    const worktreeSpawn = track.invocations.find((i) => !i.socketPath.endsWith("/shared.sock"));
+    if (worktreeSpawn === undefined) throw new Error("expected a worktree spawn");
+    const config = parseYaml(readFileSync(worktreeSpawn.configPath, "utf8")) as {
+      processes: Record<string, { depends_on?: Record<string, { condition: string }> }>;
+    };
+    expect(config.processes.web?.depends_on).toEqual({ api: { condition: "process_started" } });
+  });
+
+  it("does not emit cross-tier depends_on edges in the derived worktree config", async () => {
+    // The whole point of the deriver's edge-dropping: process-compose would
+    // raise an "unknown process 'postgres'" error otherwise.
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const deps: CommandDeps = {
+      ...stubDeps({ stack: crossTierStack, track }),
+      waitForSharedHealth: () => Promise.resolve(),
+    };
+    await runUp(deps);
+    const worktreeSpawn = track.invocations.find((i) => !i.socketPath.endsWith("/shared.sock"));
+    if (worktreeSpawn === undefined) throw new Error("expected a worktree spawn");
+    const config = parseYaml(readFileSync(worktreeSpawn.configPath, "utf8")) as {
+      processes: Record<string, { depends_on?: Record<string, { condition: string }> }>;
+    };
+    // No depends_on at all on `web` — `postgres` is the only declared dep and
+    // it's cross-tier (dropped); the field is omitted entirely.
+    expect("depends_on" in (config.processes.web ?? {})).toBe(false);
+  });
+});
+
 describe("runDown — shared lifecycle is decoupled from worktree lifecycle", () => {
   const mixedStack: ResolvedStack = {
     services: [

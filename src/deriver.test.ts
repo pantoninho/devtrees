@@ -276,3 +276,163 @@ describe("config deriver — shared instance", () => {
     expect(out.env).toEqual({});
   });
 });
+
+describe("config deriver — cross-tier depends_on handling (ADR-0003)", () => {
+  function mixedDepsStack(): ResolvedStack {
+    return {
+      services: [
+        {
+          name: "api",
+          tier: "isolated",
+          command: "node api.js",
+          ports: ["API_PORT"],
+          dependsOn: [],
+          environment: [],
+        },
+        {
+          name: "web",
+          tier: "isolated",
+          command: "node server.js",
+          ports: ["WEB_PORT"],
+          // api (isolated → same tier), postgres + cache (isolated → shared, cross-tier)
+          dependsOn: ["api", "postgres", "cache"],
+          environment: [],
+        },
+        {
+          name: "postgres",
+          tier: "shared",
+          command: "postgres",
+          ports: ["DB_PORT"],
+          dependsOn: [],
+          environment: [],
+        },
+        {
+          name: "cache",
+          tier: "shared",
+          command: "redis",
+          ports: ["CACHE_PORT"],
+          // shared → shared, same tier
+          dependsOn: ["postgres"],
+          environment: [],
+        },
+      ],
+    };
+  }
+
+  it("emits same-tier (isolated→isolated) depends_on into derived worktree processes", () => {
+    const derived = deriveWorktreeConfig(mixedDepsStack(), {
+      worktreeId: "login",
+      worktreeRoot: "/wt/login",
+      portFor: () => 20512,
+      sharedPortFor: () => 19000,
+    });
+    const web = derived.config.processes.web;
+    if (web === undefined) throw new Error("expected 'web'");
+    // Map form, keyed by dependency name, with the default condition.
+    expect(web.depends_on).toEqual({ api: { condition: "process_started" } });
+  });
+
+  it("drops cross-tier (isolated→shared) edges from the derived worktree config", () => {
+    const derived = deriveWorktreeConfig(mixedDepsStack(), {
+      worktreeId: "login",
+      worktreeRoot: "/wt/login",
+      portFor: () => 20512,
+      sharedPortFor: () => 19000,
+    });
+    const web = derived.config.processes.web;
+    if (web === undefined) throw new Error("expected 'web'");
+    // The shared deps must not appear under the worktree process — process-compose
+    // would error on an unknown process otherwise.
+    expect(web.depends_on?.postgres).toBeUndefined();
+    expect(web.depends_on?.cache).toBeUndefined();
+  });
+
+  it("reports each dropped cross-tier edge so the behavior is observable", () => {
+    const derived = deriveWorktreeConfig(mixedDepsStack(), {
+      worktreeId: "login",
+      worktreeRoot: "/wt/login",
+      portFor: () => 20512,
+      sharedPortFor: () => 19000,
+    });
+    // Each cross-tier edge from this worktree's isolated services becomes a
+    // dropped-edge record so commands.runUp can surface it to the user.
+    expect(derived.droppedEdges).toEqual(
+      expect.arrayContaining([
+        { from: "web", to: "postgres", fromTier: "isolated", toTier: "shared" },
+        { from: "web", to: "cache", fromTier: "isolated", toTier: "shared" },
+      ]),
+    );
+    expect(derived.droppedEdges).toHaveLength(2);
+  });
+
+  it("emits same-tier (shared→shared) depends_on into derived shared processes", () => {
+    const derived = deriveSharedConfig(mixedDepsStack(), {
+      workingDir: "/anchor",
+      portFor: () => 19000,
+    });
+    const cache = derived.config.processes.cache;
+    if (cache === undefined) throw new Error("expected 'cache'");
+    expect(cache.depends_on).toEqual({ postgres: { condition: "process_started" } });
+  });
+
+  it("omits depends_on entirely when a process has no surviving edges", () => {
+    // Stripping all of `web`'s deps (all of them shared) would leave it
+    // with an empty depends_on map. Omit the field instead — cleaner derived YAML.
+    const onlyCrossTier: ResolvedStack = {
+      services: [
+        {
+          name: "web",
+          tier: "isolated",
+          command: "node server.js",
+          ports: [],
+          dependsOn: ["postgres"],
+          environment: [],
+        },
+        {
+          name: "postgres",
+          tier: "shared",
+          command: "postgres",
+          ports: [],
+          dependsOn: [],
+          environment: [],
+        },
+      ],
+    };
+    const derived = deriveWorktreeConfig(onlyCrossTier, {
+      worktreeId: "login",
+      worktreeRoot: "/wt/login",
+      portFor: () => 20512,
+      sharedPortFor: () => 19000,
+    });
+    const web = derived.config.processes.web;
+    if (web === undefined) throw new Error("expected 'web'");
+    expect("depends_on" in web).toBe(false);
+  });
+
+  it("silently skips depends_on edges that target an unknown service", () => {
+    // Same as process-compose would — but we drop it rather than emit a dangling
+    // dep into the derived config (process-compose would then error on it). A
+    // deeper "dangling deps" pass is left for a later slice; for now don't
+    // crash the deriver.
+    const dangling: ResolvedStack = {
+      services: [
+        {
+          name: "web",
+          tier: "isolated",
+          command: "node server.js",
+          ports: [],
+          dependsOn: ["does-not-exist"],
+          environment: [],
+        },
+      ],
+    };
+    const derived = deriveWorktreeConfig(dangling, {
+      worktreeId: "login",
+      worktreeRoot: "/wt/login",
+      portFor: () => 20512,
+    });
+    const web = derived.config.processes.web;
+    if (web === undefined) throw new Error("expected 'web'");
+    expect("depends_on" in web).toBe(false);
+  });
+});

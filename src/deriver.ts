@@ -21,10 +21,16 @@
  * `portFor` lookups so the deriver stays decoupled from the allocator.
  */
 
-import type { ResolvedStack } from "./stack.js";
+import type { ResolvedStack, Tier } from "./stack.js";
 
 /** Env-var name devtrees injects the stable worktree id under. */
 const WORKTREE_ID_ENV = "DEVTREES_WORKTREE_ID";
+
+/**
+ * Default process-compose `depends_on` condition. Same as process-compose's own
+ * default — startup ordering only, no health gating.
+ */
+const DEFAULT_DEPENDS_ON_CONDITION = "process_started";
 
 /** A single derived process-compose process entry (tier-free). */
 export interface DerivedProcess {
@@ -32,6 +38,19 @@ export interface DerivedProcess {
   readonly working_dir: string;
   readonly environment: ReadonlyArray<string>;
   readonly depends_on?: Readonly<Record<string, { condition: string }>>;
+}
+
+/**
+ * A `depends_on` edge devtrees dropped from a derived config because it crossed
+ * the instance boundary (isolated → shared). Returned by the deriver so a
+ * caller can surface it to the user — silent dropping would make the behavior
+ * a mystery (ADR-0003 "Consequences").
+ */
+export interface DroppedEdge {
+  readonly from: string;
+  readonly to: string;
+  readonly fromTier: Tier;
+  readonly toTier: Tier;
 }
 
 /** The clean process-compose config for one instance. */
@@ -65,6 +84,12 @@ export interface DerivedWorktree {
    * the shared-port entry.
    */
   readonly env: Record<string, string>;
+  /**
+   * Cross-tier `depends_on` edges that were stripped from the derived config
+   * because process-compose can't express a dependency on a process in another
+   * instance (ADR-0003). Empty when nothing was dropped.
+   */
+  readonly droppedEdges: ReadonlyArray<DroppedEdge>;
 }
 
 /**
@@ -89,6 +114,13 @@ function collectPortEnv(
  * Derive the worktree instance's config + env injection from the stack and this
  * worktree's allocation. Only `isolated` services land in the worktree instance;
  * shared services' named ports are still injected as connection info.
+ *
+ * Per-process `depends_on` edges are partitioned by the dependency's tier:
+ * same-tier (isolated → isolated) edges flow through to the derived config so
+ * process-compose still enforces startup ordering within the worktree instance;
+ * cross-tier (isolated → shared) edges are dropped (ADR-0003) and surfaced in
+ * `droppedEdges` for visibility — the caller waits for shared services to be
+ * healthy at the orchestration layer instead.
  */
 export function deriveWorktreeConfig(stack: ResolvedStack, ctx: DeriveContext): DerivedWorktree {
   const isolated = stack.services.filter((s) => s.tier === "isolated");
@@ -102,20 +134,15 @@ export function deriveWorktreeConfig(stack: ResolvedStack, ctx: DeriveContext): 
   collectPortEnv(isolated, ctx.portFor, env);
   if (ctx.sharedPortFor) collectPortEnv(shared, ctx.sharedPortFor, env);
 
-  const injection = Object.entries(env).map(([k, v]) => `${k}=${v}`);
+  const { processes, droppedEdges } = buildTierProcesses({
+    stack,
+    tier: "isolated",
+    services: isolated,
+    workingDir: ctx.worktreeRoot,
+    extraEnvLines: envLines(env),
+  });
 
-  const processes: Record<string, DerivedProcess> = {};
-  for (const service of isolated) {
-    processes[service.name] = {
-      command: service.command,
-      working_dir: ctx.worktreeRoot,
-      // Author-declared env first, then devtrees injection (injection wins on dups
-      // because process-compose takes the last occurrence).
-      environment: [...service.environment, ...injection],
-    };
-  }
-
-  return { config: { processes }, env };
+  return { config: { processes }, env, droppedEdges };
 }
 
 /** Context for the shared instance: the anchor (working dir) and the repo-wide port resolver. */
@@ -133,6 +160,12 @@ export interface DerivedShared {
   readonly config: DerivedConfig;
   /** Flat env injection for the shared instance: the shared services' named ports. */
   readonly env: Record<string, string>;
+  /**
+   * Cross-tier `depends_on` edges that were stripped from the shared config.
+   * Always empty in practice because `shared → isolated` is rejected at load
+   * time (stack.validateStack); exposed for symmetry with `DerivedWorktree`.
+   */
+  readonly droppedEdges: ReadonlyArray<DroppedEdge>;
 }
 
 /**
@@ -147,16 +180,101 @@ export function deriveSharedConfig(stack: ResolvedStack, ctx: SharedDeriveContex
   const env: Record<string, string> = {};
   collectPortEnv(shared, ctx.portFor, env);
 
-  const injection = Object.entries(env).map(([k, v]) => `${k}=${v}`);
+  const { processes, droppedEdges } = buildTierProcesses({
+    stack,
+    tier: "shared",
+    services: shared,
+    workingDir: ctx.workingDir,
+    extraEnvLines: envLines(env),
+  });
 
+  return { config: { processes }, env, droppedEdges };
+}
+
+/** Flatten an env map into the `KEY=VALUE` lines process-compose's `environment` accepts. */
+function envLines(env: Record<string, string>): string[] {
+  return Object.entries(env).map(([k, v]) => `${k}=${v}`);
+}
+
+/**
+ * Build the derived `processes` map for one tier (isolated or shared): pins
+ * `working_dir`, appends devtrees' env injection, and partitions each
+ * service's `depends_on` into kept same-tier edges + dropped cross-tier
+ * edges. Both `deriveWorktreeConfig` and `deriveSharedConfig` differ only in
+ * which tier they pass in and which working_dir they use.
+ */
+function buildTierProcesses(input: {
+  stack: ResolvedStack;
+  tier: Tier;
+  services: ReadonlyArray<{
+    name: string;
+    command: string;
+    environment: ReadonlyArray<string>;
+    dependsOn: ReadonlyArray<string>;
+  }>;
+  workingDir: string;
+  extraEnvLines: ReadonlyArray<string>;
+}): { processes: Record<string, DerivedProcess>; droppedEdges: DroppedEdge[] } {
+  const tierIndex = buildTierIndex(input.stack);
+  const droppedEdges: DroppedEdge[] = [];
   const processes: Record<string, DerivedProcess> = {};
-  for (const service of shared) {
-    processes[service.name] = {
-      command: service.command,
-      working_dir: ctx.workingDir,
-      environment: [...service.environment, ...injection],
-    };
+  for (const service of input.services) {
+    const partition = partitionDependsOn(service.name, input.tier, service.dependsOn, tierIndex);
+    droppedEdges.push(...partition.dropped);
+    processes[service.name] = withOptionalDependsOn(
+      {
+        command: service.command,
+        working_dir: input.workingDir,
+        // Author-declared env first, then devtrees injection (injection wins on
+        // duplicate keys because process-compose takes the last occurrence).
+        environment: [...service.environment, ...input.extraEnvLines],
+      },
+      partition.kept,
+    );
   }
+  return { processes, droppedEdges };
+}
 
-  return { config: { processes }, env };
+/** Index `name → tier` over a resolved stack — keeps depends_on classification O(1). */
+function buildTierIndex(stack: ResolvedStack): Map<string, Tier> {
+  return new Map(stack.services.map((s) => [s.name, s.tier]));
+}
+
+/**
+ * Split a service's `depends_on` list into edges to keep (same-tier, named
+ * target exists) and edges to drop (cross-tier). Targets that aren't in the
+ * stack at all are silently skipped: this slice rejects neither nor relays
+ * them; a future "dangling deps" pass can lift them out.
+ */
+function partitionDependsOn(
+  from: string,
+  fromTier: Tier,
+  deps: ReadonlyArray<string>,
+  tierIndex: Map<string, Tier>,
+): { kept: string[]; dropped: DroppedEdge[] } {
+  const kept: string[] = [];
+  const dropped: DroppedEdge[] = [];
+  for (const to of deps) {
+    const toTier = tierIndex.get(to);
+    if (toTier === undefined) continue; // dangling; skip silently for now
+    if (toTier === fromTier) {
+      kept.push(to);
+    } else {
+      dropped.push({ from, to, fromTier, toTier });
+    }
+  }
+  return { kept, dropped };
+}
+
+/** Attach a `depends_on` map keyed by `kept` names, or omit the field when empty. */
+function withOptionalDependsOn(
+  base: Omit<DerivedProcess, "depends_on">,
+  kept: ReadonlyArray<string>,
+): DerivedProcess {
+  if (kept.length === 0) return base;
+  const depends_on: Record<string, { condition: string }> = {};
+  for (const name of kept) {
+    depends_on[name] = { condition: DEFAULT_DEPENDS_ON_CONDITION };
+  }
+  return { ...base, depends_on };
 }

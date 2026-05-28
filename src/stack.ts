@@ -85,6 +85,21 @@ function asStringArray(value: unknown): string[] {
   return value.map(asString);
 }
 
+/**
+ * Normalize a `depends_on` field into a list of dependency names. Accepts:
+ *  - the array shorthand `[a, b]`
+ *  - the canonical process-compose map form `{ a: { condition: ... }, b: ... }`
+ * Conditions are not surfaced here — same-tier edges flow through to process-compose
+ * unchanged (deriver re-emits them), and cross-tier edges are dropped (ADR-0003).
+ */
+function asDependencyList(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map(asString).filter((n) => n !== "");
+  if (value !== null && typeof value === "object") {
+    return Object.keys(value as Record<string, unknown>);
+  }
+  return [];
+}
+
 /** Optional inputs to `parseStack`, currently the extend-mode base config. */
 export interface ParseStackOptions {
   /**
@@ -155,14 +170,51 @@ export function parseStack(yamlText: string, options: ParseStackOptions = {}): R
       tier: ((over.tier ?? base.tier) as Tier | undefined) ?? DEFAULT_TIER,
       command: asString(over.command ?? base.command),
       ports: asStringArray(over.ports ?? base.ports),
-      dependsOn: asStringArray(over.depends_on ?? base.depends_on),
+      dependsOn: asDependencyList(over.depends_on ?? base.depends_on),
       environment: asStringArray(over.environment ?? base.environment),
     };
   });
 
   const allocator = parseAllocator(doc);
   const stack: ResolvedStack = allocator ? { services, allocator } : { services };
+  validateStack(stack);
   return stack;
+}
+
+/**
+ * Raised when `devtrees.yaml` declares a structurally-impossible dependency,
+ * e.g. a shared service depending on an isolated one (ADR-0003). The class is
+ * internal — callers match on the message text, not the constructor — but the
+ * named subclass makes stack traces and `instanceof` debugging clearer.
+ */
+class StackConfigError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "StackConfigError";
+  }
+}
+
+/**
+ * Cross-service validation pass over a resolved stack. Currently checks the
+ * ADR-0003 rule: a `shared` service may not `depends_on` an `isolated` service
+ * — that would mean depending on N per-worktree copies of one process and is
+ * undefined. Rejected at load time so the developer hears about it before the
+ * stack ever tries to start.
+ */
+function validateStack(stack: ResolvedStack): void {
+  const tierOf = new Map(stack.services.map((s) => [s.name, s.tier]));
+  for (const service of stack.services) {
+    if (service.tier !== "shared") continue;
+    for (const dep of service.dependsOn) {
+      if (tierOf.get(dep) === "isolated") {
+        throw new StackConfigError(
+          `shared service '${service.name}' cannot depends_on isolated service '${dep}': ` +
+            `a shared service is a single instance and an isolated service has one copy per worktree, ` +
+            `so the dependency is undefined. Either move '${dep}' to the shared tier or drop the edge.`,
+        );
+      }
+    }
+  }
 }
 
 /**

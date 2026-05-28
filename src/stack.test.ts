@@ -215,3 +215,104 @@ services:
     expect(stack.allocator).toEqual({ portBase: 25000 });
   });
 });
+
+describe("stack model — depends_on parsing (process-compose map form)", () => {
+  it("parses depends_on map form (name -> { condition }) into a name list", () => {
+    // The canonical process-compose form is a map. Tier-aware deriving needs the
+    // dependency *names*; conditions are preserved through the derived config later.
+    const yaml = `
+services:
+  web:
+    command: "node server.js"
+    depends_on:
+      postgres:
+        condition: process_healthy
+      redis:
+        condition: process_started
+`;
+    const stack = parseStack(yaml);
+    expect(stack.services[0]?.dependsOn).toEqual(["postgres", "redis"]);
+  });
+
+  it("still accepts the array shorthand", () => {
+    const yaml = `
+services:
+  web:
+    command: "node server.js"
+    depends_on: [postgres, redis]
+`;
+    const stack = parseStack(yaml);
+    expect(stack.services[0]?.dependsOn).toEqual(["postgres", "redis"]);
+  });
+});
+
+describe("stack model — cross-tier dependency validation (ADR-0003)", () => {
+  it("rejects a shared service that depends_on an isolated service (load time)", () => {
+    // A shared service is one instance; an isolated service is per-worktree. A
+    // shared → isolated edge is undefined — which of N per-worktree copies?
+    const yaml = `
+services:
+  postgres:
+    tier: shared
+    command: "postgres"
+    depends_on: [web]
+  web:
+    tier: isolated
+    command: "node server.js"
+`;
+    expect(() => parseStack(yaml)).toThrow(/shared.*depends_on.*isolated/i);
+  });
+
+  it("mentions both the offending service and the target in the error", () => {
+    const yaml = `
+services:
+  cache:
+    tier: shared
+    command: "redis"
+    depends_on: [api]
+  api:
+    tier: isolated
+    command: "node api.js"
+`;
+    try {
+      parseStack(yaml);
+      throw new Error("expected parseStack to throw");
+    } catch (err) {
+      const msg = (err as Error).message;
+      expect(msg).toContain("cache");
+      expect(msg).toContain("api");
+    }
+  });
+
+  it("allows shared → shared and isolated → shared edges", () => {
+    const yaml = `
+services:
+  postgres:
+    tier: shared
+    command: "postgres"
+  cache:
+    tier: shared
+    command: "redis"
+    depends_on: [postgres]
+  web:
+    tier: isolated
+    command: "node server.js"
+    depends_on: [postgres, cache]
+`;
+    expect(() => parseStack(yaml)).not.toThrow();
+  });
+
+  it("allows isolated → isolated edges", () => {
+    const yaml = `
+services:
+  api:
+    tier: isolated
+    command: "node api.js"
+  web:
+    tier: isolated
+    command: "node server.js"
+    depends_on: [api]
+`;
+    expect(() => parseStack(yaml)).not.toThrow();
+  });
+});

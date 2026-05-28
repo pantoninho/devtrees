@@ -10,7 +10,7 @@
 
 import { allocateBlock, type AllocatorOptions, type RegistrySnapshot } from "./allocator.js";
 import { resolveAnchor, type GitProbe } from "./anchor.js";
-import { deriveSharedConfig, deriveWorktreeConfig } from "./deriver.js";
+import { deriveSharedConfig, deriveWorktreeConfig, type DroppedEdge } from "./deriver.js";
 import { discoverInstances, type InstanceInfo } from "./instances.js";
 import { SHARED_REGISTRY_KEY, instancePaths, sharedInstancePaths } from "./paths.js";
 import { loadStack, type ResolvedService, type ResolvedStack } from "./stack.js";
@@ -31,6 +31,19 @@ export type WithRegistryLock = (
 /** Type of the async lifecycle lock the caller passes for testability. */
 export type WithSharedLock = <T>(anchor: string, fn: () => Promise<T>) => Promise<T>;
 
+/**
+ * Wait until every shared service is healthy enough that an isolated service
+ * depending on it can be started. Called between starting the shared instance
+ * and starting the worktree instance whenever the worktree has cross-tier
+ * `depends_on` edges (ADR-0003). The default polls process-compose over the
+ * shared instance's UDS; tests stub it.
+ */
+export type WaitForSharedHealth = (args: {
+  readonly anchor: string;
+  readonly socketPath: string;
+  readonly sharedServiceNames: ReadonlyArray<string>;
+}) => Promise<void>;
+
 export interface CommandDeps {
   /** Working directory to resolve the worktree from. Default: process.cwd(). */
   readonly cwd?: string;
@@ -49,6 +62,13 @@ export interface CommandDeps {
    * lockfile at <anchor>/devtrees/shared.lock. Injected so tests can stub it.
    */
   readonly withSharedLock?: WithSharedLock;
+  /**
+   * Wait for shared services to be healthy before bringing the worktree
+   * instance up — orchestration-layer stand-in for the dropped cross-tier
+   * `depends_on` edges (ADR-0003). Default: polls `process-compose process
+   * list` over the shared UDS. Injected so tests can stub it.
+   */
+  readonly waitForSharedHealth?: WaitForSharedHealth;
   /** Is a concrete port free to bind? Default: probes a real TCP bind. */
   readonly isPortFree?: (port: number) => boolean;
   /**
@@ -227,6 +247,13 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     warn(warning);
   }
 
+  // Surface every cross-tier `depends_on` edge devtrees just dropped. Silent
+  // dropping would make the orchestration-layer wiring a mystery (ADR-0003
+  // "Consequences").
+  for (const edge of derived.droppedEdges) {
+    warn(formatDroppedEdgeWarning(edge));
+  }
+
   const paths = instancePaths(anchor.anchor, anchor.worktreeId);
   mkdirSync(paths.runDir, { recursive: true });
   writeFileSync(paths.configPath, stringifyYaml(derived.config), "utf8");
@@ -241,6 +268,23 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
   if (sharedNeeded) {
     sharedStarted = await ensureSharedStarted(anchor.anchor, stack, sharedPortFor, sharedLock, {
       driver,
+    });
+  }
+
+  // Shared-health wait: gate the worktree start on the shared services'
+  // readiness probes whenever this worktree drops a cross-tier `depends_on`
+  // edge — orchestration-layer stand-in for the edge process-compose can't
+  // express across instances (ADR-0003). Skipped when there are no such edges
+  // (a stack with shared services nobody isolated depends on doesn't need it).
+  if (derived.droppedEdges.length > 0) {
+    const sharedPaths = sharedInstancePaths(anchor.anchor);
+    const sharedNames = stack.services.filter((s) => s.tier === "shared").map((s) => s.name);
+    warn(formatHealthWaitNotice(sharedNames));
+    const wait = deps.waitForSharedHealth ?? defaultWaitForSharedHealth;
+    await wait({
+      anchor: anchor.anchor,
+      socketPath: sharedPaths.socketPath,
+      sharedServiceNames: sharedNames,
     });
   }
 
@@ -533,4 +577,94 @@ function defaultIsPortFree(port: number): boolean {
 
 function defaultWarn(message: string): void {
   process.stderr.write(`${message}\n`);
+}
+
+/**
+ * One human-readable line per dropped cross-tier edge. Tells the developer
+ * which edge devtrees just lifted out of the derived config and why — the
+ * orchestration layer is now responsible for the equivalent gating.
+ */
+function formatDroppedEdgeWarning(edge: DroppedEdge): string {
+  return (
+    `devtrees: dropped cross-tier depends_on '${edge.from}' (${edge.fromTier}) -> ` +
+    `'${edge.to}' (${edge.toTier}). ` +
+    `Process-compose cannot express a dependency across instances (ADR-0003); ` +
+    `devtrees waits for shared services to be healthy before starting the worktree instance instead.`
+  );
+}
+
+/** Single notice that the worktree start is gated on the shared-health wait. */
+function formatHealthWaitNotice(sharedNames: ReadonlyArray<string>): string {
+  return (
+    `devtrees: waiting for shared services to be healthy ` +
+    `[${sharedNames.join(", ")}] before starting this worktree's instance...`
+  );
+}
+
+/**
+ * Default shared-health wait: shells out to `process-compose process list`
+ * over the shared instance's UDS and polls until every shared service reports
+ * a healthy state ('Running'/'Ready'/'Completed') or the timeout expires.
+ *
+ * "Healthy enough to start a depender" = the process is up. Services with a
+ * readiness probe report `Ready`; services without one report `Running`; one-shot
+ * jobs may have already moved to `Completed` — all three are fine to depend on.
+ * Anything else (`Pending`, `Restarting`, `Failed`) means we keep waiting.
+ */
+const SHARED_HEALTH_TIMEOUT_MS = 30_000;
+const SHARED_HEALTH_POLL_MS = 200;
+const HEALTHY_STATES = new Set(["running", "ready", "completed"]);
+
+const defaultWaitForSharedHealth: WaitForSharedHealth = async ({
+  socketPath,
+  sharedServiceNames,
+}) => {
+  if (sharedServiceNames.length === 0) return;
+  const deadline = Date.now() + SHARED_HEALTH_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const states = readSharedProcessStates(socketPath);
+    if (states !== undefined) {
+      const allHealthy = sharedServiceNames.every((name) => {
+        const status = states.get(name)?.toLowerCase();
+        return status !== undefined && HEALTHY_STATES.has(status);
+      });
+      if (allHealthy) return;
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, SHARED_HEALTH_POLL_MS));
+  }
+  throw new Error(
+    `timed out waiting for shared services to be healthy [${sharedServiceNames.join(", ")}] ` +
+      `after ${SHARED_HEALTH_TIMEOUT_MS}ms. Check the shared instance's logs (\`devtrees attach --shared\`).`,
+  );
+};
+
+/**
+ * Run `process-compose process list -U -u <socket> -o json` and return a
+ * `name -> status` map. Returns `undefined` when the socket isn't reachable
+ * yet (the shared instance is still starting), so the caller treats it as
+ * "not ready, keep polling".
+ */
+function readSharedProcessStates(socketPath: string): Map<string, string> | undefined {
+  try {
+    const out = execFileSync(
+      "process-compose",
+      ["process", "list", "-U", "-u", socketPath, "-o", "json"],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+    );
+    interface RawProc {
+      readonly name?: string;
+      readonly status?: string;
+    }
+    const parsed: unknown = JSON.parse(out);
+    const items: ReadonlyArray<RawProc> = Array.isArray(parsed)
+      ? (parsed as ReadonlyArray<RawProc>)
+      : ((parsed as { processes?: ReadonlyArray<RawProc> }).processes ?? []);
+    const map = new Map<string, string>();
+    for (const item of items) {
+      if (item.name && item.status) map.set(item.name, item.status);
+    }
+    return map;
+  } catch {
+    return undefined;
+  }
 }
