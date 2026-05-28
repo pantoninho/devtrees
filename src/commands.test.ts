@@ -835,9 +835,7 @@ describe("runAttach — attach to a running instance", () => {
       track,
     });
     // No socket file exists.
-    await expect(runAttach(deps, { shared: false })).rejects.toThrow(
-      /no worktree instance.*login/,
-    );
+    await expect(runAttach(deps, { shared: false })).rejects.toThrow(/no worktree instance.*login/);
     expect(track.invocations).toEqual([]);
   });
 

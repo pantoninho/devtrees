@@ -69,6 +69,22 @@ if (cmd === "up") {
   });
   // Stay alive holding the socket; `down` will terminate us.
   setInterval(() => {}, 1 << 30);
+} else if (cmd === "attach") {
+  // The real `process-compose attach` opens an interactive TUI bound to the
+  // instance's UDS. For the e2e we just need observable evidence the call
+  // reached the right socket and then exit cleanly so the driver's
+  // `attach` promise resolves. We touch a sibling marker file at
+  // `<socket>.attached`; the test asserts the marker exists.
+  if (existsSync(socketPath)) {
+    writeFileSync(`${socketPath}.attached`, "");
+    process.exit(0);
+  } else {
+    // Mirror the real binary's behaviour: a missing socket is an error. The
+    // devtrees command layer should refuse to call us in this state, so seeing
+    // this in the e2e logs would indicate a bug.
+    process.stderr.write(`stub-process-compose: no instance at ${socketPath}\n`);
+    process.exit(1);
+  }
 } else if (cmd === "down") {
   if (existsSync(`${socketPath}.pids`)) {
     const pids = JSON.parse(readFileSync(`${socketPath}.pids`, "utf8"));

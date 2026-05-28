@@ -12,7 +12,7 @@ import {
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
-import { runDown, runLs, runUp } from "./commands.js";
+import { runAttach, runDown, runLs, runUp } from "./commands.js";
 
 // Unix domain socket paths are capped (~104 bytes on macOS, ~108 on Linux). The
 // control socket lives at `<git-common-dir>/devtrees/run/<id>.sock`, so the temp
@@ -433,4 +433,75 @@ describe("e2e smoke — extend an existing process-compose.yaml", () => {
     await runDown(deps as never);
     expect(await waitForGone(port)).toBe(true);
   }, 20000);
+});
+
+describe("e2e — attach to a running worktree instance", () => {
+  it("up then attach reaches process-compose with the worktree's control socket; attach fails clearly when nothing is running", async () => {
+    const repo = makeRepo("dt-att-", ["login"]);
+    cleanups.push(() => rmSync(repo.root, { recursive: true, force: true }));
+    const worktree = repo.worktrees.login;
+    if (worktree === undefined) throw new Error("expected login worktree");
+    writeStackConfig(worktree);
+
+    const deps = stubDriverDeps(worktree);
+
+    // Acceptance: attaching with nothing running is a clear, non-zero error.
+    await expect(runAttach(deps as never)).rejects.toThrow(/no worktree instance is running/);
+
+    const up = await runUp(deps as never);
+    cleanups.push(() => {
+      void runDown(deps as never);
+    });
+    expect(await waitForHttp(Number(up.env.WEB_PORT))).toBe(true);
+
+    // Acceptance: attach reaches `process-compose attach` against the
+    // running instance's UDS. The stub records evidence as a sibling
+    // `<socket>.attached` marker.
+    const commonDir = git(worktree, "rev-parse", "--git-common-dir");
+    const absCommon = commonDir.startsWith("/") ? commonDir : join(worktree, commonDir);
+    const sock = join(absCommon, "devtrees", "run", `${up.worktreeId}.sock`);
+    expect(existsSync(sock)).toBe(true);
+
+    await runAttach(deps as never);
+    expect(existsSync(`${sock}.attached`)).toBe(true);
+
+    await runDown(deps as never);
+    expect(await waitForGone(Number(up.env.WEB_PORT))).toBe(true);
+  }, 20000);
+});
+
+describe("e2e — attach to the shared instance", () => {
+  it("up (with a shared service) then attach --shared reaches the shared socket; attach --shared fails clearly without a running shared instance", async () => {
+    const repo = makeRepo("dt-att-sh-", ["login"]);
+    cleanups.push(() => rmSync(repo.root, { recursive: true, force: true }));
+    const worktree = repo.worktrees.login;
+    if (worktree === undefined) throw new Error("expected login worktree");
+    writeMixedTierStack(worktree);
+
+    const deps = stubDriverDeps(worktree);
+
+    // Acceptance: attaching --shared with nothing running is a clear error.
+    await expect(runAttach(deps as never, { shared: true })).rejects.toThrow(
+      /no shared instance is running/,
+    );
+
+    const up = await runUp(deps as never);
+    cleanups.push(() => {
+      void runDown(deps as never).catch(() => {});
+    });
+    expect(up.sharedStarted).toBe(true);
+    expect(await waitForTcp(Number(up.env.DB_PORT))).toBe(true);
+
+    const commonDir = git(worktree, "rev-parse", "--git-common-dir");
+    const absCommon = commonDir.startsWith("/") ? commonDir : join(worktree, commonDir);
+    const sharedSock = join(absCommon, "devtrees", "run", "shared.sock");
+    expect(existsSync(sharedSock)).toBe(true);
+
+    await runAttach(deps as never, { shared: true });
+    expect(existsSync(`${sharedSock}.attached`)).toBe(true);
+
+    await runDown(deps as never);
+    await runDown(deps as never, { shared: true });
+    expect(existsSync(sharedSock)).toBe(false);
+  }, 30000);
 });
