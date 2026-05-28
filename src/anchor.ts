@@ -26,8 +26,14 @@ export interface Anchor {
   readonly isBare: boolean;
 }
 
-/** Slugify a path's final segment into a stable, filesystem-safe worktree id. */
-function slugifyWorktreeId(worktreeRoot: string): string {
+/**
+ * Slugify a path's final segment into a stable, filesystem-safe worktree id.
+ *
+ * Exported so `prune` can derive ids from `git worktree list --porcelain`
+ * paths the same way an instance's id was derived at `up` time — they must
+ * match exactly or prune would false-positive every worktree as an orphan.
+ */
+export function slugifyWorktreeId(worktreeRoot: string): string {
   const base =
     worktreeRoot
       .replace(/[/\\]+$/, "")
