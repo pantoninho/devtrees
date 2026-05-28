@@ -563,6 +563,97 @@ describe("runGenerate — emit derived configs to disk", () => {
     const onDisk = parseYaml(readFileSync(result.worktreePath, "utf8"));
     expect(onDisk).toEqual(expected.config);
   });
+
+  it("also writes the shared subset to <anchor>/devtrees/shared.yaml and its YAML matches the shared deriver's output", async () => {
+    const mixedStack: ResolvedStack = {
+      services: [
+        isolated("web", "node server.js", ["WEB_PORT"]),
+        shared("postgres", "postgres -D ./pgdata", ["DB_PORT"]),
+      ],
+    };
+    const result = await runGenerate(stubDeps({ stack: mixedStack }));
+
+    expect(result.sharedPath).toBeDefined();
+    expect(result.sharedPath).toMatch(/devtrees\/shared\.yaml$/);
+    if (!result.sharedPath) throw new Error("expected sharedPath");
+    expect(existsSync(result.sharedPath)).toBe(true);
+    if (!result.sharedEnv) throw new Error("expected sharedEnv");
+
+    const expected = deriveSharedConfig(mixedStack, {
+      workingDir: result.sharedPath.replace(/\/devtrees\/shared\.yaml$/, ""),
+      portFor: (name) =>
+        result.sharedEnv?.[name] !== undefined ? Number(result.sharedEnv[name]) : undefined,
+    });
+    const onDisk = parseYaml(readFileSync(result.sharedPath, "utf8"));
+    expect(onDisk).toEqual(expected.config);
+
+    // The worktree config also reflects shared ports injected as connection info.
+    expect(result.env.DB_PORT).toBe(result.sharedEnv.DB_PORT);
+  });
+
+  it("omits the shared file when the stack declares no shared services", async () => {
+    const stack: ResolvedStack = {
+      services: [isolated("web", "node x.js", ["WEB_PORT"])],
+    };
+    const result = await runGenerate(stubDeps({ stack }));
+
+    expect(result.sharedPath).toBeUndefined();
+    expect(result.sharedEnv).toBeUndefined();
+    // The directory contains only the worktree config, not shared.yaml.
+    const sharedYaml = result.worktreePath.replace(/login\.yaml$/, "shared.yaml");
+    expect(existsSync(sharedYaml)).toBe(false);
+  });
+
+  it("does not spawn process-compose (generate is a write-only command)", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const stack: ResolvedStack = {
+      services: [
+        isolated("web", "node server.js", ["WEB_PORT"]),
+        shared("postgres", "postgres", ["DB_PORT"]),
+      ],
+    };
+    await runGenerate(stubDeps({ stack, track }));
+    expect(track.invocations).toEqual([]);
+  });
+
+  it("strips the devtrees-only `tier` key — emitted YAML is clean process-compose", async () => {
+    const stack: ResolvedStack = {
+      services: [
+        isolated("web", "node server.js", ["WEB_PORT"]),
+        shared("postgres", "postgres", ["DB_PORT"]),
+      ],
+    };
+    const result = await runGenerate(stubDeps({ stack }));
+
+    const wt = parseYaml(readFileSync(result.worktreePath, "utf8")) as {
+      processes: Record<string, Record<string, unknown>>;
+    };
+    for (const proc of Object.values(wt.processes)) {
+      expect("tier" in proc).toBe(false);
+    }
+    if (!result.sharedPath) throw new Error("expected sharedPath");
+    const sh = parseYaml(readFileSync(result.sharedPath, "utf8")) as {
+      processes: Record<string, Record<string, unknown>>;
+    };
+    for (const proc of Object.values(sh.processes)) {
+      expect("tier" in proc).toBe(false);
+    }
+  });
+
+  it("persists the worktree's block in the registry so a subsequent up reuses it", async () => {
+    const stack: ResolvedStack = {
+      services: [isolated("web", "node x.js", ["WEB_PORT"])],
+    };
+    const registryRef = { snapshot: {} as RegistrySnapshot };
+    const deps = stubDeps({ stack, registryRef });
+
+    const generated = await runGenerate(deps);
+    expect(registryRef.snapshot.login).toBeGreaterThanOrEqual(20000);
+
+    // The follow-up `up` against the same registry sees the same block.
+    const upped = await runUp(deps);
+    expect(upped.env.WEB_PORT).toBe(generated.env.WEB_PORT);
+  });
 });
 
 describe("findUnmanagedPortBinds — heuristic", () => {
