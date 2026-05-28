@@ -17,10 +17,12 @@ import { parse as parseYaml } from "yaml";
 import {
   findUnmanagedPortBinds,
   runDown,
+  runGenerate,
   runUp,
   type CommandDeps,
   type WithSharedLock,
 } from "./commands.js";
+import { deriveSharedConfig, deriveWorktreeConfig } from "./deriver.js";
 import type { RegistrySnapshot } from "./allocator.js";
 import type { SpawnedProcess } from "./driver.js";
 import { SHARED_REGISTRY_KEY } from "./paths.js";
@@ -536,6 +538,30 @@ describe("runDown — shared lifecycle is decoupled from worktree lifecycle", ()
     // No prior `up` — the socket doesn't exist.
     await runDown(deps, { shared: true });
     // Nothing thrown; registry still has no shared entry.
+  });
+});
+
+describe("runGenerate — emit derived configs to disk", () => {
+  it("writes the worktree-isolated config to <anchor>/devtrees/<worktreeId>.yaml and its YAML matches the deriver's output", async () => {
+    const stack: ResolvedStack = {
+      services: [isolated("web", "node server.js", ["WEB_PORT", "METRICS_PORT"])],
+    };
+    const deps = stubDeps({ stack });
+    const result = await runGenerate(deps);
+
+    // The emitted path is the same one runUp would write (acceptance: runnable with raw process-compose).
+    expect(result.worktreePath).toMatch(/devtrees\/login\.yaml$/);
+    expect(existsSync(result.worktreePath)).toBe(true);
+
+    // Re-derive with the same allocation and assert byte-equivalent content.
+    const expected = deriveWorktreeConfig(stack, {
+      worktreeId: "login",
+      worktreeRoot: result.worktreeRoot,
+      portFor: (name) =>
+        result.env[name] !== undefined ? Number(result.env[name]) : undefined,
+    });
+    const onDisk = parseYaml(readFileSync(result.worktreePath, "utf8"));
+    expect(onDisk).toEqual(expected.config);
   });
 });
 

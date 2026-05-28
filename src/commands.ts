@@ -76,6 +76,23 @@ export interface UpResult {
   readonly sharedStarted: boolean;
 }
 
+export interface GenerateResult {
+  readonly worktreeId: string;
+  readonly worktreeRoot: string;
+  /** Path of the written worktree-isolated config. */
+  readonly worktreePath: string;
+  /** Path of the written shared config — present iff the stack has shared services. */
+  readonly sharedPath?: string;
+  /**
+   * Env injection the worktree instance would receive — this worktree's own
+   * named ports + the shared services' named ports + the worktree id. Same
+   * shape `runUp` returns; lets callers re-derive identically.
+   */
+  readonly env: Record<string, string>;
+  /** Env injection for the shared instance — present iff a shared file was written. */
+  readonly sharedEnv?: Record<string, string>;
+}
+
 export interface DownOptions {
   /**
    * When true, tears down the shared instance (CONTEXT.md "Shared instance":
@@ -236,6 +253,95 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     socketPath: paths.socketPath,
     env: derived.env,
     sharedStarted,
+  };
+}
+
+/**
+ * Emit the derived process-compose config(s) to disk without starting anything.
+ * Allocates port blocks the same way `runUp` does — so the emitted files reflect
+ * the very ports `up` would use — but does not spawn `process-compose` and does
+ * not lazy-start the shared instance. Useful for debugging or for running with
+ * raw `process-compose -f <derived>.yaml` (acceptance, #10).
+ *
+ * The worktree-isolated subset is always written. The shared subset is written
+ * only when the stack declares shared services.
+ */
+export async function runGenerate(deps: CommandDeps = {}): Promise<GenerateResult> {
+  const { anchor } = resolve(deps);
+  const readStack = deps.readStack ?? loadStack;
+  const lock = deps.withRegistryLock ?? defaultWithRegistryLock;
+  const isPortFree = deps.isPortFree ?? defaultIsPortFree;
+
+  const stack = readStack(anchor.worktreeRoot);
+  const options = resolveAllocatorOptions(stack, deps.allocator ?? DEFAULT_ALLOCATOR);
+  const sharedNeeded = hasTier(stack, "shared");
+
+  let blockBase = -1;
+  let sharedBase: number | undefined;
+  lock(anchor.anchor, (snapshot) => {
+    let next = snapshot;
+    const block = allocateBlock(anchor.worktreeId, next, options, isPortFree);
+    blockBase = block.base;
+    if (next[anchor.worktreeId] === undefined) {
+      next = { ...next, [anchor.worktreeId]: block.base };
+    }
+    if (sharedNeeded) {
+      const sblock = allocateBlock(SHARED_REGISTRY_KEY, next, options, isPortFree);
+      sharedBase = sblock.base;
+      if (next[SHARED_REGISTRY_KEY] === undefined) {
+        next = { ...next, [SHARED_REGISTRY_KEY]: sblock.base };
+      }
+    }
+    return next === snapshot ? snapshot : next;
+  });
+
+  const isolatedOffsets = buildOffsetMap(stack.services, "isolated", options.blockSize);
+  const sharedOffsets = sharedNeeded
+    ? buildOffsetMap(stack.services, "shared", options.blockSize)
+    : new Map<string, number>();
+
+  const sharedPortFor = (name: string): number | undefined => {
+    if (sharedBase === undefined) return undefined;
+    const offset = sharedOffsets.get(name);
+    return offset === undefined ? undefined : sharedBase + offset;
+  };
+
+  const derivedWt = deriveWorktreeConfig(stack, {
+    worktreeId: anchor.worktreeId,
+    worktreeRoot: anchor.worktreeRoot,
+    portFor: (name) => {
+      const offset = isolatedOffsets.get(name);
+      return offset === undefined ? undefined : blockBase + offset;
+    },
+    sharedPortFor,
+  });
+
+  const paths = instancePaths(anchor.anchor, anchor.worktreeId);
+  mkdirSync(paths.runDir, { recursive: true });
+  writeFileSync(paths.configPath, stringifyYaml(derivedWt.config), "utf8");
+
+  if (sharedNeeded) {
+    const derivedShared = deriveSharedConfig(stack, {
+      workingDir: anchor.anchor,
+      portFor: sharedPortFor,
+    });
+    const sharedPaths = sharedInstancePaths(anchor.anchor);
+    writeFileSync(sharedPaths.configPath, stringifyYaml(derivedShared.config), "utf8");
+    return {
+      worktreeId: anchor.worktreeId,
+      worktreeRoot: anchor.worktreeRoot,
+      worktreePath: paths.configPath,
+      sharedPath: sharedPaths.configPath,
+      env: derivedWt.env,
+      sharedEnv: derivedShared.env,
+    };
+  }
+
+  return {
+    worktreeId: anchor.worktreeId,
+    worktreeRoot: anchor.worktreeRoot,
+    worktreePath: paths.configPath,
+    env: derivedWt.env,
   };
 }
 
