@@ -180,4 +180,38 @@ services:
     const stack = parseStack(yaml);
     expect(stack.services[0]?.tier).toBe("isolated");
   });
+
+  it("reads per-repo allocator config (port_base, block_size) from the top level", () => {
+    const yaml = `
+port_base: 30000
+block_size: 64
+services:
+  web:
+    command: "node server.js"
+    ports: [WEB_PORT]
+`;
+    const stack = parseStack(yaml);
+    expect(stack.allocator).toEqual({ portBase: 30000, blockSize: 64 });
+  });
+
+  it("omits the allocator section when neither port_base nor block_size is set", () => {
+    const yaml = `
+services:
+  web:
+    command: "node server.js"
+`;
+    const stack = parseStack(yaml);
+    expect(stack.allocator).toBeUndefined();
+  });
+
+  it("accepts a partial allocator override (port_base only)", () => {
+    const yaml = `
+port_base: 25000
+services:
+  web:
+    command: "node server.js"
+`;
+    const stack = parseStack(yaml);
+    expect(stack.allocator).toEqual({ portBase: 25000 });
+  });
 });

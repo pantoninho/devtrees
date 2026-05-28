@@ -42,9 +42,17 @@ export interface ResolvedService {
   readonly environment: ReadonlyArray<string>;
 }
 
+/** Per-repo allocator overrides, partial — unspecified fields fall back to defaults. */
+export interface AllocatorOverrides {
+  readonly portBase?: number;
+  readonly blockSize?: number;
+}
+
 /** The validated, normalized stack. */
 export interface ResolvedStack {
   readonly services: ReadonlyArray<ResolvedService>;
+  /** Per-repo allocator overrides parsed from `devtrees.yaml`, or `undefined` for defaults. */
+  readonly allocator?: AllocatorOverrides;
 }
 
 /** Shape of a raw service block as authored in `devtrees.yaml` (inline form). */
@@ -88,6 +96,27 @@ export interface ParseStackOptions {
   readonly baseYaml?: string;
 }
 
+/** Coerce a YAML scalar to a positive integer, or `undefined` if absent / unusable. */
+function asPositiveInt(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+  const n = Math.trunc(value);
+  return n > 0 ? n : undefined;
+}
+
+/** Pull the per-repo allocator overrides out of the raw doc, or `undefined` if none. */
+function parseAllocator(doc: {
+  port_base?: unknown;
+  block_size?: unknown;
+}): AllocatorOverrides | undefined {
+  const portBase = asPositiveInt(doc.port_base);
+  const blockSize = asPositiveInt(doc.block_size);
+  if (portBase === undefined && blockSize === undefined) return undefined;
+  const out: { portBase?: number; blockSize?: number } = {};
+  if (portBase !== undefined) out.portBase = portBase;
+  if (blockSize !== undefined) out.blockSize = blockSize;
+  return out;
+}
+
 /**
  * Parse and normalize already-read `devtrees.yaml` text into a `ResolvedStack`.
  * Supports two authoring modes that may be mixed in one file:
@@ -102,7 +131,11 @@ export interface ParseStackOptions {
  * leaving the base file untouched on disk.
  */
 export function parseStack(yamlText: string, options: ParseStackOptions = {}): ResolvedStack {
-  const doc = (parseYaml(yamlText) ?? {}) as { services?: Record<string, RawService> };
+  const doc = (parseYaml(yamlText) ?? {}) as {
+    services?: Record<string, RawService>;
+    port_base?: unknown;
+    block_size?: unknown;
+  };
   const overlay = doc.services ?? {};
 
   const baseProcesses: Record<string, RawService> = options.baseYaml
@@ -127,7 +160,9 @@ export function parseStack(yamlText: string, options: ParseStackOptions = {}): R
     };
   });
 
-  return { services };
+  const allocator = parseAllocator(doc);
+  const stack: ResolvedStack = allocator ? { services, allocator } : { services };
+  return stack;
 }
 
 /**
