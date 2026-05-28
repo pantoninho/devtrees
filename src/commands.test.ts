@@ -10,7 +10,7 @@
  */
 
 import { afterEach, describe, expect, it } from "vite-plus/test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
@@ -1024,5 +1024,292 @@ describe("runAttach — attach to a running instance", () => {
       /no shared instance is running/,
     );
     expect(track.invocations).toEqual([]);
+  });
+});
+
+describe("runPrune — reconcile instances against git worktree list", () => {
+  /**
+   * Build a fake git probe that answers `--git-common-dir`/`--show-toplevel`
+   * for the anchor resolver and supplies `git worktree list --porcelain`
+   * output for the prune step.
+   */
+  function pruneGit(opts: {
+    anchor: string;
+    worktreeRoot: string;
+    worktreeId: string;
+    porcelain: string;
+  }): CommandDeps["git"] {
+    return (args) => {
+      const [verb, ...rest] = args;
+      if (verb === "rev-parse") {
+        const flag = rest[0];
+        if (flag === "--git-common-dir") return opts.anchor;
+        if (flag === "--show-toplevel") return join(opts.worktreeRoot, opts.worktreeId);
+        if (flag === "--is-bare-repository") return "false";
+      }
+      if (verb === "worktree" && rest[0] === "list" && rest[1] === "--porcelain") {
+        return opts.porcelain;
+      }
+      throw new Error(`unexpected git invocation: ${args.join(" ")}`);
+    };
+  }
+
+  function instance(
+    id: string,
+    overrides: {
+      kind?: "worktree" | "shared";
+      status?: "running" | "stale";
+      socketPath?: string;
+    } = {},
+  ) {
+    return {
+      id,
+      kind: overrides.kind ?? ("worktree" as const),
+      status: overrides.status ?? ("stale" as const),
+      socketPath: overrides.socketPath ?? `/anchor/devtrees/run/${id}.sock`,
+      ports: {} as Readonly<Record<string, number>>,
+      blockBase: undefined,
+    };
+  }
+
+  it("returns an empty pruned list when every worktree instance is still live", async () => {
+    const tmp = tmpAnchor();
+    const git = pruneGit({
+      anchor: tmp.anchor,
+      worktreeRoot: tmp.worktreeRoot,
+      worktreeId: "login",
+      porcelain: [
+        `worktree ${join(tmp.worktreeRoot, "login")}`,
+        "HEAD x",
+        "",
+        `worktree ${join(tmp.worktreeRoot, "billing")}`,
+        "HEAD y",
+        "",
+      ].join("\n"),
+    });
+    const { runPrune } = await import("./commands.js");
+    const result = await runPrune({
+      cwd: join(tmp.worktreeRoot, "login"),
+      git,
+      discover: async () => [instance("login"), instance("billing")],
+    });
+    expect(result.pruned).toEqual([]);
+  });
+
+  it("never prunes the shared instance, even when no worktrees are reported live", async () => {
+    // The shared instance is anchored at the git common dir, not at any
+    // worktree. Removing every worktree must NOT take shared down — only an
+    // explicit `devtrees down --shared` does that (ADR-0001).
+    const tmp = tmpAnchor();
+    const git = pruneGit({
+      anchor: tmp.anchor,
+      worktreeRoot: tmp.worktreeRoot,
+      worktreeId: "login",
+      porcelain: "",
+    });
+    const { runPrune } = await import("./commands.js");
+    const result = await runPrune({
+      cwd: join(tmp.worktreeRoot, "login"),
+      git,
+      discover: async () => [instance("shared", { kind: "shared" })],
+    });
+    expect(result.pruned).toEqual([]);
+  });
+
+  it("stops a running orphan via the driver and cleans up its anchor state", async () => {
+    // The motivating case from CONTEXT.md's example dialogue: a worktree was
+    // removed with `git worktree remove` while its stack was still running.
+    // Prune stops the orphan and removes its socket, derived config, and
+    // registry entry.
+    const tmp = tmpAnchor();
+    // Pre-stage the anchor state for the orphan instance.
+    mkdirSync(join(tmp.anchor, "devtrees", "run"), { recursive: true });
+    const orphanSocket = join(tmp.anchor, "devtrees", "run", "removed.sock");
+    const orphanConfig = join(tmp.anchor, "devtrees", "removed.yaml");
+    writeFileSync(orphanSocket, "");
+    writeFileSync(orphanConfig, "processes: {}\n");
+
+    const downCalls: Array<{ configPath: string; socketPath: string }> = [];
+
+    const git = pruneGit({
+      anchor: tmp.anchor,
+      worktreeRoot: tmp.worktreeRoot,
+      worktreeId: "login",
+      porcelain: [`worktree ${join(tmp.worktreeRoot, "login")}`, "HEAD x", ""].join("\n"),
+    });
+
+    const registryRef = { snapshot: { login: 20000, removed: 20032 } as RegistrySnapshot };
+
+    const { runPrune } = await import("./commands.js");
+    const result = await runPrune({
+      cwd: join(tmp.worktreeRoot, "login"),
+      git,
+      discover: async () => [
+        instance("login", { status: "running", socketPath: "/x/login.sock" }),
+        instance("removed", {
+          status: "running",
+          socketPath: orphanSocket,
+        }),
+      ],
+      withRegistryLock: (_anchor, mutate) => {
+        const after = mutate(registryRef.snapshot);
+        registryRef.snapshot = after;
+        return after;
+      },
+      driver: {
+        exists: () => Promise.resolve(true),
+        spawner: (_binary, args) => {
+          // The driver invokes `down -U -u <socket>`.
+          const verb = args[0];
+          const si = args.indexOf("-u");
+          if (verb === "down" && si >= 0) {
+            const socketPath = args[si + 1] ?? "";
+            downCalls.push({ configPath: "", socketPath });
+          }
+          return spawnedOk();
+        },
+      },
+    });
+
+    // Acceptance: orphan is reported in the result.
+    expect(result.pruned.map((p) => p.id)).toEqual(["removed"]);
+    // Acceptance: driver.down was called for the orphan only.
+    expect(downCalls.map((c) => c.socketPath)).toEqual([orphanSocket]);
+    // Acceptance: anchor state for the orphan is gone.
+    expect(existsSync(orphanSocket)).toBe(false);
+    expect(existsSync(orphanConfig)).toBe(false);
+    // Acceptance: the live worktree's registry entry is untouched.
+    expect(registryRef.snapshot.login).toBe(20000);
+    // Acceptance: the orphan's registry entry is gone.
+    expect("removed" in registryRef.snapshot).toBe(false);
+  });
+
+  it("cleans up a stale orphan (socket file with no listener) without calling driver.down", async () => {
+    // When the process-compose has already died, there is nothing to stop —
+    // just leftover files to clear. The driver should not be invoked.
+    const tmp = tmpAnchor();
+    mkdirSync(join(tmp.anchor, "devtrees", "run"), { recursive: true });
+    const orphanSocket = join(tmp.anchor, "devtrees", "run", "removed.sock");
+    const orphanConfig = join(tmp.anchor, "devtrees", "removed.yaml");
+    writeFileSync(orphanSocket, "");
+    writeFileSync(orphanConfig, "processes: {}\n");
+
+    const downCalls: string[] = [];
+    const git = pruneGit({
+      anchor: tmp.anchor,
+      worktreeRoot: tmp.worktreeRoot,
+      worktreeId: "login",
+      porcelain: "",
+    });
+    const registryRef = { snapshot: { removed: 20000 } as RegistrySnapshot };
+
+    const { runPrune } = await import("./commands.js");
+    const result = await runPrune({
+      cwd: join(tmp.worktreeRoot, "login"),
+      git,
+      discover: async () => [
+        instance("removed", { status: "stale", socketPath: orphanSocket }),
+      ],
+      withRegistryLock: (_anchor, mutate) => {
+        const after = mutate(registryRef.snapshot);
+        registryRef.snapshot = after;
+        return after;
+      },
+      driver: {
+        exists: () => Promise.resolve(true),
+        spawner: (_binary, args) => {
+          downCalls.push(args[0] ?? "");
+          return spawnedOk();
+        },
+      },
+    });
+
+    expect(result.pruned.map((p) => p.id)).toEqual(["removed"]);
+    // Acceptance: no driver.down for a stale instance — nothing is listening.
+    expect(downCalls).toEqual([]);
+    expect(existsSync(orphanSocket)).toBe(false);
+    expect(existsSync(orphanConfig)).toBe(false);
+    expect("removed" in registryRef.snapshot).toBe(false);
+  });
+
+  it("leaves an instance whose worktree still exists alone, even if status is stale", async () => {
+    // A stale-status worktree instance whose worktree dir still exists is
+    // not an orphan from prune's perspective — the developer may have just
+    // crashed the stack and want to re-up. Reconciliation uses the worktree
+    // list, not the socket liveness, as the source of truth (#9 acceptance).
+    const tmp = tmpAnchor();
+    const git = pruneGit({
+      anchor: tmp.anchor,
+      worktreeRoot: tmp.worktreeRoot,
+      worktreeId: "login",
+      porcelain: [`worktree ${join(tmp.worktreeRoot, "login")}`, "HEAD x", ""].join("\n"),
+    });
+    const { runPrune } = await import("./commands.js");
+    const result = await runPrune({
+      cwd: join(tmp.worktreeRoot, "login"),
+      git,
+      discover: async () => [instance("login", { status: "stale" })],
+    });
+    expect(result.pruned).toEqual([]);
+  });
+
+  it("continues pruning the rest when one orphan's driver.down fails", async () => {
+    // A best-effort cleanup: if `process-compose down` errors (binary gone,
+    // socket already half-dead), prune still removes anchor state and moves
+    // on. The whole point of prune is to reclaim stale state.
+    const tmp = tmpAnchor();
+    mkdirSync(join(tmp.anchor, "devtrees", "run"), { recursive: true });
+    const a = join(tmp.anchor, "devtrees", "run", "alpha.sock");
+    const b = join(tmp.anchor, "devtrees", "run", "beta.sock");
+    writeFileSync(a, "");
+    writeFileSync(b, "");
+    writeFileSync(join(tmp.anchor, "devtrees", "alpha.yaml"), "");
+    writeFileSync(join(tmp.anchor, "devtrees", "beta.yaml"), "");
+
+    const git = pruneGit({
+      anchor: tmp.anchor,
+      worktreeRoot: tmp.worktreeRoot,
+      worktreeId: "live",
+      porcelain: [`worktree ${join(tmp.worktreeRoot, "live")}`, "HEAD x", ""].join("\n"),
+    });
+    const registryRef = { snapshot: { alpha: 20000, beta: 20032 } as RegistrySnapshot };
+    let firstDown = true;
+    const { runPrune } = await import("./commands.js");
+    const result = await runPrune({
+      cwd: join(tmp.worktreeRoot, "live"),
+      git,
+      discover: async () => [
+        instance("alpha", { status: "running", socketPath: a }),
+        instance("beta", { status: "running", socketPath: b }),
+      ],
+      withRegistryLock: (_anchor, mutate) => {
+        const after = mutate(registryRef.snapshot);
+        registryRef.snapshot = after;
+        return after;
+      },
+      driver: {
+        exists: () => Promise.resolve(true),
+        spawner: (_binary, _args) => {
+          if (firstDown) {
+            firstDown = false;
+            // Simulate process-compose down failing — emit exit(1).
+            return {
+              on(event: "error" | "exit", cb: (arg: never) => void): void {
+                if (event === "exit") queueMicrotask(() => (cb as (c: number) => void)(1));
+              },
+              unref: () => {},
+            };
+          }
+          return spawnedOk();
+        },
+      },
+    });
+
+    expect(result.pruned.map((p) => p.id).sort()).toEqual(["alpha", "beta"]);
+    // Both orphans had their anchor state cleared regardless of down outcome.
+    expect(existsSync(a)).toBe(false);
+    expect(existsSync(b)).toBe(false);
+    expect("alpha" in registryRef.snapshot).toBe(false);
+    expect("beta" in registryRef.snapshot).toBe(false);
   });
 });

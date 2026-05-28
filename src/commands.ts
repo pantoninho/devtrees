@@ -13,6 +13,7 @@ import { resolveAnchor, type GitProbe } from "./anchor.js";
 import { deriveSharedConfig, deriveWorktreeConfig, type DroppedEdge } from "./deriver.js";
 import { discoverInstances, type InstanceInfo } from "./instances.js";
 import { SHARED_REGISTRY_KEY, instancePaths, sharedInstancePaths } from "./paths.js";
+import { findOrphans, parseWorktreeIds } from "./prune.js";
 import { loadStack, type ResolvedService, type ResolvedStack } from "./stack.js";
 import { createDriver, type DriverDeps } from "./driver.js";
 import { withRegistryLock, withSharedLock } from "./registry.js";
@@ -601,6 +602,118 @@ export async function runLs(deps: LsDeps = {}): Promise<LsResult> {
   const discover = deps.discover ?? discoverInstances;
   const instances = await discover(anchor.anchor);
   return { anchor: anchor.anchor, instances };
+}
+
+/** Inputs unique to `runPrune` — same anchor resolution as the other commands. */
+export interface PruneDeps {
+  /** Working directory to resolve the anchor from. Default: process.cwd(). */
+  readonly cwd?: string;
+  /**
+   * Inject git. Default: runs the real `git` in `cwd`. Prune additionally
+   * calls `git worktree list --porcelain` to enumerate live worktrees —
+   * devtrees does not manage git, so this is the authoritative liveness
+   * signal (#9 acceptance).
+   */
+  readonly git?: GitProbe;
+  /**
+   * Discover instances at the anchor. Default: real socket enumeration via
+   * `discoverInstances`. Injected so the command can be unit-tested without
+   * touching `<anchor>/devtrees/run/`.
+   */
+  readonly discover?: (anchor: string) => Promise<InstanceInfo[]>;
+  /**
+   * Driver for invoking `process-compose down` on a running orphan. Default:
+   * real shell-out. Injected so tests can assert on the spawn surface
+   * without launching `process-compose`.
+   */
+  readonly driver?: DriverDeps;
+  /**
+   * Acquire the allocation-registry lock to delete each orphan's entry under
+   * the same read-modify-write semantics `up`/`down` use. Default: real lock
+   * under the anchor.
+   */
+  readonly withRegistryLock?: WithRegistryLock;
+}
+
+export interface PruneResult {
+  readonly anchor: string;
+  /** The orphans that were stopped + cleaned. Source order from discovery. */
+  readonly pruned: ReadonlyArray<InstanceInfo>;
+}
+
+/**
+ * Reconcile devtrees' notion of running instances against `git worktree list`
+ * and reclaim any orphan state.
+ *
+ * Devtrees does not manage git worktrees (CONTEXT.md "Devtrees"); when a
+ * developer runs `git worktree remove` while the stack is still up, the
+ * instance's anchor state survives unnoticed. `runPrune` walks the discovered
+ * instances, treats any worktree-kind instance whose worktree dir is no
+ * longer in `git worktree list` as an orphan, and cleans it up:
+ *
+ *   1. If the orphan is still running, ask the driver to stop it. Errors are
+ *      swallowed — the whole point of prune is to reclaim stale state, and a
+ *      `process-compose down` against a half-dead socket must not abort the
+ *      sweep over other orphans.
+ *   2. Remove the orphan's control socket and derived config from the anchor
+ *      state.
+ *   3. Drop the orphan's allocation-registry entry under the registry lock.
+ *
+ * The shared instance is never an orphan: it is anchored at the git common
+ * dir, not at any single worktree, and its lifecycle is decoupled from any
+ * worktree's `down` (ADR-0001). Tear it down explicitly with `down --shared`.
+ */
+export async function runPrune(deps: PruneDeps = {}): Promise<PruneResult> {
+  const cwd = deps.cwd ?? process.cwd();
+  const git = deps.git ?? defaultGit(cwd);
+  const anchor = resolveAnchor(cwd, git);
+  const discover = deps.discover ?? discoverInstances;
+  const lock = deps.withRegistryLock ?? defaultWithRegistryLock;
+  const driver = createDriver(deps.driver);
+
+  const instances = await discover(anchor.anchor);
+  const porcelain = git(["worktree", "list", "--porcelain"]);
+  const liveIds = parseWorktreeIds(porcelain);
+  const orphans = findOrphans(instances, liveIds);
+  if (orphans.length === 0) return { anchor: anchor.anchor, pruned: [] };
+
+  for (const orphan of orphans) {
+    const paths = instancePaths(anchor.anchor, orphan.id);
+    if (orphan.status === "running") {
+      try {
+        await driver.down({
+          configPath: paths.configPath,
+          socketPath: paths.socketPath,
+        });
+      } catch {
+        // Best-effort: a failed down still leaves us removing the on-disk
+        // state below, which is the whole point of prune.
+      }
+    }
+    // Remove the socket file (driver.down typically removes it on a clean
+    // exit, but stale/failed orphans need explicit cleanup).
+    rmSync(paths.socketPath, { force: true });
+    // Remove the derived config — a future `up` re-derives it.
+    rmSync(paths.configPath, { force: true });
+  }
+
+  // Drop every orphan's registry entry under one lock acquire so concurrent
+  // `up`s can re-use the freed block bases.
+  lock(anchor.anchor, (snapshot) => {
+    let next = snapshot;
+    let changed = false;
+    for (const orphan of orphans) {
+      if (next[orphan.id] !== undefined) {
+        const { [orphan.id]: _drop, ...rest } = next;
+        void _drop;
+        next = rest;
+        changed = true;
+      }
+    }
+    return changed ? next : snapshot;
+  });
+
+  return { anchor: anchor.anchor, pruned: orphans };
 }
 
 // --- default I/O implementations -------------------------------------------
