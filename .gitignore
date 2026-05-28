@@ -4,3 +4,6 @@ dist/
 .DS_Store
 coverage/
 .vite-plus/
+
+# fallow runtime cache (committed baselines live in fallow-baselines/)
+.fallow/

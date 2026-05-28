@@ -1,6 +1,12 @@
 import { defineConfig } from "vite-plus";
 
-const ignorePatterns = ["dist/**", "node_modules/**", "**/*.md"];
+const ignorePatterns = [
+  "dist/**",
+  "node_modules/**",
+  "**/*.md",
+  // fallow's saved baselines are machine-generated; don't reformat/lint them.
+  "fallow-baselines/**",
+];
 
 export default defineConfig({
   pack: {
@@ -18,5 +24,11 @@ export default defineConfig({
   },
   lint: {
     ignorePatterns,
+    options: {
+      // Run TypeScript type-aware lint rules and full type-checking as part of
+      // `vp check`, so CI's check stage actually type-checks (see issue #12).
+      typeAware: true,
+      typeCheck: true,
+    },
   },
 });
