@@ -2,12 +2,7 @@ import { afterEach, describe, expect, it } from "vite-plus/test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-  RegistryLockedError,
-  readRegistry,
-  withRegistryLock,
-  withSharedLock,
-} from "./registry.js";
+import { RegistryLockedError, readRegistry, withRegistryLock, withSharedLock } from "./registry.js";
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {

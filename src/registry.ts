@@ -77,20 +77,31 @@ function sleepSync(ms: number): void {
   }
 }
 
+/** Outcome of one `wx`-create attempt. */
+type AttemptResult = "acquired" | "contended";
+
+/**
+ * One `wx`-create attempt: `acquired` on success, `contended` on EEXIST, rethrow
+ * on any other errno. Shared by the sync and async acquire loops.
+ */
+function tryWxCreate(path: string): AttemptResult {
+  try {
+    writeFileSync(path, `${process.pid}\n`, { flag: "wx" });
+    return "acquired";
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    return "contended";
+  }
+}
+
 /** Try to acquire a lockfile by `wx`-creating it; throws RegistryLockedError on timeout. */
 function acquireLockAt(path: string, options: LockOptions): void {
   const retries = options.retries ?? DEFAULT_RETRIES;
   const delay = options.retryDelayMs ?? DEFAULT_DELAY_MS;
   for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      // `wx` fails if the file already exists — atomic across POSIX processes.
-      writeFileSync(path, `${process.pid}\n`, { flag: "wx" });
-      return;
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-      if (attempt === retries) throw new RegistryLockedError(path);
-      sleepSync(delay);
-    }
+    if (tryWxCreate(path) === "acquired") return;
+    if (attempt === retries) throw new RegistryLockedError(path);
+    sleepSync(delay);
   }
 }
 
@@ -104,14 +115,9 @@ async function acquireLockAtAsync(path: string, options: LockOptions): Promise<v
   const retries = options.retries ?? DEFAULT_RETRIES;
   const delay = options.retryDelayMs ?? DEFAULT_DELAY_MS;
   for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      writeFileSync(path, `${process.pid}\n`, { flag: "wx" });
-      return;
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-      if (attempt === retries) throw new RegistryLockedError(path);
-      await new Promise<void>((resolve) => setTimeout(resolve, delay));
-    }
+    if (tryWxCreate(path) === "acquired") return;
+    if (attempt === retries) throw new RegistryLockedError(path);
+    await new Promise<void>((resolve) => setTimeout(resolve, delay));
   }
 }
 

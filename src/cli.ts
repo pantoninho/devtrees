@@ -107,9 +107,7 @@ export async function execute(argv: ReadonlyArray<string>, deps: ExecuteDeps): P
       const ports = Object.entries(result.env)
         .map(([k, v]) => `  ${k}=${v}`)
         .join("\n");
-      const sharedNote = result.sharedStarted
-        ? "devtrees up: shared instance started.\n"
-        : "";
+      const sharedNote = result.sharedStarted ? "devtrees up: shared instance started.\n" : "";
       return {
         code: 0,
         stdout: `${sharedNote}devtrees up: '${result.worktreeId}' is up.\n${ports}\n`,

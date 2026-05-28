@@ -22,6 +22,7 @@ import {
   type WithSharedLock,
 } from "./commands.js";
 import type { RegistrySnapshot } from "./allocator.js";
+import type { SpawnedProcess } from "./driver.js";
 import { SHARED_REGISTRY_KEY } from "./paths.js";
 import type { ResolvedStack } from "./stack.js";
 
@@ -69,15 +70,48 @@ interface StubSpawn {
   touchSocket: boolean;
 }
 
+/**
+ * SpawnedProcess that pretends to be a real `process-compose` child: fires
+ * `exit(0)` on the next tick so `driver.down`/`attach` (which await an exit
+ * event) resolve cleanly, and ignores `error` listeners.
+ */
+function spawnedOk(): SpawnedProcess {
+  const exitHandlers: Array<(code: number | null) => void> = [];
+  queueMicrotask(() => {
+    for (const h of exitHandlers) h(0);
+  });
+  return {
+    on(event: "error" | "exit", cb: (arg: never) => void): void {
+      if (event === "exit") exitHandlers.push(cb as (code: number | null) => void);
+    },
+    unref: () => {},
+  };
+}
+
+/** Find the shared-instance up-spawn in a tracker, asserting it happened. */
+function findSharedSpawn(track: StubSpawn): UpInvocation {
+  const spawn = track.invocations.find((i) => i.socketPath.endsWith("/shared.sock"));
+  if (spawn === undefined) throw new Error("expected a shared.sock spawn");
+  return spawn;
+}
+
+/** Allocate a temp anchor + worktree-root + registry ref for a multi-worktree test. */
+function multiWorktreeFixture(prefix: string): {
+  sharedAnchor: string;
+  wtRoot: string;
+  registryRef: { snapshot: RegistrySnapshot };
+} {
+  const root = mkdtempSync(join(tmpdir(), prefix));
+  cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+  return {
+    sharedAnchor: join(root, ".git"),
+    wtRoot: join(root, "wt"),
+    registryRef: { snapshot: {} as RegistrySnapshot },
+  };
+}
+
 function makeStubSpawner(track: StubSpawn) {
-  return (
-    _binary: string,
-    args: ReadonlyArray<string>,
-    _options: unknown,
-  ): {
-    on: (e: "error" | "exit", cb: (...a: unknown[]) => void) => void;
-    unref: () => void;
-  } => {
+  return (_binary: string, args: ReadonlyArray<string>, _options: unknown): SpawnedProcess => {
     const ai = args.indexOf("-f");
     const si = args.indexOf("-u");
     if (ai >= 0 && si >= 0 && args[0] === "up") {
@@ -89,18 +123,7 @@ function makeStubSpawner(track: StubSpawn) {
         writeFileSync(socketPath, "");
       }
     }
-    // Fire `exit(0)` on the next tick so `driver.down`/`attach` (which await
-    // an exit event) resolve cleanly — exactly what a real process would.
-    const handlers: Record<string, (...a: unknown[]) => void> = {};
-    queueMicrotask(() => {
-      handlers.exit?.(0);
-    });
-    return {
-      on: (event, cb) => {
-        handlers[event] = cb;
-      },
-      unref: () => {},
-    };
+    return spawnedOk();
   };
 }
 
@@ -125,7 +148,8 @@ function stubDeps(opts: {
   const worktreeRoot = opts.worktreeRootOverride ?? tmp.worktreeRoot;
   const worktreeId = opts.worktreeId ?? "login";
   const snapshotRef =
-    opts.registryRef ?? ({ snapshot: opts.initialRegistry ?? {} } as { snapshot: RegistrySnapshot });
+    opts.registryRef ??
+    ({ snapshot: opts.initialRegistry ?? {} } as { snapshot: RegistrySnapshot });
 
   // Fake git: tell the anchor resolver everything it needs without spawning git.
   const git = (args: ReadonlyArray<string>): string => {
@@ -337,11 +361,7 @@ describe("runUp — shared tier lazy start", () => {
   it("a second worktree reuses the running shared instance rather than starting another", async () => {
     // Two worktrees, same anchor and same registry — the second `up` must see
     // the shared socket from the first and skip lazy-start (acceptance).
-    const root = mkdtempSync(join(tmpdir(), "dt-shared-"));
-    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
-    const sharedAnchor = join(root, ".git");
-    const wtRoot = join(root, "wt");
-    const registryRef = { snapshot: {} as RegistrySnapshot };
+    const { sharedAnchor, wtRoot, registryRef } = multiWorktreeFixture("dt-shared-");
 
     const trackA: StubSpawn = { invocations: [], touchSocket: true };
     const trackB: StubSpawn = { invocations: [], touchSocket: true };
@@ -386,9 +406,7 @@ describe("runUp — shared tier lazy start", () => {
     const deps = stubDeps({ stack: mixedStack, track });
     await runUp(deps);
     // The anchor is whatever the stubbed git returned, recoverable from the spawn.
-    const sharedSpawn = track.invocations.find((i) => i.socketPath.endsWith("/shared.sock"));
-    expect(sharedSpawn).toBeDefined();
-    if (sharedSpawn === undefined) return;
+    const sharedSpawn = findSharedSpawn(track);
     expect(existsSync(sharedSpawn.configPath)).toBe(true);
     const config = parseYaml(readFileSync(sharedSpawn.configPath, "utf8")) as {
       processes: Record<string, { command: string }>;
@@ -410,11 +428,7 @@ describe("runUp — shared tier lazy start", () => {
   it("two simultaneous ups see the lock-guarded ensureSharedStarted serialize them", async () => {
     // The shared lifecycle lock serialises the check-and-start, so even if both
     // worktrees race their ups, only one ends up spawning the shared instance.
-    const root = mkdtempSync(join(tmpdir(), "dt-race-"));
-    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
-    const sharedAnchor = join(root, ".git");
-    const wtRoot = join(root, "wt");
-    const registryRef = { snapshot: {} as RegistrySnapshot };
+    const { sharedAnchor, wtRoot, registryRef } = multiWorktreeFixture("dt-race-");
 
     // Use a real serialising lock so the test exercises the gate, not a mock.
     let held = false;
@@ -455,8 +469,7 @@ describe("runUp — shared tier lazy start", () => {
     };
 
     const [a, b] = await Promise.all([runUp(depsA), runUp(depsB)]);
-    const totalSharedStarts =
-      Number(a.sharedStarted) + Number(b.sharedStarted);
+    const totalSharedStarts = Number(a.sharedStarted) + Number(b.sharedStarted);
     expect(totalSharedStarts).toBe(1);
     const sharedSpawnA = trackA.invocations.find((i) => i.socketPath.endsWith("/shared.sock"));
     const sharedSpawnB = trackB.invocations.find((i) => i.socketPath.endsWith("/shared.sock"));
@@ -477,9 +490,7 @@ describe("runDown — shared lifecycle is decoupled from worktree lifecycle", ()
     const track: StubSpawn = { invocations: [], touchSocket: true };
     const deps = stubDeps({ stack: mixedStack, track });
     await runUp(deps);
-    const sharedSpawn = track.invocations.find((i) => i.socketPath.endsWith("/shared.sock"));
-    expect(sharedSpawn).toBeDefined();
-    if (sharedSpawn === undefined) return;
+    const sharedSpawn = findSharedSpawn(track);
 
     // shared.sock was created by the stub spawner; runDown without --shared must leave it.
     expect(existsSync(sharedSpawn.socketPath)).toBe(true);
@@ -494,33 +505,22 @@ describe("runDown — shared lifecycle is decoupled from worktree lifecycle", ()
     await runUp(deps);
 
     expect(registryRef.snapshot[SHARED_REGISTRY_KEY]).toBeDefined();
-    const sharedSpawn = track.invocations.find((i) => i.socketPath.endsWith("/shared.sock"));
-    expect(sharedSpawn).toBeDefined();
-    if (sharedSpawn === undefined) return;
+    const sharedSpawn = findSharedSpawn(track);
     expect(existsSync(sharedSpawn.socketPath)).toBe(true);
 
     // Simulate the real driver: down() removes the socket. The stub driver in
     // commands' spawner just records — we drop the socket here to mimic it.
-    const downTrack: StubSpawn = { invocations: [], touchSocket: false };
     const downDeps: CommandDeps = {
       ...deps,
       driver: {
         exists: () => Promise.resolve(true),
-        spawner: (_b, args, _o) => {
+        spawner: (_b, args, _o): SpawnedProcess => {
           const si = args.indexOf("-u");
           if (args[0] === "down" && si >= 0) {
             const socketPath = args[si + 1];
             if (socketPath) rmSync(socketPath, { force: true });
           }
-          downTrack.invocations.push({ configPath: "", socketPath: args[si + 1] ?? "" });
-          const handlers: Record<string, (...a: unknown[]) => void> = {};
-          queueMicrotask(() => handlers.exit?.(0));
-          return {
-            on: (e: string, cb: (...a: unknown[]) => void) => {
-              handlers[e] = cb;
-            },
-            unref: () => {},
-          };
+          return spawnedOk();
         },
       },
     };

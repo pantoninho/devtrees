@@ -129,9 +129,7 @@ function buildOffsetMap(
     }
   }
   if (next > blockSize) {
-    throw new Error(
-      `stack declares ${next} ${tier} named ports but block_size is ${blockSize}`,
-    );
+    throw new Error(`stack declares ${next} ${tier} named ports but block_size is ${blockSize}`);
   }
   return out;
 }
@@ -338,10 +336,7 @@ export function findUnmanagedPortBinds(
  * shared instance is not running, the call is a no-op and the registry entry
  * is still cleared so a subsequent `up` can re-lazy-start it.
  */
-export async function runDown(
-  deps: CommandDeps = {},
-  options: DownOptions = {},
-): Promise<void> {
+export async function runDown(deps: CommandDeps = {}, options: DownOptions = {}): Promise<void> {
   const { anchor } = resolve(deps);
   const driver = createDriver(deps.driver);
 

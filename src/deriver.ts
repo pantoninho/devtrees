@@ -39,18 +39,21 @@ export interface DerivedConfig {
   readonly processes: Record<string, DerivedProcess>;
 }
 
+/** Resolves a declared named port to its allocated number, or undefined. */
+export type PortResolver = (portName: string) => number | undefined;
+
 export interface DeriveContext {
   readonly worktreeId: string;
   readonly worktreeRoot: string;
   /** Resolve a declared isolated named port to its allocated number for this worktree. */
-  portFor(portName: string): number | undefined;
+  readonly portFor: PortResolver;
   /**
    * Resolve a declared shared named port to its repo-wide allocated number.
    * Injected so the worktree instance gets the shared services' connection
    * info — identical in every worktree (CONTEXT.md "Injected value"). Optional:
    * a stack with no shared services may omit it.
    */
-  sharedPortFor?(portName: string): number | undefined;
+  readonly sharedPortFor?: PortResolver;
 }
 
 export interface DerivedWorktree {
@@ -62,6 +65,24 @@ export interface DerivedWorktree {
    * the shared-port entry.
    */
   readonly env: Record<string, string>;
+}
+
+/**
+ * For each named port a service in `services` declares, look it up via `resolve`
+ * and accumulate the resolved entries into `target`. Missing resolutions are
+ * skipped — the deriver does not invent numbers it was not given.
+ */
+function collectPortEnv(
+  services: ReadonlyArray<{ readonly ports: ReadonlyArray<string> }>,
+  resolve: (portName: string) => number | undefined,
+  target: Record<string, string>,
+): void {
+  for (const service of services) {
+    for (const portName of service.ports) {
+      const port = resolve(portName);
+      if (port !== undefined) target[portName] = String(port);
+    }
+  }
 }
 
 /**
@@ -78,20 +99,8 @@ export function deriveWorktreeConfig(stack: ResolvedStack, ctx: DeriveContext): 
   //  - this worktree's own named ports (allocated per-worktree)
   //  - the shared services' named ports (allocated repo-wide; identical in every worktree)
   const env: Record<string, string> = { [WORKTREE_ID_ENV]: ctx.worktreeId };
-  for (const service of isolated) {
-    for (const portName of service.ports) {
-      const port = ctx.portFor(portName);
-      if (port !== undefined) env[portName] = String(port);
-    }
-  }
-  if (ctx.sharedPortFor) {
-    for (const service of shared) {
-      for (const portName of service.ports) {
-        const port = ctx.sharedPortFor(portName);
-        if (port !== undefined) env[portName] = String(port);
-      }
-    }
-  }
+  collectPortEnv(isolated, ctx.portFor, env);
+  if (ctx.sharedPortFor) collectPortEnv(shared, ctx.sharedPortFor, env);
 
   const injection = Object.entries(env).map(([k, v]) => `${k}=${v}`);
 
@@ -117,7 +126,7 @@ export interface SharedDeriveContext {
    */
   readonly workingDir: string;
   /** Resolve a declared shared named port to its repo-wide allocated number. */
-  portFor(portName: string): number | undefined;
+  readonly portFor: PortResolver;
 }
 
 export interface DerivedShared {
@@ -136,12 +145,7 @@ export function deriveSharedConfig(stack: ResolvedStack, ctx: SharedDeriveContex
   const shared = stack.services.filter((s) => s.tier === "shared");
 
   const env: Record<string, string> = {};
-  for (const service of shared) {
-    for (const portName of service.ports) {
-      const port = ctx.portFor(portName);
-      if (port !== undefined) env[portName] = String(port);
-    }
-  }
+  collectPortEnv(shared, ctx.portFor, env);
 
   const injection = Object.entries(env).map(([k, v]) => `${k}=${v}`);
 
