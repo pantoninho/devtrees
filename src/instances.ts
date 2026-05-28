@@ -24,12 +24,7 @@ import { connect } from "node:net";
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { readRegistry } from "./registry.js";
-import {
-  SHARED_INSTANCE_ID,
-  SHARED_REGISTRY_KEY,
-  instancePaths,
-  stateDir,
-} from "./paths.js";
+import { SHARED_INSTANCE_ID, SHARED_REGISTRY_KEY, instancePaths, stateDir } from "./paths.js";
 
 /** Whether an instance hosts the shared services or one worktree's isolated ones. */
 export type InstanceKind = "worktree" | "shared";
@@ -123,28 +118,36 @@ async function probeSocket(socketPath: string): Promise<InstanceStatus> {
 }
 
 /**
- * Extract every `KEY=NUMBER` env entry that appears in any process's
- * `environment:` list of a derived config. devtrees' deriver writes named-port
- * allocations exactly that way (`WEB_PORT=20512`) and never rewrites commands,
- * so reading the derived config back recovers the same mapping the original
- * `up` injected — without re-running the allocator or the stack loader.
+ * Parse one `KEY=NUMBER` entry from a derived config's `environment:` list, or
+ * return `undefined` for anything else. Devtrees writes named-port allocations
+ * exactly that way (`WEB_PORT=20512`); any other shape (object literals, env
+ * entries that aren't ports) is ignored.
+ */
+function parsePortEnvEntry(entry: unknown): readonly [string, number] | undefined {
+  if (typeof entry !== "string") return undefined;
+  const eq = entry.indexOf("=");
+  if (eq <= 0) return undefined;
+  const raw = entry.slice(eq + 1);
+  if (!/^\d+$/.test(raw)) return undefined;
+  return [entry.slice(0, eq), Number(raw)];
+}
+
+/**
+ * Extract every `KEY=NUMBER` env entry from any process's `environment:` list
+ * of a derived config. Devtrees never rewrites commands, so reading the
+ * derived config back recovers the same mapping the original `up` injected —
+ * without re-running the allocator or the stack loader.
  */
 function readPortsFromDerived(configPath: string): Record<string, number> {
   if (!existsSync(configPath)) return {};
-  const text = readFileSync(configPath, "utf8");
-  const doc = (parseYaml(text) ?? {}) as {
+  const doc = (parseYaml(readFileSync(configPath, "utf8")) ?? {}) as {
     processes?: Record<string, { environment?: ReadonlyArray<unknown> }>;
   };
   const ports: Record<string, number> = {};
   for (const proc of Object.values(doc.processes ?? {})) {
     for (const entry of proc.environment ?? []) {
-      if (typeof entry !== "string") continue;
-      const eq = entry.indexOf("=");
-      if (eq <= 0) continue;
-      const key = entry.slice(0, eq);
-      const raw = entry.slice(eq + 1);
-      if (!/^\d+$/.test(raw)) continue;
-      ports[key] = Number(raw);
+      const parsed = parsePortEnvEntry(entry);
+      if (parsed) ports[parsed[0]] = parsed[1];
     }
   }
   return ports;

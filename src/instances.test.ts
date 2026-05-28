@@ -16,11 +16,13 @@ import { createServer, type Server } from "node:net";
 import { discoverInstances } from "./instances.js";
 import { SHARED_INSTANCE_ID, SHARED_REGISTRY_KEY } from "./paths.js";
 
-const cleanups: Array<() => void> = [];
+// Cleanups may be sync (rmSync) or async (server.close); each is wrapped to a
+// promise so afterEach can await them uniformly without tripping the lint rule.
+const cleanups: Array<() => void | Promise<void>> = [];
 afterEach(async () => {
   while (cleanups.length) {
     const c = cleanups.pop();
-    if (c) await c();
+    if (c) await Promise.resolve(c());
   }
 });
 
