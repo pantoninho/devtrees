@@ -127,4 +127,61 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
     expect(result.code).toBe(1);
     expect(result.stderr).toMatch(/devtrees\.yaml not found/);
   });
+
+  it("routes `ls` to the ls command and formats the table", async () => {
+    const ls = vi.fn().mockResolvedValue({
+      anchor: "/repo/.git",
+      instances: [
+        {
+          id: "shared",
+          kind: "shared",
+          status: "running",
+          socketPath: "/repo/.git/devtrees/run/shared.sock",
+          ports: { DB_PORT: 30000 },
+          blockBase: 30000,
+        },
+        {
+          id: "login",
+          kind: "worktree",
+          status: "running",
+          socketPath: "/repo/.git/devtrees/run/login.sock",
+          ports: { WEB_PORT: 20512 },
+          blockBase: 20512,
+        },
+      ],
+    });
+    const result = await execute(["ls"], { up: vi.fn(), down: vi.fn(), ls });
+    expect(ls).toHaveBeenCalledOnce();
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("shared");
+    expect(result.stdout).toContain("login");
+    expect(result.stdout).toContain("running");
+    expect(result.stdout).toContain("WEB_PORT=20512");
+    expect(result.stdout).toContain("DB_PORT=30000");
+  });
+
+  it("`ls` says 'no devtrees instances running' when none are discovered", async () => {
+    const ls = vi.fn().mockResolvedValue({ anchor: "/repo/.git", instances: [] });
+    const result = await execute(["ls"], { up: vi.fn(), down: vi.fn(), ls });
+    expect(result.code).toBe(0);
+    expect(result.stdout).toMatch(/no devtrees instances/i);
+  });
+
+  it("`ls` marks stale entries in its output so an operator can spot orphans", async () => {
+    const ls = vi.fn().mockResolvedValue({
+      anchor: "/repo/.git",
+      instances: [
+        {
+          id: "login",
+          kind: "worktree",
+          status: "stale",
+          socketPath: "/repo/.git/devtrees/run/login.sock",
+          ports: {},
+          blockBase: 20512,
+        },
+      ],
+    });
+    const result = await execute(["ls"], { up: vi.fn(), down: vi.fn(), ls });
+    expect(result.stdout).toContain("stale");
+  });
 });
