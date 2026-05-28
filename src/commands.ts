@@ -178,6 +178,73 @@ function hasTier(stack: ResolvedStack, tier: "isolated" | "shared"): boolean {
   return stack.services.some((s) => s.tier === tier);
 }
 
+interface AllocatedPortMaps {
+  readonly blockBase: number;
+  readonly sharedBase?: number;
+  /** Resolve an isolated-tier named port to a concrete number, or `undefined` if unknown. */
+  readonly portFor: (name: string) => number | undefined;
+  /** Resolve a shared-tier named port; `undefined` when the stack has no shared services. */
+  readonly sharedPortFor: (name: string) => number | undefined;
+}
+
+/**
+ * Allocate this worktree's port block — and, if the stack declares shared
+ * services, the shared block — under one read-modify-write of the registry
+ * lock, then build the named-port → number resolvers from the resulting
+ * offsets. Both `runUp` and `runGenerate` need the same allocation pass; the
+ * only thing they do differently is what they do with the resolved ports
+ * afterwards.
+ */
+function allocateAndBuildPortMaps(args: {
+  readonly anchor: string;
+  readonly worktreeId: string;
+  readonly stack: ResolvedStack;
+  readonly options: AllocatorOptions;
+  readonly lock: WithRegistryLock;
+  readonly isPortFree: (port: number) => boolean;
+}): AllocatedPortMaps {
+  const { anchor, worktreeId, stack, options, lock, isPortFree } = args;
+  const sharedNeeded = hasTier(stack, "shared");
+
+  let blockBase = -1;
+  let sharedBase: number | undefined;
+  lock(anchor, (snapshot) => {
+    let next = snapshot;
+    const block = allocateBlock(worktreeId, next, options, isPortFree);
+    blockBase = block.base;
+    if (next[worktreeId] === undefined) {
+      next = { ...next, [worktreeId]: block.base };
+    }
+    if (sharedNeeded) {
+      const sblock = allocateBlock(SHARED_REGISTRY_KEY, next, options, isPortFree);
+      sharedBase = sblock.base;
+      if (next[SHARED_REGISTRY_KEY] === undefined) {
+        next = { ...next, [SHARED_REGISTRY_KEY]: sblock.base };
+      }
+    }
+    return next === snapshot ? snapshot : next;
+  });
+
+  const isolatedOffsets = buildOffsetMap(stack.services, "isolated", options.blockSize);
+  const sharedOffsets = sharedNeeded
+    ? buildOffsetMap(stack.services, "shared", options.blockSize)
+    : new Map<string, number>();
+
+  const portFor = (name: string): number | undefined => {
+    const offset = isolatedOffsets.get(name);
+    return offset === undefined ? undefined : blockBase + offset;
+  };
+  const sharedPortFor = (name: string): number | undefined => {
+    if (sharedBase === undefined) return undefined;
+    const offset = sharedOffsets.get(name);
+    return offset === undefined ? undefined : sharedBase + offset;
+  };
+
+  return sharedBase === undefined
+    ? { blockBase, portFor, sharedPortFor }
+    : { blockBase, sharedBase, portFor, sharedPortFor };
+}
+
 /** Bring up this worktree's isolated stack and lazily start the shared instance if needed. */
 export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
   const { anchor } = resolve(deps);
@@ -198,53 +265,25 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
   // consistent regardless of which worktree got there first (acceptance:
   // "shared instance appears in the allocation registry as an anchor-keyed
   // entry with its own block", PRD US-32).
-  let blockBase = -1;
-  let sharedBase: number | undefined;
-  lock(anchor.anchor, (snapshot) => {
-    let next = snapshot;
-    const block = allocateBlock(anchor.worktreeId, next, options, isPortFree);
-    blockBase = block.base;
-    if (next[anchor.worktreeId] === undefined) {
-      next = { ...next, [anchor.worktreeId]: block.base };
-    }
-    if (sharedNeeded) {
-      const sblock = allocateBlock(SHARED_REGISTRY_KEY, next, options, isPortFree);
-      sharedBase = sblock.base;
-      if (next[SHARED_REGISTRY_KEY] === undefined) {
-        next = { ...next, [SHARED_REGISTRY_KEY]: sblock.base };
-      }
-    }
-    return next === snapshot ? snapshot : next;
+  const { blockBase, portFor, sharedPortFor } = allocateAndBuildPortMaps({
+    anchor: anchor.anchor,
+    worktreeId: anchor.worktreeId,
+    stack,
+    options,
+    lock,
+    isPortFree,
   });
-  const block = { base: blockBase, portFor: (offset: number) => blockBase + offset };
-
-  // Each tier's named ports map to fixed offsets within its block so a service
-  // declaring multiple named ports (http + metrics + debug) gets consecutive
-  // numbers starting from its own base offset.
-  const isolatedOffsets = buildOffsetMap(stack.services, "isolated", options.blockSize);
-  const sharedOffsets = sharedNeeded
-    ? buildOffsetMap(stack.services, "shared", options.blockSize)
-    : new Map<string, number>();
-
-  const sharedPortFor = (name: string): number | undefined => {
-    if (sharedBase === undefined) return undefined;
-    const offset = sharedOffsets.get(name);
-    return offset === undefined ? undefined : sharedBase + offset;
-  };
 
   const derived = deriveWorktreeConfig(stack, {
     worktreeId: anchor.worktreeId,
     worktreeRoot: anchor.worktreeRoot,
-    portFor: (name) => {
-      const offset = isolatedOffsets.get(name);
-      return offset === undefined ? undefined : block.portFor(offset);
-    },
+    portFor,
     sharedPortFor,
   });
 
   // Warn for any port literal in a service command that is outside this
   // worktree's block — a hardcoded number devtrees did not allocate (PRD US-24).
-  for (const warning of findUnmanagedPortBinds(stack, block.base, options.blockSize)) {
+  for (const warning of findUnmanagedPortBinds(stack, blockBase, options.blockSize)) {
     warn(warning);
   }
 
@@ -322,43 +361,19 @@ export async function runGenerate(deps: CommandDeps = {}): Promise<GenerateResul
   const options = resolveAllocatorOptions(stack, deps.allocator ?? DEFAULT_ALLOCATOR);
   const sharedNeeded = hasTier(stack, "shared");
 
-  let blockBase = -1;
-  let sharedBase: number | undefined;
-  lock(anchor.anchor, (snapshot) => {
-    let next = snapshot;
-    const block = allocateBlock(anchor.worktreeId, next, options, isPortFree);
-    blockBase = block.base;
-    if (next[anchor.worktreeId] === undefined) {
-      next = { ...next, [anchor.worktreeId]: block.base };
-    }
-    if (sharedNeeded) {
-      const sblock = allocateBlock(SHARED_REGISTRY_KEY, next, options, isPortFree);
-      sharedBase = sblock.base;
-      if (next[SHARED_REGISTRY_KEY] === undefined) {
-        next = { ...next, [SHARED_REGISTRY_KEY]: sblock.base };
-      }
-    }
-    return next === snapshot ? snapshot : next;
+  const { portFor, sharedPortFor } = allocateAndBuildPortMaps({
+    anchor: anchor.anchor,
+    worktreeId: anchor.worktreeId,
+    stack,
+    options,
+    lock,
+    isPortFree,
   });
-
-  const isolatedOffsets = buildOffsetMap(stack.services, "isolated", options.blockSize);
-  const sharedOffsets = sharedNeeded
-    ? buildOffsetMap(stack.services, "shared", options.blockSize)
-    : new Map<string, number>();
-
-  const sharedPortFor = (name: string): number | undefined => {
-    if (sharedBase === undefined) return undefined;
-    const offset = sharedOffsets.get(name);
-    return offset === undefined ? undefined : sharedBase + offset;
-  };
 
   const derivedWt = deriveWorktreeConfig(stack, {
     worktreeId: anchor.worktreeId,
     worktreeRoot: anchor.worktreeRoot,
-    portFor: (name) => {
-      const offset = isolatedOffsets.get(name);
-      return offset === undefined ? undefined : blockBase + offset;
-    },
+    portFor,
     sharedPortFor,
   });
 
