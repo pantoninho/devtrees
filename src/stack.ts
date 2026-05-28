@@ -183,9 +183,11 @@ export function parseStack(yamlText: string, options: ParseStackOptions = {}): R
 
 /**
  * Raised when `devtrees.yaml` declares a structurally-impossible dependency,
- * e.g. a shared service depending on an isolated one (ADR-0003).
+ * e.g. a shared service depending on an isolated one (ADR-0003). The class is
+ * internal — callers match on the message text, not the constructor — but the
+ * named subclass makes stack traces and `instanceof` debugging clearer.
  */
-export class StackConfigError extends Error {
+class StackConfigError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "StackConfigError";
@@ -199,7 +201,7 @@ export class StackConfigError extends Error {
  * undefined. Rejected at load time so the developer hears about it before the
  * stack ever tries to start.
  */
-export function validateStack(stack: ResolvedStack): void {
+function validateStack(stack: ResolvedStack): void {
   const tierOf = new Map(stack.services.map((s) => [s.name, s.tier]));
   for (const service of stack.services) {
     if (service.tier !== "shared") continue;

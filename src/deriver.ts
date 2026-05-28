@@ -134,26 +134,13 @@ export function deriveWorktreeConfig(stack: ResolvedStack, ctx: DeriveContext): 
   collectPortEnv(isolated, ctx.portFor, env);
   if (ctx.sharedPortFor) collectPortEnv(shared, ctx.sharedPortFor, env);
 
-  const injection = Object.entries(env).map(([k, v]) => `${k}=${v}`);
-
-  const tierIndex = buildTierIndex(stack);
-  const droppedEdges: DroppedEdge[] = [];
-
-  const processes: Record<string, DerivedProcess> = {};
-  for (const service of isolated) {
-    const partition = partitionDependsOn(service.name, "isolated", service.dependsOn, tierIndex);
-    droppedEdges.push(...partition.dropped);
-    processes[service.name] = withOptionalDependsOn(
-      {
-        command: service.command,
-        working_dir: ctx.worktreeRoot,
-        // Author-declared env first, then devtrees injection (injection wins on dups
-        // because process-compose takes the last occurrence).
-        environment: [...service.environment, ...injection],
-      },
-      partition.kept,
-    );
-  }
+  const { processes, droppedEdges } = buildTierProcesses({
+    stack,
+    tier: "isolated",
+    services: isolated,
+    workingDir: ctx.worktreeRoot,
+    extraEnvLines: envLines(env),
+  });
 
   return { config: { processes }, env, droppedEdges };
 }
@@ -193,26 +180,59 @@ export function deriveSharedConfig(stack: ResolvedStack, ctx: SharedDeriveContex
   const env: Record<string, string> = {};
   collectPortEnv(shared, ctx.portFor, env);
 
-  const injection = Object.entries(env).map(([k, v]) => `${k}=${v}`);
+  const { processes, droppedEdges } = buildTierProcesses({
+    stack,
+    tier: "shared",
+    services: shared,
+    workingDir: ctx.workingDir,
+    extraEnvLines: envLines(env),
+  });
 
-  const tierIndex = buildTierIndex(stack);
+  return { config: { processes }, env, droppedEdges };
+}
+
+/** Flatten an env map into the `KEY=VALUE` lines process-compose's `environment` accepts. */
+function envLines(env: Record<string, string>): string[] {
+  return Object.entries(env).map(([k, v]) => `${k}=${v}`);
+}
+
+/**
+ * Build the derived `processes` map for one tier (isolated or shared): pins
+ * `working_dir`, appends devtrees' env injection, and partitions each
+ * service's `depends_on` into kept same-tier edges + dropped cross-tier
+ * edges. Both `deriveWorktreeConfig` and `deriveSharedConfig` differ only in
+ * which tier they pass in and which working_dir they use.
+ */
+function buildTierProcesses(input: {
+  stack: ResolvedStack;
+  tier: Tier;
+  services: ReadonlyArray<{
+    name: string;
+    command: string;
+    environment: ReadonlyArray<string>;
+    dependsOn: ReadonlyArray<string>;
+  }>;
+  workingDir: string;
+  extraEnvLines: ReadonlyArray<string>;
+}): { processes: Record<string, DerivedProcess>; droppedEdges: DroppedEdge[] } {
+  const tierIndex = buildTierIndex(input.stack);
   const droppedEdges: DroppedEdge[] = [];
-
   const processes: Record<string, DerivedProcess> = {};
-  for (const service of shared) {
-    const partition = partitionDependsOn(service.name, "shared", service.dependsOn, tierIndex);
+  for (const service of input.services) {
+    const partition = partitionDependsOn(service.name, input.tier, service.dependsOn, tierIndex);
     droppedEdges.push(...partition.dropped);
     processes[service.name] = withOptionalDependsOn(
       {
         command: service.command,
-        working_dir: ctx.workingDir,
-        environment: [...service.environment, ...injection],
+        working_dir: input.workingDir,
+        // Author-declared env first, then devtrees injection (injection wins on
+        // duplicate keys because process-compose takes the last occurrence).
+        environment: [...service.environment, ...input.extraEnvLines],
       },
       partition.kept,
     );
   }
-
-  return { config: { processes }, env, droppedEdges };
+  return { processes, droppedEdges };
 }
 
 /** Index `name → tier` over a resolved stack — keeps depends_on classification O(1). */

@@ -651,10 +651,14 @@ function readSharedProcessStates(socketPath: string): Map<string, string> | unde
       ["process", "list", "-U", "-u", socketPath, "-o", "json"],
       { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
     );
-    const parsed = JSON.parse(out) as
-      | { processes?: ReadonlyArray<{ name?: string; status?: string }> }
-      | ReadonlyArray<{ name?: string; status?: string }>;
-    const items = Array.isArray(parsed) ? parsed : (parsed.processes ?? []);
+    interface RawProc {
+      readonly name?: string;
+      readonly status?: string;
+    }
+    const parsed: unknown = JSON.parse(out);
+    const items: ReadonlyArray<RawProc> = Array.isArray(parsed)
+      ? (parsed as ReadonlyArray<RawProc>)
+      : ((parsed as { processes?: ReadonlyArray<RawProc> }).processes ?? []);
     const map = new Map<string, string>();
     for (const item of items) {
       if (item.name && item.status) map.set(item.name, item.status);
