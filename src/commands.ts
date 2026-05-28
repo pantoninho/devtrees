@@ -391,6 +391,55 @@ export async function runGenerate(deps: CommandDeps = {}): Promise<GenerateResul
 }
 
 /**
+ * Options for `runAttach`. Default is to attach this worktree's instance;
+ * `{ shared: true }` attaches the shared instance instead.
+ */
+export interface AttachOptions {
+  readonly shared?: boolean;
+}
+
+/**
+ * Attach a TUI to a running instance — this worktree's by default, or the
+ * shared one with `{ shared: true }`. The instance is identified by its
+ * control socket under the anchor (CONTEXT.md "Control socket"); if that
+ * socket is absent the instance is not running and we throw a clear error
+ * instead of letting `process-compose attach` fail with a noisy stack
+ * (acceptance, #11).
+ *
+ * No allocation, no spawn of `up`-style detached processes — we run the
+ * driver's `attach` foreground so the TUI inherits the user's terminal,
+ * then return when the user detaches and the child exits.
+ */
+export async function runAttach(
+  deps: CommandDeps = {},
+  options: AttachOptions = {},
+): Promise<void> {
+  const { anchor } = resolve(deps);
+  const driver = createDriver(deps.driver);
+
+  if (options.shared) {
+    const paths = sharedInstancePaths(anchor.anchor);
+    if (!existsSync(paths.socketPath)) {
+      throw new Error(
+        "no shared instance is running. Bring it up implicitly via `devtrees up` " +
+          "(when the stack declares shared services) before attaching.",
+      );
+    }
+    await driver.attach({ configPath: paths.configPath, socketPath: paths.socketPath });
+    return;
+  }
+
+  const paths = instancePaths(anchor.anchor, anchor.worktreeId);
+  if (!existsSync(paths.socketPath)) {
+    throw new Error(
+      `no worktree instance is running for '${anchor.worktreeId}'. ` +
+        `Run \`devtrees up\` to bring it up first.`,
+    );
+  }
+  await driver.attach({ configPath: paths.configPath, socketPath: paths.socketPath });
+}
+
+/**
  * Idempotently lazy-start the shared instance: under the shared lifecycle lock,
  * if its control socket is already present do nothing; otherwise write a fresh
  * derived shared config and spawn `process-compose` against it. The lock is the
