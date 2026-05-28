@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
+import { stringify as stringifyYaml } from "yaml";
 import { deriveWorktreeConfig } from "./deriver.js";
-import type { ResolvedStack } from "./stack.js";
+import { parseStack, type ResolvedStack } from "./stack.js";
 
 const stack: ResolvedStack = {
   services: [
@@ -50,6 +51,43 @@ describe("config deriver — isolated worktree instance", () => {
   it("references the port verbatim as ${NAME} in the command, leaving it for the env", () => {
     // the deriver never rewrites the command (ADR-0002)
     expect(web.command).toBe("node server.js");
+  });
+
+  it("emits a derived config with no `tier` key anywhere — strict-safe under is_strict: true", () => {
+    // Extend mode: the base contributes the bodies; the overlay attaches tiers.
+    // The deriver must never leak `tier` into the process-compose config, or
+    // process-compose would reject it when run with `is_strict: true`.
+    const devtrees = `
+extends: ./process-compose.yaml
+services:
+  postgres:
+    tier: shared
+  web:
+    tier: isolated
+    ports: [WEB_PORT]
+`;
+    const base = `
+processes:
+  postgres:
+    command: "postgres -D ./pgdata"
+  web:
+    command: "node server.js"
+`;
+    const merged = parseStack(devtrees, { baseYaml: base });
+    const derived = deriveWorktreeConfig(merged, {
+      worktreeId: "login",
+      worktreeRoot: "/home/me/wt/login",
+      portFor: () => 20512,
+    });
+
+    // No process in the derived config carries a tier key.
+    for (const proc of Object.values(derived.config.processes)) {
+      expect("tier" in proc).toBe(false);
+    }
+    // And the serialized YAML — what actually reaches process-compose — has
+    // no `tier:` line at all.
+    const yaml = stringifyYaml(derived.config);
+    expect(yaml).not.toMatch(/^\s*tier:/m);
   });
 
   it("excludes shared services from the worktree instance", () => {
