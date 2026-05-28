@@ -92,4 +92,39 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
     const result = await execute(["--version"], { up: vi.fn(), down: vi.fn() });
     expect(result.stdout.trim()).toMatch(/^\d+\.\d+\.\d+$/);
   });
+
+  it("routes `generate` to the generate command and reports the written paths", async () => {
+    const generate = vi.fn().mockResolvedValue({
+      worktreeId: "login",
+      worktreeRoot: "/r/wt/login",
+      worktreePath: "/r/.git/devtrees/login.yaml",
+      env: { WEB_PORT: "20512" },
+    });
+    const result = await execute(["generate"], { up: vi.fn(), down: vi.fn(), generate });
+    expect(generate).toHaveBeenCalledOnce();
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("/r/.git/devtrees/login.yaml");
+  });
+
+  it("`generate` also prints the shared config path when one was written", async () => {
+    const generate = vi.fn().mockResolvedValue({
+      worktreeId: "login",
+      worktreeRoot: "/r/wt/login",
+      worktreePath: "/r/.git/devtrees/login.yaml",
+      sharedPath: "/r/.git/devtrees/shared.yaml",
+      env: { WEB_PORT: "20512", DB_PORT: "20000" },
+      sharedEnv: { DB_PORT: "20000" },
+    });
+    const result = await execute(["generate"], { up: vi.fn(), down: vi.fn(), generate });
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("/r/.git/devtrees/login.yaml");
+    expect(result.stdout).toContain("/r/.git/devtrees/shared.yaml");
+  });
+
+  it("turns a generate failure into a clear, non-zero error", async () => {
+    const generate = vi.fn().mockRejectedValue(new Error("devtrees.yaml not found"));
+    const result = await execute(["generate"], { up: vi.fn(), down: vi.fn(), generate });
+    expect(result.code).toBe(1);
+    expect(result.stderr).toMatch(/devtrees\.yaml not found/);
+  });
 });
