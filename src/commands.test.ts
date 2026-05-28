@@ -1207,9 +1207,7 @@ describe("runPrune — reconcile instances against git worktree list", () => {
     const result = await runPrune({
       cwd: join(tmp.worktreeRoot, "login"),
       git,
-      discover: async () => [
-        instance("removed", { status: "stale", socketPath: orphanSocket }),
-      ],
+      discover: async () => [instance("removed", { status: "stale", socketPath: orphanSocket })],
       withRegistryLock: (_anchor, mutate) => {
         const after = mutate(registryRef.snapshot);
         registryRef.snapshot = after;

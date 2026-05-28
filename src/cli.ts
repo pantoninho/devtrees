@@ -252,9 +252,7 @@ export async function execute(argv: ReadonlyArray<string>, deps: ExecuteDeps): P
 
 // Run only when invoked as the program, not when imported by a test.
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const { runUp, runDown, runGenerate, runLs, runAttach, runPrune } = await import(
-    "./commands.js"
-  );
+  const { runUp, runDown, runGenerate, runLs, runAttach, runPrune } = await import("./commands.js");
   const result = await execute(process.argv.slice(2), {
     up: () => runUp(),
     down: ({ shared }) => runDown({}, { shared }),

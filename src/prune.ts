@@ -34,9 +34,7 @@ export function findOrphans(
   instances: ReadonlyArray<InstanceInfo>,
   liveWorktreeIds: ReadonlySet<string>,
 ): InstanceInfo[] {
-  return instances.filter(
-    (inst) => inst.kind === "worktree" && !liveWorktreeIds.has(inst.id),
-  );
+  return instances.filter((inst) => inst.kind === "worktree" && !liveWorktreeIds.has(inst.id));
 }
 
 /**

@@ -12,7 +12,7 @@ import {
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
-import { runAttach, runDown, runLs, runUp } from "./commands.js";
+import { runAttach, runDown, runLs, runPrune, runUp } from "./commands.js";
 
 // Unix domain socket paths are capped (~104 bytes on macOS, ~108 on Linux). The
 // control socket lives at `<git-common-dir>/devtrees/run/<id>.sock`, so the temp
@@ -517,6 +517,78 @@ describe("e2e — shared→isolated depends_on is rejected at load time (ADR-000
     const deps = stubDriverDeps(worktree);
     await expect(runUp(deps as never)).rejects.toThrow(/shared.*depends_on.*isolated/i);
   });
+});
+
+/**
+ * `devtrees prune` end-to-end (#9): bring two worktrees up, remove one with
+ * `git worktree remove --force` mid-run, then reconcile against
+ * `git worktree list`. The orphan's instance must be stopped and its anchor
+ * state (control socket, derived config, registry entry) cleared; the
+ * surviving worktree's instance must be untouched.
+ */
+describe("e2e — devtrees prune reconciles against git worktree list", () => {
+  it("stops the orphan, cleans its anchor state, leaves the surviving instance alone", async () => {
+    const repo = makeRepo("dt-prune-", ["login", "billing"]);
+    cleanups.push(() => rmSync(repo.root, { recursive: true, force: true }));
+
+    const loginWt = repo.worktrees.login;
+    const billingWt = repo.worktrees.billing;
+    if (loginWt === undefined || billingWt === undefined) {
+      throw new Error("expected login and billing worktrees");
+    }
+    writeStackConfig(loginWt);
+    writeStackConfig(billingWt);
+
+    const loginDeps = stubDriverDeps(loginWt);
+    const billingDeps = stubDriverDeps(billingWt);
+
+    const login = await runUp(loginDeps as never);
+    const billing = await runUp(billingDeps as never);
+    cleanups.push(() => {
+      void runDown(billingDeps as never).catch(() => {});
+    });
+
+    expect(await waitForHttp(Number(login.env.WEB_PORT))).toBe(true);
+    expect(await waitForHttp(Number(billing.env.WEB_PORT))).toBe(true);
+
+    // Pre-state: both instances visible at the anchor.
+    const commonDir = git(billingWt, "rev-parse", "--git-common-dir");
+    const absCommon = commonDir.startsWith("/") ? commonDir : join(billingWt, commonDir);
+    const loginSocket = join(absCommon, "devtrees", "run", "login.sock");
+    const loginConfig = join(absCommon, "devtrees", "login.yaml");
+    expect(existsSync(loginSocket)).toBe(true);
+    expect(existsSync(loginConfig)).toBe(true);
+
+    // Remove the login worktree with git, while its stack is still running —
+    // exactly the situation CONTEXT.md's example dialogue describes.
+    git(billingWt, "worktree", "remove", "--force", loginWt);
+
+    // Prune from the surviving worktree (cwd doesn't have to be the orphan —
+    // discovery is anchor-wide).
+    const result = await runPrune({
+      cwd: billingWt,
+      driver: { binary: process.execPath, prefixArgs: [STUB] },
+    });
+
+    // Acceptance: prune reports the orphan, the surviving instance is left alone.
+    expect(result.pruned.map((p) => p.id).sort()).toEqual(["login"]);
+
+    // Acceptance: the orphan's anchor state is gone.
+    expect(existsSync(loginSocket)).toBe(false);
+    expect(existsSync(loginConfig)).toBe(false);
+
+    // Acceptance: the surviving instance is still up.
+    expect(await waitForHttp(Number(billing.env.WEB_PORT))).toBe(true);
+    const billingSocket = join(absCommon, "devtrees", "run", "billing.sock");
+    expect(existsSync(billingSocket)).toBe(true);
+
+    // Acceptance: a follow-up prune is a no-op (idempotent).
+    const second = await runPrune({
+      cwd: billingWt,
+      driver: { binary: process.execPath, prefixArgs: [STUB] },
+    });
+    expect(second.pruned).toEqual([]);
+  }, 30000);
 });
 
 describe("e2e smoke — extend an existing process-compose.yaml", () => {
