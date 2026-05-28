@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vite-plus/test";
-import { run } from "./cli.js";
+import { describe, expect, it, vi } from "vite-plus/test";
+import { execute, run } from "./cli.js";
 
 describe("devtrees CLI", () => {
   it("prints the version with --version", () => {
@@ -37,5 +37,39 @@ describe("devtrees CLI", () => {
     const result = run(["frobnicate"]);
     expect(result.code).toBe(1);
     expect(result.stderr).toContain("frobnicate");
+  });
+});
+
+describe("devtrees CLI — execute (effectful dispatch)", () => {
+  it("routes `up` to the up command and reports the resolved port", async () => {
+    const up = vi.fn().mockResolvedValue({
+      worktreeId: "login",
+      socketPath: "/x.sock",
+      env: { WEB_PORT: "20512" },
+    });
+    const result = await execute(["up"], { up, down: vi.fn() });
+    expect(up).toHaveBeenCalledOnce();
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("login");
+    expect(result.stdout).toContain("WEB_PORT");
+  });
+
+  it("routes `down` to the down command", async () => {
+    const down = vi.fn().mockResolvedValue(undefined);
+    const result = await execute(["down"], { up: vi.fn(), down });
+    expect(down).toHaveBeenCalledOnce();
+    expect(result.code).toBe(0);
+  });
+
+  it("turns a missing process-compose binary into a clear, non-zero error", async () => {
+    const up = vi.fn().mockRejectedValue(new Error("process-compose not found. ... install"));
+    const result = await execute(["up"], { up, down: vi.fn() });
+    expect(result.code).toBe(1);
+    expect(result.stderr).toMatch(/process-compose/);
+  });
+
+  it("delegates non-effectful commands to the pure run()", async () => {
+    const result = await execute(["--version"], { up: vi.fn(), down: vi.fn() });
+    expect(result.stdout.trim()).toMatch(/^\d+\.\d+\.\d+$/);
   });
 });
