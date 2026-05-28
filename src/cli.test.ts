@@ -184,4 +184,38 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
     const result = await execute(["ls"], { up: vi.fn(), down: vi.fn(), ls });
     expect(result.stdout).toContain("stale");
   });
+
+  it("routes `attach` to the attach command with shared=false by default", async () => {
+    const attach = vi.fn().mockResolvedValue(undefined);
+    const result = await execute(["attach"], { up: vi.fn(), down: vi.fn(), attach });
+    expect(attach).toHaveBeenCalledWith({ shared: false });
+    expect(result.code).toBe(0);
+  });
+
+  it("passes shared=true through to attach when --shared is given", async () => {
+    const attach = vi.fn().mockResolvedValue(undefined);
+    const result = await execute(["attach", "--shared"], { up: vi.fn(), down: vi.fn(), attach });
+    expect(attach).toHaveBeenCalledWith({ shared: true });
+    expect(result.code).toBe(0);
+  });
+
+  it("turns an attach failure (no running instance) into a clear, non-zero error", async () => {
+    const attach = vi
+      .fn()
+      .mockRejectedValue(new Error("no worktree instance is running for 'login'"));
+    const result = await execute(["attach"], { up: vi.fn(), down: vi.fn(), attach });
+    expect(result.code).toBe(1);
+    expect(result.stderr).toMatch(/no worktree instance is running/);
+  });
+
+  it("surfaces an attach-shared failure (no running shared instance) clearly", async () => {
+    const attach = vi.fn().mockRejectedValue(new Error("no shared instance is running"));
+    const result = await execute(["attach", "--shared"], {
+      up: vi.fn(),
+      down: vi.fn(),
+      attach,
+    });
+    expect(result.code).toBe(1);
+    expect(result.stderr).toMatch(/no shared instance is running/);
+  });
 });

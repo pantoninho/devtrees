@@ -116,6 +116,13 @@ export interface ExecuteDeps {
    * exiting with "not implemented" if a caller dispatches `ls` without it.
    */
   ls?: () => Promise<{ anchor: string; instances: ReadonlyArray<LsInstanceRow> }>;
+  /**
+   * Attach a TUI to a running instance — this worktree's by default, or the
+   * shared one with `--shared`. Optional on the deps so existing call sites
+   * (and tests that only exercise `up`/`down`) keep working; routing through
+   * `execute` for `attach` requires it.
+   */
+  attach?: (options: { shared: boolean }) => Promise<void>;
 }
 
 /**
@@ -200,6 +207,13 @@ export async function execute(argv: ReadonlyArray<string>, deps: ExecuteDeps): P
       const result = await deps.ls();
       return { code: 0, stdout: formatLs(result.instances), stderr: "" };
     }
+    if (first === "attach" && deps.attach) {
+      const shared = rest.includes("--shared");
+      await deps.attach({ shared });
+      // `attach` runs the TUI in-process; on a clean exit there is nothing to
+      // print (the TUI itself is the user-visible output).
+      return { code: 0, stdout: "", stderr: "" };
+    }
   } catch (err) {
     return { code: 1, stdout: "", stderr: `devtrees: ${(err as Error).message}\n` };
   }
@@ -209,12 +223,13 @@ export async function execute(argv: ReadonlyArray<string>, deps: ExecuteDeps): P
 
 // Run only when invoked as the program, not when imported by a test.
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const { runUp, runDown, runGenerate, runLs } = await import("./commands.js");
+  const { runUp, runDown, runGenerate, runLs, runAttach } = await import("./commands.js");
   const result = await execute(process.argv.slice(2), {
     up: () => runUp(),
     down: ({ shared }) => runDown({}, { shared }),
     generate: () => runGenerate(),
     ls: () => runLs(),
+    attach: ({ shared }) => runAttach({}, { shared }),
   });
   if (result.stdout) process.stdout.write(result.stdout);
   if (result.stderr) process.stderr.write(result.stderr);
