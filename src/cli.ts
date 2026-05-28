@@ -80,17 +80,26 @@ export function run(argv: ReadonlyArray<string>): RunResult {
 
 /** The effectful commands, injected so `execute` stays unit-testable. */
 export interface ExecuteDeps {
-  up: () => Promise<{ worktreeId: string; socketPath: string; env: Record<string, string> }>;
-  down: () => Promise<void>;
+  up: () => Promise<{
+    worktreeId: string;
+    socketPath: string;
+    env: Record<string, string>;
+    sharedStarted?: boolean;
+  }>;
+  down: (options: { shared: boolean }) => Promise<void>;
 }
 
 /**
  * Resolve a command line, performing effects for `up`/`down` and delegating
  * everything else to the pure `run`. Errors (e.g. a missing process-compose
  * binary) become a clear, non-zero result rather than an unhandled rejection.
+ *
+ * `down --shared` tears down the shared instance (ADR-0001): an explicit,
+ * opt-in flag because the shared instance is decoupled from any single
+ * worktree's lifecycle.
  */
 export async function execute(argv: ReadonlyArray<string>, deps: ExecuteDeps): Promise<RunResult> {
-  const [first] = argv;
+  const [first, ...rest] = argv;
 
   try {
     if (first === "up") {
@@ -98,15 +107,25 @@ export async function execute(argv: ReadonlyArray<string>, deps: ExecuteDeps): P
       const ports = Object.entries(result.env)
         .map(([k, v]) => `  ${k}=${v}`)
         .join("\n");
+      const sharedNote = result.sharedStarted
+        ? "devtrees up: shared instance started.\n"
+        : "";
       return {
         code: 0,
-        stdout: `devtrees up: '${result.worktreeId}' is up.\n${ports}\n`,
+        stdout: `${sharedNote}devtrees up: '${result.worktreeId}' is up.\n${ports}\n`,
         stderr: "",
       };
     }
     if (first === "down") {
-      await deps.down();
-      return { code: 0, stdout: "devtrees down: worktree instance stopped.\n", stderr: "" };
+      const shared = rest.includes("--shared");
+      await deps.down({ shared });
+      return {
+        code: 0,
+        stdout: shared
+          ? "devtrees down: shared instance stopped.\n"
+          : "devtrees down: worktree instance stopped.\n",
+        stderr: "",
+      };
     }
   } catch (err) {
     return { code: 1, stdout: "", stderr: `devtrees: ${(err as Error).message}\n` };
@@ -120,7 +139,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const { runUp, runDown } = await import("./commands.js");
   const result = await execute(process.argv.slice(2), {
     up: () => runUp(),
-    down: () => runDown(),
+    down: ({ shared }) => runDown({}, { shared }),
   });
   if (result.stdout) process.stdout.write(result.stdout);
   if (result.stderr) process.stderr.write(result.stderr);
