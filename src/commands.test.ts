@@ -16,6 +16,7 @@ import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import {
   findUnmanagedPortBinds,
+  runAttach,
   runDown,
   runGenerate,
   runUp,
@@ -728,5 +729,130 @@ describe("runLs — instance enumeration", () => {
       discover: async () => stub,
     });
     expect(result.instances).toEqual(stub);
+  });
+});
+
+/**
+ * Tracker for `process-compose attach` invocations — the spawner records the
+ * args so the test can assert which socket path was attached against.
+ */
+interface AttachInvocation {
+  args: ReadonlyArray<string>;
+}
+
+function makeAttachSpawner(track: { invocations: AttachInvocation[] }) {
+  return (_binary: string, args: ReadonlyArray<string>, _options: unknown): SpawnedProcess => {
+    if (args[0] === "attach") {
+      track.invocations.push({ args });
+    }
+    return spawnedOk();
+  };
+}
+
+/**
+ * Build a `CommandDeps` whose `driver` collaborates with the attach spawner;
+ * unlike `stubDeps`, this skips the allocator/lock plumbing because `runAttach`
+ * does not allocate ports or read the stack.
+ */
+function attachDeps(opts: {
+  anchor: string;
+  worktreeRoot: string;
+  worktreeId: string;
+  track: { invocations: AttachInvocation[] };
+}): CommandDeps {
+  const git = (args: ReadonlyArray<string>): string => {
+    const flag = args[1];
+    if (flag === "--git-common-dir") return opts.anchor;
+    if (flag === "--show-toplevel") return join(opts.worktreeRoot, opts.worktreeId);
+    if (flag === "--is-bare-repository") return "false";
+    throw new Error(`unexpected git invocation: ${args.join(" ")}`);
+  };
+  return {
+    cwd: join(opts.worktreeRoot, opts.worktreeId),
+    git,
+    driver: {
+      exists: () => Promise.resolve(true),
+      spawner: makeAttachSpawner(opts.track),
+    },
+  };
+}
+
+describe("runAttach — attach to a running instance", () => {
+  it("attaches the worktree instance by default — driver receives that socket", async () => {
+    const tmp = tmpAnchor();
+    const worktreeId = "login";
+    const paths = {
+      configPath: join(tmp.anchor, "devtrees", `${worktreeId}.yaml`),
+      socketPath: join(tmp.anchor, "devtrees", "run", `${worktreeId}.sock`),
+    };
+    // Mimic a running instance: the control socket file exists.
+    mkdtempSync(join(tmpdir(), "dt-noop-")); // (no-op; keep symmetric with other tests)
+    // Use the actual path layout — create the directory and socket file.
+    const { mkdirSync } = await import("node:fs");
+    mkdirSync(join(tmp.anchor, "devtrees", "run"), { recursive: true });
+    writeFileSync(paths.socketPath, "");
+
+    const track = { invocations: [] as AttachInvocation[] };
+    const deps = attachDeps({
+      anchor: tmp.anchor,
+      worktreeRoot: tmp.worktreeRoot,
+      worktreeId,
+      track,
+    });
+
+    await runAttach(deps, { shared: false });
+    expect(track.invocations).toHaveLength(1);
+    expect(track.invocations[0]?.args).toContain(paths.socketPath);
+  });
+
+  it("attaches the shared instance with { shared: true }", async () => {
+    const tmp = tmpAnchor();
+    const { mkdirSync } = await import("node:fs");
+    const sharedSocket = join(tmp.anchor, "devtrees", "run", "shared.sock");
+    mkdirSync(join(tmp.anchor, "devtrees", "run"), { recursive: true });
+    writeFileSync(sharedSocket, "");
+
+    const track = { invocations: [] as AttachInvocation[] };
+    const deps = attachDeps({
+      anchor: tmp.anchor,
+      worktreeRoot: tmp.worktreeRoot,
+      worktreeId: "login",
+      track,
+    });
+
+    await runAttach(deps, { shared: true });
+    expect(track.invocations).toHaveLength(1);
+    expect(track.invocations[0]?.args).toContain(sharedSocket);
+  });
+
+  it("throws a clear error when the worktree instance is not running", async () => {
+    const tmp = tmpAnchor();
+    const track = { invocations: [] as AttachInvocation[] };
+    const deps = attachDeps({
+      anchor: tmp.anchor,
+      worktreeRoot: tmp.worktreeRoot,
+      worktreeId: "login",
+      track,
+    });
+    // No socket file exists.
+    await expect(runAttach(deps, { shared: false })).rejects.toThrow(
+      /no worktree instance.*login/,
+    );
+    expect(track.invocations).toEqual([]);
+  });
+
+  it("throws a clear error when the shared instance is not running", async () => {
+    const tmp = tmpAnchor();
+    const track = { invocations: [] as AttachInvocation[] };
+    const deps = attachDeps({
+      anchor: tmp.anchor,
+      worktreeRoot: tmp.worktreeRoot,
+      worktreeId: "login",
+      track,
+    });
+    await expect(runAttach(deps, { shared: true })).rejects.toThrow(
+      /no shared instance is running/,
+    );
+    expect(track.invocations).toEqual([]);
   });
 });
