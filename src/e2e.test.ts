@@ -65,6 +65,7 @@ function stubDriverDeps(worktree: string): {
   driver: { binary: string; prefixArgs: string[] };
   attach: false;
   waitForHealth: () => Promise<void>;
+  getServiceStatuses: () => Promise<never[]>;
 } {
   return {
     cwd: worktree,
@@ -75,6 +76,12 @@ function stubDriverDeps(worktree: string): {
     // tested in commands.test.ts (#28); e2e here only proves the up/down
     // wiring against the stub binary.
     waitForHealth: () => Promise.resolve(),
+    // The issue-#30 `up --json` envelope publishes per-service rows via the
+    // driver's `getServiceStatuses` (same hook `ls --json` uses, issue #29).
+    // Default it to an empty snapshot for up/down-focused e2e tests so this
+    // call doesn't race the stub's async socket setup; the real shape is
+    // exercised in commands.test.ts and through `runLs` in the #29 e2e.
+    getServiceStatuses: () => Promise.resolve([]),
   };
 }
 

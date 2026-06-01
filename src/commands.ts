@@ -11,7 +11,7 @@
 import { allocateBlock, type AllocatorOptions, type RegistrySnapshot } from "./allocator.js";
 import { resolveAnchor, type GitProbe } from "./anchor.js";
 import { deriveSharedConfig, deriveWorktreeConfig, type DroppedEdge } from "./deriver.js";
-import { discoverInstances, type InstanceInfo } from "./instances.js";
+import { discoverInstances, type InstanceInfo, type Service } from "./instances.js";
 import { SHARED_REGISTRY_KEY, instancePaths, sharedInstancePaths } from "./paths.js";
 import { findOrphans, parseWorktreeIds } from "./prune.js";
 import { loadStack, type ResolvedService, type ResolvedStack } from "./stack.js";
@@ -120,6 +120,13 @@ export interface CommandDeps {
   readonly waitForHealth?: WaitForHealth;
   /** Health-wait window for the worktree instance. Default: 120s. */
   readonly waitTimeoutMs?: number;
+  /**
+   * Read the per-service runtime state for the worktree instance after health
+   * is reached, so `runUp` can publish `services[]` in the issue-#30 state
+   * envelope. Default: shells out to the driver's `getServiceStatuses` (same
+   * primitive `ls --json` uses, issue #29). Injected so tests stub it.
+   */
+  readonly getServiceStatuses?: (socketPath: string) => Promise<ServiceStatus[]>;
   /** Is a concrete port free to bind? Default: probes a real TCP bind. */
   readonly isPortFree?: (port: number) => boolean;
   /**
@@ -156,6 +163,19 @@ export interface UpResult {
   readonly env: Record<string, string>;
   /** True iff this `up` triggered the lazy start of the shared instance. */
   readonly sharedStarted: boolean;
+  /**
+   * Base port of this worktree's allocation block (issue #30). The `env`
+   * named-port numbers all fall within `[blockBase, blockBase + blockSize)`;
+   * `block_base` in the `up --json` envelope is this value.
+   */
+  readonly blockBase: number;
+  /**
+   * One row per service the driver reports running on this worktree's
+   * instance after the health-wait — same shape `ls --json` (issue #29)
+   * publishes. Degrades to `[]` on a getServiceStatuses error so a flaky
+   * driver call cannot fail an otherwise-healthy `up`.
+   */
+  readonly services: ReadonlyArray<Service>;
 }
 
 export interface GenerateResult {
@@ -392,6 +412,13 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
 
   await waitForWorktreeHealth(stack, paths.socketPath, deps);
 
+  // After the health-wait, snapshot the per-service runtime rows so the
+  // issue-#30 `up --json` envelope can publish them without a follow-up
+  // `ls --json`. Best-effort: a driver-side hiccup here must not turn the
+  // healthy worktree into a failed `up` (same containment rule `ls --json`
+  // applies, issue #29).
+  const services = await collectIsolatedServices(stack, paths.socketPath, portFor, deps, driver);
+
   if (shouldAttachAfterUp(deps)) await driver.attach(inst);
 
   return {
@@ -399,7 +426,53 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     socketPath: paths.socketPath,
     env: derived.env,
     sharedStarted,
+    blockBase,
+    services,
   };
+}
+
+/**
+ * Read this worktree instance's per-service runtime state and zip it with the
+ * named-port allocations devtrees injected at derivation time. Returns the
+ * same `Service` rows `discoverInstances` produces — that's the slice-#29
+ * shape `up --json` reuses.
+ *
+ * Best-effort: a driver-side hiccup (process-compose has gone away between
+ * the health-wait and now, a permission glitch on the UDS, …) yields an
+ * empty array rather than throwing — the worktree itself is healthy at this
+ * point, and an agent reading the envelope can still see the port block and
+ * env, just without per-service rows.
+ */
+async function collectIsolatedServices(
+  stack: ResolvedStack,
+  socketPath: string,
+  portFor: (name: string) => number | undefined,
+  deps: CommandDeps,
+  driver: ReturnType<typeof createDriver>,
+): Promise<Service[]> {
+  const fetch = deps.getServiceStatuses ?? ((s: string) => driver.getServiceStatuses(s));
+  let statuses: ServiceStatus[];
+  try {
+    statuses = await fetch(socketPath);
+  } catch {
+    return [];
+  }
+  const portsByService = new Map<string, Record<string, number>>();
+  for (const svc of stack.services) {
+    if (svc.tier !== "isolated") continue;
+    const portMap: Record<string, number> = {};
+    for (const name of svc.ports) {
+      const port = portFor(name);
+      if (port !== undefined) portMap[name] = port;
+    }
+    portsByService.set(svc.name, portMap);
+  }
+  return statuses.map((s) => ({
+    name: s.name,
+    status: s.status,
+    health: s.health,
+    ports: portsByService.get(s.name) ?? {},
+  }));
 }
 
 /**
