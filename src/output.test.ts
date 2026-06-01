@@ -11,6 +11,7 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   ERROR_CODES,
   SCHEMA_VERSION,
+  formatEnv,
   formatError,
   formatLs,
   type ErrorCode,
@@ -157,6 +158,54 @@ describe("output formatter — formatLs", () => {
     const result = formatLs(rows, "json");
     expect(result.stdout.endsWith("\n")).toBe(true);
     // exactly one trailing newline
+    expect(result.stdout.endsWith("\n\n")).toBe(false);
+  });
+});
+
+describe("output formatter — formatEnv", () => {
+  const sample: Readonly<Record<string, string>> = {
+    DEVTREES_WORKTREE_ID: "login",
+    WEB_PORT: "20512",
+    DB_PORT: "30000",
+  };
+
+  it("in human mode, emits one KEY=value line per entry, suitable for `eval $(devtrees env)`", () => {
+    const result = formatEnv(sample, "human");
+    expect(result.stderr).toBe("");
+    const lines = result.stdout.trimEnd().split("\n");
+    expect(lines).toContain("DEVTREES_WORKTREE_ID=login");
+    expect(lines).toContain("WEB_PORT=20512");
+    expect(lines).toContain("DB_PORT=30000");
+    expect(lines).toHaveLength(3);
+    expect(result.stdout.endsWith("\n")).toBe(true);
+  });
+
+  it("in human mode with no entries, emits empty stdout (no trailing chatter)", () => {
+    const result = formatEnv({}, "human");
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toBe("");
+  });
+
+  it("in JSON mode, wraps the map under {schema_version, env}", () => {
+    const result = formatEnv(sample, "json");
+    expect(result.stderr).toBe("");
+    const parsed = JSON.parse(result.stdout) as {
+      schema_version: string;
+      env: Record<string, string>;
+    };
+    expect(parsed.schema_version).toBe(SCHEMA_VERSION);
+    expect(parsed.env).toEqual(sample);
+  });
+
+  it("in JSON mode with no entries, emits {env:{}} (not 'no env' text)", () => {
+    const result = formatEnv({}, "json");
+    const parsed = JSON.parse(result.stdout) as { env: Record<string, string> };
+    expect(parsed.env).toEqual({});
+  });
+
+  it("JSON output ends with a single trailing newline (line-friendly for shell consumers)", () => {
+    const result = formatEnv(sample, "json");
+    expect(result.stdout.endsWith("\n")).toBe(true);
     expect(result.stdout.endsWith("\n\n")).toBe(false);
   });
 });

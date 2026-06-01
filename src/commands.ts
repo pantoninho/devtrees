@@ -16,7 +16,7 @@ import { SHARED_REGISTRY_KEY, instancePaths, sharedInstancePaths } from "./paths
 import { findOrphans, parseWorktreeIds } from "./prune.js";
 import { loadStack, type ResolvedService, type ResolvedStack } from "./stack.js";
 import { createDriver, type DriverDeps } from "./driver.js";
-import { withRegistryLock, withSharedLock } from "./registry.js";
+import { readRegistry, withRegistryLock, withSharedLock } from "./registry.js";
 import { execFileSync, execSync } from "node:child_process";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { stringify as stringifyYaml } from "yaml";
@@ -58,6 +58,12 @@ export interface CommandDeps {
    * anchor (`registry.ts`). Injected so tests can stub it.
    */
   readonly withRegistryLock?: WithRegistryLock;
+  /**
+   * Read the persisted allocation registry without acquiring the lock — used by
+   * pure-read commands (e.g. `env`, #32) that must not interfere with concurrent
+   * `up`s. Default: real read from `<anchor>/devtrees/registry.json`.
+   */
+  readonly readRegistry?: (anchor: string) => RegistrySnapshot;
   /**
    * Async lifecycle lock around shared-instance start/stop. Default: real
    * lockfile at <anchor>/devtrees/shared.lock. Injected so tests can stub it.
@@ -729,6 +735,72 @@ export async function runPrune(deps: PruneDeps = {}): Promise<PruneResult> {
   });
 
   return { anchor: anchor.anchor, pruned: orphans };
+}
+
+export interface EnvResult {
+  readonly worktreeId: string;
+  /**
+   * The injected-value map the worktree instance would receive — same shape
+   * `runUp` and `runGenerate` produce. Computed without spawning, locking, or
+   * persisting (issue #32 "Pure read").
+   */
+  readonly env: Record<string, string>;
+}
+
+/**
+ * Emit the injected-value map for this worktree without starting anything,
+ * without acquiring the allocation-registry lock, and without writing.
+ *
+ * The map is exactly what the config deriver would inject (CONTEXT.md
+ * "Injected value"): this worktree's named ports + the shared services' named
+ * ports + the worktree id. The registry is read directly (no lock). When the
+ * worktree (or shared) entry is absent, the allocator's deterministic
+ * hash-and-probe yields the "would-be" block against the read snapshot — the
+ * same answer a follow-up `up` would persist, barring a concurrent allocation
+ * (the racy edge case the spec explicitly accepts).
+ */
+export async function runEnv(deps: CommandDeps = {}): Promise<EnvResult> {
+  const { anchor } = resolve(deps);
+  const readStack = deps.readStack ?? loadStack;
+  const isPortFree = deps.isPortFree ?? defaultIsPortFree;
+  const readReg = deps.readRegistry ?? readRegistry;
+
+  const stack = readStack(anchor.worktreeRoot);
+  const options = resolveAllocatorOptions(stack, deps.allocator ?? DEFAULT_ALLOCATOR);
+  const sharedNeeded = hasTier(stack, "shared");
+
+  // Pure read — no lock. If the registry has no entry for this worktree (or
+  // shared), `allocateBlock` returns what a future `up` would pick against
+  // this snapshot. No write happens here.
+  const snapshot = readReg(anchor.anchor);
+  const block = allocateBlock(anchor.worktreeId, snapshot, options, isPortFree);
+  const sharedBlock = sharedNeeded
+    ? allocateBlock(SHARED_REGISTRY_KEY, snapshot, options, isPortFree)
+    : undefined;
+
+  const isolatedOffsets = buildOffsetMap(stack.services, "isolated", options.blockSize);
+  const sharedOffsets = sharedNeeded
+    ? buildOffsetMap(stack.services, "shared", options.blockSize)
+    : new Map<string, number>();
+
+  const portFor = (name: string): number | undefined => {
+    const offset = isolatedOffsets.get(name);
+    return offset === undefined ? undefined : block.base + offset;
+  };
+  const sharedPortFor = (name: string): number | undefined => {
+    if (sharedBlock === undefined) return undefined;
+    const offset = sharedOffsets.get(name);
+    return offset === undefined ? undefined : sharedBlock.base + offset;
+  };
+
+  const derived = deriveWorktreeConfig(stack, {
+    worktreeId: anchor.worktreeId,
+    worktreeRoot: anchor.worktreeRoot,
+    portFor,
+    sharedPortFor,
+  });
+
+  return { worktreeId: anchor.worktreeId, env: derived.env };
 }
 
 // --- default I/O implementations -------------------------------------------

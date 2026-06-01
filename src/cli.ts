@@ -18,6 +18,7 @@ import { pathToFileURL } from "node:url";
 import {
   classifyError,
   formatDown,
+  formatEnv,
   formatError,
   formatGenerate,
   formatLs,
@@ -42,6 +43,10 @@ export const COMMANDS: ReadonlyArray<{ name: string; summary: string }> = [
   {
     name: "prune",
     summary: "Reconcile against `git worktree list` and clean up orphaned instances",
+  },
+  {
+    name: "env",
+    summary: "Print this worktree's injected env (KEY=value, or --json for a map)",
   },
 ];
 
@@ -144,6 +149,12 @@ export interface ExecuteDeps {
    * exercise `up`/`down` and don't have to stub `prune`.
    */
   prune?: () => Promise<{ anchor: string; pruned: ReadonlyArray<LsInstanceRow> }>;
+  /**
+   * Emit the injected-value map for this worktree (issue #32). Pure read — no
+   * driver call, no allocation-registry write, no lock. Optional so existing
+   * test stubs (up/down-only) keep working without supplying it.
+   */
+  env?: () => Promise<{ worktreeId: string; env: Record<string, string> }>;
 }
 
 /**
@@ -248,6 +259,17 @@ async function handlePrune(
   return { code: 0, stdout: out.stdout, stderr: out.stderr };
 }
 
+async function handleEnv(
+  _rest: ReadonlyArray<string>,
+  deps: ExecuteDeps,
+  mode: FormatMode,
+): Promise<RunResult | undefined> {
+  if (deps.env === undefined) return undefined;
+  const result = await deps.env();
+  const out = formatEnv(result.env, mode);
+  return { code: 0, stdout: out.stdout, stderr: out.stderr };
+}
+
 const HANDLERS: ReadonlyMap<string, Handler> = new Map([
   ["up", handleUp],
   ["down", handleDown],
@@ -255,6 +277,7 @@ const HANDLERS: ReadonlyMap<string, Handler> = new Map([
   ["ls", handleLs],
   ["attach", handleAttach],
   ["prune", handlePrune],
+  ["env", handleEnv],
 ]);
 
 /**
@@ -303,7 +326,8 @@ export function isEntrypoint(metaUrl: string, argv1: string | undefined): boolea
 }
 
 if (isEntrypoint(import.meta.url, process.argv[1])) {
-  const { runUp, runDown, runGenerate, runLs, runAttach, runPrune } = await import("./commands.js");
+  const { runUp, runDown, runEnv, runGenerate, runLs, runAttach, runPrune } =
+    await import("./commands.js");
   const result = await execute(process.argv.slice(2), {
     up: () => runUp(),
     down: ({ shared }) => runDown({}, { shared }),
@@ -311,6 +335,7 @@ if (isEntrypoint(import.meta.url, process.argv[1])) {
     ls: () => runLs(),
     attach: ({ shared }) => runAttach({}, { shared }),
     prune: () => runPrune(),
+    env: () => runEnv(),
   });
   if (result.stdout) process.stdout.write(result.stdout);
   if (result.stderr) process.stderr.write(result.stderr);

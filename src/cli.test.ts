@@ -246,6 +246,42 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
     expect(result.stderr).toMatch(/no worktree instance is running/);
   });
 
+  it("routes `env` to the env command and prints KEY=value lines", async () => {
+    const env = vi.fn().mockResolvedValue({
+      worktreeId: "login",
+      env: { DEVTREES_WORKTREE_ID: "login", WEB_PORT: "20512", DB_PORT: "30000" },
+    });
+    const result = await execute(["env"], { up: vi.fn(), down: vi.fn(), env });
+    expect(env).toHaveBeenCalledOnce();
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("DEVTREES_WORKTREE_ID=login");
+    expect(result.stdout).toContain("WEB_PORT=20512");
+    expect(result.stdout).toContain("DB_PORT=30000");
+  });
+
+  it("`env --json` emits {schema_version, env} on stdout", async () => {
+    const env = vi.fn().mockResolvedValue({
+      worktreeId: "login",
+      env: { DEVTREES_WORKTREE_ID: "login", WEB_PORT: "20512" },
+    });
+    const result = await execute(["env", "--json"], { up: vi.fn(), down: vi.fn(), env });
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+    const parsed = JSON.parse(result.stdout) as {
+      schema_version: string;
+      env: Record<string, string>;
+    };
+    expect(parsed.schema_version).toBeDefined();
+    expect(parsed.env).toEqual({ DEVTREES_WORKTREE_ID: "login", WEB_PORT: "20512" });
+  });
+
+  it("turns an env failure (e.g. missing devtrees.yaml) into a clear, non-zero error", async () => {
+    const env = vi.fn().mockRejectedValue(new Error("devtrees.yaml not found"));
+    const result = await execute(["env"], { up: vi.fn(), down: vi.fn(), env });
+    expect(result.code).toBe(1);
+    expect(result.stderr).toMatch(/devtrees\.yaml not found/);
+  });
+
   it("surfaces an attach-shared failure (no running shared instance) clearly", async () => {
     const attach = vi.fn().mockRejectedValue(new Error("no shared instance is running"));
     const result = await execute(["attach", "--shared"], {
