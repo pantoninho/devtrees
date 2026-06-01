@@ -226,10 +226,7 @@ export function formatGenerate(payload: GeneratePayload, mode: FormatMode): Outp
  *     `eval $(devtrees env)`. Empty map renders as empty stdout.
  *   - `json`: `{schema_version, env: { KEY: "value", ... }}`.
  */
-export function formatEnv(
-  env: Readonly<Record<string, string>>,
-  mode: FormatMode,
-): OutputResult {
+export function formatEnv(env: Readonly<Record<string, string>>, mode: FormatMode): OutputResult {
   if (mode === "json") {
     const doc = { schema_version: SCHEMA_VERSION, env };
     return { stdout: `${JSON.stringify(doc)}\n`, stderr: "" };
