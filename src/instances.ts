@@ -23,6 +23,7 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { connect } from "node:net";
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
+import type { ServiceStatus } from "./driver.js";
 import { readRegistry } from "./registry.js";
 import { SHARED_INSTANCE_ID, SHARED_REGISTRY_KEY, instancePaths, stateDir } from "./paths.js";
 
@@ -34,6 +35,28 @@ export type InstanceKind = "worktree" | "shared";
  * (running) or is an orphaned file no one is listening on (stale).
  */
 export type InstanceStatus = "running" | "stale";
+
+/**
+ * One service inside a worktree (or shared) instance, as exposed by `ls`.
+ * Combines the runtime fields the driver reads from `process-compose process
+ * list -o json` with the per-service named-port allocation devtrees injected
+ * at `up` time. The two come from different sources so an agent asking "is
+ * `worker` healthy and on what port?" gets one row per service with both
+ * dimensions in hand.
+ */
+export interface Service {
+  readonly name: string;
+  /** process-compose's process-state string (e.g. "Running", "Completed"). */
+  readonly status: string;
+  /** Normalised readiness: ready | not_ready | unknown. */
+  readonly health: ServiceStatus["health"];
+  /**
+   * Named-port → allocated-number map for this service, parsed from the
+   * process's `environment:` list in the derived config (devtrees writes the
+   * worktree's named ports there at `up` time).
+   */
+  readonly ports: Readonly<Record<string, number>>;
+}
 
 export interface InstanceInfo {
   /** Worktree id, or the well-known shared id (`SHARED_INSTANCE_ID`). */
@@ -55,6 +78,14 @@ export interface InstanceInfo {
    * for this id (stale state worth surfacing to the operator).
    */
   readonly blockBase: number | undefined;
+  /**
+   * One row per service in the instance's derived config, combined with its
+   * runtime state from `getServiceStatuses`. Empty when the socket is stale,
+   * when no `getServiceStatuses` injector is provided, or when the single
+   * driver call for this instance failed (we don't fail the whole `ls` for
+   * one flaky instance).
+   */
+  readonly services: ReadonlyArray<Service>;
 }
 
 /**
@@ -133,22 +164,38 @@ function parsePortEnvEntry(entry: unknown): readonly [string, number] | undefine
 }
 
 /**
- * Extract every `KEY=NUMBER` env entry from any process's `environment:` list
- * of a derived config. Devtrees never rewrites commands, so reading the
- * derived config back recovers the same mapping the original `up` injected —
- * without re-running the allocator or the stack loader.
+ * Read the derived config back into a per-process port map: for each process
+ * declared, extract every `KEY=NUMBER` entry from its `environment:` list.
+ * Devtrees never rewrites commands, so reading the derived config recovers the
+ * same mapping the original `up` injected — without re-running the allocator
+ * or the stack loader.
  */
-function readPortsFromDerived(configPath: string): Record<string, number> {
+function readPortsByProcess(configPath: string): Record<string, Record<string, number>> {
   if (!existsSync(configPath)) return {};
   const doc = (parseYaml(readFileSync(configPath, "utf8")) ?? {}) as {
     processes?: Record<string, { environment?: ReadonlyArray<unknown> }>;
   };
-  const ports: Record<string, number> = {};
-  for (const proc of Object.values(doc.processes ?? {})) {
+  const byProc: Record<string, Record<string, number>> = {};
+  for (const [name, proc] of Object.entries(doc.processes ?? {})) {
+    const ports: Record<string, number> = {};
     for (const entry of proc.environment ?? []) {
       const parsed = parsePortEnvEntry(entry);
       if (parsed) ports[parsed[0]] = parsed[1];
     }
+    byProc[name] = ports;
+  }
+  return byProc;
+}
+
+/**
+ * Flatten the per-process port map down to the instance-level
+ * `{name → number}` projection — the shape `InstanceInfo.ports` has always
+ * exposed.
+ */
+function flattenPorts(byProc: Record<string, Record<string, number>>): Record<string, number> {
+  const ports: Record<string, number> = {};
+  for (const procPorts of Object.values(byProc)) {
+    for (const [k, v] of Object.entries(procPorts)) ports[k] = v;
   }
   return ports;
 }
@@ -164,11 +211,51 @@ function compareInstances(a: InstanceInfo, b: InstanceInfo): number {
 }
 
 /**
+ * Knobs for the discovery walk. All optional: the default path stays
+ * lock-free (no registry write) and makes zero driver calls — the per-service
+ * `services[]` rows are only fetched when the caller injects a runtime
+ * `getServiceStatuses` reader.
+ */
+export interface DiscoverDeps {
+  /**
+   * Read the per-service runtime state from a running instance — one call per
+   * discovered running instance. Defaults to no-op: discovery is the
+   * primitive `prune` and the old `ls` walk; only the agent-facing `ls --json`
+   * path supplies this.
+   */
+  readonly getServiceStatuses?: (socketPath: string) => Promise<ServiceStatus[]>;
+}
+
+/**
+ * Best-effort fetch of a single instance's runtime services. A driver error
+ * for one instance must not abort the whole `ls` — agents and operators both
+ * want a partial answer (the other instances) over a fatal exception.
+ */
+async function safeGetServiceStatuses(
+  socketPath: string,
+  fetch: (socketPath: string) => Promise<ServiceStatus[]>,
+): Promise<ServiceStatus[]> {
+  try {
+    return await fetch(socketPath);
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Discover every running (and stale) devtrees instance at `anchor`. The result
  * is the same primitive `devtrees ls` renders and `devtrees prune` walks — no
- * caller has to enumerate sockets themselves.
+ * caller has to enumerate sockets themselves. Lock-free: no allocation-registry
+ * write happens here.
+ *
+ * When `deps.getServiceStatuses` is provided, each running instance is
+ * enriched with one shell-out to the driver, populating `services[]`. Stale
+ * instances never see a driver call.
  */
-export async function discoverInstances(anchor: string): Promise<InstanceInfo[]> {
+export async function discoverInstances(
+  anchor: string,
+  deps: DiscoverDeps = {},
+): Promise<InstanceInfo[]> {
   const stems = listSocketStems(anchor);
   if (stems.length === 0) return [];
 
@@ -179,16 +266,43 @@ export async function discoverInstances(anchor: string): Promise<InstanceInfo[]>
       const paths = instancePaths(anchor, stem);
       const status = await probeSocket(paths.socketPath);
       const blockBase = registry[registryKeyFor(stem)];
+      const portsByProc = readPortsByProcess(paths.configPath);
+      const services =
+        status === "running" && deps.getServiceStatuses
+          ? buildServices(
+              await safeGetServiceStatuses(paths.socketPath, deps.getServiceStatuses),
+              portsByProc,
+            )
+          : [];
       return {
         id: stem,
         kind: kindFor(stem),
         status,
         socketPath: paths.socketPath,
-        ports: readPortsFromDerived(paths.configPath),
+        ports: flattenPorts(portsByProc),
         blockBase,
+        services,
       };
     }),
   );
 
   return infos.sort(compareInstances);
+}
+
+/**
+ * Zip a driver's `ServiceStatus[]` with the per-process port allocations from
+ * the derived config. Ordering follows the driver's response — that's the
+ * order an agent walking the array will naturally see services in. A service
+ * the derived config has no port entry for keeps an empty `ports: {}`.
+ */
+function buildServices(
+  statuses: ReadonlyArray<ServiceStatus>,
+  portsByProc: Record<string, Record<string, number>>,
+): Service[] {
+  return statuses.map((s) => ({
+    name: s.name,
+    status: s.status,
+    health: s.health,
+    ports: portsByProc[s.name] ?? {},
+  }));
 }

@@ -11,7 +11,15 @@
 
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
@@ -897,6 +905,7 @@ describe("runLs — instance enumeration", () => {
         socketPath: "/x/login.sock",
         ports: { WEB_PORT: 20512 },
         blockBase: 20512,
+        services: [],
       },
     ];
     const { runLs } = await import("./commands.js");
@@ -906,6 +915,57 @@ describe("runLs — instance enumeration", () => {
       discover: async () => stub,
     });
     expect(result.instances).toEqual(stub);
+  });
+
+  it("never writes the allocation registry lock-file — `ls` is a pure read path", async () => {
+    // The lock-free guarantee is on ADR-0001's critical path: concurrent
+    // agents enumerating from sibling worktrees must not serialise through
+    // the registry. Probe the on-disk lock-file: a no-write `ls` leaves it
+    // untouched (mtime unchanged from a baseline written before the call).
+    const tmp = tmpAnchor();
+    mkdirSync(join(tmp.anchor, "devtrees"), { recursive: true });
+    const lockPath = join(tmp.anchor, "devtrees", "registry.json.lock");
+    // Seed a baseline lockfile so we can compare its mtime.
+    writeFileSync(lockPath, "", "utf8");
+    const before = statSync(lockPath).mtimeMs;
+    const git: CommandDeps["git"] = (args) => {
+      const flag = args[1];
+      if (flag === "--git-common-dir") return tmp.anchor;
+      if (flag === "--show-toplevel") return join(tmp.worktreeRoot, "login");
+      if (flag === "--is-bare-repository") return "false";
+      throw new Error("unexpected");
+    };
+    const { runLs } = await import("./commands.js");
+    await runLs({ cwd: join(tmp.worktreeRoot, "login"), git });
+    expect(statSync(lockPath).mtimeMs).toBe(before);
+  });
+
+  it("threads the driver's getServiceStatuses into the discoverer (issue #29 plumbing)", async () => {
+    const tmp = tmpAnchor();
+    const git: CommandDeps["git"] = (args) => {
+      const flag = args[1];
+      if (flag === "--git-common-dir") return tmp.anchor;
+      if (flag === "--show-toplevel") return join(tmp.worktreeRoot, "login");
+      if (flag === "--is-bare-repository") return "false";
+      throw new Error("unexpected");
+    };
+    // Driver injection is the same one up/down use — exists+spawner. The
+    // spawner here is never reached because runLs's getServiceStatuses goes
+    // through the driver and the discoverer below sees the function only.
+    let receivedFetch: unknown;
+    const { runLs } = await import("./commands.js");
+    await runLs({
+      cwd: join(tmp.worktreeRoot, "login"),
+      git,
+      driver: { exists: () => Promise.resolve(true) },
+      discover: async (_anchor, deps) => {
+        receivedFetch = deps.getServiceStatuses;
+        return [];
+      },
+    });
+    // The discoverer must have been handed a callable — the wiring exists,
+    // even when no instance ends up exercising it.
+    expect(typeof receivedFetch).toBe("function");
   });
 });
 
@@ -1074,6 +1134,7 @@ describe("runPrune — reconcile instances against git worktree list", () => {
       socketPath: overrides.socketPath ?? `/anchor/devtrees/run/${id}.sock`,
       ports: {} as Readonly<Record<string, number>>,
       blockBase: undefined,
+      services: [] as ReadonlyArray<never>,
     };
   }
 

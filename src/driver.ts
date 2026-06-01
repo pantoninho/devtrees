@@ -43,6 +43,67 @@ export function buildAttachArgs(inst: InstanceRef): string[] {
   return ["attach", "-U", "-u", inst.socketPath];
 }
 
+/**
+ * List the running processes of an instance over its UDS, in JSON. devtrees
+ * always asks for JSON — the human table is for operators driving
+ * process-compose directly; the driver parses the response.
+ */
+export function buildProcessListArgs(socketPath: string): string[] {
+  return ["process", "list", "-U", "-u", socketPath, "-o", "json"];
+}
+
+/** Health-state surface devtrees exposes for a service in a running instance. */
+export type HealthState = "ready" | "not_ready" | "unknown";
+
+/**
+ * One service's runtime state, as the driver reads it from
+ * `process-compose process list -o json`. `status` is process-compose's own
+ * string (e.g. "Running", "Completed", "Failed", "Pending"); `health`
+ * normalises the orthogonal readiness signal so callers can branch on it
+ * without sniffing the multiple shapes process-compose has emitted over its
+ * history (`is_ready` strings vs. a boolean `ready` field).
+ */
+export interface ServiceStatus {
+  readonly name: string;
+  readonly status: string;
+  readonly health: HealthState;
+}
+
+interface RawProc {
+  readonly name?: unknown;
+  readonly status?: unknown;
+  readonly is_ready?: unknown;
+  readonly ready?: unknown;
+}
+
+function readHealth(raw: RawProc): HealthState {
+  if (typeof raw.ready === "boolean") return raw.ready ? "ready" : "not_ready";
+  if (raw.is_ready === "Ready") return "ready";
+  if (raw.is_ready === "Not Ready") return "not_ready";
+  return "unknown";
+}
+
+/**
+ * Parse `process-compose process list -o json` output into a `ServiceStatus[]`.
+ *
+ * process-compose has emitted both a bare array and a `{processes: [...]}`
+ * envelope across versions, so this accepts either. Rows missing the
+ * mandatory fields (name, status) are dropped — the driver only surfaces
+ * well-formed runtime state, never partial guesses.
+ */
+export function parseServiceStatuses(stdout: string): ServiceStatus[] {
+  const parsed: unknown = JSON.parse(stdout);
+  const items: ReadonlyArray<RawProc> = Array.isArray(parsed)
+    ? (parsed as ReadonlyArray<RawProc>)
+    : (((parsed as { processes?: unknown }).processes ?? []) as ReadonlyArray<RawProc>);
+  const out: ServiceStatus[] = [];
+  for (const raw of items) {
+    if (typeof raw.name !== "string" || typeof raw.status !== "string") continue;
+    out.push({ name: raw.name, status: raw.status, health: readHealth(raw) });
+  }
+  return out;
+}
+
 /** Tunable flags shared by `buildLogsArgs` and `streamLogs`. */
 export interface LogsFlags {
   /** Keep streaming after the historical buffer drains (process-compose `-f`). */
@@ -86,7 +147,7 @@ export interface SpawnedProcess {
   on(event: "error", cb: (err: Error) => void): void;
   on(event: "exit", cb: (code: number | null) => void): void;
   unref?(): void;
-  /** Stdout pipe — present when the caller asked for piped stdio (e.g. logs). */
+  /** Stdout pipe — present when the caller asked for piped stdio (e.g. logs, getServiceStatuses). */
   readonly stdout?: NodeJS.ReadableStream | null;
   /** Stderr pipe — present when the caller asked for piped stdio. */
   readonly stderr?: NodeJS.ReadableStream | null;
@@ -168,6 +229,36 @@ export function createDriver(deps: DriverDeps = {}) {
     /** Attach a TUI to the running instance. */
     attach(inst: InstanceRef): Promise<void> {
       return run(buildAttachArgs(inst), { stdio: "inherit" });
+    },
+    /**
+     * Read every service's runtime state from a running instance: one shell-out
+     * to `process-compose process list -o json` over the UDS, parsed into
+     * `ServiceStatus[]`. Stays lock-free — this is a read against the
+     * instance, never the allocation registry.
+     */
+    async getServiceStatuses(socketPath: string): Promise<ServiceStatus[]> {
+      await ensureBinary({ binary, exists });
+      return new Promise<ServiceStatus[]>((resolve, reject) => {
+        const child = spawner(binary, [...prefix, ...buildProcessListArgs(socketPath)], {
+          stdio: ["ignore", "pipe", "ignore"],
+        });
+        let stdout = "";
+        child.stdout?.on("data", (chunk: Buffer | string) => {
+          stdout += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+        });
+        child.on("error", (err) => reject(err));
+        child.on("exit", (code) => {
+          if (code !== 0 && code !== null) {
+            reject(new Error(`${binary} process list exited with code ${code}`));
+            return;
+          }
+          try {
+            resolve(parseServiceStatuses(stdout || "[]"));
+          } catch (err) {
+            reject(err as Error);
+          }
+        });
+      });
     },
     /**
      * Stream a service's logs from the instance at `socketPath` as an async

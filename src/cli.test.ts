@@ -431,6 +431,52 @@ describe("devtrees CLI — --json (agent-facing surface)", () => {
     const parsed = JSON.parse(result.stdout) as { instances: unknown[] };
     expect(parsed.instances).toEqual([]);
   });
+
+  /**
+   * Issue #29 — `ls --json` carries a per-service nesting so an agent can ask
+   * 'is `worker` healthy in my worktree instance?' with one call.
+   */
+  it("`ls --json` nests services[] (name/status/health/ports) on every instance entry", async () => {
+    const ls = vi.fn().mockResolvedValue({
+      anchor: "/repo/.git",
+      instances: [
+        {
+          id: "login",
+          kind: "worktree" as const,
+          status: "running" as const,
+          socketPath: "/repo/.git/devtrees/run/login.sock",
+          ports: { WEB_PORT: 20000, WORKER_PORT: 20001 },
+          blockBase: 20000,
+          services: [
+            { name: "web", status: "Running", health: "ready", ports: { WEB_PORT: 20000 } },
+            {
+              name: "worker",
+              status: "Running",
+              health: "not_ready",
+              ports: { WORKER_PORT: 20001 },
+            },
+          ],
+        },
+      ],
+    });
+    const result = await execute(["ls", "--json"], { up: vi.fn(), down: vi.fn(), ls });
+    const parsed = JSON.parse(result.stdout) as {
+      instances: ReadonlyArray<{
+        id: string;
+        services: ReadonlyArray<{
+          name: string;
+          status: string;
+          health: string;
+          ports: Record<string, number>;
+        }>;
+      }>;
+    };
+    const login = parsed.instances.find((i) => i.id === "login");
+    expect(login?.services).toEqual([
+      { name: "web", status: "Running", health: "ready", ports: { WEB_PORT: 20000 } },
+      { name: "worker", status: "Running", health: "not_ready", ports: { WORKER_PORT: 20001 } },
+    ]);
+  });
 });
 
 describe("devtrees CLI — logs (#33)", () => {

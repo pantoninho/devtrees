@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { createServer, type Server } from "node:net";
 import { discoverInstances } from "./instances.js";
 import { SHARED_INSTANCE_ID, SHARED_REGISTRY_KEY } from "./paths.js";
+import type { ServiceStatus } from "./driver.js";
 
 // Cleanups may be sync (rmSync) or async (server.close); each is wrapped to a
 // promise so afterEach can await them uniformly without tripping the lint rule.
@@ -189,6 +190,102 @@ describe("discoverInstances", () => {
 
     const instances = await discoverInstances(anchor);
     expect(instances).toEqual([]);
+  });
+
+  it("populates services[] on each running instance via a single getServiceStatuses call per instance", async () => {
+    const anchor = tmpAnchor();
+    writeRegistry(anchor, { login: 20000, billing: 21000 });
+    writeDerivedConfig(anchor, "login", {
+      web: { ports: [["WEB_PORT", 20000]] },
+      worker: { ports: [["WORKER_PORT", 20001]] },
+    });
+    writeDerivedConfig(anchor, "billing", { web: { ports: [["WEB_PORT", 21000]] } });
+    await bindSocketServer(anchor, "login");
+    await bindSocketServer(anchor, "billing");
+
+    const calls: string[] = [];
+    const fakeStatuses: Record<string, ServiceStatus[]> = {
+      login: [
+        { name: "web", status: "Running", health: "ready" },
+        { name: "worker", status: "Running", health: "not_ready" },
+      ],
+      billing: [{ name: "web", status: "Running", health: "ready" }],
+    };
+    const getServiceStatuses = async (socketPath: string): Promise<ServiceStatus[]> => {
+      calls.push(socketPath);
+      const id = socketPath.endsWith("login.sock") ? "login" : "billing";
+      const statuses = fakeStatuses[id];
+      if (statuses === undefined) throw new Error(`no fake for ${id}`);
+      return statuses;
+    };
+
+    const instances = await discoverInstances(anchor, { getServiceStatuses });
+    // One call per discovered (running) instance — never more.
+    expect(calls).toHaveLength(2);
+
+    const byId = new Map(instances.map((i) => [i.id, i]));
+    const login = byId.get("login");
+    const billing = byId.get("billing");
+    expect(login?.services).toEqual([
+      { name: "web", status: "Running", health: "ready", ports: { WEB_PORT: 20000 } },
+      { name: "worker", status: "Running", health: "not_ready", ports: { WORKER_PORT: 20001 } },
+    ]);
+    expect(billing?.services).toEqual([
+      { name: "web", status: "Running", health: "ready", ports: { WEB_PORT: 21000 } },
+    ]);
+  });
+
+  it("skips getServiceStatuses for stale instances — services[] is empty for an orphaned socket", async () => {
+    const anchor = tmpAnchor();
+    writeRegistry(anchor, { login: 20000 });
+    writeDerivedConfig(anchor, "login", { web: { ports: [["WEB_PORT", 20000]] } });
+    touchSocketMarker(anchor, "login");
+
+    let called = false;
+    const getServiceStatuses = async (): Promise<ServiceStatus[]> => {
+      called = true;
+      return [];
+    };
+
+    const [instance] = await discoverInstances(anchor, { getServiceStatuses });
+    expect(instance?.status).toBe("stale");
+    expect(instance?.services).toEqual([]);
+    expect(called).toBe(false);
+  });
+
+  it("services[] defaults to [] when no getServiceStatuses injector is provided", async () => {
+    // Lock-free read path: callers (and the default fallback) must not be
+    // forced to talk to the binary just to discover instances. Tests that
+    // don't care about service rows pass no injector.
+    const anchor = tmpAnchor();
+    writeRegistry(anchor, { login: 20000 });
+    writeDerivedConfig(anchor, "login", { web: { ports: [["WEB_PORT", 20000]] } });
+    await bindSocketServer(anchor, "login");
+
+    const [instance] = await discoverInstances(anchor);
+    expect(instance?.services).toEqual([]);
+  });
+
+  it("swallows a getServiceStatuses error for one instance without losing the others", async () => {
+    const anchor = tmpAnchor();
+    writeRegistry(anchor, { login: 20000, billing: 21000 });
+    writeDerivedConfig(anchor, "login", { web: { ports: [["WEB_PORT", 20000]] } });
+    writeDerivedConfig(anchor, "billing", { web: { ports: [["WEB_PORT", 21000]] } });
+    await bindSocketServer(anchor, "login");
+    await bindSocketServer(anchor, "billing");
+
+    const getServiceStatuses = async (socketPath: string): Promise<ServiceStatus[]> => {
+      if (socketPath.endsWith("login.sock")) throw new Error("socket hiccup");
+      return [{ name: "web", status: "Running", health: "ready" }];
+    };
+
+    const instances = await discoverInstances(anchor, { getServiceStatuses });
+    const login = instances.find((i) => i.id === "login");
+    const billing = instances.find((i) => i.id === "billing");
+    expect(login?.services).toEqual([]);
+    expect(billing?.services).toEqual([
+      { name: "web", status: "Running", health: "ready", ports: { WEB_PORT: 21000 } },
+    ]);
   });
 
   it("returns instances sorted by id with the shared instance first", async () => {
