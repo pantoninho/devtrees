@@ -21,12 +21,14 @@ import {
   formatEnv,
   formatError,
   formatGenerate,
+  formatLogLine,
   formatLs,
   formatPrune,
   formatUp,
   type FormatMode,
   type LsInstanceRow,
 } from "./output.js";
+import type { LogEvent } from "./driver.js";
 
 export const VERSION = "0.0.1";
 
@@ -47,6 +49,10 @@ export const COMMANDS: ReadonlyArray<{ name: string; summary: string }> = [
   {
     name: "env",
     summary: "Print this worktree's injected env (KEY=value, or --json for a map)",
+  },
+  {
+    name: "logs",
+    summary: "Stream a service's logs (--follow, --tail=N, --since=DUR, --all, --shared)",
   },
 ];
 
@@ -155,6 +161,26 @@ export interface ExecuteDeps {
    * test stubs (up/down-only) keep working without supplying it.
    */
   env?: () => Promise<{ worktreeId: string; env: Record<string, string> }>;
+  /**
+   * Stream a service's logs over the instance's control socket (#33). Returns
+   * the resolved service list (so the CLI knows whether to prefix in human
+   * mode) plus an `AsyncIterable<LogEvent>` the CLI consumes one line at a
+   * time. Optional so existing test stubs keep working without supplying it.
+   */
+  logs?: (options: LogsCliOptions) => Promise<{
+    services: ReadonlyArray<string>;
+    events: AsyncIterable<LogEvent>;
+  }>;
+}
+
+/** Parsed `devtrees logs` options threaded into `deps.logs`. */
+export interface LogsCliOptions {
+  readonly service?: string;
+  readonly all: boolean;
+  readonly shared: boolean;
+  readonly follow: boolean;
+  readonly tail?: number;
+  readonly since?: string;
 }
 
 /**
@@ -270,6 +296,59 @@ async function handleEnv(
   return { code: 0, stdout: out.stdout, stderr: out.stderr };
 }
 
+/**
+ * Parse `devtrees logs <service?>` argv into structured options.
+ *
+ * Flags: `--follow` (or `-f`), `--tail=N`, `--since=DUR`, `--all`, `--shared`.
+ * The first non-flag positional is the service name; with `--all` it is
+ * optional (and ignored if both are given — `--all` wins).
+ */
+export function parseLogsArgs(rest: ReadonlyArray<string>): LogsCliOptions {
+  let service: string | undefined;
+  let all = false;
+  let shared = false;
+  let follow = false;
+  let tail: number | undefined;
+  let since: string | undefined;
+  for (const arg of rest) {
+    if (arg === "--all") all = true;
+    else if (arg === "--shared") shared = true;
+    else if (arg === "--follow" || arg === "-f") follow = true;
+    else if (arg.startsWith("--tail=")) {
+      const n = Number(arg.slice("--tail=".length));
+      if (Number.isFinite(n) && n >= 0) tail = n;
+    } else if (arg.startsWith("--since=")) since = arg.slice("--since=".length);
+    else if (!arg.startsWith("-") && service === undefined) service = arg;
+  }
+  return { service, all, shared, follow, tail, since };
+}
+
+async function handleLogs(
+  rest: ReadonlyArray<string>,
+  deps: ExecuteDeps,
+  mode: FormatMode,
+): Promise<RunResult | undefined> {
+  if (deps.logs === undefined) return undefined;
+  const opts = parseLogsArgs(rest);
+  if (!opts.all && opts.service === undefined) {
+    return {
+      code: 1,
+      stdout: "",
+      stderr: "devtrees logs: specify a service (e.g. `devtrees logs web`) or pass `--all`.\n",
+    };
+  }
+  const { services, events } = await deps.logs(opts);
+  // Stream lines one at a time. Human mode prefixes `[service]` when --all is
+  // set or when more than one service is in play; JSON mode emits NDJSON.
+  const prefixService = mode === "human" && services.length > 1;
+  let stdout = "";
+  for await (const event of events) {
+    const out = formatLogLine(event, mode, { prefixService });
+    stdout += out.stdout;
+  }
+  return { code: 0, stdout, stderr: "" };
+}
+
 const HANDLERS: ReadonlyMap<string, Handler> = new Map([
   ["up", handleUp],
   ["down", handleDown],
@@ -278,6 +357,7 @@ const HANDLERS: ReadonlyMap<string, Handler> = new Map([
   ["attach", handleAttach],
   ["prune", handlePrune],
   ["env", handleEnv],
+  ["logs", handleLogs],
 ]);
 
 /**
@@ -326,7 +406,7 @@ export function isEntrypoint(metaUrl: string, argv1: string | undefined): boolea
 }
 
 if (isEntrypoint(import.meta.url, process.argv[1])) {
-  const { runUp, runDown, runEnv, runGenerate, runLs, runAttach, runPrune } =
+  const { runUp, runDown, runEnv, runGenerate, runLs, runAttach, runPrune, runLogs } =
     await import("./commands.js");
   const result = await execute(process.argv.slice(2), {
     up: () => runUp(),
@@ -336,6 +416,18 @@ if (isEntrypoint(import.meta.url, process.argv[1])) {
     attach: ({ shared }) => runAttach({}, { shared }),
     prune: () => runPrune(),
     env: () => runEnv(),
+    logs: (opts) =>
+      runLogs(
+        {},
+        {
+          service: opts.service,
+          all: opts.all,
+          shared: opts.shared,
+          follow: opts.follow,
+          tail: opts.tail,
+          since: opts.since,
+        },
+      ),
   });
   if (result.stdout) process.stdout.write(result.stdout);
   if (result.stderr) process.stderr.write(result.stderr);

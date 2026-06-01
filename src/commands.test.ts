@@ -10,16 +10,19 @@
  */
 
 import { afterEach, describe, expect, it } from "vite-plus/test";
+import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { parse as parseYaml } from "yaml";
+import { Readable } from "node:stream";
+import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import {
   findUnmanagedPortBinds,
   runAttach,
   runDown,
   runEnv,
   runGenerate,
+  runLogs,
   runUp,
   type CommandDeps,
   type WithSharedLock,
@@ -1420,5 +1423,271 @@ describe("runEnv — pure read of injected env", () => {
     expect(result.env.WEB_PORT).toBe("20000");
     expect(result.env.DEVTREES_WORKTREE_ID).toBe("login");
     expect(result.env).not.toHaveProperty("DB_PORT");
+  });
+});
+
+/**
+ * `runLogs` — stream a service's logs without locking (#33).
+ *
+ * Driver-level streaming is unit-tested in driver.test.ts; here we pin the
+ * orchestration: anchor + socket selection, --shared dispatch, --all
+ * enumeration from the derived config, missing-socket failure, and the
+ * lock-free promise.
+ */
+
+interface LogsInvocation {
+  args: ReadonlyArray<string>;
+  socket: string;
+  service: string;
+}
+
+/**
+ * Stub spawner that records every `process logs` invocation and returns a
+ * fake child that emits the canned lines for that service on stdout, then
+ * exits 0. Tests assert on `invocations` and on the collected `LogEvent`s.
+ */
+function makeLogsSpawner(
+  invocations: LogsInvocation[],
+  linesPerService: Readonly<Record<string, ReadonlyArray<string>>>,
+) {
+  return (_binary: string, args: ReadonlyArray<string>, _options: unknown): SpawnedProcess => {
+    const service = args[2] ?? "";
+    const ui = args.indexOf("-u");
+    const socket = ui >= 0 ? (args[ui + 1] ?? "") : "";
+    invocations.push({ args, socket, service });
+
+    const lines = linesPerService[service] ?? [];
+    const stdout = Readable.from(lines.map((l) => `${l}\n`).join(""));
+    const stderr = Readable.from("");
+    const emitter = new EventEmitter();
+    stdout.on("end", () => queueMicrotask(() => emitter.emit("exit", 0)));
+
+    return {
+      stdout,
+      stderr,
+      on(event: "error" | "exit", cb: (arg: never) => void): void {
+        emitter.on(event, cb as (...args: unknown[]) => void);
+      },
+      kill: () => {
+        stdout.destroy();
+        return true;
+      },
+    };
+  };
+}
+
+/** Build a CommandDeps for runLogs tests — no allocator/lock plumbing needed. */
+function logsDeps(opts: {
+  anchor: string;
+  worktreeRoot: string;
+  worktreeId: string;
+  invocations: LogsInvocation[];
+  linesPerService: Readonly<Record<string, ReadonlyArray<string>>>;
+}): CommandDeps {
+  const git = (args: ReadonlyArray<string>): string => {
+    const flag = args[1];
+    if (flag === "--git-common-dir") return opts.anchor;
+    if (flag === "--show-toplevel") return join(opts.worktreeRoot, opts.worktreeId);
+    if (flag === "--is-bare-repository") return "false";
+    throw new Error(`unexpected git invocation: ${args.join(" ")}`);
+  };
+  return {
+    cwd: join(opts.worktreeRoot, opts.worktreeId),
+    git,
+    driver: {
+      exists: () => Promise.resolve(true),
+      spawner: makeLogsSpawner(opts.invocations, opts.linesPerService),
+    },
+  };
+}
+
+async function collectLogs(
+  it: AsyncIterable<{
+    service: string;
+    line: string;
+    ts: string;
+    stream: string;
+  }>,
+): Promise<Array<{ service: string; line: string }>> {
+  const out: Array<{ service: string; line: string }> = [];
+  for await (const ev of it) out.push({ service: ev.service, line: ev.line });
+  return out;
+}
+
+/** Write a minimal derived config to the anchor so --all enumeration works. */
+function writeDerivedConfig(
+  anchor: string,
+  fileStem: string,
+  services: ReadonlyArray<string>,
+): string {
+  const dir = join(anchor, "devtrees");
+  mkdirSync(dir, { recursive: true });
+  const processes: Record<string, { command: string }> = {};
+  for (const s of services) processes[s] = { command: "sleep 1" };
+  const path = join(dir, `${fileStem}.yaml`);
+  writeFileSync(path, stringifyYaml({ processes }));
+  return path;
+}
+
+/** Touch the control socket file so existence checks pass. */
+function touchSocket(anchor: string, fileStem: string): string {
+  const runDir = join(anchor, "devtrees", "run");
+  mkdirSync(runDir, { recursive: true });
+  const path = join(runDir, `${fileStem}.sock`);
+  writeFileSync(path, "");
+  return path;
+}
+
+describe("runLogs — stream service logs without locking", () => {
+  it("streams the worktree instance's named service from its socket", async () => {
+    const tmp = tmpAnchor();
+    const worktreeId = "login";
+    const socketPath = touchSocket(tmp.anchor, worktreeId);
+    writeDerivedConfig(tmp.anchor, worktreeId, ["web", "worker"]);
+
+    const invocations: LogsInvocation[] = [];
+    const deps = logsDeps({
+      anchor: tmp.anchor,
+      worktreeRoot: tmp.worktreeRoot,
+      worktreeId,
+      invocations,
+      linesPerService: { web: ["hello", "world"] },
+    });
+
+    const result = await runLogs(deps, { service: "web" });
+    expect(result.services).toEqual(["web"]);
+    const events = await collectLogs(result.events);
+    expect(events).toEqual([
+      { service: "web", line: "hello" },
+      { service: "web", line: "world" },
+    ]);
+    expect(invocations).toHaveLength(1);
+    expect(invocations[0]?.socket).toBe(socketPath);
+    expect(invocations[0]?.service).toBe("web");
+  });
+
+  it("streams the shared instance with { shared: true } (different socket)", async () => {
+    const tmp = tmpAnchor();
+    const sharedSocket = touchSocket(tmp.anchor, "shared");
+    writeDerivedConfig(tmp.anchor, "shared", ["postgres"]);
+
+    const invocations: LogsInvocation[] = [];
+    const deps = logsDeps({
+      anchor: tmp.anchor,
+      worktreeRoot: tmp.worktreeRoot,
+      worktreeId: "login",
+      invocations,
+      linesPerService: { postgres: ["ready to accept connections"] },
+    });
+
+    const result = await runLogs(deps, { service: "postgres", shared: true });
+    const events = await collectLogs(result.events);
+    expect(events).toEqual([{ service: "postgres", line: "ready to accept connections" }]);
+    expect(invocations[0]?.socket).toBe(sharedSocket);
+  });
+
+  it("throws a clear error when the worktree control socket is missing (→ INSTANCE_NOT_FOUND)", async () => {
+    const tmp = tmpAnchor();
+    // No socket file written.
+    const invocations: LogsInvocation[] = [];
+    const deps = logsDeps({
+      anchor: tmp.anchor,
+      worktreeRoot: tmp.worktreeRoot,
+      worktreeId: "login",
+      invocations,
+      linesPerService: {},
+    });
+    await expect(runLogs(deps, { service: "web" })).rejects.toThrow(/no worktree instance.*login/);
+    expect(invocations).toEqual([]);
+  });
+
+  it("throws when --shared is set and the shared socket is missing", async () => {
+    const tmp = tmpAnchor();
+    const invocations: LogsInvocation[] = [];
+    const deps = logsDeps({
+      anchor: tmp.anchor,
+      worktreeRoot: tmp.worktreeRoot,
+      worktreeId: "login",
+      invocations,
+      linesPerService: {},
+    });
+    await expect(runLogs(deps, { service: "postgres", shared: true })).rejects.toThrow(
+      /no shared instance is running/,
+    );
+    expect(invocations).toEqual([]);
+  });
+
+  it("with { all: true }, enumerates services from the derived config and interleaves them", async () => {
+    const tmp = tmpAnchor();
+    const worktreeId = "login";
+    touchSocket(tmp.anchor, worktreeId);
+    writeDerivedConfig(tmp.anchor, worktreeId, ["web", "worker"]);
+
+    const invocations: LogsInvocation[] = [];
+    const deps = logsDeps({
+      anchor: tmp.anchor,
+      worktreeRoot: tmp.worktreeRoot,
+      worktreeId,
+      invocations,
+      linesPerService: { web: ["w1", "w2"], worker: ["k1"] },
+    });
+
+    const result = await runLogs(deps, { all: true });
+    expect([...result.services].sort()).toEqual(["web", "worker"]);
+    const events = await collectLogs(result.events);
+    // Both services must appear; order is not guaranteed (real interleave).
+    expect(events.map((e) => e.line).sort()).toEqual(["k1", "w1", "w2"]);
+    // One subprocess per service.
+    expect(invocations.map((i) => i.service).sort()).toEqual(["web", "worker"]);
+  });
+
+  it("forwards follow and tail to the driver's argv", async () => {
+    const tmp = tmpAnchor();
+    const worktreeId = "login";
+    touchSocket(tmp.anchor, worktreeId);
+    writeDerivedConfig(tmp.anchor, worktreeId, ["web"]);
+
+    const invocations: LogsInvocation[] = [];
+    const deps = logsDeps({
+      anchor: tmp.anchor,
+      worktreeRoot: tmp.worktreeRoot,
+      worktreeId,
+      invocations,
+      linesPerService: { web: ["a"] },
+    });
+    const result = await runLogs(deps, { service: "web", follow: true, tail: 10 });
+    // Drain so the spawn happens.
+    await collectLogs(result.events);
+    const args = invocations[0]?.args ?? [];
+    expect(args).toContain("-f");
+    const ni = args.indexOf("-n");
+    expect(ni).toBeGreaterThan(-1);
+    expect(args[ni + 1]).toBe("10");
+  });
+
+  it("does not take the allocation-registry lock (lock-free path)", async () => {
+    const tmp = tmpAnchor();
+    const worktreeId = "login";
+    touchSocket(tmp.anchor, worktreeId);
+    writeDerivedConfig(tmp.anchor, worktreeId, ["web"]);
+
+    const invocations: LogsInvocation[] = [];
+    let lockCalls = 0;
+    const deps: CommandDeps = {
+      ...logsDeps({
+        anchor: tmp.anchor,
+        worktreeRoot: tmp.worktreeRoot,
+        worktreeId,
+        invocations,
+        linesPerService: { web: ["a"] },
+      }),
+      withRegistryLock: () => {
+        lockCalls++;
+        throw new Error("runLogs must not take the allocation-registry lock");
+      },
+    };
+    const result = await runLogs(deps, { service: "web" });
+    await collectLogs(result.events);
+    expect(lockCalls).toBe(0);
   });
 });

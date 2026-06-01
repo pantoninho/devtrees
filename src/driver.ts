@@ -9,6 +9,7 @@
  */
 
 import { spawn, type SpawnOptions } from "node:child_process";
+import { createInterface } from "node:readline";
 
 /** Identifies one process-compose instance: its derived config and control socket. */
 export interface InstanceRef {
@@ -42,11 +43,55 @@ export function buildAttachArgs(inst: InstanceRef): string[] {
   return ["attach", "-U", "-u", inst.socketPath];
 }
 
+/** Tunable flags shared by `buildLogsArgs` and `streamLogs`. */
+export interface LogsFlags {
+  /** Keep streaming after the historical buffer drains (process-compose `-f`). */
+  readonly follow?: boolean;
+  /** Start at the last N lines (process-compose `-n N`). */
+  readonly tail?: number;
+}
+
+/** Options for `streamLogs` — `LogsFlags` plus the single service to stream. */
+export interface StreamLogsOptions extends LogsFlags {
+  /** Name of the service to stream. One subprocess per service; `--all` is handled by the caller. */
+  readonly service: string;
+}
+
+/**
+ * Build the argv for `process-compose process logs <service>` over the
+ * instance's UDS in raw-log mode (no per-line process-name prefix; the driver
+ * attaches service attribution itself when emitting `LogEvent`s).
+ */
+export function buildLogsArgs(socketPath: string, service: string, opts: LogsFlags): string[] {
+  const args = ["process", "logs", service, "-U", "-u", socketPath, "--raw-log"];
+  if (opts.follow) args.push("-f");
+  if (opts.tail !== undefined) args.push("-n", String(opts.tail));
+  return args;
+}
+
+/** A single line of log output, normalized into the NDJSON shape `devtrees logs --json` emits. */
+export interface LogEvent {
+  /** ISO 8601 timestamp captured by the driver when the line was read. */
+  readonly ts: string;
+  /** Service name (matches the `process-compose` service this came from). */
+  readonly service: string;
+  /** Always "stdout" today — `process-compose process logs` does not split streams. */
+  readonly stream: "stdout" | "stderr";
+  /** The log line content, without trailing newline. */
+  readonly line: string;
+}
+
 /** Minimal child-process surface the driver relies on. */
 export interface SpawnedProcess {
   on(event: "error", cb: (err: Error) => void): void;
   on(event: "exit", cb: (code: number | null) => void): void;
   unref?(): void;
+  /** Stdout pipe — present when the caller asked for piped stdio (e.g. logs). */
+  readonly stdout?: NodeJS.ReadableStream | null;
+  /** Stderr pipe — present when the caller asked for piped stdio. */
+  readonly stderr?: NodeJS.ReadableStream | null;
+  /** Send a signal to the child (e.g. on cancellation). */
+  kill?(signal?: NodeJS.Signals | number): boolean;
 }
 
 /** Spawn a process-compose subprocess. Injected so tests can stub it. */
@@ -124,5 +169,68 @@ export function createDriver(deps: DriverDeps = {}) {
     attach(inst: InstanceRef): Promise<void> {
       return run(buildAttachArgs(inst), { stdio: "inherit" });
     },
+    /**
+     * Stream a service's logs from the instance at `socketPath` as an async
+     * iterable of `LogEvent`s. Spawns `process-compose process logs <service>`
+     * with piped stdout, reads it line-by-line, and emits one event per line
+     * tagged with the wall-clock time the line was read (process-compose's
+     * `process logs` does not carry per-line timestamps).
+     *
+     * Lock-free — concurrent agents tailing sibling worktrees do not contend
+     * on a shared lock (acceptance, #33).
+     */
+    streamLogs(socketPath: string, opts: StreamLogsOptions): AsyncIterable<LogEvent> {
+      return streamLogsImpl(socketPath, opts, { binary, prefix, exists, spawner });
+    },
   };
+}
+
+/**
+ * Implementation of `streamLogs`. Kept as a top-level async generator so the
+ * `createDriver` factory body stays a flat object literal — the closure over
+ * `binary`/`prefix`/`exists`/`spawner` is threaded in explicitly.
+ */
+async function* streamLogsImpl(
+  socketPath: string,
+  opts: StreamLogsOptions,
+  deps: {
+    readonly binary: string;
+    readonly prefix: ReadonlyArray<string>;
+    readonly exists: (binary: string) => Promise<boolean>;
+    readonly spawner: Spawner;
+  },
+): AsyncIterable<LogEvent> {
+  await ensureBinary({ binary: deps.binary, exists: deps.exists });
+
+  const args = [...deps.prefix, ...buildLogsArgs(socketPath, opts.service, opts)];
+  const child = deps.spawner(deps.binary, args, { stdio: ["ignore", "pipe", "pipe"] });
+  const stdout = child.stdout;
+  if (!stdout) {
+    throw new Error("process-compose child has no stdout — cannot stream logs");
+  }
+
+  const exitPromise = new Promise<void>((resolve, reject) => {
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      if (code === 0 || code === null) resolve();
+      else reject(new Error(`${deps.binary} process logs exited with code ${code}`));
+    });
+  });
+  // Surface a spawn error even if no one awaits exitPromise.
+  exitPromise.catch(() => {});
+
+  try {
+    const reader = createInterface({ input: stdout, crlfDelay: Number.POSITIVE_INFINITY });
+    for await (const line of reader) {
+      yield {
+        ts: new Date().toISOString(),
+        service: opts.service,
+        stream: "stdout",
+        line,
+      };
+    }
+    await exitPromise;
+  } finally {
+    child.kill?.();
+  }
 }

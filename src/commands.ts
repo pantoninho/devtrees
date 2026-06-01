@@ -15,11 +15,11 @@ import { discoverInstances, type InstanceInfo } from "./instances.js";
 import { SHARED_REGISTRY_KEY, instancePaths, sharedInstancePaths } from "./paths.js";
 import { findOrphans, parseWorktreeIds } from "./prune.js";
 import { loadStack, type ResolvedService, type ResolvedStack } from "./stack.js";
-import { createDriver, type DriverDeps } from "./driver.js";
+import { createDriver, type DriverDeps, type LogEvent, type StreamLogsOptions } from "./driver.js";
 import { readRegistry, withRegistryLock, withSharedLock } from "./registry.js";
 import { execFileSync, execSync } from "node:child_process";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { stringify as stringifyYaml } from "yaml";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
 const DEFAULT_ALLOCATOR: AllocatorOptions = { portBase: 20000, blockSize: 32 };
 
@@ -801,6 +801,161 @@ export async function runEnv(deps: CommandDeps = {}): Promise<EnvResult> {
   });
 
   return { worktreeId: anchor.worktreeId, env: derived.env };
+}
+
+/**
+ * Options governing a `devtrees logs` call. The single-service form passes
+ * `service`; `--all` (interleave every service in the instance) sets `all`.
+ * `--shared` flips socket selection from the worktree instance to the shared
+ * one. `follow`, `tail`, and `since` thread straight through to the driver.
+ */
+export interface LogsOptions {
+  /** Name of one service to stream. Mutually exclusive with `all`. */
+  readonly service?: string;
+  /** Interleave every service in the target instance. Reads the derived config to enumerate. */
+  readonly all?: boolean;
+  /** Read the shared instance's socket instead of the worktree's. */
+  readonly shared?: boolean;
+  /** Keep streaming after the historical buffer drains. */
+  readonly follow?: boolean;
+  /** Start from the last N lines. */
+  readonly tail?: number;
+  /**
+   * Start from the given duration ago (e.g. "5m"). Currently accepted but not
+   * passed through to process-compose — its `process logs` CLI does not yet
+   * expose a `--since` flag, so the option is recorded for forward compatibility
+   * and surfaced in the driver's `LogEvent` ts (the agent can filter client-side).
+   */
+  readonly since?: string;
+}
+
+export interface LogsResult {
+  /** Services this call is streaming. One entry for the single-service form; many for `--all`. */
+  readonly services: ReadonlyArray<string>;
+  /** Merged log stream. Iterating consumes the spawn(s); cancelling the iterator kills the children. */
+  readonly events: AsyncIterable<LogEvent>;
+}
+
+/**
+ * Stream a service's logs from a running instance without taking any lock.
+ *
+ * Socket selection — `options.shared` flips between this worktree's control
+ * socket and the shared instance's. If the target socket is missing, the
+ * instance is not running and we throw a clear error here that `classifyError`
+ * maps to the `INSTANCE_NOT_FOUND` envelope (ADR-0005). The lock-free path
+ * (acceptance, #33) is what lets concurrent agents tail sibling worktrees
+ * without serializing on a shared mutex.
+ *
+ * `--all` enumerates services from the derived config on disk — the same file
+ * `devtrees up` writes — so we don't need a process-compose round-trip to list
+ * processes. One driver `streamLogs` call per service; their outputs are
+ * merged into a single async iterable.
+ */
+export async function runLogs(
+  deps: CommandDeps = {},
+  options: LogsOptions = {},
+): Promise<LogsResult> {
+  const { anchor } = resolve(deps);
+  const paths = options.shared
+    ? sharedInstancePaths(anchor.anchor)
+    : instancePaths(anchor.anchor, anchor.worktreeId);
+
+  if (!existsSync(paths.socketPath)) {
+    if (options.shared) {
+      throw new Error(
+        "no shared instance is running. Bring it up implicitly via `devtrees up` " +
+          "(when the stack declares shared services) before tailing its logs.",
+      );
+    }
+    throw new Error(
+      `no worktree instance is running for '${anchor.worktreeId}'. ` +
+        "Run `devtrees up` to bring it up first.",
+    );
+  }
+
+  const services = options.all
+    ? readDerivedServices(paths.configPath)
+    : options.service !== undefined
+      ? [options.service]
+      : [];
+  if (services.length === 0) {
+    throw new Error("devtrees logs: specify a service (e.g. `devtrees logs web`) or pass `--all`.");
+  }
+
+  const driver = createDriver(deps.driver);
+  const streams = services.map((service) => {
+    const driverOpts: StreamLogsOptions = {
+      service,
+      follow: options.follow,
+      tail: options.tail,
+    };
+    return driver.streamLogs(paths.socketPath, driverOpts);
+  });
+
+  return { services, events: mergeAsyncIterables(streams) };
+}
+
+/**
+ * Read the derived process-compose config from disk and return its service
+ * names in source order. Used by `--all` to know which services to spawn a
+ * `process logs` subprocess for. The config is the same file `devtrees up`
+ * writes, so the list is authoritative for the running instance.
+ */
+function readDerivedServices(configPath: string): string[] {
+  try {
+    const raw = readFileSync(configPath, "utf8");
+    const parsed = parseYaml(raw) as { processes?: Record<string, unknown> } | null;
+    if (parsed === null || typeof parsed !== "object") return [];
+    return Object.keys(parsed.processes ?? {});
+  } catch {
+    // Treat any read/parse failure as "no services known"; the caller errors
+    // with a usage hint via the empty-services check above.
+    return [];
+  }
+}
+
+/**
+ * Merge N async iterables into one. Races each iterator's `next()` and yields
+ * whichever event arrives first; finishes when every iterator is done. On
+ * consumer break/throw, the `return()` calls cascade to each underlying
+ * iterator so the spawned children are killed (the driver's `finally` block).
+ */
+async function* mergeAsyncIterables<T>(
+  iterables: ReadonlyArray<AsyncIterable<T>>,
+): AsyncIterable<T> {
+  if (iterables.length === 0) return;
+  if (iterables.length === 1) {
+    const only = iterables[0];
+    if (only === undefined) return;
+    yield* only;
+    return;
+  }
+  type Live = {
+    it: AsyncIterator<T>;
+    pending: Promise<{ live: Live; result: IteratorResult<T> }>;
+  };
+  const lives: Live[] = [];
+  for (const iterable of iterables) {
+    const it = iterable[Symbol.asyncIterator]();
+    const slot: Live = { it, pending: Promise.resolve() as unknown as Live["pending"] };
+    slot.pending = it.next().then((result) => ({ live: slot, result }));
+    lives.push(slot);
+  }
+
+  try {
+    while (lives.length > 0) {
+      const { live, result } = await Promise.race(lives.map((l) => l.pending));
+      if (result.done) {
+        const idx = lives.indexOf(live);
+        if (idx >= 0) lives.splice(idx, 1);
+        continue;
+      }
+      yield result.value;
+      live.pending = live.it.next().then((r) => ({ live, result: r }));
+    }
+  } finally {
+    await Promise.allSettled(lives.map((l) => Promise.resolve(l.it.return?.(undefined))));
+  }
 }
 
 // --- default I/O implementations -------------------------------------------
