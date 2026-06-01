@@ -119,6 +119,7 @@ describe("output formatter — formatLs", () => {
       kind: "shared",
       status: "running",
       ports: { CACHE: 40001 },
+      services: [],
       block_base: 40001,
     });
     expect(parsed.instances[1]).toEqual({
@@ -126,6 +127,7 @@ describe("output formatter — formatLs", () => {
       kind: "worktree",
       status: "stale",
       ports: { API: 40097 },
+      services: [],
       block_base: 40097,
     });
   });
@@ -160,6 +162,96 @@ describe("output formatter — formatLs", () => {
     expect(result.stdout.endsWith("\n")).toBe(true);
     // exactly one trailing newline
     expect(result.stdout.endsWith("\n\n")).toBe(false);
+  });
+
+  /**
+   * services[] nesting (issue #29) — `ls --json` carries per-service rows
+   * (name/status/health/ports) so an agent can ask "is `worker` healthy in
+   * my worktree instance?" with one call. The human path stays unchanged.
+   */
+  describe("formatLs — services[] nesting (issue #29)", () => {
+    const rowsWithServices: ReadonlyArray<LsInstanceRow> = [
+      {
+        id: "login",
+        kind: "worktree",
+        status: "running",
+        ports: { WEB_PORT: 20000, WORKER_PORT: 20001 },
+        blockBase: 20000,
+        services: [
+          {
+            name: "web",
+            status: "Running",
+            health: "ready",
+            ports: { WEB_PORT: 20000 },
+          },
+          {
+            name: "worker",
+            status: "Running",
+            health: "not_ready",
+            ports: { WORKER_PORT: 20001 },
+          },
+        ],
+      },
+    ];
+
+    it("emits one services[] row per service with name, status, health and ports", () => {
+      const result = formatLs(rowsWithServices, "json");
+      const parsed = JSON.parse(result.stdout) as {
+        instances: ReadonlyArray<{
+          id: string;
+          services: ReadonlyArray<{
+            name: string;
+            status: string;
+            health: string;
+            ports: Record<string, number>;
+          }>;
+        }>;
+      };
+      expect(parsed.instances[0]?.services).toEqual([
+        { name: "web", status: "Running", health: "ready", ports: { WEB_PORT: 20000 } },
+        { name: "worker", status: "Running", health: "not_ready", ports: { WORKER_PORT: 20001 } },
+      ]);
+    });
+
+    it("emits services:[] when an instance has no service rows (stale / no driver call)", () => {
+      const result = formatLs(
+        [
+          {
+            id: "stale-one",
+            kind: "worktree",
+            status: "stale",
+            ports: {},
+            blockBase: 20000,
+            services: [],
+          },
+        ],
+        "json",
+      );
+      const parsed = JSON.parse(result.stdout) as {
+        instances: ReadonlyArray<{ services: unknown[] }>;
+      };
+      expect(parsed.instances[0]?.services).toEqual([]);
+    });
+
+    it("defaults services to [] when the row doesn't carry one (back-compat: optional in the row type)", () => {
+      // Older callers (and the human path) hand the formatter rows without
+      // services. JSON output must still include the field — the schema
+      // promise is `services[] on every instance entry`.
+      const result = formatLs(rows, "json");
+      const parsed = JSON.parse(result.stdout) as {
+        instances: ReadonlyArray<{ services?: unknown }>;
+      };
+      for (const inst of parsed.instances) expect(inst.services).toEqual([]);
+    });
+
+    it("human-mode ls is byte-for-byte unchanged when services are present", () => {
+      const withServices = formatLs(rowsWithServices, "human").stdout;
+      const withoutServices = formatLs(
+        rowsWithServices.map(({ services: _unused, ...rest }) => rest),
+        "human",
+      ).stdout;
+      expect(withServices).toBe(withoutServices);
+    });
   });
 });
 

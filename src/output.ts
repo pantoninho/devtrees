@@ -52,9 +52,23 @@ export interface OutputResult {
 }
 
 /**
+ * One service inside an `ls` row (issue #29). Mirrors `instances.Service`
+ * structurally — kept duplicated so the formatter doesn't depend on the
+ * discovery module (the same loose-coupling rule the row type follows).
+ */
+export interface LsServiceRow {
+  readonly name: string;
+  readonly status: string;
+  readonly health: "ready" | "not_ready" | "unknown";
+  readonly ports: Readonly<Record<string, number>>;
+}
+
+/**
  * One row in the `ls` table. Kept loose so it doesn't pin the formatter to
  * `InstanceInfo` — `cli.ts` adapts both the test-injected stub shape and the
- * real discovery output into this row before calling `formatLs`.
+ * real discovery output into this row before calling `formatLs`. `services`
+ * is optional so callers that don't populate it (the human path, older
+ * tests) keep working; JSON output defaults missing values to `[]`.
  */
 export interface LsInstanceRow {
   readonly id: string;
@@ -62,6 +76,7 @@ export interface LsInstanceRow {
   readonly status: "running" | "stale";
   readonly ports: Readonly<Record<string, number>>;
   readonly blockBase?: number;
+  readonly services?: ReadonlyArray<LsServiceRow>;
 }
 
 // --- ls ---------------------------------------------------------------------
@@ -94,12 +109,24 @@ function formatLsHuman(instances: ReadonlyArray<LsInstanceRow>): string {
   return `${[header, ...rows].join("\n")}\n`;
 }
 
+interface LsServiceJson {
+  readonly name: string;
+  readonly status: string;
+  readonly health: "ready" | "not_ready" | "unknown";
+  readonly ports: Readonly<Record<string, number>>;
+}
+
 interface LsInstanceJson {
   readonly id: string;
   readonly kind: "worktree" | "shared";
   readonly status: "running" | "stale";
   readonly ports: Readonly<Record<string, number>>;
+  readonly services: ReadonlyArray<LsServiceJson>;
   readonly block_base?: number;
+}
+
+function lsServiceJson(svc: LsServiceRow): LsServiceJson {
+  return { name: svc.name, status: svc.status, health: svc.health, ports: svc.ports };
 }
 
 function lsInstanceJson(row: LsInstanceRow): LsInstanceJson {
@@ -108,6 +135,7 @@ function lsInstanceJson(row: LsInstanceRow): LsInstanceJson {
     kind: row.kind,
     status: row.status,
     ports: row.ports,
+    services: (row.services ?? []).map(lsServiceJson),
   };
   return row.blockBase === undefined ? base : { ...base, block_base: row.blockBase };
 }
