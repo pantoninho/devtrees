@@ -803,6 +803,101 @@ describe("runUp — wait-for-healthy (worktree instance, #28)", () => {
     expect(attachCalled).toBe(false);
   });
 
+  it("auto-detect: attaches when isTTY()===true and deps.attach is unset", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const baseDeps = stubDeps({ stack: twoIsolated, track });
+    const inner = baseDeps.driver?.spawner;
+    if (inner === undefined) throw new Error("expected stub spawner");
+
+    let attached = false;
+    const deps: CommandDeps = {
+      ...baseDeps,
+      attach: undefined,
+      isTTY: () => true,
+      driver: {
+        ...baseDeps.driver,
+        spawner: (binary, args, options) => {
+          if (args[0] === "attach") attached = true;
+          return inner(binary, args, options);
+        },
+      },
+    };
+    await runUp(deps);
+    expect(attached).toBe(true);
+  });
+
+  it("auto-detect: skips attach when isTTY()===false (non-interactive caller)", async () => {
+    // The whole point of #28: an agent / CI step calling `devtrees up` must
+    // not be hijacked into a TUI. With no explicit override and a non-TTY
+    // environment, the TUI stays off and `up` returns after the health-wait.
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const baseDeps = stubDeps({ stack: twoIsolated, track });
+    const inner = baseDeps.driver?.spawner;
+    if (inner === undefined) throw new Error("expected stub spawner");
+
+    let attached = false;
+    const deps: CommandDeps = {
+      ...baseDeps,
+      attach: undefined,
+      isTTY: () => false,
+      driver: {
+        ...baseDeps.driver,
+        spawner: (binary, args, options) => {
+          if (args[0] === "attach") attached = true;
+          return inner(binary, args, options);
+        },
+      },
+    };
+    await runUp(deps);
+    expect(attached).toBe(false);
+  });
+
+  it("explicit deps.attach=true overrides isTTY()===false", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const baseDeps = stubDeps({ stack: twoIsolated, track });
+    const inner = baseDeps.driver?.spawner;
+    if (inner === undefined) throw new Error("expected stub spawner");
+
+    let attached = false;
+    const deps: CommandDeps = {
+      ...baseDeps,
+      attach: true,
+      isTTY: () => false,
+      driver: {
+        ...baseDeps.driver,
+        spawner: (binary, args, options) => {
+          if (args[0] === "attach") attached = true;
+          return inner(binary, args, options);
+        },
+      },
+    };
+    await runUp(deps);
+    expect(attached).toBe(true);
+  });
+
+  it("explicit deps.attach=false overrides isTTY()===true", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const baseDeps = stubDeps({ stack: twoIsolated, track });
+    const inner = baseDeps.driver?.spawner;
+    if (inner === undefined) throw new Error("expected stub spawner");
+
+    let attached = false;
+    const deps: CommandDeps = {
+      ...baseDeps,
+      attach: false,
+      isTTY: () => true,
+      driver: {
+        ...baseDeps.driver,
+        spawner: (binary, args, options) => {
+          if (args[0] === "attach") attached = true;
+          return inner(binary, args, options);
+        },
+      },
+    };
+    await runUp(deps);
+    expect(attached).toBe(false);
+  });
+
   it("attaches after a successful wait when deps.attach is true", async () => {
     const track: StubSpawn = { invocations: [], touchSocket: false };
     const baseDeps = stubDeps({ stack: twoIsolated, track });

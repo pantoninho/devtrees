@@ -64,11 +64,17 @@ function stubDriverDeps(worktree: string): {
   cwd: string;
   driver: { binary: string; prefixArgs: string[] };
   attach: false;
+  waitForHealth: () => Promise<void>;
 } {
   return {
     cwd: worktree,
     driver: { binary: process.execPath, prefixArgs: [STUB] },
     attach: false,
+    // The stub doesn't implement `process-compose process list`, so the real
+    // poll loop would hang. The wait-for-healthy contract itself is unit-
+    // tested in commands.test.ts (#28); e2e here only proves the up/down
+    // wiring against the stub binary.
+    waitForHealth: () => Promise.resolve(),
   };
 }
 

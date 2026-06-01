@@ -116,8 +116,18 @@ export interface CommandDeps {
    */
   readonly allocator?: AllocatorOptions;
   readonly driver?: DriverDeps;
-  /** Attach the TUI after a successful up. Default: only when stdout is a TTY. */
+  /**
+   * Attach the TUI after a successful up. Default: only when both stdout and
+   * stderr are TTYs (ADR-0005 — agent invocations shouldn't be hijacked by
+   * the TUI). Setting this explicitly overrides the auto-detect.
+   */
   readonly attach?: boolean;
+  /**
+   * Inject the TTY check so unit tests can prove the auto-detect logic
+   * without touching `process.stdout.isTTY`. Default: returns true only when
+   * both stdout and stderr are TTYs. Ignored when `attach` is set explicitly.
+   */
+  readonly isTTY?: () => boolean;
   /** Sink for non-fatal warnings (e.g. unmanaged port detection). Default: stderr. */
   readonly warn?: (message: string) => void;
 }
@@ -381,7 +391,8 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     timeoutMs: deps.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS,
   });
 
-  const shouldAttach = deps.attach ?? Boolean(process.stdout.isTTY && process.stderr.isTTY);
+  const isTTY = deps.isTTY ?? defaultIsTTY;
+  const shouldAttach = deps.attach ?? isTTY();
   if (shouldAttach) await driver.attach(inst);
 
   return {
@@ -805,6 +816,16 @@ function defaultIsPortFree(port: number): boolean {
 
 function defaultWarn(message: string): void {
   process.stderr.write(`${message}\n`);
+}
+
+/**
+ * Both stdout AND stderr must be TTYs for the auto-detect to mean "a human at
+ * a terminal is watching". If either is redirected (a pipe, a CI log capture,
+ * an agent's pty wrapper that only inherits stdout), we skip the TUI so the
+ * caller gets the headless behaviour they implicitly asked for (ADR-0005).
+ */
+function defaultIsTTY(): boolean {
+  return Boolean(process.stdout.isTTY && process.stderr.isTTY);
 }
 
 /**

@@ -64,9 +64,14 @@ function helpText(): string {
     commands,
     "",
     "Options:",
-    "  -h, --help     Print this help text",
-    "  -v, --version  Print the version",
-    "      --json     Emit machine-readable output (see ADR-0005)",
+    "  -h, --help              Print this help text",
+    "  -v, --version           Print the version",
+    "      --json              Emit machine-readable output (see ADR-0005)",
+    "",
+    "`up` options:",
+    "      --attach            Force-attach the TUI (default: only when stdout & stderr are TTYs)",
+    "      --no-attach         Skip the TUI even when running interactively",
+    "      --wait-timeout=N    Seconds to wait for services to become healthy (default: 120)",
     "",
   ].join("\n");
 }
@@ -102,9 +107,21 @@ export function run(argv: ReadonlyArray<string>): RunResult {
   };
 }
 
+/**
+ * Options the `up` handler threads from CLI flags into the underlying `runUp`.
+ * Optional everywhere: when omitted, runUp's own defaults apply (TTY detection
+ * for `attach`, 120s for `waitTimeoutMs`).
+ */
+export interface UpOptions {
+  /** Force-attach (`--attach`) or force-skip (`--no-attach`). */
+  readonly attach?: boolean;
+  /** Health-wait window in ms (`--wait-timeout=<seconds>`). */
+  readonly waitTimeoutMs?: number;
+}
+
 /** The effectful commands, injected so `execute` stays unit-testable. */
 export interface ExecuteDeps {
-  up: () => Promise<{
+  up: (options?: UpOptions) => Promise<{
     worktreeId: string;
     socketPath: string;
     env: Record<string, string>;
@@ -171,12 +188,41 @@ type Handler = (
   mode: FormatMode,
 ) => Promise<RunResult | undefined>;
 
+/**
+ * Parse `--attach` / `--no-attach` / `--wait-timeout` out of `up`'s argv.
+ * Mutually-exclusive `--attach`/`--no-attach` aren't policed — the last one
+ * wins, matching common Unix flag-parser behaviour. `--wait-timeout` accepts
+ * both `--wait-timeout=30` and `--wait-timeout 30` forms; the value must
+ * parse as a positive number of seconds.
+ *
+ * Throws on a malformed `--wait-timeout` so the user sees a clear error
+ * rather than a silently-defaulted timeout that hides the typo.
+ */
+function parseUpOptions(rest: ReadonlyArray<string>): UpOptions {
+  const out: { attach?: boolean; waitTimeoutMs?: number } = {};
+  for (let i = 0; i < rest.length; i++) {
+    const arg = rest[i];
+    if (arg === "--attach") out.attach = true;
+    else if (arg === "--no-attach") out.attach = false;
+    else if (arg === "--wait-timeout" || arg?.startsWith("--wait-timeout=")) {
+      const raw = arg === "--wait-timeout" ? rest[++i] : arg.slice("--wait-timeout=".length);
+      const seconds = Number(raw);
+      if (!Number.isFinite(seconds) || seconds <= 0) {
+        throw new Error(`--wait-timeout expects a positive number of seconds, got '${raw ?? ""}'.`);
+      }
+      out.waitTimeoutMs = Math.round(seconds * 1000);
+    }
+  }
+  return out;
+}
+
 async function handleUp(
-  _rest: ReadonlyArray<string>,
+  rest: ReadonlyArray<string>,
   deps: ExecuteDeps,
   mode: FormatMode,
 ): Promise<RunResult> {
-  const result = await deps.up();
+  const options = parseUpOptions(rest);
+  const result = await deps.up(options);
   const out = formatUp(
     {
       worktreeId: result.worktreeId,
@@ -305,7 +351,11 @@ export function isEntrypoint(metaUrl: string, argv1: string | undefined): boolea
 if (isEntrypoint(import.meta.url, process.argv[1])) {
   const { runUp, runDown, runGenerate, runLs, runAttach, runPrune } = await import("./commands.js");
   const result = await execute(process.argv.slice(2), {
-    up: () => runUp(),
+    up: (options) =>
+      runUp({
+        ...(options?.attach !== undefined ? { attach: options.attach } : {}),
+        ...(options?.waitTimeoutMs !== undefined ? { waitTimeoutMs: options.waitTimeoutMs } : {}),
+      }),
     down: ({ shared }) => runDown({}, { shared }),
     generate: () => runGenerate(),
     ls: () => runLs(),

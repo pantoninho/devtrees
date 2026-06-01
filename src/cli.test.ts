@@ -393,6 +393,79 @@ describe("devtrees CLI — --json (agent-facing surface)", () => {
   });
 });
 
+/**
+ * Issue #28: `devtrees up` must be usable from a non-TTY caller. The CLI
+ * surface adds `--attach`/`--no-attach` to override the implicit TTY-based
+ * decision, and `--wait-timeout` to bound the health-wait window. The
+ * `HEALTH_TIMEOUT` error code joins the documented `--json` envelope.
+ */
+describe("devtrees CLI — up non-interactive (#28)", () => {
+  const baseUpResult = {
+    worktreeId: "login",
+    socketPath: "/x.sock",
+    env: { WEB_PORT: "20512" },
+  };
+
+  it("passes attach=true to `up` when --attach is given (force-attach)", async () => {
+    const up = vi.fn().mockResolvedValue(baseUpResult);
+    await execute(["up", "--attach"], { up, down: vi.fn() });
+    expect(up).toHaveBeenCalledWith(expect.objectContaining({ attach: true }));
+  });
+
+  it("passes attach=false to `up` when --no-attach is given (force-skip)", async () => {
+    const up = vi.fn().mockResolvedValue(baseUpResult);
+    await execute(["up", "--no-attach"], { up, down: vi.fn() });
+    expect(up).toHaveBeenCalledWith(expect.objectContaining({ attach: false }));
+  });
+
+  it("omits attach from `up` options when neither flag is given (TTY default applies)", async () => {
+    const up = vi.fn().mockResolvedValue(baseUpResult);
+    await execute(["up"], { up, down: vi.fn() });
+    const call = up.mock.calls[0]?.[0] ?? {};
+    expect(call.attach).toBeUndefined();
+  });
+
+  it("parses --wait-timeout=<seconds> into milliseconds for `up`", async () => {
+    const up = vi.fn().mockResolvedValue(baseUpResult);
+    await execute(["up", "--wait-timeout=30"], { up, down: vi.fn() });
+    expect(up).toHaveBeenCalledWith(expect.objectContaining({ waitTimeoutMs: 30_000 }));
+  });
+
+  it("parses --wait-timeout <seconds> (space-separated) for `up`", async () => {
+    const up = vi.fn().mockResolvedValue(baseUpResult);
+    await execute(["up", "--wait-timeout", "45"], { up, down: vi.fn() });
+    expect(up).toHaveBeenCalledWith(expect.objectContaining({ waitTimeoutMs: 45_000 }));
+  });
+
+  it("rejects --wait-timeout values that aren't a positive number", async () => {
+    const up = vi.fn().mockResolvedValue(baseUpResult);
+    const result = await execute(["up", "--wait-timeout=zero"], { up, down: vi.fn() });
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toMatch(/--wait-timeout/);
+    expect(up).not.toHaveBeenCalled();
+  });
+
+  it("`up --json` HEALTH_TIMEOUT failure → error envelope with code:HEALTH_TIMEOUT", async () => {
+    const err = Object.assign(new Error("timed out waiting for services to be healthy [web]"), {
+      code: "HEALTH_TIMEOUT" as const,
+    });
+    const up = vi.fn().mockRejectedValue(err);
+    const result = await execute(["up", "--json"], { up, down: vi.fn() });
+    expect(result.code).not.toBe(0);
+    const parsed = JSON.parse(result.stdout) as { error: { code: string; message: string } };
+    expect(parsed.error.code).toBe("HEALTH_TIMEOUT");
+    expect(parsed.error.message).toMatch(/timed out/);
+    expect(result.stderr).toMatch(/timed out/);
+  });
+
+  it("help text mentions --attach, --no-attach, and --wait-timeout", () => {
+    const help = run(["--help"]).stdout;
+    expect(help).toMatch(/--attach/);
+    expect(help).toMatch(/--no-attach/);
+    expect(help).toMatch(/--wait-timeout/);
+  });
+});
+
 describe("devtrees CLI — isEntrypoint", () => {
   // The published binary is invoked through a symlink (npm-link bin, pnpm
   // shim, Homebrew bin). `process.argv[1]` is the symlink path; `import.meta.url`

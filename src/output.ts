@@ -248,12 +248,17 @@ export function formatError(err: ErrorPayload, mode: FormatMode): OutputResult {
 
 /**
  * Classify an unknown error caught at the CLI entrypoint into the documented
- * code enum. Pattern-based on the error message because the underlying error
- * sites (driver, commands) raise plain `Error`s today; later slices may attach
- * a `.code` field directly, which would short-circuit this.
+ * code enum. An error that carries a `.code` field matching one of the known
+ * codes short-circuits the message-based heuristics — that's how typed errors
+ * (e.g. `HealthTimeoutError`) surface their code without depending on the
+ * exact wording of their message.
  */
 export function classifyError(err: Error): ErrorPayload {
   const message = err.message;
+  const tagged = (err as { code?: unknown }).code;
+  if (typeof tagged === "string" && (ERROR_CODES as ReadonlyArray<string>).includes(tagged)) {
+    return { code: tagged as ErrorCode, message };
+  }
   if (/process-compose.*not found|not found.*process-compose/i.test(message)) {
     return { code: "PROCESS_COMPOSE_NOT_FOUND", message };
   }
