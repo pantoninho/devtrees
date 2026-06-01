@@ -378,22 +378,9 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
 
   await driver.up(inst);
 
-  // Wait for the worktree instance's services to be healthy before returning
-  // success. On timeout we surface `HEALTH_TIMEOUT` and leave the stack
-  // running so the agent can inspect it (ADR-0005). The TUI is not attached
-  // on timeout — attaching a TUI to a half-failed stack is hostile to a
-  // non-interactive caller (a coding agent, a CI step).
-  const wait = deps.waitForHealth ?? defaultWaitForHealth;
-  const serviceNames = stack.services.filter((s) => s.tier === "isolated").map((s) => s.name);
-  await wait({
-    socketPath: paths.socketPath,
-    serviceNames,
-    timeoutMs: deps.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS,
-  });
+  await waitForWorktreeHealth(stack, paths.socketPath, deps);
 
-  const isTTY = deps.isTTY ?? defaultIsTTY;
-  const shouldAttach = deps.attach ?? isTTY();
-  if (shouldAttach) await driver.attach(inst);
+  if (shouldAttachAfterUp(deps)) await driver.attach(inst);
 
   return {
     worktreeId: anchor.worktreeId,
@@ -826,6 +813,30 @@ function defaultWarn(message: string): void {
  */
 function defaultIsTTY(): boolean {
   return Boolean(process.stdout.isTTY && process.stderr.isTTY);
+}
+
+/**
+ * Worktree-instance health gate: poll until every isolated service reports a
+ * healthy state, or throw `HealthTimeoutError` (code: HEALTH_TIMEOUT) so the
+ * caller exits non-zero. The stack is left running on failure — the explicit
+ * ADR-0005 choice so the agent can inspect logs after the timeout.
+ */
+async function waitForWorktreeHealth(
+  stack: ResolvedStack,
+  socketPath: string,
+  deps: CommandDeps,
+): Promise<void> {
+  const wait = deps.waitForHealth ?? defaultWaitForHealth;
+  await wait({
+    socketPath,
+    serviceNames: stack.services.filter((s) => s.tier === "isolated").map((s) => s.name),
+    timeoutMs: deps.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS,
+  });
+}
+
+/** Explicit `attach`/`no-attach` override wins; otherwise consult `isTTY()`. */
+function shouldAttachAfterUp(deps: CommandDeps): boolean {
+  return deps.attach ?? (deps.isTTY ?? defaultIsTTY)();
 }
 
 /**

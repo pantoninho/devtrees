@@ -198,20 +198,24 @@ type Handler = (
  * Throws on a malformed `--wait-timeout` so the user sees a clear error
  * rather than a silently-defaulted timeout that hides the typo.
  */
+/** Coerce a `--wait-timeout` argument value into ms, or throw a clear error. */
+function parseWaitTimeoutSecondsToMs(raw: string | undefined): number {
+  const seconds = Number(raw);
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    throw new Error(`--wait-timeout expects a positive number of seconds, got '${raw ?? ""}'.`);
+  }
+  return Math.round(seconds * 1000);
+}
+
 function parseUpOptions(rest: ReadonlyArray<string>): UpOptions {
   const out: { attach?: boolean; waitTimeoutMs?: number } = {};
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i];
     if (arg === "--attach") out.attach = true;
     else if (arg === "--no-attach") out.attach = false;
-    else if (arg === "--wait-timeout" || arg?.startsWith("--wait-timeout=")) {
-      const raw = arg === "--wait-timeout" ? rest[++i] : arg.slice("--wait-timeout=".length);
-      const seconds = Number(raw);
-      if (!Number.isFinite(seconds) || seconds <= 0) {
-        throw new Error(`--wait-timeout expects a positive number of seconds, got '${raw ?? ""}'.`);
-      }
-      out.waitTimeoutMs = Math.round(seconds * 1000);
-    }
+    else if (arg === "--wait-timeout") out.waitTimeoutMs = parseWaitTimeoutSecondsToMs(rest[++i]);
+    else if (arg?.startsWith("--wait-timeout="))
+      out.waitTimeoutMs = parseWaitTimeoutSecondsToMs(arg.slice("--wait-timeout=".length));
   }
   return out;
 }
