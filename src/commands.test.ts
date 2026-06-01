@@ -18,6 +18,7 @@ import {
   findUnmanagedPortBinds,
   runAttach,
   runDown,
+  runEnv,
   runGenerate,
   runUp,
   type CommandDeps,
@@ -174,6 +175,7 @@ function stubDeps(opts: {
       snapshotRef.snapshot = after;
       return after;
     },
+    readRegistry: () => snapshotRef.snapshot,
     withSharedLock: passThroughSharedLock,
     isPortFree: opts.isPortFree ?? (() => true),
     warn: opts.warn,
@@ -1309,5 +1311,114 @@ describe("runPrune — reconcile instances against git worktree list", () => {
     expect(existsSync(b)).toBe(false);
     expect("alpha" in registryRef.snapshot).toBe(false);
     expect("beta" in registryRef.snapshot).toBe(false);
+  });
+});
+
+/**
+ * `runEnv` — pure read of the injected-value map (#32).
+ *
+ * Contract: returns the same map the config deriver would inject into the
+ * worktree instance — this worktree's named ports + the shared services'
+ * named ports + the worktree id — without spawning process-compose, without
+ * acquiring the allocation-registry lock, and without persisting anything.
+ * Calling `env` when the worktree instance is not running is valid.
+ */
+describe("runEnv — pure read of injected env", () => {
+  it("returns the same env map the deriver would inject for this worktree", async () => {
+    const stack: ResolvedStack = {
+      services: [
+        isolated("web", "node server.js", ["WEB_PORT", "METRICS_PORT"]),
+        shared("postgres", "postgres -D ./pgdata", ["DB_PORT"]),
+      ],
+    };
+    // Seed the registry so the answer is deterministic without an up.
+    const initialRegistry: RegistrySnapshot = { login: 20000, [SHARED_REGISTRY_KEY]: 30000 };
+    const result = await runEnv(stubDeps({ stack, initialRegistry }));
+
+    expect(result.env.DEVTREES_WORKTREE_ID).toBe("login");
+    expect(result.env.WEB_PORT).toBe("20000");
+    expect(result.env.METRICS_PORT).toBe("20001");
+    expect(result.env.DB_PORT).toBe("30000");
+  });
+
+  it("matches deriveWorktreeConfig's env byte-for-byte for the same allocation", async () => {
+    const stack: ResolvedStack = {
+      services: [
+        isolated("web", "node server.js", ["WEB_PORT"]),
+        shared("postgres", "postgres", ["DB_PORT"]),
+      ],
+    };
+    const initialRegistry: RegistrySnapshot = { login: 20096, [SHARED_REGISTRY_KEY]: 30016 };
+    const result = await runEnv(stubDeps({ stack, initialRegistry }));
+
+    // The deriver's env is the source of truth; runEnv must reproduce it exactly.
+    const expected = deriveWorktreeConfig(stack, {
+      worktreeId: "login",
+      worktreeRoot: "ignored",
+      portFor: (name) => (name === "WEB_PORT" ? 20096 : undefined),
+      sharedPortFor: (name) => (name === "DB_PORT" ? 30016 : undefined),
+    });
+    expect(result.env).toEqual(expected.env);
+  });
+
+  it("does not spawn process-compose (pure read; no driver interaction)", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const stack: ResolvedStack = {
+      services: [
+        isolated("web", "node x.js", ["WEB_PORT"]),
+        shared("postgres", "postgres", ["DB_PORT"]),
+      ],
+    };
+    await runEnv(stubDeps({ stack, track }));
+    expect(track.invocations).toEqual([]);
+  });
+
+  it("does not acquire the allocation-registry lock and does not persist anything", async () => {
+    const stack: ResolvedStack = {
+      services: [isolated("web", "node x.js", ["WEB_PORT"])],
+    };
+    const registryRef = { snapshot: { login: 20064 } as RegistrySnapshot };
+    let lockCalls = 0;
+    const deps: CommandDeps = {
+      ...stubDeps({ stack, registryRef }),
+      // Sentinel lock that records and rejects any acquire — runEnv must not call it.
+      withRegistryLock: () => {
+        lockCalls++;
+        throw new Error("runEnv must not take the allocation-registry lock");
+      },
+    };
+    const before = { ...registryRef.snapshot };
+    const result = await runEnv(deps);
+    expect(lockCalls).toBe(0);
+    // Persistence is unchanged — the snapshot ref is identical.
+    expect(registryRef.snapshot).toEqual(before);
+    expect(result.env.WEB_PORT).toBe("20064");
+  });
+
+  it("works when the worktree instance is not running (no control socket on disk)", async () => {
+    // A fresh anchor with no run/ dir means no instance has ever come up.
+    // runEnv must still produce the would-be injected values.
+    const stack: ResolvedStack = {
+      services: [isolated("web", "node x.js", ["WEB_PORT"])],
+    };
+    // Empty registry — runEnv computes the would-be block without writing.
+    const result = await runEnv(stubDeps({ stack, initialRegistry: {} }));
+    // The would-be allocation is deterministic; we don't pin the exact number
+    // but it must be in the default block range and consistent across calls.
+    expect(Number(result.env.WEB_PORT)).toBeGreaterThanOrEqual(20000);
+    expect(result.env.DEVTREES_WORKTREE_ID).toBe("login");
+
+    const again = await runEnv(stubDeps({ stack, initialRegistry: {} }));
+    expect(again.env.WEB_PORT).toBe(result.env.WEB_PORT);
+  });
+
+  it("omits shared ports when the stack declares no shared services", async () => {
+    const stack: ResolvedStack = {
+      services: [isolated("web", "node x.js", ["WEB_PORT"])],
+    };
+    const result = await runEnv(stubDeps({ stack, initialRegistry: { login: 20000 } }));
+    expect(result.env.WEB_PORT).toBe("20000");
+    expect(result.env.DEVTREES_WORKTREE_ID).toBe("login");
+    expect(result.env).not.toHaveProperty("DB_PORT");
   });
 });
