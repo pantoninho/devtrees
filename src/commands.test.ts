@@ -178,6 +178,10 @@ function stubDeps(opts: {
     isPortFree: opts.isPortFree ?? (() => true),
     warn: opts.warn,
     attach: false,
+    // Tests that don't care about the worktree health-wait (#28) get a no-op
+    // stub — the default polls a real `process-compose` over the UDS, which
+    // would hang the unit test. Tests that *do* care override this field.
+    waitForHealth: () => Promise.resolve(),
     // Driver that records every spawn but doesn't actually run anything.
     driver: {
       exists: () => Promise.resolve(true),
@@ -650,6 +654,178 @@ describe("runUp — cross-tier wiring (ADR-0003)", () => {
     // No depends_on at all on `web` — `postgres` is the only declared dep and
     // it's cross-tier (dropped); the field is omitted entirely.
     expect("depends_on" in (config.processes.web ?? {})).toBe(false);
+  });
+});
+
+describe("runUp — wait-for-healthy (worktree instance, #28)", () => {
+  /** Two isolated services so the wait must reason about more than one process. */
+  const twoIsolated: ResolvedStack = {
+    services: [
+      isolated("web", "node web.js", ["WEB_PORT"]),
+      isolated("worker", "node worker.js", ["WORKER_PORT"]),
+    ],
+  };
+
+  it("waits for the worktree instance's services to be healthy after starting it", async () => {
+    // The wait must happen between `driver.up` of the worktree and any subsequent
+    // attach — that is the gate that turns "up returned" into "the stack is
+    // serving traffic" (PRD #26, ADR-0005).
+    const order: string[] = [];
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const baseDeps = stubDeps({ stack: twoIsolated, track });
+    const inner = baseDeps.driver?.spawner;
+    if (inner === undefined) throw new Error("expected stub spawner");
+
+    const deps: CommandDeps = {
+      ...baseDeps,
+      driver: {
+        ...baseDeps.driver,
+        spawner: (binary, args, options) => {
+          if (args[0] === "up") order.push("up:worktree");
+          if (args[0] === "attach") order.push("attach");
+          return inner(binary, args, options);
+        },
+      },
+      waitForHealth: async ({ serviceNames }) => {
+        order.push(`wait:${[...serviceNames].sort().join(",")}`);
+      },
+    };
+
+    await runUp(deps);
+    expect(order).toContain("wait:web,worker");
+    // The wait must run after the worktree up-spawn (otherwise it polls a
+    // socket that doesn't exist yet).
+    expect(order.indexOf("up:worktree")).toBeLessThan(order.indexOf("wait:web,worker"));
+  });
+
+  it("passes the worktree's own socket path to the wait — not the shared one", async () => {
+    const seen: string[] = [];
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const deps: CommandDeps = {
+      ...stubDeps({ stack: twoIsolated, track }),
+      waitForHealth: async ({ socketPath }) => {
+        seen.push(socketPath);
+      },
+    };
+    await runUp(deps);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatch(/login\.sock$/);
+  });
+
+  it("threads the timeout from deps to the wait", async () => {
+    let observed: number | undefined;
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const deps: CommandDeps = {
+      ...stubDeps({ stack: twoIsolated, track }),
+      waitTimeoutMs: 7777,
+      waitForHealth: async ({ timeoutMs }) => {
+        observed = timeoutMs;
+      },
+    };
+    await runUp(deps);
+    expect(observed).toBe(7777);
+  });
+
+  it("defaults the wait timeout to 120s when deps don't override it", async () => {
+    let observed: number | undefined;
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const deps: CommandDeps = {
+      ...stubDeps({ stack: twoIsolated, track }),
+      waitForHealth: async ({ timeoutMs }) => {
+        observed = timeoutMs;
+      },
+    };
+    await runUp(deps);
+    expect(observed).toBe(120_000);
+  });
+
+  it("on health timeout: throws HEALTH_TIMEOUT and does NOT attach the TUI", async () => {
+    // ADR-0005: timeout exits non-zero, leaves the stack running, agent can
+    // then call `devtrees logs <service>` to inspect. So the worktree's
+    // `process-compose down` must NOT be invoked from this path.
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const baseDeps = stubDeps({ stack: twoIsolated, track });
+    const inner = baseDeps.driver?.spawner;
+    if (inner === undefined) throw new Error("expected stub spawner");
+
+    const sawAttach = { called: false };
+    const sawDown = { called: false };
+    const deps: CommandDeps = {
+      ...baseDeps,
+      attach: true, // force attach so we can prove the timeout skipped it
+      waitForHealth: async () => {
+        const err = new Error(
+          "timed out waiting for services to be healthy [web, worker] after 120000ms",
+        ) as Error & { code: string };
+        err.code = "HEALTH_TIMEOUT";
+        throw err;
+      },
+      driver: {
+        ...baseDeps.driver,
+        spawner: (binary, args, options) => {
+          if (args[0] === "attach") sawAttach.called = true;
+          if (args[0] === "down") sawDown.called = true;
+          return inner(binary, args, options);
+        },
+      },
+    };
+
+    const err = await runUp(deps).then(
+      () => undefined,
+      (e: unknown) => e as Error & { code?: string },
+    );
+    if (err === undefined) throw new Error("expected runUp to reject");
+    expect(err.code).toBe("HEALTH_TIMEOUT");
+    expect(sawAttach.called).toBe(false);
+    expect(sawDown.called).toBe(false);
+  });
+
+  it("does not attach when deps.attach is false even if the wait succeeds", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const baseDeps = stubDeps({ stack: twoIsolated, track });
+    const inner = baseDeps.driver?.spawner;
+    if (inner === undefined) throw new Error("expected stub spawner");
+
+    let attachCalled = false;
+    const deps: CommandDeps = {
+      ...baseDeps,
+      attach: false,
+      waitForHealth: async () => {},
+      driver: {
+        ...baseDeps.driver,
+        spawner: (binary, args, options) => {
+          if (args[0] === "attach") attachCalled = true;
+          return inner(binary, args, options);
+        },
+      },
+    };
+    await runUp(deps);
+    expect(attachCalled).toBe(false);
+  });
+
+  it("attaches after a successful wait when deps.attach is true", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const baseDeps = stubDeps({ stack: twoIsolated, track });
+    const inner = baseDeps.driver?.spawner;
+    if (inner === undefined) throw new Error("expected stub spawner");
+
+    const order: string[] = [];
+    const deps: CommandDeps = {
+      ...baseDeps,
+      attach: true,
+      waitForHealth: async () => {
+        order.push("wait");
+      },
+      driver: {
+        ...baseDeps.driver,
+        spawner: (binary, args, options) => {
+          if (args[0] === "attach") order.push("attach");
+          return inner(binary, args, options);
+        },
+      },
+    };
+    await runUp(deps);
+    expect(order).toEqual(["wait", "attach"]);
   });
 });
 
