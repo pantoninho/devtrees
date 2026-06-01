@@ -1,5 +1,9 @@
-import { describe, expect, it, vi } from "vite-plus/test";
-import { execute, run } from "./cli.js";
+import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+import { execute, isEntrypoint, run } from "./cli.js";
 
 describe("devtrees CLI", () => {
   it("prints the version with --version", () => {
@@ -251,5 +255,61 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
     });
     expect(result.code).toBe(1);
     expect(result.stderr).toMatch(/no shared instance is running/);
+  });
+});
+
+describe("devtrees CLI — isEntrypoint", () => {
+  // The published binary is invoked through a symlink (npm-link bin, pnpm
+  // shim, Homebrew bin). `process.argv[1]` is the symlink path; `import.meta.url`
+  // is the resolved target. A raw `argv[1] === fileURLToPath(import.meta.url)`
+  // misses this case, leaving the CLI silently inert. Lock the symlink path in.
+  let dir: string;
+
+  function createDir(): string {
+    return mkdtempSync(join(tmpdir(), "devtrees-cli-entry-"));
+  }
+
+  afterEach(() => {
+    if (dir !== undefined) rmSync(dir, { recursive: true, force: true });
+  });
+
+  // `tmpdir()` on macOS is itself a symlink (`/var/folders → /private/var/folders`),
+  // so module URLs in this repo's tests use the realpathed path to match what
+  // `import.meta.url` would produce for a real module.
+  function moduleUrl(file: string): string {
+    return pathToFileURL(realpathSync(file)).href;
+  }
+
+  it("recognizes the module as entrypoint when argv[1] is the same file", () => {
+    dir = createDir();
+    const file = join(dir, "real.mjs");
+    writeFileSync(file, "");
+    expect(isEntrypoint(moduleUrl(file), file)).toBe(true);
+  });
+
+  it("recognizes the module as entrypoint when argv[1] is a symlink to it", () => {
+    dir = createDir();
+    const real = join(dir, "real.mjs");
+    const link = join(dir, "link.mjs");
+    writeFileSync(real, "");
+    symlinkSync(real, link);
+    expect(isEntrypoint(moduleUrl(real), link)).toBe(true);
+  });
+
+  it("returns false when argv[1] is undefined (imported, not invoked)", () => {
+    expect(isEntrypoint("file:///somewhere/cli.mjs", undefined)).toBe(false);
+  });
+
+  it("returns false when argv[1] points at a different file", () => {
+    dir = createDir();
+    const a = join(dir, "a.mjs");
+    const b = join(dir, "b.mjs");
+    writeFileSync(a, "");
+    writeFileSync(b, "");
+    expect(isEntrypoint(moduleUrl(a), b)).toBe(false);
+  });
+
+  it("returns false when argv[1] cannot be resolved", () => {
+    expect(isEntrypoint("file:///somewhere/cli.mjs", "/nonexistent/file")).toBe(false);
   });
 });

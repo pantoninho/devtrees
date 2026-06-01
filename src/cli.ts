@@ -8,6 +8,9 @@
  * unit-testable.
  */
 
+import { realpathSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
 export const VERSION = "0.0.1";
 
 /** The command surface devtrees will grow into (see PRD #1). Stubbed for now. */
@@ -292,8 +295,24 @@ export async function execute(argv: ReadonlyArray<string>, deps: ExecuteDeps): P
   return run(argv);
 }
 
-// Run only when invoked as the program, not when imported by a test.
-if (import.meta.url === `file://${process.argv[1]}`) {
+/**
+ * True when this module is the program's entrypoint, accounting for symlinks
+ * (npm-link bin, pnpm shim, Homebrew bin). `process.argv[1]` is the path as
+ * invoked — often a symlink — while `import.meta.url` is the resolved file
+ * URL, so raw string equality misses the published-binary case. We compare
+ * after `realpathSync` + `pathToFileURL` so both sides are normalized.
+ */
+export function isEntrypoint(metaUrl: string, argv1: string | undefined): boolean {
+  if (argv1 === undefined) return false;
+  try {
+    return metaUrl === pathToFileURL(realpathSync(argv1)).href;
+  } catch {
+    // argv1 didn't resolve (deleted file, permission issue) — can't be us.
+    return false;
+  }
+}
+
+if (isEntrypoint(import.meta.url, process.argv[1])) {
   const { runUp, runDown, runGenerate, runLs, runAttach, runPrune } = await import("./commands.js");
   const result = await execute(process.argv.slice(2), {
     up: () => runUp(),
