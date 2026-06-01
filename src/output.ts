@@ -217,6 +217,29 @@ export function formatGenerate(payload: GeneratePayload, mode: FormatMode): Outp
   return { stdout: lines.join("\n"), stderr: "" };
 }
 
+// --- env --------------------------------------------------------------------
+
+/**
+ * Render the injected-value map a worktree instance would receive.
+ *
+ *   - `human`: one `KEY=value` line per entry — suitable for
+ *     `eval $(devtrees env)`. Empty map renders as empty stdout.
+ *   - `json`: `{schema_version, env: { KEY: "value", ... }}`.
+ */
+export function formatEnv(
+  env: Readonly<Record<string, string>>,
+  mode: FormatMode,
+): OutputResult {
+  if (mode === "json") {
+    const doc = { schema_version: SCHEMA_VERSION, env };
+    return { stdout: `${JSON.stringify(doc)}\n`, stderr: "" };
+  }
+  const entries = Object.entries(env);
+  if (entries.length === 0) return { stdout: "", stderr: "" };
+  const lines = entries.map(([k, v]) => `${k}=${v}`);
+  return { stdout: `${lines.join("\n")}\n`, stderr: "" };
+}
+
 // --- error envelope ---------------------------------------------------------
 
 /**
