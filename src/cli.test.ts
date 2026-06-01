@@ -326,41 +326,55 @@ describe("devtrees CLI — --json (agent-facing surface)", () => {
     );
   });
 
-  it("an `up` failure with --json emits {error:{code:PROCESS_COMPOSE_NOT_FOUND,...}} on stdout, non-zero exit, and keeps today's diagnostic on stderr", async () => {
-    const up = vi.fn().mockRejectedValue(new Error("process-compose not found on PATH"));
-    const result = await execute(["up", "--json"], { up, down: vi.fn() });
-    expect(result.code).not.toBe(0);
-    // ADR-0005: structured envelope on stdout, human diagnostic still on stderr.
-    expect(result.stderr).toMatch(/process-compose/);
-    const parsed = JSON.parse(result.stdout) as { error: { code: string; message: string } };
-    expect(parsed.error.code).toBe("PROCESS_COMPOSE_NOT_FOUND");
-    expect(parsed.error.message).toMatch(/process-compose/);
-  });
-
-  it("an `attach` failure with --json classifies as INSTANCE_NOT_FOUND on stdout and keeps stderr human-readable", async () => {
-    const attach = vi
-      .fn()
-      .mockRejectedValue(new Error("no worktree instance is running for 'login'"));
-    const result = await execute(["attach", "--json"], { up: vi.fn(), down: vi.fn(), attach });
-    expect(result.code).not.toBe(0);
-    expect(result.stderr).toMatch(/no worktree instance is running/);
-    const parsed = JSON.parse(result.stdout) as { error: { code: string } };
-    expect(parsed.error.code).toBe("INSTANCE_NOT_FOUND");
-  });
+  /**
+   * One row per documented failure mode (ADR-0005's error-code enum). Each
+   * row pins both halves of the envelope shape: the stdout JSON document and
+   * the human diagnostic on stderr.
+   */
+  it.each([
+    {
+      cmd: "up",
+      depKey: "up" as const,
+      message: "process-compose not found on PATH",
+      expectedCode: "PROCESS_COMPOSE_NOT_FOUND",
+      stderrMatch: /process-compose/,
+    },
+    {
+      cmd: "attach",
+      depKey: "attach" as const,
+      message: "no worktree instance is running for 'login'",
+      expectedCode: "INSTANCE_NOT_FOUND",
+      stderrMatch: /no worktree instance is running/,
+    },
+    {
+      cmd: "prune",
+      depKey: "prune" as const,
+      message: "could not list worktrees",
+      expectedCode: "UNKNOWN",
+      stderrMatch: /could not list worktrees/,
+    },
+  ])(
+    "`$cmd --json` failure → {error:{code:$expectedCode}} on stdout, human diagnostic on stderr, non-zero exit",
+    async ({ cmd, depKey, message, expectedCode, stderrMatch }) => {
+      const failing = vi.fn().mockRejectedValue(new Error(message));
+      const deps = {
+        up: vi.fn(),
+        down: vi.fn(),
+        [depKey]: failing,
+      } as unknown as Parameters<typeof execute>[1];
+      const result = await execute([cmd, "--json"], deps);
+      expect(result.code).not.toBe(0);
+      expect(result.stderr).toMatch(stderrMatch);
+      const parsed = JSON.parse(result.stdout) as { error: { code: string; message: string } };
+      expect(parsed.error.code).toBe(expectedCode);
+      expect(parsed.error.message).toMatch(stderrMatch);
+    },
+  );
 
   it("`ls --json` success leaves stderr untouched (no diagnostics in success cases)", async () => {
     const ls = vi.fn().mockResolvedValue(lsRows);
     const result = await execute(["ls", "--json"], { up: vi.fn(), down: vi.fn(), ls });
     expect(result.stderr).toBe("");
-  });
-
-  it("an unknown error with --json falls back to code:UNKNOWN (not a crash)", async () => {
-    const prune = vi.fn().mockRejectedValue(new Error("could not list worktrees"));
-    const result = await execute(["prune", "--json"], { up: vi.fn(), down: vi.fn(), prune });
-    expect(result.code).not.toBe(0);
-    const parsed = JSON.parse(result.stdout) as { error: { code: string; message: string } };
-    expect(parsed.error.code).toBe("UNKNOWN");
-    expect(parsed.error.message).toMatch(/could not list worktrees/);
   });
 
   it("error without --json continues today's behaviour — message on stderr, stdout empty", async () => {

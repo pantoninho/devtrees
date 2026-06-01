@@ -75,31 +75,21 @@ describe("output formatter — formatError", () => {
 });
 
 describe("output formatter — formatLs", () => {
+  // Distinct fixture from cli.test.ts so the two tests pin behaviour
+  // independently — the formatter doesn't care which ids/ports the caller
+  // hands it.
   const rows: ReadonlyArray<LsInstanceRow> = [
-    {
-      id: "shared",
-      kind: "shared",
-      status: "running",
-      ports: { DB_PORT: 30000 },
-      blockBase: 30000,
-    },
-    {
-      id: "login",
-      kind: "worktree",
-      status: "running",
-      ports: { WEB_PORT: 20512 },
-      blockBase: 20512,
-    },
+    { id: "alpha", kind: "shared", status: "running", ports: { CACHE: 40001 }, blockBase: 40001 },
+    { id: "beta", kind: "worktree", status: "stale", ports: { API: 40097 }, blockBase: 40097 },
   ];
 
   it("in human mode, renders the existing table (id/kind/status/ports)", () => {
     const result = formatLs(rows, "human");
     expect(result.stderr).toBe("");
-    expect(result.stdout).toContain("shared");
-    expect(result.stdout).toContain("login");
-    expect(result.stdout).toContain("running");
-    expect(result.stdout).toContain("WEB_PORT=20512");
-    expect(result.stdout).toContain("DB_PORT=30000");
+    expect(result.stdout).toContain("alpha");
+    expect(result.stdout).toContain("beta");
+    expect(result.stdout).toContain("CACHE=40001");
+    expect(result.stdout).toContain("API=40097");
   });
 
   it("in human mode with no instances, prints the existing 'no instances' line", () => {
@@ -123,18 +113,18 @@ describe("output formatter — formatLs", () => {
     expect(parsed.schema_version).toBe(SCHEMA_VERSION);
     expect(parsed.instances).toHaveLength(2);
     expect(parsed.instances[0]).toEqual({
-      id: "shared",
+      id: "alpha",
       kind: "shared",
       status: "running",
-      ports: { DB_PORT: 30000 },
-      block_base: 30000,
+      ports: { CACHE: 40001 },
+      block_base: 40001,
     });
     expect(parsed.instances[1]).toEqual({
-      id: "login",
+      id: "beta",
       kind: "worktree",
-      status: "running",
-      ports: { WEB_PORT: 20512 },
-      block_base: 20512,
+      status: "stale",
+      ports: { API: 40097 },
+      block_base: 40097,
     });
   });
 

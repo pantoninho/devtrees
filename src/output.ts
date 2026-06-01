@@ -14,8 +14,6 @@
  * produces strings.
  */
 
-import type { InstanceInfo } from "./instances.js";
-
 /**
  * Stable contract: present on every `--json` payload. Field additions are
  * non-breaking; renames and removals bump this. New error codes are additive.
@@ -64,17 +62,6 @@ export interface LsInstanceRow {
   readonly status: "running" | "stale";
   readonly ports: Readonly<Record<string, number>>;
   readonly blockBase?: number;
-}
-
-/** Adapt an `InstanceInfo` from discovery into the row the formatter consumes. */
-export function instanceRow(info: InstanceInfo): LsInstanceRow {
-  return {
-    id: info.id,
-    kind: info.kind,
-    status: info.status,
-    ports: info.ports,
-    blockBase: info.blockBase,
-  };
 }
 
 // --- ls ---------------------------------------------------------------------
