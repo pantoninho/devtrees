@@ -85,6 +85,31 @@ if (cmd === "up") {
     process.stderr.write(`stub-process-compose: no instance at ${socketPath}\n`);
     process.exit(1);
   }
+} else if (cmd === "process") {
+  // `process logs <service> -U -u <socket> --raw-log [-f] [-n N]`
+  const sub = process.argv[3];
+  if (sub !== "logs") {
+    process.stderr.write(`stub-process-compose: unknown subcommand 'process ${sub}'\n`);
+    process.exit(1);
+  }
+  const service = process.argv[4];
+  // The fixture file the integration test seeds:
+  // `${socketPath}.<service>.log` — one line per log entry.
+  const logPath = `${socketPath}.${service}.log`;
+  if (!existsSync(logPath)) {
+    process.exit(0);
+  }
+  const lines = readFileSync(logPath, "utf8")
+    .split(/\r?\n/)
+    .filter((l) => l !== "");
+  // Honor -n N (tail) before emitting.
+  const ni = process.argv.indexOf("-n");
+  if (ni > -1) {
+    const n = Number(process.argv[ni + 1]);
+    if (Number.isFinite(n) && n >= 0) lines.splice(0, Math.max(0, lines.length - n));
+  }
+  for (const line of lines) process.stdout.write(`${line}\n`);
+  process.exit(0);
 } else if (cmd === "down") {
   if (existsSync(`${socketPath}.pids`)) {
     const pids = JSON.parse(readFileSync(`${socketPath}.pids`, "utf8"));
