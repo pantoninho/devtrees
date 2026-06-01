@@ -51,6 +51,35 @@ export type WaitForSharedHealth = (args: {
   readonly sharedServiceNames: ReadonlyArray<string>;
 }) => Promise<void>;
 
+/**
+ * Wait until every named service in an instance is healthy. Called after the
+ * worktree instance starts so `up` only returns 0 when the stack can actually
+ * serve traffic (PRD #26, ADR-0005). On timeout, implementations must throw a
+ * `HealthTimeoutError` — left running, not torn down, so the agent can inspect
+ * the failure with `devtrees logs <service>` afterwards.
+ */
+export type WaitForHealth = (args: {
+  readonly socketPath: string;
+  readonly serviceNames: ReadonlyArray<string>;
+  readonly timeoutMs: number;
+}) => Promise<void>;
+
+/**
+ * Throw on health-wait timeout; carries the `HEALTH_TIMEOUT` error code so the
+ * CLI's error classifier routes it to the documented `--json` envelope without
+ * pattern-matching on the message.
+ */
+class HealthTimeoutError extends Error {
+  readonly code = "HEALTH_TIMEOUT" as const;
+  constructor(message: string) {
+    super(message);
+    this.name = "HealthTimeoutError";
+  }
+}
+
+/** Default health-wait window for the worktree instance — overridable per call. */
+const DEFAULT_WAIT_TIMEOUT_MS = 120_000;
+
 export interface CommandDeps {
   /** Working directory to resolve the worktree from. Default: process.cwd(). */
   readonly cwd?: string;
@@ -82,6 +111,15 @@ export interface CommandDeps {
    * list` over the shared UDS. Injected so tests can stub it.
    */
   readonly waitForSharedHealth?: WaitForSharedHealth;
+  /**
+   * Wait for the worktree instance's services to be healthy after `driver.up`
+   * — the gate that turns "up returned" into "the stack is serving traffic"
+   * (PRD #26, ADR-0005). Default polls process-compose over the worktree
+   * instance's UDS; injected so tests stub it.
+   */
+  readonly waitForHealth?: WaitForHealth;
+  /** Health-wait window for the worktree instance. Default: 120s. */
+  readonly waitTimeoutMs?: number;
   /** Is a concrete port free to bind? Default: probes a real TCP bind. */
   readonly isPortFree?: (port: number) => boolean;
   /**
@@ -90,8 +128,18 @@ export interface CommandDeps {
    */
   readonly allocator?: AllocatorOptions;
   readonly driver?: DriverDeps;
-  /** Attach the TUI after a successful up. Default: only when stdout is a TTY. */
+  /**
+   * Attach the TUI after a successful up. Default: only when both stdout and
+   * stderr are TTYs (ADR-0005 — agent invocations shouldn't be hijacked by
+   * the TUI). Setting this explicitly overrides the auto-detect.
+   */
   readonly attach?: boolean;
+  /**
+   * Inject the TTY check so unit tests can prove the auto-detect logic
+   * without touching `process.stdout.isTTY`. Default: returns true only when
+   * both stdout and stderr are TTYs. Ignored when `attach` is set explicitly.
+   */
+  readonly isTTY?: () => boolean;
   /** Sink for non-fatal warnings (e.g. unmanaged port detection). Default: stderr. */
   readonly warn?: (message: string) => void;
 }
@@ -342,8 +390,9 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
 
   await driver.up(inst);
 
-  const shouldAttach = deps.attach ?? Boolean(process.stdout.isTTY);
-  if (shouldAttach) await driver.attach(inst);
+  await waitForWorktreeHealth(stack, paths.socketPath, deps);
+
+  if (shouldAttachAfterUp(deps)) await driver.attach(inst);
 
   return {
     worktreeId: anchor.worktreeId,
@@ -1007,6 +1056,40 @@ function defaultWarn(message: string): void {
 }
 
 /**
+ * Both stdout AND stderr must be TTYs for the auto-detect to mean "a human at
+ * a terminal is watching". If either is redirected (a pipe, a CI log capture,
+ * an agent's pty wrapper that only inherits stdout), we skip the TUI so the
+ * caller gets the headless behaviour they implicitly asked for (ADR-0005).
+ */
+function defaultIsTTY(): boolean {
+  return Boolean(process.stdout.isTTY && process.stderr.isTTY);
+}
+
+/**
+ * Worktree-instance health gate: poll until every isolated service reports a
+ * healthy state, or throw `HealthTimeoutError` (code: HEALTH_TIMEOUT) so the
+ * caller exits non-zero. The stack is left running on failure — the explicit
+ * ADR-0005 choice so the agent can inspect logs after the timeout.
+ */
+async function waitForWorktreeHealth(
+  stack: ResolvedStack,
+  socketPath: string,
+  deps: CommandDeps,
+): Promise<void> {
+  const wait = deps.waitForHealth ?? defaultWaitForHealth;
+  await wait({
+    socketPath,
+    serviceNames: stack.services.filter((s) => s.tier === "isolated").map((s) => s.name),
+    timeoutMs: deps.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS,
+  });
+}
+
+/** Explicit `attach`/`no-attach` override wins; otherwise consult `isTTY()`. */
+function shouldAttachAfterUp(deps: CommandDeps): boolean {
+  return deps.attach ?? (deps.isTTY ?? defaultIsTTY)();
+}
+
+/**
  * One human-readable line per dropped cross-tier edge. Tells the developer
  * which edge devtrees just lifted out of the derived config and why — the
  * orchestration layer is now responsible for the equivalent gating.
@@ -1049,7 +1132,7 @@ const defaultWaitForSharedHealth: WaitForSharedHealth = async ({
   if (sharedServiceNames.length === 0) return;
   const deadline = Date.now() + SHARED_HEALTH_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    const states = readSharedProcessStates(socketPath);
+    const states = readProcessStates(socketPath);
     if (states !== undefined) {
       const allHealthy = sharedServiceNames.every((name) => {
         const status = states.get(name)?.toLowerCase();
@@ -1066,12 +1149,44 @@ const defaultWaitForSharedHealth: WaitForSharedHealth = async ({
 };
 
 /**
+ * Default worktree health-wait: same poll loop as the shared variant — the
+ * mechanics are identical (poll `process-compose process list` over the
+ * instance's UDS until every named service reports a healthy state) and only
+ * the socket path, service set, and timeout differ. On timeout, throws
+ * `HealthTimeoutError` so the CLI maps it to the documented `HEALTH_TIMEOUT`
+ * envelope without pattern-matching on the message (ADR-0005).
+ *
+ * A zero-service wait returns immediately so a stack with no isolated services
+ * does not synthesize a timeout out of thin air.
+ */
+const defaultWaitForHealth: WaitForHealth = async ({ socketPath, serviceNames, timeoutMs }) => {
+  if (serviceNames.length === 0) return;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const states = readProcessStates(socketPath);
+    if (states !== undefined) {
+      const allHealthy = serviceNames.every((name) => {
+        const status = states.get(name)?.toLowerCase();
+        return status !== undefined && HEALTHY_STATES.has(status);
+      });
+      if (allHealthy) return;
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, SHARED_HEALTH_POLL_MS));
+  }
+  throw new HealthTimeoutError(
+    `timed out waiting for services to be healthy [${serviceNames.join(", ")}] ` +
+      `after ${timeoutMs}ms. The worktree instance is still running — ` +
+      `inspect it with \`devtrees logs <service>\` or \`devtrees ls --json\`.`,
+  );
+};
+
+/**
  * Run `process-compose process list -U -u <socket> -o json` and return a
  * `name -> status` map. Returns `undefined` when the socket isn't reachable
  * yet (the shared instance is still starting), so the caller treats it as
  * "not ready, keep polling".
  */
-function readSharedProcessStates(socketPath: string): Map<string, string> | undefined {
+function readProcessStates(socketPath: string): Map<string, string> | undefined {
   try {
     const out = execFileSync(
       "process-compose",
