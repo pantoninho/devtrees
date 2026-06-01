@@ -147,7 +147,7 @@ export interface SpawnedProcess {
   on(event: "error", cb: (err: Error) => void): void;
   on(event: "exit", cb: (code: number | null) => void): void;
   unref?(): void;
-  /** Stdout pipe — present when the caller asked for piped stdio (e.g. logs). */
+  /** Stdout pipe — present when the caller asked for piped stdio (e.g. logs, getServiceStatuses). */
   readonly stdout?: NodeJS.ReadableStream | null;
   /** Stderr pipe — present when the caller asked for piped stdio. */
   readonly stderr?: NodeJS.ReadableStream | null;
@@ -242,9 +242,9 @@ export function createDriver(deps: DriverDeps = {}) {
         const child = spawner(binary, [...prefix, ...buildProcessListArgs(socketPath)], {
           stdio: ["ignore", "pipe", "ignore"],
         });
-        const chunks: Buffer[] = [];
-        child.stdout?.on("data", (chunk: Buffer) => {
-          chunks.push(chunk);
+        let stdout = "";
+        child.stdout?.on("data", (chunk: Buffer | string) => {
+          stdout += typeof chunk === "string" ? chunk : chunk.toString("utf8");
         });
         child.on("error", (err) => reject(err));
         child.on("exit", (code) => {
@@ -253,8 +253,7 @@ export function createDriver(deps: DriverDeps = {}) {
             return;
           }
           try {
-            const stdout = Buffer.concat(chunks).toString("utf8") || "[]";
-            resolve(parseServiceStatuses(stdout));
+            resolve(parseServiceStatuses(stdout || "[]"));
           } catch (err) {
             reject(err as Error);
           }

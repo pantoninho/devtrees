@@ -209,6 +209,81 @@ describe("process-compose driver — streamLogs", () => {
   });
 });
 
+describe("process-compose driver — getServiceStatuses", () => {
+  /**
+   * Fake spawner that emits a JSON stdout payload then exits 0. Mirrors the
+   * shape the real `process-compose process list -o json` produces; tests
+   * inject this in place of the real child process so the driver call is
+   * exercised end-to-end without touching the binary.
+   */
+  function spawnerEmitting(stdout: string): () => SpawnedProcess {
+    return () => {
+      const emitter = new EventEmitter() as EventEmitter & {
+        stdout: Readable;
+        kill: () => void;
+      };
+      const stdoutStream = Readable.from(stdout);
+      emitter.stdout = stdoutStream;
+      emitter.kill = () => stdoutStream.destroy();
+      stdoutStream.on("end", () => queueMicrotask(() => emitter.emit("exit", 0)));
+      return emitter as unknown as SpawnedProcess;
+    };
+  }
+
+  it("returns ServiceStatus[] parsed from the binary's stdout", async () => {
+    const stdout = JSON.stringify([
+      { name: "web", status: "Running", is_ready: "Ready" },
+      { name: "worker", status: "Completed", is_ready: "-" },
+    ]);
+    const driver = createDriver({
+      exists: () => Promise.resolve(true),
+      spawner: spawnerEmitting(stdout),
+    });
+    const statuses = await driver.getServiceStatuses("/anchor/run/login.sock");
+    expect(statuses).toEqual([
+      { name: "web", status: "Running", health: "ready" },
+      { name: "worker", status: "Completed", health: "unknown" },
+    ]);
+  });
+
+  it("refuses to spawn and surfaces MissingProcessComposeError when the binary is absent", async () => {
+    let spawned = false;
+    const driver = createDriver({
+      exists: () => Promise.resolve(false),
+      spawner: () => {
+        spawned = true;
+        return spawnerEmitting("[]")();
+      },
+    });
+    await expect(driver.getServiceStatuses("/x.sock")).rejects.toBeInstanceOf(
+      MissingProcessComposeError,
+    );
+    expect(spawned).toBe(false);
+  });
+
+  it("invokes process-compose with the process-list argv built from the socket path", async () => {
+    let capturedArgs: ReadonlyArray<string> | undefined;
+    const emit = spawnerEmitting("[]");
+    const driver = createDriver({
+      exists: () => Promise.resolve(true),
+      spawner: (_binary, args) => {
+        capturedArgs = args;
+        return emit();
+      },
+    });
+    await driver.getServiceStatuses("/anchor/run/login.sock");
+    expect(capturedArgs).toEqual([
+      "process",
+      "list",
+      "-U",
+      "-u",
+      "/anchor/run/login.sock",
+      "-o",
+      "json",
+    ]);
+  });
+});
+
 describe("process-compose driver — missing binary", () => {
   it("MissingProcessComposeError carries an actionable, named message", () => {
     const err = new MissingProcessComposeError("process-compose");
