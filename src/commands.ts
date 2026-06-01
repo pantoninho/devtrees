@@ -63,7 +63,7 @@ export type WaitForHealth = (args: {
  * CLI's error classifier routes it to the documented `--json` envelope without
  * pattern-matching on the message.
  */
-export class HealthTimeoutError extends Error {
+class HealthTimeoutError extends Error {
   readonly code = "HEALTH_TIMEOUT" as const;
   constructor(message: string) {
     super(message);
@@ -72,7 +72,7 @@ export class HealthTimeoutError extends Error {
 }
 
 /** Default health-wait window for the worktree instance — overridable per call. */
-export const DEFAULT_WAIT_TIMEOUT_MS = 120_000;
+const DEFAULT_WAIT_TIMEOUT_MS = 120_000;
 
 export interface CommandDeps {
   /** Working directory to resolve the worktree from. Default: process.cwd(). */
