@@ -3,7 +3,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
-import { execute, isEntrypoint, run } from "./cli.js";
+import { execute, isEntrypoint, parseLogsArgs, run } from "./cli.js";
+
+async function* fromArray<T>(items: ReadonlyArray<T>): AsyncIterable<T> {
+  for (const item of items) yield item;
+}
 
 describe("devtrees CLI", () => {
   it("prints the version with --version", () => {
@@ -426,6 +430,153 @@ describe("devtrees CLI — --json (agent-facing surface)", () => {
     const result = await execute(["ls", "--json"], { up: vi.fn(), down: vi.fn(), ls });
     const parsed = JSON.parse(result.stdout) as { instances: unknown[] };
     expect(parsed.instances).toEqual([]);
+  });
+});
+
+describe("devtrees CLI — logs (#33)", () => {
+  it("parses positional service name and default flags", () => {
+    expect(parseLogsArgs(["web"])).toEqual({
+      service: "web",
+      all: false,
+      shared: false,
+      follow: false,
+      tail: undefined,
+      since: undefined,
+    });
+  });
+
+  it("parses --follow / -f / --tail=N / --since=DUR / --all / --shared", () => {
+    expect(parseLogsArgs(["web", "--follow", "--tail=25", "--since=5m"])).toMatchObject({
+      service: "web",
+      follow: true,
+      tail: 25,
+      since: "5m",
+    });
+    expect(parseLogsArgs(["-f", "--all", "--shared"])).toMatchObject({
+      service: undefined,
+      all: true,
+      shared: true,
+      follow: true,
+    });
+  });
+
+  it("routes `logs <service>` to deps.logs and writes lines verbatim in human mode", async () => {
+    const logs = vi.fn().mockResolvedValue({
+      services: ["web"],
+      events: fromArray([
+        { ts: "T1", service: "web", stream: "stdout" as const, line: "alpha" },
+        { ts: "T2", service: "web", stream: "stdout" as const, line: "beta" },
+      ]),
+    });
+    const result = await execute(["logs", "web"], { up: vi.fn(), down: vi.fn(), logs });
+    expect(result.code).toBe(0);
+    expect(logs).toHaveBeenCalledWith(
+      expect.objectContaining({ service: "web", all: false, shared: false }),
+    );
+    expect(result.stdout).toBe("alpha\nbeta\n");
+    expect(result.stderr).toBe("");
+  });
+
+  it("`logs <service> --json` emits NDJSON with one {ts,service,stream,line} per line", async () => {
+    const logs = vi.fn().mockResolvedValue({
+      services: ["web"],
+      events: fromArray([
+        { ts: "2026-06-01T22:00:00Z", service: "web", stream: "stdout" as const, line: "hello" },
+        {
+          ts: "2026-06-01T22:00:01Z",
+          service: "web",
+          stream: "stdout" as const,
+          line: 'json: {"a":1}',
+        },
+      ]),
+    });
+    const result = await execute(["logs", "web", "--json"], {
+      up: vi.fn(),
+      down: vi.fn(),
+      logs,
+    });
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+    const lines = result.stdout.trimEnd().split("\n");
+    expect(lines).toHaveLength(2);
+    const first = JSON.parse(lines[0] ?? "") as Record<string, unknown>;
+    expect(first).toEqual({
+      ts: "2026-06-01T22:00:00Z",
+      service: "web",
+      stream: "stdout",
+      line: "hello",
+    });
+    const second = JSON.parse(lines[1] ?? "") as Record<string, unknown>;
+    expect(second).toEqual({
+      ts: "2026-06-01T22:00:01Z",
+      service: "web",
+      stream: "stdout",
+      line: 'json: {"a":1}',
+    });
+  });
+
+  it("`logs --all` prefixes lines with [service] in human mode for attribution", async () => {
+    const logs = vi.fn().mockResolvedValue({
+      services: ["web", "worker"],
+      events: fromArray([
+        { ts: "T1", service: "web", stream: "stdout" as const, line: "w1" },
+        { ts: "T2", service: "worker", stream: "stdout" as const, line: "k1" },
+      ]),
+    });
+    const result = await execute(["logs", "--all"], { up: vi.fn(), down: vi.fn(), logs });
+    expect(result.code).toBe(0);
+    expect(result.stdout).toBe("[web] w1\n[worker] k1\n");
+  });
+
+  it("`logs --all --json` does NOT add the [service] prefix (the field is the attribution)", async () => {
+    const logs = vi.fn().mockResolvedValue({
+      services: ["web", "worker"],
+      events: fromArray([{ ts: "T1", service: "web", stream: "stdout" as const, line: "raw" }]),
+    });
+    const result = await execute(["logs", "--all", "--json"], {
+      up: vi.fn(),
+      down: vi.fn(),
+      logs,
+    });
+    const line = result.stdout.trimEnd();
+    expect(line.startsWith("[")).toBe(false);
+    const parsed = JSON.parse(line) as { line: string };
+    expect(parsed.line).toBe("raw");
+  });
+
+  it("passes --shared and --follow through to deps.logs", async () => {
+    const logs = vi.fn().mockResolvedValue({ services: ["postgres"], events: fromArray([]) });
+    await execute(["logs", "postgres", "--shared", "--follow"], {
+      up: vi.fn(),
+      down: vi.fn(),
+      logs,
+    });
+    expect(logs).toHaveBeenCalledWith(
+      expect.objectContaining({ service: "postgres", shared: true, follow: true }),
+    );
+  });
+
+  it("errors with usage hint when no service and no --all is given (exit 1, stderr)", async () => {
+    const logs = vi.fn();
+    const result = await execute(["logs"], { up: vi.fn(), down: vi.fn(), logs });
+    expect(result.code).toBe(1);
+    expect(result.stderr).toMatch(/specify a service|--all/);
+    expect(logs).not.toHaveBeenCalled();
+  });
+
+  it("`logs --json` failure (missing socket) → INSTANCE_NOT_FOUND envelope on stdout", async () => {
+    const logs = vi
+      .fn()
+      .mockRejectedValue(new Error("no worktree instance is running for 'login'"));
+    const result = await execute(["logs", "web", "--json"], {
+      up: vi.fn(),
+      down: vi.fn(),
+      logs,
+    });
+    expect(result.code).not.toBe(0);
+    const parsed = JSON.parse(result.stdout) as { error: { code: string } };
+    expect(parsed.error.code).toBe("INSTANCE_NOT_FOUND");
+    expect(result.stderr).toMatch(/no worktree instance is running/);
   });
 });
 

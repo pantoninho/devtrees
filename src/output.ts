@@ -237,6 +237,55 @@ export function formatEnv(env: Readonly<Record<string, string>>, mode: FormatMod
   return { stdout: `${lines.join("\n")}\n`, stderr: "" };
 }
 
+// --- logs (streaming) -------------------------------------------------------
+
+/**
+ * One line of a service's log output, as the driver emits it. The formatter
+ * renders these one-at-a-time so the command path stays streaming — there is
+ * no `formatLogs(events[])` that materializes the full buffer.
+ */
+export interface LogLine {
+  readonly ts: string;
+  readonly service: string;
+  readonly stream: "stdout" | "stderr";
+  readonly line: string;
+}
+
+export interface LogLineOptions {
+  /**
+   * Prefix the rendered line with `[service]` in human mode. Used when
+   * `--all` interleaves multiple services so the reader can attribute lines;
+   * ignored in JSON mode (the `service` field is the structured attribution).
+   */
+  readonly prefixService: boolean;
+}
+
+/**
+ * Render one log event.
+ *
+ *   - `human`: the raw line, optionally prefixed with `[service]`.
+ *   - `json`: an NDJSON line `{ts, service, stream, line}`. Schema is per-line —
+ *     no top-level `schema_version` wrapper because the consumer reads one
+ *     object per line, not one document for the whole stream.
+ */
+export function formatLogLine(
+  event: LogLine,
+  mode: FormatMode,
+  opts: LogLineOptions,
+): OutputResult {
+  if (mode === "json") {
+    const doc = {
+      ts: event.ts,
+      service: event.service,
+      stream: event.stream,
+      line: event.line,
+    };
+    return { stdout: `${JSON.stringify(doc)}\n`, stderr: "" };
+  }
+  const prefix = opts.prefixService ? `[${event.service}] ` : "";
+  return { stdout: `${prefix}${event.line}\n`, stderr: "" };
+}
+
 // --- error envelope ---------------------------------------------------------
 
 /**

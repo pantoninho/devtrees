@@ -13,6 +13,7 @@ import {
   SCHEMA_VERSION,
   formatEnv,
   formatError,
+  formatLogLine,
   formatLs,
   type ErrorCode,
   type LsInstanceRow,
@@ -207,6 +208,51 @@ describe("output formatter — formatEnv", () => {
     const result = formatEnv(sample, "json");
     expect(result.stdout.endsWith("\n")).toBe(true);
     expect(result.stdout.endsWith("\n\n")).toBe(false);
+  });
+});
+
+describe("output formatter — formatLogLine", () => {
+  const event = {
+    ts: "2026-06-01T22:00:00.000Z",
+    service: "web",
+    stream: "stdout" as const,
+    line: 'listening on 3000 {"foo":"bar"}',
+  };
+
+  it("in human mode without prefix, emits the line verbatim with a trailing newline", () => {
+    const result = formatLogLine(event, "human", { prefixService: false });
+    expect(result.stdout).toBe('listening on 3000 {"foo":"bar"}\n');
+    expect(result.stderr).toBe("");
+  });
+
+  it("in human mode with prefix, prefixes the line with [service]", () => {
+    const result = formatLogLine(event, "human", { prefixService: true });
+    expect(result.stdout).toBe('[web] listening on 3000 {"foo":"bar"}\n');
+  });
+
+  it("in JSON mode, emits one NDJSON line with {ts, service, stream, line}", () => {
+    const result = formatLogLine(event, "json", { prefixService: false });
+    expect(result.stderr).toBe("");
+    expect(result.stdout.endsWith("\n")).toBe(true);
+    expect(result.stdout.endsWith("\n\n")).toBe(false);
+    const parsed = JSON.parse(result.stdout) as {
+      ts: string;
+      service: string;
+      stream: string;
+      line: string;
+    };
+    expect(parsed).toEqual({
+      ts: "2026-06-01T22:00:00.000Z",
+      service: "web",
+      stream: "stdout",
+      line: 'listening on 3000 {"foo":"bar"}',
+    });
+  });
+
+  it("in JSON mode, NDJSON is one event per line regardless of prefixService (the field is human-only)", () => {
+    const a = formatLogLine(event, "json", { prefixService: false });
+    const b = formatLogLine(event, "json", { prefixService: true });
+    expect(a.stdout).toBe(b.stdout);
   });
 });
 
