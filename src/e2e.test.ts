@@ -361,8 +361,10 @@ describe("e2e — devtrees ls discovers worktree instances + the shared instance
     expect(await waitForTcp(Number(login.env.DB_PORT))).toBe(true);
 
     // Discovery is anchored at the shared git common dir — call from either
-    // worktree and the answer is the same.
-    const lsFromLogin = await runLs({ cwd: loginWt });
+    // worktree and the answer is the same. The driver dep points at the stub
+    // so `getServiceStatuses` (issue #29) reaches the stub's `process list`
+    // rather than the real process-compose binary against a stub UDS.
+    const lsFromLogin = await runLs({ cwd: loginWt, driver: loginDeps.driver });
     const ids = lsFromLogin.instances.map((i) => i.id).sort();
     expect(ids).toEqual(["billing", "login", "shared"]);
 
@@ -386,8 +388,56 @@ describe("e2e — devtrees ls discovers worktree instances + the shared instance
     expect(sharedEntry?.ports.DB_PORT).toBe(Number(login.env.DB_PORT));
 
     // Acceptance: ls from the other worktree returns the same set.
-    const lsFromBilling = await runLs({ cwd: billingWt });
+    const lsFromBilling = await runLs({ cwd: billingWt, driver: billingDeps.driver });
     expect(lsFromBilling.instances.map((i) => i.id).sort()).toEqual(ids);
+  }, 30000);
+
+  /**
+   * Issue #29 — agent-facing `ls` populates `services[]` on each running
+   * instance via one `getServiceStatuses` shell-out per instance. Runs the
+   * driver against the stub process-compose, which serves a deterministic
+   * `process list -o json` snapshot recovered from the derived config it
+   * was started with.
+   */
+  it("populates services[] (name/status/health/ports) on each running instance", async () => {
+    const repo = makeRepo("dt-svc-", ["login"]);
+    cleanups.push(() => rmSync(repo.root, { recursive: true, force: true }));
+    const loginWt = repo.worktrees.login;
+    if (loginWt === undefined) throw new Error("expected login worktree");
+    writeMixedTierStack(loginWt);
+
+    const deps = stubDriverDeps(loginWt);
+    const up = await runUp(deps as never);
+    cleanups.push(() => {
+      void runDown(deps as never).catch(() => {});
+      void runDown(deps as never, { shared: true }).catch(() => {});
+    });
+    expect(await waitForHttp(Number(up.env.WEB_PORT))).toBe(true);
+
+    // `getServiceStatuses` is per-driver; ls must use the same stub-pointing
+    // driver deps the up/down path used so the call reaches the stub
+    // (otherwise it'd shell out to a non-existent real `process-compose`).
+    const ls = await runLs({ cwd: loginWt, driver: deps.driver });
+
+    const login = ls.instances.find((i) => i.id === "login");
+    const shared = ls.instances.find((i) => i.id === "shared");
+    expect(login?.services?.map((s) => s.name)).toEqual(["web"]);
+    expect(login?.services?.[0]?.status).toBe("Running");
+    expect(login?.services?.[0]?.health).toBe("ready");
+    // Web sees its own WEB_PORT plus the shared DB_PORT (cross-tier
+    // connection-info injection). The worktree-id env var lives alongside
+    // these but is filtered out — only `KEY=NUMBER` entries qualify as ports.
+    expect(login?.services?.[0]?.ports).toEqual({
+      WEB_PORT: Number(up.env.WEB_PORT),
+      DB_PORT: Number(up.env.DB_PORT),
+    });
+
+    expect(shared?.services?.map((s) => s.name)).toEqual(["pgstub"]);
+    expect(shared?.services?.[0]?.status).toBe("Running");
+    expect(shared?.services?.[0]?.health).toBe("ready");
+    expect(shared?.services?.[0]?.ports).toEqual({
+      DB_PORT: Number(up.env.DB_PORT),
+    });
   }, 30000);
 });
 
