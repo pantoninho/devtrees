@@ -125,10 +125,7 @@ function lsInstanceJson(row: LsInstanceRow): LsInstanceJson {
   return row.blockBase === undefined ? base : { ...base, block_base: row.blockBase };
 }
 
-export function formatLs(
-  instances: ReadonlyArray<LsInstanceRow>,
-  mode: FormatMode,
-): OutputResult {
+export function formatLs(instances: ReadonlyArray<LsInstanceRow>, mode: FormatMode): OutputResult {
   if (mode === "json") {
     const doc = {
       schema_version: SCHEMA_VERSION,
@@ -150,10 +147,7 @@ function formatPruneHuman(pruned: ReadonlyArray<LsInstanceRow>): string {
   return `devtrees prune: cleaned ${pruned.length} ${noun}:\n${lines.join("\n")}\n`;
 }
 
-export function formatPrune(
-  pruned: ReadonlyArray<LsInstanceRow>,
-  mode: FormatMode,
-): OutputResult {
+export function formatPrune(pruned: ReadonlyArray<LsInstanceRow>, mode: FormatMode): OutputResult {
   if (mode === "json") {
     const doc = {
       schema_version: SCHEMA_VERSION,
@@ -241,23 +235,28 @@ export function formatGenerate(payload: GeneratePayload, mode: FormatMode): Outp
 /**
  * Render an error.
  *
- * In `--json` mode: `{schema_version, error: {code, message, details?}}` to
- * stdout, nothing to stderr — the agent reads one stream and branches on
- * `error.code`.
- *
- * In human mode: `devtrees: <message>` to stderr — today's diagnostic.
- *
  * The caller is responsible for the exit code (non-zero) — `formatError`
  * produces output strings only.
+ *
+ * Mode behaviour (ADR-0005):
+ *
+ *   - `json`: stdout gets `{schema_version, error: {code, message, details?}}`
+ *     so the agent reads one stream and branches on `error.code`. Stderr also
+ *     gets the human diagnostic line `devtrees: <message>` — the agent's
+ *     captured log still contains a readable failure cause without merging
+ *     streams. (On success, stderr stays untouched.)
+ *   - `human`: stdout is empty; stderr gets `devtrees: <message>` — today's
+ *     diagnostic, unchanged.
  */
 export function formatError(err: ErrorPayload, mode: FormatMode): OutputResult {
+  const humanDiagnostic = `devtrees: ${err.message}\n`;
   if (mode === "json") {
     const error: Record<string, unknown> = { code: err.code, message: err.message };
     if (err.details !== undefined) error.details = err.details;
     const doc = { schema_version: SCHEMA_VERSION, error };
-    return { stdout: `${JSON.stringify(doc)}\n`, stderr: "" };
+    return { stdout: `${JSON.stringify(doc)}\n`, stderr: humanDiagnostic };
   }
-  return { stdout: "", stderr: `devtrees: ${err.message}\n` };
+  return { stdout: "", stderr: humanDiagnostic };
 }
 
 /**

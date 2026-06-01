@@ -258,6 +258,127 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
   });
 });
 
+/**
+ * The agent-facing surface (issue #27): a global `--json` flag at the CLI
+ * entrypoint, threaded into every command, routed through the output
+ * formatter. The human surface stays byte-for-byte unchanged when `--json`
+ * is absent.
+ */
+describe("devtrees CLI — --json (agent-facing surface)", () => {
+  const lsRows = {
+    anchor: "/repo/.git",
+    instances: [
+      {
+        id: "shared",
+        kind: "shared" as const,
+        status: "running" as const,
+        socketPath: "/repo/.git/devtrees/run/shared.sock",
+        ports: { DB_PORT: 30000 },
+        blockBase: 30000,
+      },
+      {
+        id: "login",
+        kind: "worktree" as const,
+        status: "running" as const,
+        socketPath: "/repo/.git/devtrees/run/login.sock",
+        ports: { WEB_PORT: 20512 },
+        blockBase: 20512,
+      },
+    ],
+  };
+
+  it("`ls --json` emits a single JSON document with schema_version on stdout", async () => {
+    const ls = vi.fn().mockResolvedValue(lsRows);
+    const result = await execute(["ls", "--json"], { up: vi.fn(), down: vi.fn(), ls });
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+    const parsed = JSON.parse(result.stdout) as {
+      schema_version: string;
+      instances: ReadonlyArray<{ id: string; ports: Record<string, number> }>;
+    };
+    expect(parsed.schema_version).toBeDefined();
+    expect(parsed.instances).toHaveLength(2);
+    expect(parsed.instances.find((i) => i.id === "login")?.ports).toEqual({ WEB_PORT: 20512 });
+  });
+
+  it("`--json` is accepted before the command name too (global flag, any position)", async () => {
+    const ls = vi.fn().mockResolvedValue(lsRows);
+    const result = await execute(["--json", "ls"], { up: vi.fn(), down: vi.fn(), ls });
+    expect(result.code).toBe(0);
+    // Must still parse as JSON — the flag was honored even though it preceded `ls`.
+    expect(() => JSON.parse(result.stdout)).not.toThrow();
+  });
+
+  it("`ls` without --json is byte-for-byte unchanged from today's table", async () => {
+    // The exact pre-formatter output (from cli.ts at HEAD), captured here so a
+    // regression in the human path is impossible to introduce silently.
+    const ls = vi.fn().mockResolvedValue(lsRows);
+    const result = await execute(["ls"], { up: vi.fn(), down: vi.fn(), ls });
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toBe(
+      [
+        "ID      KIND      STATUS   PORTS",
+        "shared  shared    running  DB_PORT=30000",
+        "login   worktree  running  WEB_PORT=20512",
+        "",
+      ].join("\n"),
+    );
+  });
+
+  it("an `up` failure with --json emits {error:{code:PROCESS_COMPOSE_NOT_FOUND,...}} on stdout, non-zero exit, and keeps today's diagnostic on stderr", async () => {
+    const up = vi.fn().mockRejectedValue(new Error("process-compose not found on PATH"));
+    const result = await execute(["up", "--json"], { up, down: vi.fn() });
+    expect(result.code).not.toBe(0);
+    // ADR-0005: structured envelope on stdout, human diagnostic still on stderr.
+    expect(result.stderr).toMatch(/process-compose/);
+    const parsed = JSON.parse(result.stdout) as { error: { code: string; message: string } };
+    expect(parsed.error.code).toBe("PROCESS_COMPOSE_NOT_FOUND");
+    expect(parsed.error.message).toMatch(/process-compose/);
+  });
+
+  it("an `attach` failure with --json classifies as INSTANCE_NOT_FOUND on stdout and keeps stderr human-readable", async () => {
+    const attach = vi
+      .fn()
+      .mockRejectedValue(new Error("no worktree instance is running for 'login'"));
+    const result = await execute(["attach", "--json"], { up: vi.fn(), down: vi.fn(), attach });
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toMatch(/no worktree instance is running/);
+    const parsed = JSON.parse(result.stdout) as { error: { code: string } };
+    expect(parsed.error.code).toBe("INSTANCE_NOT_FOUND");
+  });
+
+  it("`ls --json` success leaves stderr untouched (no diagnostics in success cases)", async () => {
+    const ls = vi.fn().mockResolvedValue(lsRows);
+    const result = await execute(["ls", "--json"], { up: vi.fn(), down: vi.fn(), ls });
+    expect(result.stderr).toBe("");
+  });
+
+  it("an unknown error with --json falls back to code:UNKNOWN (not a crash)", async () => {
+    const prune = vi.fn().mockRejectedValue(new Error("could not list worktrees"));
+    const result = await execute(["prune", "--json"], { up: vi.fn(), down: vi.fn(), prune });
+    expect(result.code).not.toBe(0);
+    const parsed = JSON.parse(result.stdout) as { error: { code: string; message: string } };
+    expect(parsed.error.code).toBe("UNKNOWN");
+    expect(parsed.error.message).toMatch(/could not list worktrees/);
+  });
+
+  it("error without --json continues today's behaviour — message on stderr, stdout empty", async () => {
+    const up = vi.fn().mockRejectedValue(new Error("process-compose not found on PATH"));
+    const result = await execute(["up"], { up, down: vi.fn() });
+    expect(result.code).not.toBe(0);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toMatch(/process-compose/);
+  });
+
+  it("`ls --json` with no instances emits {instances:[]} (not the 'no instances' string)", async () => {
+    const ls = vi.fn().mockResolvedValue({ anchor: "/repo/.git", instances: [] });
+    const result = await execute(["ls", "--json"], { up: vi.fn(), down: vi.fn(), ls });
+    const parsed = JSON.parse(result.stdout) as { instances: unknown[] };
+    expect(parsed.instances).toEqual([]);
+  });
+});
+
 describe("devtrees CLI — isEntrypoint", () => {
   // The published binary is invoked through a symlink (npm-link bin, pnpm
   // shim, Homebrew bin). `process.argv[1]` is the symlink path; `import.meta.url`

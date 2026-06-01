@@ -6,10 +6,26 @@
  * `run` is a pure function: argv in, a result out. The process-level shell at
  * the bottom of this file is the only impure part, so the command surface stays
  * unit-testable.
+ *
+ * The global `--json` flag (ADR-0005) is parsed once here and threaded into
+ * every command handler. All stdout content is produced by `src/output.ts`
+ * (the only seam that knows about format mode and the JSON schema); this file
+ * routes commands and converts errors into the formatter's envelope.
  */
 
 import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
+import {
+  classifyError,
+  formatDown,
+  formatError,
+  formatGenerate,
+  formatLs,
+  formatPrune,
+  formatUp,
+  type FormatMode,
+  type LsInstanceRow,
+} from "./output.js";
 
 export const VERSION = "0.0.1";
 
@@ -50,6 +66,7 @@ function helpText(): string {
     "Options:",
     "  -h, --help     Print this help text",
     "  -v, --version  Print the version",
+    "      --json     Emit machine-readable output (see ADR-0005)",
     "",
   ].join("\n");
 }
@@ -60,7 +77,7 @@ function helpText(): string {
  * the version; an unknown command is an error.
  */
 export function run(argv: ReadonlyArray<string>): RunResult {
-  const [first] = argv;
+  const [first] = stripGlobalFlags(argv);
 
   if (first === undefined || first === "--help" || first === "-h") {
     return { code: 0, stdout: helpText(), stderr: "" };
@@ -83,15 +100,6 @@ export function run(argv: ReadonlyArray<string>): RunResult {
     stdout: "",
     stderr: `devtrees: unknown command '${first}'\nRun 'devtrees --help' for usage.\n`,
   };
-}
-
-/** One row in the `ls` table — kept loose so it doesn't pin the CLI to `InstanceInfo`. */
-export interface LsInstanceRow {
-  readonly id: string;
-  readonly kind: "worktree" | "shared";
-  readonly status: "running" | "stale";
-  readonly ports: Readonly<Record<string, number>>;
-  readonly blockBase?: number;
 }
 
 /** The effectful commands, injected so `execute` stays unit-testable. */
@@ -139,50 +147,16 @@ export interface ExecuteDeps {
 }
 
 /**
- * Render the `ls` result as a small fixed-column table — id, kind, status, and
- * one named-port=value pair per cell. Sized off the longest id/kind/status so
- * the columns stay aligned without pulling in a formatter dependency.
+ * Strip `--json` (and any future global flags) from argv before per-command
+ * parsing. Kept tiny: this is not a real flag parser, just a global-flag
+ * splitter so a command's own argv is what `run`/handlers reason about.
  */
-function formatLs(instances: ReadonlyArray<LsInstanceRow>): string {
-  if (instances.length === 0) {
-    return "devtrees ls: no devtrees instances running.\n";
-  }
-
-  const idWidth = Math.max(2, ...instances.map((i) => i.id.length));
-  const kindWidth = Math.max(4, ...instances.map((i) => i.kind.length));
-  const statusWidth = Math.max(6, ...instances.map((i) => i.status.length));
-
-  const formatPorts = (ports: Readonly<Record<string, number>>): string =>
-    Object.entries(ports)
-      .map(([k, v]) => `${k}=${v}`)
-      .join(" ");
-
-  const header = `${"ID".padEnd(idWidth)}  ${"KIND".padEnd(kindWidth)}  ${"STATUS".padEnd(
-    statusWidth,
-  )}  PORTS`;
-
-  const rows = instances.map((i) => {
-    const ports =
-      formatPorts(i.ports) || (i.blockBase !== undefined ? `(block ${i.blockBase})` : "-");
-    return `${i.id.padEnd(idWidth)}  ${i.kind.padEnd(kindWidth)}  ${i.status.padEnd(statusWidth)}  ${ports}`;
-  });
-
-  return `${[header, ...rows].join("\n")}\n`;
+function stripGlobalFlags(argv: ReadonlyArray<string>): string[] {
+  return argv.filter((a) => a !== "--json");
 }
 
-/**
- * Render the `prune` result: one line per cleaned orphan with its id, kind,
- * and the status it had at discovery time (so the operator can see whether
- * the orphan was caught running or already stale).
- */
-function formatPrune(pruned: ReadonlyArray<LsInstanceRow>): string {
-  if (pruned.length === 0) {
-    return "devtrees prune: no orphans to clean up.\n";
-  }
-  const lines = pruned.map((p) => `  ${p.id} (${p.kind}, was ${p.status})`);
-  return `devtrees prune: cleaned ${pruned.length} orphan${pruned.length === 1 ? "" : "s"}:\n${lines.join(
-    "\n",
-  )}\n`;
+function modeFor(argv: ReadonlyArray<string>): FormatMode {
+  return argv.includes("--json") ? "json" : "human";
 }
 
 /**
@@ -191,59 +165,69 @@ function formatPrune(pruned: ReadonlyArray<LsInstanceRow>): string {
  * object lacks the optional collaborator for that command (e.g. an `up`/`down`-
  * only test stub that doesn't pass a `prune`).
  */
-type Handler = (rest: ReadonlyArray<string>, deps: ExecuteDeps) => Promise<RunResult | undefined>;
+type Handler = (
+  rest: ReadonlyArray<string>,
+  deps: ExecuteDeps,
+  mode: FormatMode,
+) => Promise<RunResult | undefined>;
 
-async function handleUp(_rest: ReadonlyArray<string>, deps: ExecuteDeps): Promise<RunResult> {
+async function handleUp(
+  _rest: ReadonlyArray<string>,
+  deps: ExecuteDeps,
+  mode: FormatMode,
+): Promise<RunResult> {
   const result = await deps.up();
-  const ports = Object.entries(result.env)
-    .map(([k, v]) => `  ${k}=${v}`)
-    .join("\n");
-  const sharedNote = result.sharedStarted ? "devtrees up: shared instance started.\n" : "";
-  return {
-    code: 0,
-    stdout: `${sharedNote}devtrees up: '${result.worktreeId}' is up.\n${ports}\n`,
-    stderr: "",
-  };
+  const out = formatUp(
+    {
+      worktreeId: result.worktreeId,
+      env: result.env,
+      sharedStarted: result.sharedStarted ?? false,
+    },
+    mode,
+  );
+  return { code: 0, stdout: out.stdout, stderr: out.stderr };
 }
 
-async function handleDown(rest: ReadonlyArray<string>, deps: ExecuteDeps): Promise<RunResult> {
+async function handleDown(
+  rest: ReadonlyArray<string>,
+  deps: ExecuteDeps,
+  mode: FormatMode,
+): Promise<RunResult> {
   const shared = rest.includes("--shared");
   await deps.down({ shared });
-  return {
-    code: 0,
-    stdout: shared
-      ? "devtrees down: shared instance stopped.\n"
-      : "devtrees down: worktree instance stopped.\n",
-    stderr: "",
-  };
+  const out = formatDown({ shared }, mode);
+  return { code: 0, stdout: out.stdout, stderr: out.stderr };
 }
 
 async function handleGenerate(
   _rest: ReadonlyArray<string>,
   deps: ExecuteDeps,
+  mode: FormatMode,
 ): Promise<RunResult | undefined> {
   if (!deps.generate) return undefined;
   const result = await deps.generate();
-  const lines = [
-    `devtrees generate: wrote ${result.worktreePath}`,
-    ...(result.sharedPath ? [`devtrees generate: wrote ${result.sharedPath}`] : []),
-    "",
-  ];
-  return { code: 0, stdout: lines.join("\n"), stderr: "" };
+  const out = formatGenerate(
+    { worktreePath: result.worktreePath, sharedPath: result.sharedPath },
+    mode,
+  );
+  return { code: 0, stdout: out.stdout, stderr: out.stderr };
 }
 
 async function handleLs(
   _rest: ReadonlyArray<string>,
   deps: ExecuteDeps,
+  mode: FormatMode,
 ): Promise<RunResult | undefined> {
   if (deps.ls === undefined) return undefined;
   const result = await deps.ls();
-  return { code: 0, stdout: formatLs(result.instances), stderr: "" };
+  const out = formatLs(result.instances, mode);
+  return { code: 0, stdout: out.stdout, stderr: out.stderr };
 }
 
 async function handleAttach(
   rest: ReadonlyArray<string>,
   deps: ExecuteDeps,
+  _mode: FormatMode,
 ): Promise<RunResult | undefined> {
   if (!deps.attach) return undefined;
   const shared = rest.includes("--shared");
@@ -256,10 +240,12 @@ async function handleAttach(
 async function handlePrune(
   _rest: ReadonlyArray<string>,
   deps: ExecuteDeps,
+  mode: FormatMode,
 ): Promise<RunResult | undefined> {
   if (deps.prune === undefined) return undefined;
   const result = await deps.prune();
-  return { code: 0, stdout: formatPrune(result.pruned), stderr: "" };
+  const out = formatPrune(result.pruned, mode);
+  return { code: 0, stdout: out.stdout, stderr: out.stderr };
 }
 
 const HANDLERS: ReadonlyMap<string, Handler> = new Map([
@@ -282,17 +268,21 @@ const HANDLERS: ReadonlyMap<string, Handler> = new Map([
  * single worktree's lifecycle.
  */
 export async function execute(argv: ReadonlyArray<string>, deps: ExecuteDeps): Promise<RunResult> {
-  const [first, ...rest] = argv;
+  const mode = modeFor(argv);
+  const commandArgv = stripGlobalFlags(argv);
+  const [first, ...rest] = commandArgv;
   const handler = first !== undefined ? HANDLERS.get(first) : undefined;
   if (handler !== undefined) {
     try {
-      const result = await handler(rest, deps);
+      const result = await handler(rest, deps, mode);
       if (result !== undefined) return result;
     } catch (err) {
-      return { code: 1, stdout: "", stderr: `devtrees: ${(err as Error).message}\n` };
+      const payload = classifyError(err as Error);
+      const out = formatError(payload, mode);
+      return { code: 1, stdout: out.stdout, stderr: out.stderr };
     }
   }
-  return run(argv);
+  return run(commandArgv);
 }
 
 /**

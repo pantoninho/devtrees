@@ -14,6 +14,7 @@ import {
   formatError,
   formatLs,
   type ErrorCode,
+  type LsInstanceRow,
 } from "./output.js";
 
 describe("output formatter — constants", () => {
@@ -31,7 +32,7 @@ describe("output formatter — constants", () => {
 });
 
 describe("output formatter — formatError", () => {
-  it("in JSON mode, emits {error:{code,message,details}} on stdout and leaves stderr empty", () => {
+  it("in JSON mode, emits {error:{code,message,details}} on stdout and the human diagnostic on stderr (ADR-0005)", () => {
     const result = formatError(
       {
         code: "INSTANCE_NOT_FOUND",
@@ -40,7 +41,9 @@ describe("output formatter — formatError", () => {
       },
       "json",
     );
-    expect(result.stderr).toBe("");
+    // stderr keeps today's diagnostic so a captured log is still readable
+    // without merging streams (ADR-0005 "JSON errors on stdout").
+    expect(result.stderr).toContain("no worktree instance is running for 'login'");
     const parsed: unknown = JSON.parse(result.stdout);
     expect(parsed).toEqual({
       schema_version: SCHEMA_VERSION,
@@ -72,18 +75,18 @@ describe("output formatter — formatError", () => {
 });
 
 describe("output formatter — formatLs", () => {
-  const rows = [
+  const rows: ReadonlyArray<LsInstanceRow> = [
     {
       id: "shared",
-      kind: "shared" as const,
-      status: "running" as const,
+      kind: "shared",
+      status: "running",
       ports: { DB_PORT: 30000 },
       blockBase: 30000,
     },
     {
       id: "login",
-      kind: "worktree" as const,
-      status: "running" as const,
+      kind: "worktree",
+      status: "running",
       ports: { WEB_PORT: 20512 },
       blockBase: 20512,
     },
@@ -109,7 +112,13 @@ describe("output formatter — formatLs", () => {
     expect(result.stderr).toBe("");
     const parsed = JSON.parse(result.stdout) as {
       schema_version: string;
-      instances: ReadonlyArray<{ id: string; kind: string; status: string; ports: Record<string, number>; block_base?: number }>;
+      instances: ReadonlyArray<{
+        id: string;
+        kind: string;
+        status: string;
+        ports: Record<string, number>;
+        block_base?: number;
+      }>;
     };
     expect(parsed.schema_version).toBe(SCHEMA_VERSION);
     expect(parsed.instances).toHaveLength(2);
