@@ -30,6 +30,7 @@ function instance(
     socketPath: `/anchor/devtrees/run/${id}.sock`,
     ports: {},
     blockBase: undefined,
+    services: [],
   };
 }
 

@@ -15,7 +15,13 @@ import { discoverInstances, type InstanceInfo } from "./instances.js";
 import { SHARED_REGISTRY_KEY, instancePaths, sharedInstancePaths } from "./paths.js";
 import { findOrphans, parseWorktreeIds } from "./prune.js";
 import { loadStack, type ResolvedService, type ResolvedStack } from "./stack.js";
-import { createDriver, type DriverDeps, type LogEvent, type StreamLogsOptions } from "./driver.js";
+import {
+  createDriver,
+  type DriverDeps,
+  type LogEvent,
+  type ServiceStatus,
+  type StreamLogsOptions,
+} from "./driver.js";
 import { readRegistry, withRegistryLock, withSharedLock } from "./registry.js";
 import { execFileSync, execSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -602,7 +608,17 @@ export interface LsDeps {
    * `discoverInstances`. Injected so the command can be unit-tested without
    * touching `<anchor>/devtrees/run/`.
    */
-  readonly discover?: (anchor: string) => Promise<InstanceInfo[]>;
+  readonly discover?: (
+    anchor: string,
+    deps: { getServiceStatuses?: (socketPath: string) => Promise<ServiceStatus[]> },
+  ) => Promise<InstanceInfo[]>;
+  /**
+   * Process-compose driver — used (best-effort) to populate each running
+   * instance's `services[]` with live runtime state. Defaults to the real
+   * driver so `ls --json` answers "is `worker` healthy?" out of the box;
+   * tests stub it.
+   */
+  readonly driver?: DriverDeps;
 }
 
 export interface LsResult {
@@ -617,11 +633,18 @@ export interface LsResult {
  * domain logic here, just wiring. The result is structured (not pre-formatted)
  * so the CLI shell, JSON output, and future callers (e.g. #9 prune) can
  * consume the same data.
+ *
+ * `ls` stays lock-free: discovery never writes the allocation registry, and
+ * the driver's `getServiceStatuses` call talks to each instance's UDS only —
+ * a stale or failing instance does not abort the walk.
  */
 export async function runLs(deps: LsDeps = {}): Promise<LsResult> {
   const { anchor } = resolve(deps);
   const discover = deps.discover ?? discoverInstances;
-  const instances = await discover(anchor.anchor);
+  const driver = createDriver(deps.driver ?? {});
+  const instances = await discover(anchor.anchor, {
+    getServiceStatuses: (socketPath) => driver.getServiceStatuses(socketPath),
+  });
   return { anchor: anchor.anchor, instances };
 }
 
