@@ -8,6 +8,7 @@ import {
   buildAttachArgs,
   buildLogsArgs,
   buildProcessListArgs,
+  buildReloadConfigArgs,
   createDriver,
   parseServiceStatuses,
   type LogEvent,
@@ -281,6 +282,81 @@ describe("process-compose driver — getServiceStatuses", () => {
       "-o",
       "json",
     ]);
+  });
+});
+
+describe("process-compose driver — reloadConfig", () => {
+  const inst = {
+    configPath: "/anchor/devtrees/login.yaml",
+    socketPath: "/anchor/devtrees/run/login.sock",
+  };
+
+  it("targets `project update` over the instance's UDS, pointing at the new config file", () => {
+    const args = buildReloadConfigArgs(inst);
+    expect(args.slice(0, 2)).toEqual(["project", "update"]);
+    expect(args).toContain("-U");
+    expect(args).toContain("-u");
+    expect(args).toContain(inst.socketPath);
+    expect(args).toContain("-f");
+    expect(args).toContain(inst.configPath);
+  });
+
+  function spawnerExiting(
+    code: number,
+    deps: { onArgs?: (args: ReadonlyArray<string>) => void } = {},
+  ) {
+    return (_b: string, args: ReadonlyArray<string>): SpawnedProcess => {
+      deps.onArgs?.(args);
+      const emitter = new EventEmitter() as EventEmitter & SpawnedProcess;
+      queueMicrotask(() => emitter.emit("exit", code));
+      return emitter;
+    };
+  }
+
+  it("returns {ok:true} on a clean exit", async () => {
+    const driver = createDriver({
+      exists: () => Promise.resolve(true),
+      spawner: spawnerExiting(0),
+    });
+    const result = await driver.reloadConfig(inst);
+    expect(result).toEqual({ ok: true });
+  });
+
+  it("returns {ok:false, reason:'not_supported'} on a non-zero exit (older process-compose without project update)", async () => {
+    const driver = createDriver({
+      exists: () => Promise.resolve(true),
+      spawner: spawnerExiting(1),
+    });
+    const result = await driver.reloadConfig(inst);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok:false");
+    expect(result.reason).toBe("not_supported");
+  });
+
+  it("returns {ok:false, reason:'not_supported'} on spawn error (missing subcommand)", async () => {
+    const driver = createDriver({
+      exists: () => Promise.resolve(true),
+      spawner: () => {
+        const emitter = new EventEmitter() as EventEmitter & SpawnedProcess;
+        queueMicrotask(() => emitter.emit("error", new Error("ENOENT")));
+        return emitter;
+      },
+    });
+    const result = await driver.reloadConfig(inst);
+    expect(result.ok).toBe(false);
+  });
+
+  it("refuses to spawn when the binary is missing", async () => {
+    let spawned = false;
+    const driver = createDriver({
+      exists: () => Promise.resolve(false),
+      spawner: () => {
+        spawned = true;
+        return { on: () => {}, unref: () => {} };
+      },
+    });
+    await expect(driver.reloadConfig(inst)).rejects.toBeInstanceOf(MissingProcessComposeError);
+    expect(spawned).toBe(false);
   });
 });
 

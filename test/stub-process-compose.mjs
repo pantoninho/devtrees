@@ -134,6 +134,36 @@ if (cmd === "up") {
   }
   process.stderr.write(`stub-process-compose: unknown subcommand 'process ${sub}'\n`);
   process.exit(1);
+} else if (cmd === "project") {
+  const sub = process.argv[3];
+  if (sub === "update") {
+    // `project update -U -u <socket> -f <config>` — hot-reload the running
+    // instance with a new derived config (issue #31). Setting
+    // STUB_RELOAD_UNSUPPORTED=1 emulates an older process-compose that
+    // doesn't implement this subcommand: exit non-zero with a clear stderr
+    // so the driver classifies the failure as `not_supported`.
+    if (process.env.STUB_RELOAD_UNSUPPORTED === "1") {
+      process.stderr.write(
+        `stub-process-compose: 'project update' is not supported by this build\n`,
+      );
+      process.exit(1);
+    }
+    const configPath = flag("-f", "-f");
+    if (!configPath || !existsSync(configPath)) {
+      process.stderr.write(`stub-process-compose: missing config at ${configPath}\n`);
+      process.exit(1);
+    }
+    if (!existsSync(socketPath)) {
+      process.stderr.write(`stub-process-compose: no instance at ${socketPath}\n`);
+      process.exit(1);
+    }
+    // Persist the swapped config alongside the socket so a follow-up `process
+    // list` reflects the new service set.
+    writeFileSync(`${socketPath}.config`, readFileSync(configPath, "utf8"));
+    process.exit(0);
+  }
+  process.stderr.write(`stub-process-compose: unknown subcommand 'project ${sub}'\n`);
+  process.exit(1);
 } else if (cmd === "down") {
   if (existsSync(`${socketPath}.pids`)) {
     const pids = JSON.parse(readFileSync(`${socketPath}.pids`, "utf8"));

@@ -23,9 +23,30 @@ import {
   type StreamLogsOptions,
 } from "./driver.js";
 import { readRegistry, withRegistryLock, withSharedLock } from "./registry.js";
+import { stackHash } from "./hash.js";
+import {
+  readStoredHash as defaultReadStoredHash,
+  writeStoredHash as defaultWriteStoredHash,
+} from "./hashes.js";
 import { execFileSync, execSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
+
+/**
+ * Thrown when `up` detects config drift against a running instance and the
+ * driver could not hot-reload (older process-compose without `project
+ * update`, or any failure to apply the new config). The instance keeps
+ * running unchanged; the CLI maps this to the `CONFIG_DRIFT` error
+ * envelope so an agent can decide whether to `down` + `up` or hand off to
+ * a human (ADR-0005).
+ */
+class ConfigDriftError extends Error {
+  readonly code = "CONFIG_DRIFT";
+  constructor(message: string) {
+    super(message);
+    this.name = "ConfigDriftError";
+  }
+}
 
 const DEFAULT_ALLOCATOR: AllocatorOptions = { portBase: 20000, blockSize: 32 };
 
@@ -135,6 +156,17 @@ export interface CommandDeps {
    */
   readonly allocator?: AllocatorOptions;
   readonly driver?: DriverDeps;
+  /**
+   * Read the resolved-stack hash previously stored for a worktree (issue #31).
+   * Default: reads `<anchor>/devtrees/hashes.json`. Injected so noop / drift
+   * branch tests can run without touching disk.
+   */
+  readonly readStoredHash?: (anchor: string, worktreeId: string) => string | undefined;
+  /**
+   * Persist the resolved-stack hash for a worktree (issue #31). Default:
+   * writes to `<anchor>/devtrees/hashes.json`.
+   */
+  readonly writeStoredHash?: (anchor: string, worktreeId: string, hash: string) => void;
   /**
    * Attach the TUI after a successful up. Default: only when both stdout and
    * stderr are TTYs (ADR-0005 — agent invocations shouldn't be hijacked by
@@ -325,7 +357,21 @@ function allocateAndBuildPortMaps(args: {
     : { blockBase, sharedBase, portFor, sharedPortFor };
 }
 
-/** Bring up this worktree's isolated stack and lazily start the shared instance if needed. */
+/**
+ * Bring up this worktree's isolated stack, idempotently.
+ *
+ * Three branches (issue #31):
+ *  - **First up** (socket absent): allocate ports, write derived config,
+ *    `driver.up`, health-wait, persist the stack-hash, return envelope.
+ *  - **Already up, unchanged config** (socket present, stored hash matches):
+ *    noop — skip `driver.up`, skip registry write, just re-emit the state
+ *    envelope an agent would see from a fresh `up`.
+ *  - **Already up, drifted config** (socket present, stored hash differs):
+ *    write the new derived config, call `driver.reloadConfig`. On success,
+ *    update the stored hash and return the new envelope; on failure
+ *    (`not_supported` or otherwise), throw `ConfigDriftError` (code
+ *    `CONFIG_DRIFT`) and leave the instance running unchanged.
+ */
 export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
   const { anchor } = resolve(deps);
   const readStack = deps.readStack ?? loadStack;
@@ -333,6 +379,8 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
   const sharedLock = deps.withSharedLock ?? defaultWithSharedLock;
   const isPortFree = deps.isPortFree ?? defaultIsPortFree;
   const warn = deps.warn ?? defaultWarn;
+  const readHash = deps.readStoredHash ?? defaultReadStoredHash;
+  const writeHash = deps.writeStoredHash ?? defaultWriteStoredHash;
 
   const stack = readStack(anchor.worktreeRoot);
   const options = resolveAllocatorOptions(stack, deps.allocator ?? DEFAULT_ALLOCATOR);
@@ -375,11 +423,32 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
   }
 
   const paths = instancePaths(anchor.anchor, anchor.worktreeId);
-  mkdirSync(paths.runDir, { recursive: true });
-  writeFileSync(paths.configPath, stringifyYaml(derived.config), "utf8");
-
   const driver = createDriver(deps.driver);
   const inst = { configPath: paths.configPath, socketPath: paths.socketPath };
+
+  // Idempotency branch (issue #31): if this worktree's control socket is
+  // already present, the instance is up. Compare the current resolved-stack
+  // hash to the one stored from the previous successful `up`:
+  //   - match  -> noop, re-emit the envelope (no driver.up, no registry write)
+  //   - drift  -> attempt hot-reload via the driver; map failure to CONFIG_DRIFT.
+  if (existsSync(paths.socketPath)) {
+    return await reconcileRunning({
+      stack,
+      anchor,
+      paths,
+      blockBase,
+      portFor,
+      derived,
+      inst,
+      driver,
+      readHash,
+      writeHash,
+      deps,
+    });
+  }
+
+  mkdirSync(paths.runDir, { recursive: true });
+  writeFileSync(paths.configPath, stringifyYaml(derived.config), "utf8");
 
   // Lazy-start the shared instance if any shared services are declared. The
   // start is gated by `withSharedLock` and an idempotent socket-presence check
@@ -418,6 +487,10 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
   // healthy worktree into a failed `up` (same containment rule `ls --json`
   // applies, issue #29).
   const services = await collectIsolatedServices(stack, paths.socketPath, portFor, deps, driver);
+
+  // First-up bookkeeping: remember the resolved-stack hash so a subsequent
+  // `up` can branch on noop vs. drift (issue #31).
+  writeHash(anchor.anchor, anchor.worktreeId, stackHash(stack));
 
   if (shouldAttachAfterUp(deps)) await driver.attach(inst);
 
@@ -1336,6 +1409,69 @@ async function* mergeAsyncIterables<T>(
   } finally {
     await Promise.allSettled(lives.map((l) => Promise.resolve(l.it.return?.(undefined))));
   }
+}
+
+/**
+ * Idempotency / drift dispatch for a `runUp` whose worktree instance is
+ * already running. Two outcomes:
+ *
+ *  - **Matching hash** -> noop: skip `driver.up` and the registry write, just
+ *    re-collect per-service runtime rows and return the same envelope shape
+ *    a fresh `up` would (issue-#30 contract).
+ *  - **Drift** -> write the new derived config and call `driver.reloadConfig`.
+ *    On success, persist the new hash and return the new envelope; on any
+ *    failure, throw `ConfigDriftError` so the CLI emits the `CONFIG_DRIFT`
+ *    envelope and the instance keeps running (ADR-0005).
+ */
+async function reconcileRunning(args: {
+  readonly stack: ResolvedStack;
+  readonly anchor: { readonly anchor: string; readonly worktreeId: string };
+  readonly paths: {
+    readonly runDir: string;
+    readonly configPath: string;
+    readonly socketPath: string;
+  };
+  readonly blockBase: number;
+  readonly portFor: (name: string) => number | undefined;
+  readonly derived: ReturnType<typeof deriveWorktreeConfig>;
+  readonly inst: { readonly configPath: string; readonly socketPath: string };
+  readonly driver: ReturnType<typeof createDriver>;
+  readonly readHash: (anchor: string, id: string) => string | undefined;
+  readonly writeHash: (anchor: string, id: string, hash: string) => void;
+  readonly deps: CommandDeps;
+}): Promise<UpResult> {
+  const { stack, anchor, paths, blockBase, portFor, derived, inst, driver } = args;
+  const currentHash = stackHash(stack);
+  const storedHash = args.readHash(anchor.anchor, anchor.worktreeId);
+  if (storedHash !== currentHash) {
+    mkdirSync(paths.runDir, { recursive: true });
+    writeFileSync(paths.configPath, stringifyYaml(derived.config), "utf8");
+    const reload = await driver.reloadConfig(inst);
+    if (!reload.ok) {
+      throw new ConfigDriftError(
+        `devtrees up: config drift detected for '${anchor.worktreeId}' and the running ` +
+          `process-compose could not hot-reload the new config` +
+          (reload.message ? ` (${reload.message})` : "") +
+          ". The instance is still running — run `devtrees down && devtrees up` to apply the new config.",
+      );
+    }
+    args.writeHash(anchor.anchor, anchor.worktreeId, currentHash);
+  }
+  const services = await collectIsolatedServices(
+    stack,
+    paths.socketPath,
+    portFor,
+    args.deps,
+    driver,
+  );
+  return {
+    worktreeId: anchor.worktreeId,
+    socketPath: paths.socketPath,
+    env: derived.env,
+    sharedStarted: false,
+    blockBase,
+    services,
+  };
 }
 
 // --- default I/O implementations -------------------------------------------
