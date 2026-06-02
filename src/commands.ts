@@ -23,12 +23,13 @@ import {
   type StreamLogsOptions,
 } from "./driver.js";
 import { readRegistry, withRegistryLock, withSharedLock } from "./registry.js";
+import { defaultIsPortFree } from "./port-probe.js";
 import { stackHash } from "./hash.js";
 import {
   readStoredHash as defaultReadStoredHash,
   writeStoredHash as defaultWriteStoredHash,
 } from "./hashes.js";
-import { execFileSync, execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
@@ -53,8 +54,8 @@ const DEFAULT_ALLOCATOR: AllocatorOptions = { portBase: 20000, blockSize: 32 };
 /** Type of the lock-guarded mutator the caller passes for testability. */
 export type WithRegistryLock = (
   anchor: string,
-  mutate: (snapshot: RegistrySnapshot) => RegistrySnapshot,
-) => RegistrySnapshot;
+  mutate: (snapshot: RegistrySnapshot) => RegistrySnapshot | Promise<RegistrySnapshot>,
+) => Promise<RegistrySnapshot>;
 
 /** Type of the async lifecycle lock the caller passes for testability. */
 export type WithSharedLock = <T>(anchor: string, fn: () => Promise<T>) => Promise<T>;
@@ -149,7 +150,7 @@ export interface CommandDeps {
    */
   readonly getServiceStatuses?: (socketPath: string) => Promise<ServiceStatus[]>;
   /** Is a concrete port free to bind? Default: probes a real TCP bind. */
-  readonly isPortFree?: (port: number) => boolean;
+  readonly isPortFree?: (port: number) => boolean | Promise<boolean>;
   /**
    * Allocator defaults — `port_base` and `block_size`. The stack's `allocator`
    * field overrides these on a field-by-field basis. Default: 20000 / 32.
@@ -307,28 +308,28 @@ interface AllocatedPortMaps {
  * only thing they do differently is what they do with the resolved ports
  * afterwards.
  */
-function allocateAndBuildPortMaps(args: {
+async function allocateAndBuildPortMaps(args: {
   readonly anchor: string;
   readonly worktreeId: string;
   readonly stack: ResolvedStack;
   readonly options: AllocatorOptions;
   readonly lock: WithRegistryLock;
-  readonly isPortFree: (port: number) => boolean;
-}): AllocatedPortMaps {
+  readonly isPortFree: (port: number) => boolean | Promise<boolean>;
+}): Promise<AllocatedPortMaps> {
   const { anchor, worktreeId, stack, options, lock, isPortFree } = args;
   const sharedNeeded = hasTier(stack, "shared");
 
   let blockBase = -1;
   let sharedBase: number | undefined;
-  lock(anchor, (snapshot) => {
+  await lock(anchor, async (snapshot) => {
     let next = snapshot;
-    const block = allocateBlock(worktreeId, next, options, isPortFree);
+    const block = await allocateBlock(worktreeId, next, options, isPortFree);
     blockBase = block.base;
     if (next[worktreeId] === undefined) {
       next = { ...next, [worktreeId]: block.base };
     }
     if (sharedNeeded) {
-      const sblock = allocateBlock(SHARED_REGISTRY_KEY, next, options, isPortFree);
+      const sblock = await allocateBlock(SHARED_REGISTRY_KEY, next, options, isPortFree);
       sharedBase = sblock.base;
       if (next[SHARED_REGISTRY_KEY] === undefined) {
         next = { ...next, [SHARED_REGISTRY_KEY]: sblock.base };
@@ -393,7 +394,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
   // consistent regardless of which worktree got there first (acceptance:
   // "shared instance appears in the allocation registry as an anchor-keyed
   // entry with its own block", PRD US-32).
-  const { blockBase, portFor, sharedPortFor } = allocateAndBuildPortMaps({
+  const { blockBase, portFor, sharedPortFor } = await allocateAndBuildPortMaps({
     anchor: anchor.anchor,
     worktreeId: anchor.worktreeId,
     stack,
@@ -568,7 +569,7 @@ export async function runGenerate(deps: CommandDeps = {}): Promise<GenerateResul
   const options = resolveAllocatorOptions(stack, deps.allocator ?? DEFAULT_ALLOCATOR);
   const sharedNeeded = hasTier(stack, "shared");
 
-  const { portFor, sharedPortFor } = allocateAndBuildPortMaps({
+  const { portFor, sharedPortFor } = await allocateAndBuildPortMaps({
     anchor: anchor.anchor,
     worktreeId: anchor.worktreeId,
     stack,
@@ -689,8 +690,23 @@ async function ensureSharedStarted(
     writeFileSync(paths.configPath, stringifyYaml(derived.config), "utf8");
 
     await deps.driver.up({ configPath: paths.configPath, socketPath: paths.socketPath });
+    // `driver.up` is fire-and-forget: spawn returns before the child binds the
+    // UDS. Hold the shared lock until the socket is observable on disk so a
+    // concurrent `up` from another worktree sees the lazy-start as complete and
+    // doesn't race a second stub against ours (the loser's exit-time cleanup
+    // would unlink the winner's socket).
+    await waitForSocket(paths.socketPath);
     return true;
   });
+}
+
+/** Poll until `socketPath` exists or the deadline lapses. */
+async function waitForSocket(socketPath: string, timeoutMs = 3000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(socketPath)) return;
+    await new Promise((r) => setTimeout(r, 10));
+  }
 }
 
 // A real port a service binds shows up in its command as `--port 3000` / `:3000` /
@@ -844,7 +860,7 @@ export async function runDown(
     // Drop the shared entry from the registry so a future `up` re-allocates
     // (or, far more likely, re-uses the same block; the entry is removed for
     // tidiness and so `ls` reflects that the shared instance is down).
-    lock(anchor.anchor, (snapshot) => {
+    await lock(anchor.anchor, (snapshot) => {
       if (snapshot[SHARED_REGISTRY_KEY] === undefined) return snapshot;
       const { [SHARED_REGISTRY_KEY]: _drop, ...rest } = snapshot;
       void _drop;
@@ -900,7 +916,7 @@ function readPriorState(
   deps: CommandDeps,
   anchor: { anchor: string; worktreeId: string; worktreeRoot: string },
   readReg: (anchor: string) => RegistrySnapshot,
-  isPortFree: (port: number) => boolean,
+  isPortFree: (port: number) => boolean | Promise<boolean>,
 ): PriorState {
   const readStack = deps.readStack ?? loadStack;
   const noop = () => undefined;
@@ -1173,7 +1189,7 @@ export async function runPrune(deps: PruneDeps = {}): Promise<PruneResult> {
 
   // Drop every orphan's registry entry under one lock acquire so concurrent
   // `up`s can re-use the freed block bases.
-  lock(anchor.anchor, (snapshot) => {
+  await lock(anchor.anchor, (snapshot) => {
     let next = snapshot;
     let changed = false;
     for (const orphan of orphans) {
@@ -1226,9 +1242,9 @@ export async function runEnv(deps: CommandDeps = {}): Promise<EnvResult> {
   // shared), `allocateBlock` returns what a future `up` would pick against
   // this snapshot. No write happens here.
   const snapshot = readReg(anchor.anchor);
-  const block = allocateBlock(anchor.worktreeId, snapshot, options, isPortFree);
+  const block = await allocateBlock(anchor.worktreeId, snapshot, options, isPortFree);
   const sharedBlock = sharedNeeded
-    ? allocateBlock(SHARED_REGISTRY_KEY, snapshot, options, isPortFree)
+    ? await allocateBlock(SHARED_REGISTRY_KEY, snapshot, options, isPortFree)
     : undefined;
 
   const isolatedOffsets = buildOffsetMap(stack.services, "isolated", options.blockSize);
@@ -1484,16 +1500,6 @@ const defaultWithRegistryLock: WithRegistryLock = (anchor, mutate) =>
   withRegistryLock(anchor, mutate);
 
 const defaultWithSharedLock: WithSharedLock = (anchor, fn) => withSharedLock(anchor, fn);
-
-function defaultIsPortFree(port: number): boolean {
-  try {
-    // Best-effort, synchronous: if lsof finds a listener, the port is busy.
-    execSync(`lsof -nP -iTCP:${port} -sTCP:LISTEN`, { stdio: "ignore" });
-    return false;
-  } catch {
-    return true;
-  }
-}
 
 function defaultWarn(message: string): void {
   process.stderr.write(`${message}\n`);

@@ -37,7 +37,7 @@ import { withRegistryLock } from ${JSON.stringify(
 const [, , anchor, key, baseStr] = process.argv;
 const base = Number(baseStr);
 
-withRegistryLock(anchor, (snapshot) => {
+await withRegistryLock(anchor, (snapshot) => {
   // Sleep a few ms while holding the lock so a non-locking implementation would
   // be guaranteed to interleave with a sibling.
   const end = Date.now() + 30;

@@ -21,56 +21,58 @@ describe("registry store — lock + persistence", () => {
     expect(readRegistry(anchor)).toEqual({});
   });
 
-  it("persists assignments under <anchor>/devtrees/registry.json and reads them back", () => {
+  it("persists assignments under <anchor>/devtrees/registry.json and reads them back", async () => {
     const anchor = newAnchor();
-    withRegistryLock(anchor, (snapshot) => ({ ...snapshot, login: 20512 }));
+    await withRegistryLock(anchor, (snapshot) => ({ ...snapshot, login: 20512 }));
     expect(readRegistry(anchor)).toEqual({ login: 20512 });
   });
 
-  it("returns the post-mutation snapshot from withRegistryLock", () => {
+  it("returns the post-mutation snapshot from withRegistryLock", async () => {
     const anchor = newAnchor();
-    const after = withRegistryLock(anchor, (snapshot) => ({ ...snapshot, login: 20512 }));
+    const after = await withRegistryLock(anchor, (snapshot) => ({ ...snapshot, login: 20512 }));
     expect(after).toEqual({ login: 20512 });
   });
 
-  it("leaves the registry untouched when the callback returns the same snapshot reference", () => {
+  it("leaves the registry untouched when the callback returns the same snapshot reference", async () => {
     const anchor = newAnchor();
-    withRegistryLock(anchor, (snapshot) => ({ ...snapshot, login: 20512 }));
+    await withRegistryLock(anchor, (snapshot) => ({ ...snapshot, login: 20512 }));
     const file = join(anchor, "devtrees", "registry.json");
     const beforeMtime = readFileSync(file, "utf8");
     // Returning the snapshot unchanged signals a pure read — no write should happen.
-    withRegistryLock(anchor, (snapshot) => snapshot);
+    await withRegistryLock(anchor, (snapshot) => snapshot);
     expect(readFileSync(file, "utf8")).toBe(beforeMtime);
   });
 
-  it("refuses to acquire the lock if another holder is already there", () => {
+  it("refuses to acquire the lock if another holder is already there", async () => {
     const anchor = newAnchor();
     // Simulate another process holding the lock.
     mkdirSync(join(anchor, "devtrees"), { recursive: true });
     writeFileSync(join(anchor, "devtrees", "registry.lock"), `${process.pid}\n`, { flag: "wx" });
 
-    expect(() => withRegistryLock(anchor, (s) => s, { retries: 0 })).toThrow(RegistryLockedError);
+    await expect(withRegistryLock(anchor, (s) => s, { retries: 0 })).rejects.toThrow(
+      RegistryLockedError,
+    );
   });
 
-  it("serializes concurrent withRegistryLock calls so neither loses an update (lock holds)", () => {
+  it("serializes concurrent withRegistryLock calls so neither loses an update (lock holds)", async () => {
     const anchor = newAnchor();
     // Two interleaved callers: each reads, then adds its own key. If the lock holds,
     // both keys survive; if it doesn't, the second writer would clobber the first.
-    withRegistryLock(anchor, (s) => ({ ...s, login: 20512 }));
-    withRegistryLock(anchor, (s) => ({ ...s, billing: 20544 }));
+    await withRegistryLock(anchor, (s) => ({ ...s, login: 20512 }));
+    await withRegistryLock(anchor, (s) => ({ ...s, billing: 20544 }));
 
     expect(readRegistry(anchor)).toEqual({ login: 20512, billing: 20544 });
   });
 
-  it("releases the lock even when the callback throws", () => {
+  it("releases the lock even when the callback throws", async () => {
     const anchor = newAnchor();
-    expect(() =>
+    await expect(
       withRegistryLock(anchor, () => {
         throw new Error("boom");
       }),
-    ).toThrow("boom");
+    ).rejects.toThrow("boom");
     // A subsequent acquire must succeed — the lock did not leak.
-    withRegistryLock(anchor, (s) => ({ ...s, login: 20512 }));
+    await withRegistryLock(anchor, (s) => ({ ...s, login: 20512 }));
     expect(readRegistry(anchor)).toEqual({ login: 20512 });
   });
 });
