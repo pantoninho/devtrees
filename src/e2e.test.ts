@@ -353,6 +353,63 @@ describe("e2e — shared instance lifecycle across two worktrees", () => {
     expect(await waitForGone(Number(billing.env.DB_PORT))).toBe(true);
     expect(existsSync(sharedSocket)).toBe(false);
   }, 30000);
+
+  /**
+   * Issue #51 — `down --shared` preserves the `__shared__` registry entry so a
+   * subsequent `up` reuses the same shared block. The end-to-end signal is
+   * stable `DB_PORT` across the teardown cycle, plus `ls --json` correctly
+   * reporting shared as gone (post-down) and running (post-second-up).
+   */
+  it("preserves the shared block across down --shared + up (#51)", async () => {
+    const repo = makeRepo("dt-sh-stab-", ["login"]);
+    cleanups.push(() => rmSync(repo.root, { recursive: true, force: true }));
+
+    const loginWt = repo.worktrees.login;
+    if (loginWt === undefined) throw new Error("expected login worktree");
+    writeMixedTierStack(loginWt);
+
+    const deps = stubDriverDeps(loginWt);
+    const commonDir = git(loginWt, "rev-parse", "--git-common-dir");
+    const absCommon = commonDir.startsWith("/") ? commonDir : join(loginWt, commonDir);
+    const sharedSocket = join(absCommon, "devtrees", "run", "shared.sock");
+
+    const first = await runUp(deps as never);
+    cleanups.push(async () => {
+      await runDown(deps as never).catch(() => {});
+      await runDown(deps as never, { shared: true }).catch(() => {});
+    });
+    expect(first.sharedStarted).toBe(true);
+    expect(await waitForTcp(Number(first.env.DB_PORT))).toBe(true);
+
+    // ls --json sees the shared instance as running, on the first DB_PORT.
+    const lsBefore = await runLs({ cwd: loginWt, driver: deps.driver });
+    const sharedBefore = lsBefore.instances.find((i) => i.id === "shared");
+    expect(sharedBefore?.status).toBe("running");
+    expect(sharedBefore?.ports.DB_PORT).toBe(Number(first.env.DB_PORT));
+
+    // Tear the worktree down first so the second `up` re-runs the full
+    // lazy-start path (the idempotency branch short-circuits otherwise).
+    await runDown(deps as never);
+    await runDown(deps as never, { shared: true });
+    expect(await waitForGone(Number(first.env.DB_PORT))).toBe(true);
+    expect(existsSync(sharedSocket)).toBe(false);
+
+    // ls --json no longer reports the shared instance (socket-driven liveness).
+    const lsAfterDown = await runLs({ cwd: loginWt, driver: deps.driver });
+    expect(lsAfterDown.instances.find((i) => i.id === "shared")).toBeUndefined();
+
+    // The next up reuses the same shared block — DB_PORT is identical.
+    const second = await runUp(deps as never);
+    expect(second.sharedStarted).toBe(true);
+    expect(second.env.DB_PORT).toBe(first.env.DB_PORT);
+    expect(await waitForTcp(Number(second.env.DB_PORT))).toBe(true);
+
+    // ls --json shows shared back up on the original DB_PORT.
+    const lsAfterUp = await runLs({ cwd: loginWt, driver: deps.driver });
+    const sharedAfter = lsAfterUp.instances.find((i) => i.id === "shared");
+    expect(sharedAfter?.status).toBe("running");
+    expect(sharedAfter?.ports.DB_PORT).toBe(Number(first.env.DB_PORT));
+  }, 30000);
 });
 
 /**

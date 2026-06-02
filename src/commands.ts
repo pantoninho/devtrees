@@ -790,8 +790,15 @@ export type DownResult =
  * The two lifecycles are decoupled (ADR-0001): worktree `down` never touches
  * shared, so other worktrees keep their connections. Shared teardown is gated
  * by the shared lifecycle lock and idempotent: if the shared instance is not
- * running, the call is a no-op and the registry entry is still cleared so a
- * subsequent `up` can re-lazy-start it.
+ * running, the call is a no-op.
+ *
+ * Shared block stability (#51): `down --shared` preserves the `__shared__`
+ * registry entry. The next `up` re-uses the same block via the allocator
+ * fast-path, giving agents that record `DB_PORT` once a stable value across
+ * `down --shared` + `up` cycles. Lazy-start of the shared instance is still
+ * driven by socket absence, not registry presence, and `ls --json` liveness
+ * flows from the socket (instances.ts) — the surviving entry is invisible to
+ * it.
  *
  * Issue #48 trimmed this command's return to operation-output only: the
  * envelope used to carry a prior-state snapshot (env, services, block_base)
@@ -806,7 +813,6 @@ export async function runDown(
   const driver = createDriver(deps.driver);
 
   if (options.shared) {
-    const lock = deps.withRegistryLock ?? defaultWithRegistryLock;
     const sharedLock = deps.withSharedLock ?? defaultWithSharedLock;
     const paths = sharedInstancePaths(anchor.anchor);
 
@@ -818,15 +824,12 @@ export async function runDown(
       rmSync(paths.configPath, { force: true });
     });
 
-    // Drop the shared entry from the registry so a future `up` re-allocates
-    // (or, far more likely, re-uses the same block; the entry is removed for
-    // tidiness and so `ls` reflects that the shared instance is down).
-    await lock(anchor.anchor, (snapshot) => {
-      if (snapshot[SHARED_REGISTRY_KEY] === undefined) return snapshot;
-      const { [SHARED_REGISTRY_KEY]: _drop, ...rest } = snapshot;
-      void _drop;
-      return rest;
-    });
+    // Keep the `__shared__` registry entry across the teardown (issue #51).
+    // The next `up` re-uses the same block via the allocator fast-path
+    // (src/allocator.ts), giving agents that record `DB_PORT` once a stable
+    // value across `down --shared` + `up` cycles. `ls --json` liveness flows
+    // from socket presence (instances.ts), not the registry, so dropping the
+    // entry was tidy theatre at the cost of port stability.
 
     return { shared: true };
   }
