@@ -13,5 +13,5 @@ Two choices in this surface are worth recording because a future contributor wil
 ## Consequences
 
 - The CLI has no "agent mode" — behavior is driven by TTY detection and explicit flags. This keeps the human-facing surface unchanged and avoids a flag the agent must remember to set on every invocation.
-- `--json` output shapes are a stable contract: changes are breaking and require versioning.
+- `--json` output shapes are a stable contract **once devtrees declares the agent surface stable** (target: `v0.1.0` / first published agent release). Until then, the project is in walking-skeleton mode and shape changes don't require a `schema_version` bump — `"1"` is a placeholder for "draft v1, expect breaking changes." Once the surface is declared stable, the first real consumer migration becomes the trigger for `schema_version: "2"`, and subsequent breaking changes require a bump. While pre-stable, breaking changes are documented in CHANGELOG / release notes, not the version field — this keeps the version field a faithful signal that a real migration is required whenever it changes.
 - Error codes (`PROCESS_COMPOSE_NOT_FOUND`, `CONFIG_INVALID`, `LOCK_CONTENTION`, `HEALTH_TIMEOUT`, `CONFIG_DRIFT`, `INSTANCE_NOT_FOUND`, …) are part of that contract; new codes are additive, renames are breaking.

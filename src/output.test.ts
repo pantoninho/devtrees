@@ -18,10 +18,10 @@ import {
   formatLs,
   formatPrune,
   formatUp,
-  type DownPayload,
   type ErrorCode,
   type LsInstanceRow,
   type LsServiceRow,
+  type PrunedRow,
   type UpPayload,
 } from "./output.js";
 
@@ -407,27 +407,29 @@ describe("output formatter — formatUp", () => {
 });
 
 /**
- * `formatPrune` — `devtrees prune --json` envelope (issue #34).
+ * `formatPrune` — `devtrees prune --json` envelope (issue #48).
  *
- * The JSON document lists every orphan the sweep reconciled away under an
- * `orphans` key, each row carrying the same shape `ls --json` publishes so a
- * downstream agent can re-use the parser. Human output is unchanged.
+ * The JSON document lists every orphan the sweep reconciled away under
+ * `prune.pruned[]`. Each entry is identity-only: `{id, kind, worktreePath}` —
+ * no status, no ports, no services, no block_base (all of which described
+ * pre-prune state that no longer exists once the orphan is gone). The list
+ * itself stays because `prune` is the only command that reconciles
+ * devtrees-state vs `git worktree list` — the agent can't have learned it
+ * otherwise. Human output is unchanged.
  */
 describe("output formatter — formatPrune", () => {
-  const rows: ReadonlyArray<LsInstanceRow> = [
+  const rows: ReadonlyArray<PrunedRow> = [
     {
       id: "removed",
       kind: "worktree",
       status: "running",
-      ports: { WEB_PORT: 20032 },
-      blockBase: 20032,
+      worktreePath: "/abs/path/.../devtrees-example-removed",
     },
     {
       id: "gone",
       kind: "worktree",
       status: "stale",
-      ports: {},
-      blockBase: 20064,
+      worktreePath: "/abs/path/.../devtrees-example-gone",
     },
   ];
 
@@ -446,44 +448,49 @@ describe("output formatter — formatPrune", () => {
     expect(result.stdout).toMatch(/no orphan/i);
   });
 
-  it("in JSON mode, emits {schema_version, orphans:[...]} with the slice-#29 row shape", () => {
+  it("in JSON mode, emits {schema_version, prune:{pruned:[...]}} with identity-only entries", () => {
     const result = formatPrune(rows, "json");
     expect(result.stderr).toBe("");
     const parsed = JSON.parse(result.stdout) as {
       schema_version: string;
-      orphans: ReadonlyArray<{
-        id: string;
-        kind: string;
-        status: string;
-        ports: Record<string, number>;
-        services: ReadonlyArray<unknown>;
-        block_base?: number;
-      }>;
+      prune: { pruned: ReadonlyArray<Record<string, unknown>> };
     };
     expect(parsed.schema_version).toBe(SCHEMA_VERSION);
-    expect(parsed.orphans).toHaveLength(2);
-    expect(parsed.orphans[0]).toEqual({
+    expect(parsed.prune.pruned).toHaveLength(2);
+    expect(parsed.prune.pruned[0]).toEqual({
       id: "removed",
       kind: "worktree",
-      status: "running",
-      ports: { WEB_PORT: 20032 },
-      services: [],
-      block_base: 20032,
+      worktreePath: "/abs/path/.../devtrees-example-removed",
     });
-    expect(parsed.orphans[1]).toEqual({
+    expect(parsed.prune.pruned[1]).toEqual({
       id: "gone",
       kind: "worktree",
-      status: "stale",
-      ports: {},
-      services: [],
-      block_base: 20064,
+      worktreePath: "/abs/path/.../devtrees-example-gone",
     });
   });
 
-  it("in JSON mode with no orphans, emits {orphans:[]} (not 'no orphans' text)", () => {
+  it("in JSON mode, omits status / ports / services / block_base on each entry", () => {
+    const result = formatPrune(rows, "json");
+    const parsed = JSON.parse(result.stdout) as {
+      prune: { pruned: ReadonlyArray<Record<string, unknown>> };
+    };
+    for (const entry of parsed.prune.pruned) {
+      expect(entry).not.toHaveProperty("status");
+      expect(entry).not.toHaveProperty("ports");
+      expect(entry).not.toHaveProperty("services");
+      expect(entry).not.toHaveProperty("block_base");
+      expect(entry).not.toHaveProperty("blockBase");
+    }
+  });
+
+  it("in JSON mode with no orphans, emits {prune:{pruned:[]}} (not 'no orphans' text, no top-level 'orphans')", () => {
     const result = formatPrune([], "json");
-    const parsed = JSON.parse(result.stdout) as { orphans: unknown[] };
-    expect(parsed.orphans).toEqual([]);
+    const parsed = JSON.parse(result.stdout) as {
+      prune: { pruned: unknown[] };
+      orphans?: unknown;
+    };
+    expect(parsed.prune.pruned).toEqual([]);
+    expect(parsed).not.toHaveProperty("orphans");
   });
 
   it("JSON output ends with a single trailing newline (line-friendly for shell consumers)", () => {
@@ -494,26 +501,17 @@ describe("output formatter — formatPrune", () => {
 });
 
 /**
- * `formatDown` — `devtrees down --json` envelope (issue #34).
+ * `formatDown` — `devtrees down --json` envelope (issue #48).
  *
- * On success, the payload carries the prior state of the instance it stopped
- * (mirroring `up --json`'s success envelope from slice #30) so an agent has a
- * record of what was torn down. The human path is unchanged.
+ * The envelope is operation-output only: exactly one of `down.shared: true`
+ * (shared teardown) or `down.worktreeId: "<id>"` (worktree teardown) — never
+ * both, never neither. Agents that want pre- or post-teardown state should
+ * call `ls --json` before/after `down`; the action envelope no longer
+ * pre-bakes either snapshot. Human output is unchanged.
  */
 describe("output formatter — formatDown", () => {
-  const services: ReadonlyArray<LsServiceRow> = [
-    { name: "web", status: "Running", health: "ready", ports: { WEB_PORT: 20512 } },
-  ];
-  const payload: DownPayload = {
-    shared: false,
-    worktreeId: "login",
-    blockBase: 20512,
-    env: { DEVTREES_WORKTREE_ID: "login", WEB_PORT: "20512", DB_PORT: "30000" },
-    services,
-  };
-
   it("in human mode for a worktree down, emits today's 'worktree instance stopped' line", () => {
-    const result = formatDown(payload, "human");
+    const result = formatDown({ worktreeId: "login" }, "human");
     expect(result.stderr).toBe("");
     expect(result.stdout).toBe("devtrees down: worktree instance stopped.\n");
   });
@@ -523,76 +521,38 @@ describe("output formatter — formatDown", () => {
     expect(result.stdout).toBe("devtrees down: shared instance stopped.\n");
   });
 
-  it("in JSON mode, emits the prior-state envelope: {schema_version, down:{worktree_id, block_base, env, services, shared}}", () => {
-    const result = formatDown(payload, "json");
+  it("in JSON mode for a worktree down, emits {schema_version, down:{worktreeId}} and nothing else", () => {
+    const result = formatDown({ worktreeId: "login" }, "json");
     expect(result.stderr).toBe("");
     const parsed = JSON.parse(result.stdout) as {
       schema_version: string;
-      down: {
-        worktree_id: string;
-        block_base: number;
-        env: Record<string, string>;
-        services: ReadonlyArray<{
-          name: string;
-          status: string;
-          health: string;
-          ports: Record<string, number>;
-        }>;
-        shared: boolean;
-      };
+      down: Record<string, unknown>;
     };
     expect(parsed.schema_version).toBe(SCHEMA_VERSION);
-    expect(parsed.down.worktree_id).toBe("login");
-    expect(parsed.down.block_base).toBe(20512);
-    expect(parsed.down.shared).toBe(false);
-    expect(parsed.down.env).toEqual({
-      DEVTREES_WORKTREE_ID: "login",
-      WEB_PORT: "20512",
-      DB_PORT: "30000",
-    });
-    expect(parsed.down.services).toEqual([
-      { name: "web", status: "Running", health: "ready", ports: { WEB_PORT: 20512 } },
-    ]);
+    expect(parsed.down).toEqual({ worktreeId: "login" });
+    expect(parsed.down).not.toHaveProperty("shared");
+    expect(parsed.down).not.toHaveProperty("env");
+    expect(parsed.down).not.toHaveProperty("services");
+    expect(parsed.down).not.toHaveProperty("block_base");
   });
 
-  it("in JSON mode for a shared down, omits worktree_id (the shared instance is not keyed by a worktree)", () => {
-    const sharedPayload: DownPayload = {
-      shared: true,
-      blockBase: 30000,
-      env: { DB_PORT: "30000" },
-      services: [
-        { name: "postgres", status: "Running", health: "ready", ports: { DB_PORT: 30000 } },
-      ],
-    };
-    const result = formatDown(sharedPayload, "json");
+  it("in JSON mode for a shared down, emits {schema_version, down:{shared:true}} and nothing else", () => {
+    const result = formatDown({ shared: true }, "json");
+    expect(result.stderr).toBe("");
     const parsed = JSON.parse(result.stdout) as {
-      down: Record<string, unknown> & { shared: boolean };
+      schema_version: string;
+      down: Record<string, unknown>;
     };
-    expect(parsed.down.shared).toBe(true);
-    expect(parsed.down).not.toHaveProperty("worktree_id");
-    expect(parsed.down.block_base).toBe(30000);
-  });
-
-  it("in JSON mode, defaults services to [] and env to {} when the caller didn't populate them", () => {
-    const result = formatDown({ shared: false, worktreeId: "login" }, "json");
-    const parsed = JSON.parse(result.stdout) as {
-      down: { services: unknown[]; env: Record<string, string> };
-    };
-    expect(parsed.down.services).toEqual([]);
-    expect(parsed.down.env).toEqual({});
-  });
-
-  it("in JSON mode, omits block_base when the registry had no entry for the instance", () => {
-    const result = formatDown(
-      { shared: false, worktreeId: "login", env: {}, services: [] },
-      "json",
-    );
-    const parsed = JSON.parse(result.stdout) as { down: Record<string, unknown> };
+    expect(parsed.schema_version).toBe(SCHEMA_VERSION);
+    expect(parsed.down).toEqual({ shared: true });
+    expect(parsed.down).not.toHaveProperty("worktreeId");
+    expect(parsed.down).not.toHaveProperty("env");
+    expect(parsed.down).not.toHaveProperty("services");
     expect(parsed.down).not.toHaveProperty("block_base");
   });
 
   it("JSON output ends with a single trailing newline (line-friendly for shell consumers)", () => {
-    const result = formatDown(payload, "json");
+    const result = formatDown({ worktreeId: "login" }, "json");
     expect(result.stdout.endsWith("\n")).toBe(true);
     expect(result.stdout.endsWith("\n\n")).toBe(false);
   });

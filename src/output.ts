@@ -153,7 +153,26 @@ export function formatLs(instances: ReadonlyArray<LsInstanceRow>, mode: FormatMo
 
 // --- prune ------------------------------------------------------------------
 
-function formatPruneHuman(pruned: ReadonlyArray<LsInstanceRow>): string {
+/**
+ * One reconciled-away orphan, as `prune` reports it. The `status` (running vs
+ * stale at discovery) and `worktreePath` (where the worktree used to live)
+ * carry the prior-state context the human path renders; the JSON path emits
+ * only identity-and-location: `{id, kind, worktreePath}` (issue #48).
+ */
+export interface PrunedRow {
+  readonly id: string;
+  readonly kind: "worktree" | "shared";
+  /** Prior status at discovery — used by the human renderer only. */
+  readonly status: "running" | "stale";
+  /**
+   * Absolute path of the worktree the orphan was anchored at. Used by both
+   * renderers: human output shows it for context, JSON output emits it as the
+   * sole non-identity field per #48.
+   */
+  readonly worktreePath: string;
+}
+
+function formatPruneHuman(pruned: ReadonlyArray<PrunedRow>): string {
   if (pruned.length === 0) {
     return "devtrees prune: no orphans to clean up.\n";
   }
@@ -163,16 +182,25 @@ function formatPruneHuman(pruned: ReadonlyArray<LsInstanceRow>): string {
 }
 
 /**
- * `devtrees prune --json` envelope (issue #34). Lists every orphan the sweep
- * reconciled away under an `orphans` key — each row uses the slice-#29
- * `lsInstanceJson` shape so an agent can re-use the same parser it uses for
- * `ls --json`. The human path is unchanged.
+ * `devtrees prune --json` envelope (issue #48). Lists every orphan the sweep
+ * reconciled away under `prune.pruned[]`. Each entry is identity-only —
+ * `{id, kind, worktreePath}` — because `prune` is a sweep over state that no
+ * longer exists by the time the envelope is read: ports / services / status
+ * described pre-prune state and have no meaning once the orphan is gone. The
+ * list itself stays because `prune` is the only command that reconciles
+ * devtrees-state vs `git worktree list`. Human output is unchanged.
  */
-export function formatPrune(pruned: ReadonlyArray<LsInstanceRow>, mode: FormatMode): OutputResult {
+export function formatPrune(pruned: ReadonlyArray<PrunedRow>, mode: FormatMode): OutputResult {
   if (mode === "json") {
     const doc = {
       schema_version: SCHEMA_VERSION,
-      orphans: pruned.map(lsInstanceJson),
+      prune: {
+        pruned: pruned.map((p) => ({
+          id: p.id,
+          kind: p.kind,
+          worktreePath: p.worktreePath,
+        })),
+      },
     };
     return { stdout: `${JSON.stringify(doc)}\n`, stderr: "" };
   }
@@ -235,61 +263,39 @@ export function formatUp(payload: UpPayload, mode: FormatMode): OutputResult {
   return { stdout: formatUpHuman(payload), stderr: "" };
 }
 
-export interface DownPayload {
-  /** True iff the teardown targeted the shared instance (`down --shared`). */
-  readonly shared: boolean;
-  /**
-   * Id of the worktree instance that was stopped. Absent for shared teardown
-   * (the shared instance is not keyed by a worktree). JSON output omits the
-   * field when undefined.
-   */
-  readonly worktreeId?: string;
-  /**
-   * Base port of the instance's allocation block at the time it was stopped.
-   * Absent when the registry had no entry for the instance (e.g. a tidy-no-op
-   * `down --shared` against an already-stopped shared instance). JSON output
-   * omits the field when undefined.
-   */
-  readonly blockBase?: number;
-  /**
-   * The injected-value map the instance was running with — same shape `up
-   * --json` and `env --json` publish. JSON output defaults to `{}` when the
-   * caller didn't populate it.
-   */
-  readonly env?: Readonly<Record<string, string>>;
-  /**
-   * Per-service runtime rows the driver reported just before the teardown —
-   * same shape `ls --json` emits (slice #29). Optional so callers that can't
-   * gather them (driver hiccup, instance already gone) still produce a valid
-   * envelope; JSON output defaults to `[]`.
-   */
-  readonly services?: ReadonlyArray<LsServiceRow>;
-}
+/**
+ * `devtrees down --json` payload (issue #48). The teardown action carries only
+ * operation-identity: exactly one of `shared: true` (shared teardown) or
+ * `worktreeId: "<id>"` (worktree teardown) — never both, never neither, encoded
+ * as a discriminated union so the type system enforces the constraint. Agents
+ * that want pre- or post-teardown state should call `ls --json` before/after
+ * `down`; the action envelope does not pre-bake either snapshot.
+ */
+export type DownPayload =
+  | { readonly shared: true; readonly worktreeId?: undefined }
+  | { readonly shared?: false; readonly worktreeId: string };
 
 /**
  * Render `devtrees down` output.
  *
  *   - `human`: today's one-liner — `worktree instance stopped` or `shared
- *     instance stopped`. Unchanged regardless of which prior-state fields the
- *     caller populated.
- *   - `json`: the prior-state envelope (issue #34) — same shape as `up --json`'s
- *     success envelope (slice #30), recording what was torn down so an agent
- *     has a structured record of the previous state. `worktree_id` and
- *     `block_base` are omitted when absent.
+ *     instance stopped`. Unchanged by the issue-#48 envelope trim.
+ *   - `json`: an operation-output-only envelope (issue #48) — `{schema_version,
+ *     down:{shared:true}}` for a shared teardown or `{schema_version,
+ *     down:{worktreeId:"<id>"}}` for a worktree teardown. No env / services /
+ *     block_base — that pre-teardown state belongs to `ls --json`, called
+ *     before or after the action.
  */
 export function formatDown(payload: DownPayload, mode: FormatMode): OutputResult {
+  const shared = payload.shared === true;
   if (mode === "json") {
-    const down: Record<string, unknown> = {
-      env: payload.env ?? {},
-      services: (payload.services ?? []).map(lsServiceJson),
-      shared: payload.shared,
-    };
-    if (payload.worktreeId !== undefined) down.worktree_id = payload.worktreeId;
-    if (payload.blockBase !== undefined) down.block_base = payload.blockBase;
+    const down: Record<string, unknown> = shared
+      ? { shared: true }
+      : { worktreeId: payload.worktreeId };
     const doc = { schema_version: SCHEMA_VERSION, down };
     return { stdout: `${JSON.stringify(doc)}\n`, stderr: "" };
   }
-  const text = payload.shared
+  const text = shared
     ? "devtrees down: shared instance stopped.\n"
     : "devtrees down: worktree instance stopped.\n";
   return { stdout: text, stderr: "" };
