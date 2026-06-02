@@ -699,6 +699,74 @@ describe("devtrees CLI — up non-interactive (#28)", () => {
   });
 });
 
+/**
+ * Issue #30: `devtrees up --json` on success emits a single JSON document
+ * with everything an agent would otherwise piece together from `ls --json`
+ * + `env --json` — the allocated port block, per-service runtime rows, and
+ * the injected-value map. The human path stays unchanged.
+ */
+describe("devtrees CLI — up --json state envelope (#30)", () => {
+  it("emits {schema_version, up:{worktree_id, block_base, env, services, shared_started}} on success", async () => {
+    const up = vi.fn().mockResolvedValue({
+      worktreeId: "login",
+      socketPath: "/x.sock",
+      env: { DEVTREES_WORKTREE_ID: "login", WEB_PORT: "20512", DB_PORT: "30000" },
+      sharedStarted: true,
+      blockBase: 20512,
+      services: [{ name: "web", status: "Running", health: "ready", ports: { WEB_PORT: 20512 } }],
+    });
+    const result = await execute(["up", "--json"], { up, down: vi.fn() });
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+    const parsed = JSON.parse(result.stdout) as {
+      schema_version: string;
+      up: {
+        worktree_id: string;
+        block_base: number;
+        env: Record<string, string>;
+        services: ReadonlyArray<{
+          name: string;
+          status: string;
+          health: string;
+          ports: Record<string, number>;
+        }>;
+        shared_started: boolean;
+      };
+    };
+    expect(parsed.schema_version).toBeDefined();
+    expect(parsed.up.worktree_id).toBe("login");
+    expect(parsed.up.block_base).toBe(20512);
+    expect(parsed.up.env).toEqual({
+      DEVTREES_WORKTREE_ID: "login",
+      WEB_PORT: "20512",
+      DB_PORT: "30000",
+    });
+    expect(parsed.up.services).toEqual([
+      { name: "web", status: "Running", health: "ready", ports: { WEB_PORT: 20512 } },
+    ]);
+    expect(parsed.up.shared_started).toBe(true);
+  });
+
+  it("human `devtrees up` output is unchanged when runUp returns the new state envelope fields", async () => {
+    const up = vi.fn().mockResolvedValue({
+      worktreeId: "login",
+      socketPath: "/x.sock",
+      env: { WEB_PORT: "20512" },
+      sharedStarted: false,
+      blockBase: 20512,
+      services: [{ name: "web", status: "Running", health: "ready", ports: { WEB_PORT: 20512 } }],
+    });
+    const result = await execute(["up"], { up, down: vi.fn() });
+    expect(result.code).toBe(0);
+    // The human path renders the same "'<id>' is up" line and KEY=value
+    // list as before — no JSON shape leaks into the human surface.
+    expect(result.stdout).toContain("'login' is up");
+    expect(result.stdout).toContain("WEB_PORT=20512");
+    expect(result.stdout).not.toContain("block_base");
+    expect(result.stdout).not.toContain("services");
+  });
+});
+
 describe("devtrees CLI — isEntrypoint", () => {
   // The published binary is invoked through a symlink (npm-link bin, pnpm
   // shim, Homebrew bin). `process.argv[1]` is the symlink path; `import.meta.url`
