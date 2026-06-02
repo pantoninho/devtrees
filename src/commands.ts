@@ -690,8 +690,23 @@ async function ensureSharedStarted(
     writeFileSync(paths.configPath, stringifyYaml(derived.config), "utf8");
 
     await deps.driver.up({ configPath: paths.configPath, socketPath: paths.socketPath });
+    // `driver.up` is fire-and-forget: spawn returns before the child binds the
+    // UDS. Hold the shared lock until the socket is observable on disk so a
+    // concurrent `up` from another worktree sees the lazy-start as complete and
+    // doesn't race a second stub against ours (the loser's exit-time cleanup
+    // would unlink the winner's socket).
+    await waitForSocket(paths.socketPath);
     return true;
   });
+}
+
+/** Poll until `socketPath` exists or the deadline lapses. */
+async function waitForSocket(socketPath: string, timeoutMs = 3000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(socketPath)) return;
+    await new Promise((r) => setTimeout(r, 10));
+  }
 }
 
 // A real port a service binds shows up in its command as `--port 3000` / `:3000` /
