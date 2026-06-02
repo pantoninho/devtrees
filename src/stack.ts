@@ -40,6 +40,17 @@ export interface ResolvedService {
   readonly dependsOn: ReadonlyArray<string>;
   /** Author-declared environment entries, `KEY=VALUE`, passed through untouched. */
   readonly environment: ReadonlyArray<string>;
+  /**
+   * process-compose `readiness_probe` block, passed through verbatim. devtrees
+   * does not model the inner shape — process-compose owns it; whatever the
+   * author writes lands here unchanged and reaches the derived YAML as-is.
+   * Absent when the author (and the extends-base) declared no probe.
+   */
+  readonly readinessProbe?: Readonly<Record<string, unknown>>;
+  /** process-compose `liveness_probe` block, opaque passthrough. See `readinessProbe`. */
+  readonly livenessProbe?: Readonly<Record<string, unknown>>;
+  /** process-compose `availability` block (restart policy etc.), opaque passthrough. */
+  readonly availability?: Readonly<Record<string, unknown>>;
 }
 
 /** Per-repo allocator overrides, partial — unspecified fields fall back to defaults. */
@@ -62,6 +73,15 @@ interface RawService {
   ports?: unknown;
   depends_on?: unknown;
   environment?: unknown;
+  /**
+   * Pure passthrough surface — devtrees never validates the inner shape of
+   * these process-compose blocks. They're typed as `unknown` here so the
+   * parser can preserve any field process-compose accepts without coupling
+   * devtrees to a specific process-compose version.
+   */
+  readiness_probe?: unknown;
+  liveness_probe?: unknown;
+  availability?: unknown;
 }
 
 const DEFAULT_TIER: Tier = "isolated";
@@ -83,6 +103,22 @@ function asString(value: unknown): string {
 function asStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value.map(asString);
+}
+
+/**
+ * Coerce a YAML node into an opaque record passthrough. Returns `undefined`
+ * when the field is absent or not an object (arrays / scalars are not valid
+ * passthrough shapes for `readiness_probe` / `liveness_probe` / `availability`,
+ * but we don't validate here — process-compose surfaces its own errors at
+ * `up` time).
+ *
+ * The inner shape is intentionally unmodeled: whatever the author put under
+ * the key reaches the derived YAML unchanged, including fields devtrees
+ * doesn't know about.
+ */
+function asOpaqueRecord(value: unknown): Readonly<Record<string, unknown>> | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  return value as Readonly<Record<string, unknown>>;
 }
 
 /**
@@ -165,14 +201,23 @@ export function parseStack(yamlText: string, options: ParseStackOptions = {}): R
   const services: ResolvedService[] = names.map((name) => {
     const base = baseProcesses[name] ?? {};
     const over = overlay[name] ?? {};
-    return {
+    const readinessProbe = asOpaqueRecord(over.readiness_probe ?? base.readiness_probe);
+    const livenessProbe = asOpaqueRecord(over.liveness_probe ?? base.liveness_probe);
+    const availability = asOpaqueRecord(over.availability ?? base.availability);
+    const service: ResolvedService = {
       name,
       tier: ((over.tier ?? base.tier) as Tier | undefined) ?? DEFAULT_TIER,
       command: asString(over.command ?? base.command),
       ports: asStringArray(over.ports ?? base.ports),
       dependsOn: asDependencyList(over.depends_on ?? base.depends_on),
       environment: asStringArray(over.environment ?? base.environment),
+      // Pure passthrough — set only when present so `"readinessProbe" in svc`
+      // accurately reflects authoring intent (no `undefined` leak).
+      ...(readinessProbe !== undefined && { readinessProbe }),
+      ...(livenessProbe !== undefined && { livenessProbe }),
+      ...(availability !== undefined && { availability }),
     };
+    return service;
   });
 
   const allocator = parseAllocator(doc);
