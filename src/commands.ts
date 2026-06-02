@@ -40,7 +40,7 @@ import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
  * envelope so an agent can decide whether to `down` + `up` or hand off to
  * a human (ADR-0005).
  */
-export class ConfigDriftError extends Error {
+class ConfigDriftError extends Error {
   readonly code = "CONFIG_DRIFT";
   constructor(message: string) {
     super(message);
@@ -432,47 +432,19 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
   //   - match  -> noop, re-emit the envelope (no driver.up, no registry write)
   //   - drift  -> attempt hot-reload via the driver; map failure to CONFIG_DRIFT.
   if (existsSync(paths.socketPath)) {
-    const currentHash = stackHash(stack);
-    const storedHash = readHash(anchor.anchor, anchor.worktreeId);
-    if (storedHash === currentHash) {
-      const services = await collectIsolatedServices(
-        stack,
-        paths.socketPath,
-        portFor,
-        deps,
-        driver,
-      );
-      return {
-        worktreeId: anchor.worktreeId,
-        socketPath: paths.socketPath,
-        env: derived.env,
-        sharedStarted: false,
-        blockBase,
-        services,
-      };
-    }
-    // Drift: write the new derived config and ask process-compose to swap it.
-    mkdirSync(paths.runDir, { recursive: true });
-    writeFileSync(paths.configPath, stringifyYaml(derived.config), "utf8");
-    const reload = await driver.reloadConfig(inst);
-    if (!reload.ok) {
-      throw new ConfigDriftError(
-        `devtrees up: config drift detected for '${anchor.worktreeId}' and the running ` +
-          `process-compose could not hot-reload the new config` +
-          (reload.message ? ` (${reload.message})` : "") +
-          `. The instance is still running — run \`devtrees down && devtrees up\` to apply the new config.`,
-      );
-    }
-    writeHash(anchor.anchor, anchor.worktreeId, currentHash);
-    const services = await collectIsolatedServices(stack, paths.socketPath, portFor, deps, driver);
-    return {
-      worktreeId: anchor.worktreeId,
-      socketPath: paths.socketPath,
-      env: derived.env,
-      sharedStarted: false,
+    return await reconcileRunning({
+      stack,
+      anchor,
+      paths,
       blockBase,
-      services,
-    };
+      portFor,
+      derived,
+      inst,
+      driver,
+      readHash,
+      writeHash,
+      deps,
+    });
   }
 
   mkdirSync(paths.runDir, { recursive: true });
@@ -1202,6 +1174,69 @@ async function* mergeAsyncIterables<T>(
   } finally {
     await Promise.allSettled(lives.map((l) => Promise.resolve(l.it.return?.(undefined))));
   }
+}
+
+/**
+ * Idempotency / drift dispatch for a `runUp` whose worktree instance is
+ * already running. Two outcomes:
+ *
+ *  - **Matching hash** -> noop: skip `driver.up` and the registry write, just
+ *    re-collect per-service runtime rows and return the same envelope shape
+ *    a fresh `up` would (issue-#30 contract).
+ *  - **Drift** -> write the new derived config and call `driver.reloadConfig`.
+ *    On success, persist the new hash and return the new envelope; on any
+ *    failure, throw `ConfigDriftError` so the CLI emits the `CONFIG_DRIFT`
+ *    envelope and the instance keeps running (ADR-0005).
+ */
+async function reconcileRunning(args: {
+  readonly stack: ResolvedStack;
+  readonly anchor: { readonly anchor: string; readonly worktreeId: string };
+  readonly paths: {
+    readonly runDir: string;
+    readonly configPath: string;
+    readonly socketPath: string;
+  };
+  readonly blockBase: number;
+  readonly portFor: (name: string) => number | undefined;
+  readonly derived: ReturnType<typeof deriveWorktreeConfig>;
+  readonly inst: { readonly configPath: string; readonly socketPath: string };
+  readonly driver: ReturnType<typeof createDriver>;
+  readonly readHash: (anchor: string, id: string) => string | undefined;
+  readonly writeHash: (anchor: string, id: string, hash: string) => void;
+  readonly deps: CommandDeps;
+}): Promise<UpResult> {
+  const { stack, anchor, paths, blockBase, portFor, derived, inst, driver } = args;
+  const currentHash = stackHash(stack);
+  const storedHash = args.readHash(anchor.anchor, anchor.worktreeId);
+  if (storedHash !== currentHash) {
+    mkdirSync(paths.runDir, { recursive: true });
+    writeFileSync(paths.configPath, stringifyYaml(derived.config), "utf8");
+    const reload = await driver.reloadConfig(inst);
+    if (!reload.ok) {
+      throw new ConfigDriftError(
+        `devtrees up: config drift detected for '${anchor.worktreeId}' and the running ` +
+          `process-compose could not hot-reload the new config` +
+          (reload.message ? ` (${reload.message})` : "") +
+          ". The instance is still running — run `devtrees down && devtrees up` to apply the new config.",
+      );
+    }
+    args.writeHash(anchor.anchor, anchor.worktreeId, currentHash);
+  }
+  const services = await collectIsolatedServices(
+    stack,
+    paths.socketPath,
+    portFor,
+    args.deps,
+    driver,
+  );
+  return {
+    worktreeId: anchor.worktreeId,
+    socketPath: paths.socketPath,
+    env: derived.env,
+    sharedStarted: false,
+    blockBase,
+    services,
+  };
 }
 
 // --- default I/O implementations -------------------------------------------

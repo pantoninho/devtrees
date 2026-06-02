@@ -62,7 +62,7 @@ export function buildReloadConfigArgs(inst: InstanceRef): string[] {
  * branches route through `runUp` to the `CONFIG_DRIFT` envelope; the
  * `reason` is preserved for diagnostics only.
  */
-export type ReloadResult =
+type ReloadResult =
   | { readonly ok: true }
   | { readonly ok: false; readonly reason: "not_supported" | "error"; readonly message?: string };
 
