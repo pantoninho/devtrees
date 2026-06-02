@@ -17,6 +17,16 @@
  * The processes here are expected to be simple shell commands; the e2e uses a
  * tiny HTTP server that binds ${PORT} and writes a relative file, so the test
  * can assert reachability and working-directory isolation.
+ *
+ * Teardown contract (see #41):
+ *   - `up` writes `<socket>.parent-pid` so `down` (and any external reaper)
+ *     can find the long-lived parent.
+ *   - The `up` parent traps SIGTERM/SIGINT/exit and synchronously kills its
+ *     spawned children before exiting, regardless of whether they were
+ *     spawned `detached`. This is the only thing that prevents detached
+ *     children from being reparented to PID 1 and outliving the suite.
+ *   - `down` signals the parent (its trap does the work) and waits for it
+ *     to exit, so callers observe a fully reaped state.
  */
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -30,6 +40,21 @@ function flag(name, short) {
     if (argv[i] === name || argv[i] === short) return argv[i + 1];
   }
   return undefined;
+}
+
+function killChild(pid) {
+  // detached children are process-group leaders; -pid kills the group.
+  try {
+    process.kill(-pid, "SIGTERM");
+    return;
+  } catch {
+    // group already gone or never existed — fall through.
+  }
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch {
+    // already gone
+  }
 }
 
 const cmd = process.argv[2];
@@ -60,6 +85,51 @@ if (cmd === "up") {
     child.unref();
     pids.push(child.pid);
   }
+
+  // Synchronous reaper: kills every recorded child. Safe to call from
+  // signal handlers and the `exit` event (which only runs sync code).
+  let reaped = false;
+  function reapAndCleanup() {
+    if (reaped) return;
+    reaped = true;
+    for (const pid of pids) killChild(pid);
+    try {
+      rmSync(`${socketPath}.pids`, { force: true });
+    } catch {
+      // ignore
+    }
+    try {
+      rmSync(`${socketPath}.parent-pid`, { force: true });
+    } catch {
+      // ignore
+    }
+    try {
+      rmSync(`${socketPath}.config`, { force: true });
+    } catch {
+      // ignore
+    }
+    try {
+      rmSync(socketPath, { force: true });
+    } catch {
+      // ignore
+    }
+  }
+
+  // Signal-driven teardown — `down` SIGTERMs us; vitest may SIGINT us.
+  process.on("SIGTERM", () => {
+    reapAndCleanup();
+    process.exit(0);
+  });
+  process.on("SIGINT", () => {
+    reapAndCleanup();
+    process.exit(0);
+  });
+  // Belt-and-suspenders for natural exit. SIGKILL bypasses this (unblockable),
+  // which is why `down` prefers SIGTERM.
+  process.on("exit", () => {
+    reapAndCleanup();
+  });
+
   // The control socket doubles as the liveness marker and a record of child pids.
   mkdirSync(dirname(socketPath), { recursive: true });
   const server = createServer();
@@ -68,6 +138,7 @@ if (cmd === "up") {
     // Remember the derived config alongside the socket so `process list` can
     // recover the service set without re-resolving the original path.
     writeFileSync(`${socketPath}.config`, readFileSync(configPath, "utf8"));
+    writeFileSync(`${socketPath}.parent-pid`, String(process.pid));
     server.unref();
   });
   // Stay alive holding the socket; `down` will terminate us.
@@ -165,21 +236,49 @@ if (cmd === "up") {
   process.stderr.write(`stub-process-compose: unknown subcommand 'project ${sub}'\n`);
   process.exit(1);
 } else if (cmd === "down") {
-  if (existsSync(`${socketPath}.pids`)) {
-    const pids = JSON.parse(readFileSync(`${socketPath}.pids`, "utf8"));
-    for (const pid of pids) {
+  // Prefer signalling the parent: its trap reaps children and removes files
+  // atomically. Fall back to the legacy path if no parent-pid is recorded
+  // (e.g. an old run, or the parent died before writing it).
+  let parentPid;
+  try {
+    parentPid = Number(readFileSync(`${socketPath}.parent-pid`, "utf8"));
+  } catch {
+    parentPid = undefined;
+  }
+
+  if (parentPid && Number.isFinite(parentPid)) {
+    try {
+      process.kill(parentPid, "SIGTERM");
+    } catch {
+      // already gone
+    }
+    // Wait for the parent to actually exit, so callers see a fully reaped
+    // state (socket removed, pids dead). 3s is generous: the trap is
+    // synchronous and only does sync kill/rm calls.
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline) {
       try {
-        process.kill(-pid, "SIGTERM");
+        process.kill(parentPid, 0);
       } catch {
-        try {
-          process.kill(pid, "SIGTERM");
-        } catch {
-          // already gone
-        }
+        break;
       }
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  }
+
+  // Belt-and-suspenders: if no parent-pid file existed (legacy), kill the
+  // recorded children directly. Also remove any files the parent missed
+  // (e.g. if SIGKILLed before its trap could fire).
+  if (existsSync(`${socketPath}.pids`)) {
+    try {
+      const pids = JSON.parse(readFileSync(`${socketPath}.pids`, "utf8"));
+      for (const pid of pids) killChild(pid);
+    } catch {
+      // pids file unreadable — nothing we can do
     }
     rmSync(`${socketPath}.pids`, { force: true });
   }
+  rmSync(`${socketPath}.parent-pid`, { force: true });
   rmSync(`${socketPath}.config`, { force: true });
   rmSync(socketPath, { force: true });
   process.exit(0);
