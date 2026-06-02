@@ -1095,13 +1095,18 @@ describe("runDown — shared lifecycle is decoupled from worktree lifecycle", ()
     expect(existsSync(sharedSpawn.socketPath)).toBe(true);
   });
 
-  it("runDown(--shared) tears down the shared instance and clears its registry entry", async () => {
+  it("runDown(--shared) tears down the shared instance but preserves its registry entry (#51)", async () => {
+    // The shared block must stay pinned across a `down --shared` + `up` cycle
+    // so agents that record `DB_PORT` once can reuse it. Liveness in `ls --json`
+    // is driven by socket presence, not registry presence (instances.ts), so
+    // dropping the entry was tidy theatre at the cost of port stability.
     const track: StubSpawn = { invocations: [], touchSocket: true };
     const registryRef = { snapshot: {} as RegistrySnapshot };
     const deps = stubDeps({ stack: mixedStack, track, registryRef });
     await runUp(deps);
 
     expect(registryRef.snapshot[SHARED_REGISTRY_KEY]).toBeDefined();
+    const priorSharedBase = registryRef.snapshot[SHARED_REGISTRY_KEY];
     const sharedSpawn = findSharedSpawn(track);
     expect(existsSync(sharedSpawn.socketPath)).toBe(true);
 
@@ -1124,8 +1129,58 @@ describe("runDown — shared lifecycle is decoupled from worktree lifecycle", ()
 
     await runDown(downDeps, { shared: true });
     expect(existsSync(sharedSpawn.socketPath)).toBe(false);
-    // The shared registry entry is cleared so `ls` and re-`up` reflect the down.
-    expect(registryRef.snapshot[SHARED_REGISTRY_KEY]).toBeUndefined();
+    // The shared registry entry survives — liveness flows from the socket
+    // (which *is* gone), and the next `up` reuses the same block.
+    expect(registryRef.snapshot[SHARED_REGISTRY_KEY]).toBe(priorSharedBase);
+  });
+
+  it("runDown(--shared) + runUp reuses the same shared block and lazy-starts it again (#51)", async () => {
+    // Stable allocator probe: `() => true` (the default in stubDeps) makes the
+    // FNV-1a slot deterministic, so the post-`down` `up` must land on the same
+    // block as the pre-`down` `up` *because the registry entry survived* —
+    // without the registry entry, even a probe that always passes still hashes
+    // from `__shared__` fresh, but the assertion that matters is the *whole
+    // workflow* round-trips identically.
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const registryRef = { snapshot: {} as RegistrySnapshot };
+    const deps = stubDeps({ stack: mixedStack, track, registryRef });
+    const firstUp = await runUp(deps);
+    const firstSharedBase = registryRef.snapshot[SHARED_REGISTRY_KEY];
+    expect(firstSharedBase).toBeDefined();
+
+    // Mimic the real driver: down() removes the socket so the next `up` will
+    // observe socket absence and lazy-start.
+    const downDeps: CommandDeps = {
+      ...deps,
+      driver: {
+        exists: () => Promise.resolve(true),
+        spawner: (_b, args, _o): SpawnedProcess => {
+          const si = args.indexOf("-u");
+          if (args[0] === "down" && si >= 0) {
+            const socketPath = args[si + 1];
+            if (socketPath) rmSync(socketPath, { force: true });
+          }
+          return spawnedOk();
+        },
+      },
+    };
+    // Tear the worktree down too so the second `up` takes the full lazy-start
+    // path (the idempotency branch in `runUp` short-circuits before it would
+    // re-check the shared socket).
+    await runDown(downDeps);
+    await runDown(downDeps, { shared: true });
+
+    // The shared registry entry survived the teardown.
+    expect(registryRef.snapshot[SHARED_REGISTRY_KEY]).toBe(firstSharedBase);
+
+    // Re-`up`: shared lazy-starts again (socket was removed) on the same block.
+    expect(existsSync(findSharedSpawn(track).socketPath)).toBe(false);
+    const secondUp = await runUp(deps);
+    expect(registryRef.snapshot[SHARED_REGISTRY_KEY]).toBe(firstSharedBase);
+    expect(secondUp.env.DB_PORT).toBe(firstUp.env.DB_PORT);
+    expect(secondUp.sharedStarted).toBe(true);
+    // Socket re-appeared: lazy-start ran.
+    expect(existsSync(findSharedSpawn(track).socketPath)).toBe(true);
   });
 
   it("runDown(--shared) is a tidy no-op when the shared instance is not running", async () => {
