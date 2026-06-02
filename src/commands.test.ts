@@ -148,7 +148,7 @@ function stubDeps(opts: {
   stack: ResolvedStack;
   worktreeId?: string;
   initialRegistry?: RegistrySnapshot;
-  isPortFree?: (port: number) => boolean;
+  isPortFree?: (port: number) => boolean | Promise<boolean>;
   warn?: (m: string) => void;
   /**
    * Tracker for `process-compose up` invocations + a flag to make the stub
@@ -182,8 +182,8 @@ function stubDeps(opts: {
     cwd: join(worktreeRoot, worktreeId),
     git,
     readStack: () => opts.stack,
-    withRegistryLock: (_anchor, mutate) => {
-      const after = mutate(snapshotRef.snapshot);
+    withRegistryLock: async (_anchor, mutate) => {
+      const after = await mutate(snapshotRef.snapshot);
       snapshotRef.snapshot = after;
       return after;
     },
@@ -299,8 +299,11 @@ describe("runUp — double allocation prevention", () => {
     // the first's allocation and probes past it — exactly the contract under
     // concurrent `up`s once the lock has serialised them.
     let snapshot: RegistrySnapshot = {};
-    const lock = (_a: string, m: (s: RegistrySnapshot) => RegistrySnapshot) => {
-      const after = m(snapshot);
+    const lock = async (
+      _a: string,
+      m: (s: RegistrySnapshot) => RegistrySnapshot | Promise<RegistrySnapshot>,
+    ) => {
+      const after = await m(snapshot);
       snapshot = after;
       return after;
     };
@@ -1797,8 +1800,8 @@ describe("runPrune — reconcile instances against git worktree list", () => {
           socketPath: orphanSocket,
         }),
       ],
-      withRegistryLock: (_anchor, mutate) => {
-        const after = mutate(registryRef.snapshot);
+      withRegistryLock: async (_anchor, mutate) => {
+        const after = await mutate(registryRef.snapshot);
         registryRef.snapshot = after;
         return after;
       },
@@ -1854,8 +1857,8 @@ describe("runPrune — reconcile instances against git worktree list", () => {
       cwd: join(tmp.worktreeRoot, "login"),
       git,
       discover: async () => [instance("removed", { status: "stale", socketPath: orphanSocket })],
-      withRegistryLock: (_anchor, mutate) => {
-        const after = mutate(registryRef.snapshot);
+      withRegistryLock: async (_anchor, mutate) => {
+        const after = await mutate(registryRef.snapshot);
         registryRef.snapshot = after;
         return after;
       },
@@ -1926,8 +1929,8 @@ describe("runPrune — reconcile instances against git worktree list", () => {
         instance("alpha", { status: "running", socketPath: a }),
         instance("beta", { status: "running", socketPath: b }),
       ],
-      withRegistryLock: (_anchor, mutate) => {
-        const after = mutate(registryRef.snapshot);
+      withRegistryLock: async (_anchor, mutate) => {
+        const after = await mutate(registryRef.snapshot);
         registryRef.snapshot = after;
         return after;
       },

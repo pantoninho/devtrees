@@ -28,8 +28,14 @@ export interface PortBlock {
 /** A read-only view of the registry: worktree id → its block base. */
 export type RegistrySnapshot = Readonly<Record<string, number>>;
 
-/** Reports whether a concrete port is free to bind. Injected so cores stay pure. */
-export type PortFreeProbe = (port: number) => boolean;
+/**
+ * Reports whether a concrete port is free to bind. Injected so cores stay pure.
+ * The default implementation (`defaultIsPortFree` in `port-probe.ts`) is async
+ * because the underlying `net.createServer().listen()` bind is async; the seam
+ * accepts a sync stub too so unit tests don't need to wrap trivial answers
+ * in promises.
+ */
+export type PortFreeProbe = (port: number) => boolean | Promise<boolean>;
 
 /** Highest valid TCP port; blocks must fit entirely at or below this. */
 const MAX_PORT = 65535;
@@ -54,15 +60,15 @@ function makeBlock(base: number): PortBlock {
   return { base, portFor: (offset) => base + offset };
 }
 
-function blockIsAvailable(
+async function blockIsAvailable(
   base: number,
   blockSize: number,
   taken: ReadonlySet<number>,
   isFree: PortFreeProbe,
-): boolean {
+): Promise<boolean> {
   if (taken.has(base)) return false;
   for (let port = base; port < base + blockSize; port++) {
-    if (!isFree(port)) return false;
+    if (!(await isFree(port))) return false;
   }
   return true;
 }
@@ -72,12 +78,12 @@ function blockIsAvailable(
  * for this worktree in `snapshot` is returned verbatim — stability across restarts.
  * Otherwise hash to a candidate and probe forward past registered or in-use blocks.
  */
-export function allocateBlock(
+export async function allocateBlock(
   worktreeId: string,
   snapshot: RegistrySnapshot,
   options: AllocatorOptions,
   isFree: PortFreeProbe,
-): PortBlock {
+): Promise<PortBlock> {
   const existing = snapshot[worktreeId];
   if (existing !== undefined) return makeBlock(existing);
 
@@ -88,7 +94,7 @@ export function allocateBlock(
 
   for (let step = 0; step < blocks; step++) {
     const base = portBase + ((startIndex + step) % blocks) * blockSize;
-    if (blockIsAvailable(base, blockSize, taken, isFree)) {
+    if (await blockIsAvailable(base, blockSize, taken, isFree)) {
       return makeBlock(base);
     }
   }

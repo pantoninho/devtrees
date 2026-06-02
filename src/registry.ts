@@ -66,23 +66,12 @@ export function readRegistry(anchor: string): RegistrySnapshot {
   return JSON.parse(text) as RegistrySnapshot;
 }
 
-/** Synchronously sleep for `ms` milliseconds — used by the lock retry loop. */
-function sleepSync(ms: number): void {
-  const end = Date.now() + ms;
-  // Atomics.wait on a shared int is the only portable, non-busy sync sleep.
-  const sab = new SharedArrayBuffer(4);
-  const view = new Int32Array(sab);
-  while (Date.now() < end) {
-    Atomics.wait(view, 0, 0, Math.max(1, end - Date.now()));
-  }
-}
-
 /** Outcome of one `wx`-create attempt. */
 type AttemptResult = "acquired" | "contended";
 
 /**
  * One `wx`-create attempt: `acquired` on success, `contended` on EEXIST, rethrow
- * on any other errno. Shared by the sync and async acquire loops.
+ * on any other errno.
  */
 function tryWxCreate(path: string): AttemptResult {
   try {
@@ -94,22 +83,10 @@ function tryWxCreate(path: string): AttemptResult {
   }
 }
 
-/** Try to acquire a lockfile by `wx`-creating it; throws RegistryLockedError on timeout. */
-function acquireLockAt(path: string, options: LockOptions): void {
-  const retries = options.retries ?? DEFAULT_RETRIES;
-  const delay = options.retryDelayMs ?? DEFAULT_DELAY_MS;
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    if (tryWxCreate(path) === "acquired") return;
-    if (attempt === retries) throw new RegistryLockedError(path);
-    sleepSync(delay);
-  }
-}
-
 /**
- * Async variant of `acquireLockAt`. Uses `setTimeout` between retries so other
- * tasks (including the current holder's `finally` release) can run. The sync
- * variant's `Atomics.wait` would block the event loop and deadlock overlapping
- * callers within one process.
+ * Acquire a lockfile by `wx`-creating it; throws RegistryLockedError on timeout.
+ * Uses `setTimeout` between retries so other tasks (including the current
+ * holder's `finally` release) can run.
  */
 async function acquireLockAtAsync(path: string, options: LockOptions): Promise<void> {
   const retries = options.retries ?? DEFAULT_RETRIES;
@@ -130,11 +107,6 @@ function releaseLockAt(path: string): void {
   }
 }
 
-function acquireLock(anchor: string, options: LockOptions): void {
-  mkdirSync(devtreesDir(anchor), { recursive: true });
-  acquireLockAt(lockFile(anchor), options);
-}
-
 function releaseLock(anchor: string): void {
   releaseLockAt(lockFile(anchor));
 }
@@ -150,16 +122,23 @@ function writeSnapshot(anchor: string, snapshot: RegistrySnapshot): void {
  * snapshot is treated as untouched and no write happens; any other returned
  * object is persisted before the lock is released. The lock is always released,
  * including on a thrown callback.
+ *
+ * `mutate` may be async — `allocateBlock` awaits the injectable port-free probe
+ * (which binds a real TCP listener by default), so the read-modify-write under
+ * the lock has natural async gaps. Acquire is async to avoid the sync
+ * `Atomics.wait` busy loop blocking the event loop while a concurrent in-process
+ * caller is holding the lock through a probe.
  */
-export function withRegistryLock(
+export async function withRegistryLock(
   anchor: string,
-  mutate: (snapshot: RegistrySnapshot) => RegistrySnapshot,
+  mutate: (snapshot: RegistrySnapshot) => RegistrySnapshot | Promise<RegistrySnapshot>,
   options: LockOptions = {},
-): RegistrySnapshot {
-  acquireLock(anchor, options);
+): Promise<RegistrySnapshot> {
+  mkdirSync(devtreesDir(anchor), { recursive: true });
+  await acquireLockAtAsync(lockFile(anchor), options);
   try {
     const before = readRegistry(anchor);
-    const after = mutate(before);
+    const after = await mutate(before);
     if (after !== before) writeSnapshot(anchor, after);
     return after;
   } finally {
