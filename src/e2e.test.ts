@@ -23,9 +23,25 @@ const SHORT_TMP = process.platform === "darwin" ? "/tmp" : (process.env.RUNNER_T
 
 const STUB = fileURLToPath(new URL("../test/stub-process-compose.mjs", import.meta.url));
 
-const cleanups: Array<() => void> = [];
-afterEach(() => {
-  while (cleanups.length) cleanups.pop()?.();
+/**
+ * `afterEach` must run cleanups to completion before vitest reports the test
+ * done — otherwise fire-and-forget `runDown` races against the `rmSync` of
+ * the worktree tmp dir, the process-compose stub is never signalled, and its
+ * detached children leak into the host port table (#41). Cleanups may be
+ * sync or async; we run them in LIFO order so a worktree's `runDown` happens
+ * before the tmp dir housing its socket is unlinked.
+ */
+const cleanups: Array<() => void | Promise<void>> = [];
+afterEach(async () => {
+  while (cleanups.length) {
+    const fn = cleanups.pop();
+    if (!fn) continue;
+    try {
+      await fn();
+    } catch {
+      // Cleanups are best-effort; one failure must not block the next.
+    }
+  }
 });
 
 function git(cwd: string, ...args: string[]): string {
@@ -147,9 +163,7 @@ describe("e2e smoke — up then down a single isolated service", () => {
     const deps = stubDriverDeps(worktree);
 
     const up = await runUp(deps as never);
-    cleanups.push(() => {
-      void runDown(deps as never);
-    });
+    cleanups.push(() => runDown(deps as never));
 
     // Acceptance: the worktree id is resolved from the directory, not the branch.
     expect(up.worktreeId).toBe("login");
@@ -290,9 +304,7 @@ describe("e2e — shared instance lifecycle across two worktrees", () => {
 
     // Acceptance: first up lazy-starts the shared instance.
     const login = await runUp(loginDeps as never);
-    cleanups.push(() => {
-      void runDown(loginDeps as never).catch(() => {});
-    });
+    cleanups.push(() => runDown(loginDeps as never));
     expect(login.sharedStarted).toBe(true);
     expect(await waitForHttp(Number(login.env.WEB_PORT))).toBe(true);
     expect(await waitForTcp(Number(login.env.DB_PORT))).toBe(true);
@@ -305,9 +317,7 @@ describe("e2e — shared instance lifecycle across two worktrees", () => {
 
     // Acceptance: a second worktree up reuses the running shared instance.
     const billing = await runUp(billingDeps as never);
-    cleanups.push(() => {
-      void runDown(billingDeps as never).catch(() => {});
-    });
+    cleanups.push(() => runDown(billingDeps as never));
     expect(billing.sharedStarted).toBe(false);
     // Shared DB_PORT is identical in both worktrees (repo-wide injection).
     expect(billing.env.DB_PORT).toBe(login.env.DB_PORT);
@@ -356,13 +366,11 @@ describe("e2e — devtrees ls discovers worktree instances + the shared instance
     const billingDeps = stubDriverDeps(billingWt);
 
     const login = await runUp(loginDeps as never);
-    cleanups.push(() => {
-      void runDown(loginDeps as never).catch(() => {});
-    });
+    cleanups.push(() => runDown(loginDeps as never));
     const billing = await runUp(billingDeps as never);
-    cleanups.push(() => {
-      void runDown(billingDeps as never).catch(() => {});
-      void runDown(billingDeps as never, { shared: true }).catch(() => {});
+    cleanups.push(async () => {
+      await runDown(billingDeps as never).catch(() => {});
+      await runDown(billingDeps as never, { shared: true }).catch(() => {});
     });
 
     // The stub `process-compose` creates its control socket from a detached
@@ -525,9 +533,9 @@ describe("e2e — cross-tier wiring: isolated waits for shared health (ADR-0003)
     };
 
     const up = await runUp(deps as never);
-    cleanups.push(() => {
-      void runDown(deps as never).catch(() => {});
-      void runDown(deps as never, { shared: true }).catch(() => {});
+    cleanups.push(async () => {
+      await runDown(deps as never).catch(() => {});
+      await runDown(deps as never, { shared: true }).catch(() => {});
     });
 
     // Acceptance: web is up and reaches the shared DB port via the injection.
@@ -607,9 +615,7 @@ describe("e2e — devtrees prune reconciles against git worktree list", () => {
 
     const login = await runUp(loginDeps as never);
     const billing = await runUp(billingDeps as never);
-    cleanups.push(() => {
-      void runDown(billingDeps as never).catch(() => {});
-    });
+    cleanups.push(() => runDown(billingDeps as never));
 
     expect(await waitForHttp(Number(login.env.WEB_PORT))).toBe(true);
     expect(await waitForHttp(Number(billing.env.WEB_PORT))).toBe(true);
@@ -669,9 +675,7 @@ describe("e2e smoke — extend an existing process-compose.yaml", () => {
     const deps = stubDriverDeps(worktree);
 
     const up = await runUp(deps as never);
-    cleanups.push(() => {
-      void runDown(deps as never);
-    });
+    cleanups.push(() => runDown(deps as never));
 
     const port = Number(up.env.WEB_PORT);
     expect(await waitForHttp(port)).toBe(true);
@@ -712,9 +716,7 @@ describe("e2e — attach to a running worktree instance", () => {
     await expect(runAttach(deps as never)).rejects.toThrow(/no worktree instance is running/);
 
     const up = await runUp(deps as never);
-    cleanups.push(() => {
-      void runDown(deps as never);
-    });
+    cleanups.push(() => runDown(deps as never));
     expect(await waitForHttp(Number(up.env.WEB_PORT))).toBe(true);
 
     // Acceptance: attach reaches `process-compose attach` against the
@@ -823,8 +825,9 @@ describe("e2e — attach to the shared instance", () => {
     );
 
     const up = await runUp(deps as never);
-    cleanups.push(() => {
-      void runDown(deps as never).catch(() => {});
+    cleanups.push(async () => {
+      await runDown(deps as never).catch(() => {});
+      await runDown(deps as never, { shared: true }).catch(() => {});
     });
     expect(up.sharedStarted).toBe(true);
     expect(await waitForTcp(Number(up.env.DB_PORT))).toBe(true);
