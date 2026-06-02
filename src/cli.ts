@@ -322,17 +322,8 @@ async function handleDown(
   mode: FormatMode,
 ): Promise<RunResult> {
   const shared = rest.includes("--shared");
-  const result = (await deps.down({ shared })) ?? undefined;
-  const out = formatDown(
-    {
-      shared,
-      ...(result?.worktreeId !== undefined ? { worktreeId: result.worktreeId } : {}),
-      ...(result?.blockBase !== undefined ? { blockBase: result.blockBase } : {}),
-      ...(result?.env !== undefined ? { env: result.env } : {}),
-      ...(result?.services !== undefined ? { services: result.services } : {}),
-    },
-    mode,
-  );
+  const prior = (await deps.down({ shared })) ?? {};
+  const out = formatDown({ ...prior, shared }, mode);
   return { code: 0, stdout: out.stdout, stderr: out.stderr };
 }
 
@@ -514,15 +505,7 @@ if (isEntrypoint(import.meta.url, process.argv[1])) {
         ...(options?.attach !== undefined ? { attach: options.attach } : {}),
         ...(options?.waitTimeoutMs !== undefined ? { waitTimeoutMs: options.waitTimeoutMs } : {}),
       }),
-    down: async ({ shared }) => {
-      const r = await runDown({}, { shared });
-      return {
-        ...(r.worktreeId !== undefined ? { worktreeId: r.worktreeId } : {}),
-        ...(r.blockBase !== undefined ? { blockBase: r.blockBase } : {}),
-        env: r.env,
-        services: r.services,
-      };
-    },
+    down: ({ shared }) => runDown({}, { shared }),
     generate: () => runGenerate(),
     ls: () => runLs(),
     attach: ({ shared }) => runAttach({}, { shared }),
