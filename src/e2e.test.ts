@@ -317,7 +317,13 @@ describe("e2e — shared instance lifecycle across two worktrees", () => {
 
     // Acceptance: a second worktree up reuses the running shared instance.
     const billing = await runUp(billingDeps as never);
-    cleanups.push(() => runDown(billingDeps as never));
+    // Include the shared tear-down in cleanup so a timeout before the test
+    // body reaches `runDown(..., {shared:true})` still reaps the shared stub
+    // (otherwise its parent process leaks past the suite).
+    cleanups.push(async () => {
+      await runDown(billingDeps as never).catch(() => {});
+      await runDown(billingDeps as never, { shared: true }).catch(() => {});
+    });
     expect(billing.sharedStarted).toBe(false);
     // Shared DB_PORT is identical in both worktrees (repo-wide injection).
     expect(billing.env.DB_PORT).toBe(login.env.DB_PORT);
