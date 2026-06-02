@@ -749,17 +749,16 @@ export async function runDown(
     const sharedLock = deps.withSharedLock ?? defaultWithSharedLock;
     const paths = sharedInstancePaths(anchor.anchor);
 
-    // Snapshot the shared services *before* the teardown — once `down`
-    // removes the socket, `getServiceStatuses` has nothing to query.
-    const services = existsSync(paths.socketPath)
-      ? await collectServicesForTier(
-          priorState.stack,
-          paths.socketPath,
-          "shared",
-          fetchStatuses,
-          (n) => priorState.sharedPortFor(n),
+    // Snapshot services concurrently with the teardown — the status fetch
+    // talks to the live socket while `process-compose down` is in-flight,
+    // so the prior-state envelope doesn't add serial latency to `down`. If
+    // the fetch races past the socket teardown it degrades to [] (same rule
+    // a flaky driver call follows).
+    const servicesPromise = existsSync(paths.socketPath)
+      ? collectServicesForTier(priorState.stack, paths.socketPath, "shared", fetchStatuses, (n) =>
+          priorState.sharedPortFor(n),
         )
-      : [];
+      : Promise.resolve<Service[]>([]);
 
     await sharedLock(anchor.anchor, async () => {
       if (existsSync(paths.socketPath)) {
@@ -779,6 +778,7 @@ export async function runDown(
       return rest;
     });
 
+    const services = await servicesPromise;
     return {
       shared: true,
       ...(priorState.sharedBase !== undefined ? { blockBase: priorState.sharedBase } : {}),
@@ -788,17 +788,14 @@ export async function runDown(
   }
 
   const paths = instancePaths(anchor.anchor, anchor.worktreeId);
-  const services = existsSync(paths.socketPath)
-    ? await collectServicesForTier(
-        priorState.stack,
-        paths.socketPath,
-        "isolated",
-        fetchStatuses,
-        (n) => priorState.portFor(n),
+  const servicesPromise = existsSync(paths.socketPath)
+    ? collectServicesForTier(priorState.stack, paths.socketPath, "isolated", fetchStatuses, (n) =>
+        priorState.portFor(n),
       )
-    : [];
+    : Promise.resolve<Service[]>([]);
 
   await driver.down({ configPath: paths.configPath, socketPath: paths.socketPath });
+  const services = await servicesPromise;
 
   return {
     shared: false,
@@ -902,10 +899,20 @@ function readPriorState(
 }
 
 /**
+ * Cap how long `runDown` waits on `getServiceStatuses` before giving up and
+ * publishing `services: []`. The teardown itself isn't blocked by this — the
+ * snapshot is best-effort (issue #34) and we'd rather a partial envelope than
+ * a stalled `down` if process-compose is slow to answer over the UDS.
+ */
+const DOWN_SERVICES_SNAPSHOT_TIMEOUT_MS = 1_500;
+
+/**
  * Snapshot per-service runtime state for one tier's services, zipped with the
  * named-port allocations devtrees would have injected at derivation time. Same
  * primitive `up --json` (#30) and `ls --json` (#29) use; degrades to `[]` on a
- * driver hiccup so a teardown can't be blocked by a flaky status fetch.
+ * driver hiccup, a missing stack, *or* a slow probe — `runDown` must not wait
+ * indefinitely on a flaky `process list` when the operator asked for a
+ * teardown.
  */
 async function collectServicesForTier(
   stack: ResolvedStack | undefined,
@@ -917,7 +924,15 @@ async function collectServicesForTier(
   if (stack === undefined) return [];
   let statuses: ServiceStatus[];
   try {
-    statuses = await fetchStatuses(socketPath);
+    statuses = await Promise.race<ServiceStatus[]>([
+      fetchStatuses(socketPath),
+      new Promise<ServiceStatus[]>((_, reject) =>
+        setTimeout(
+          () => reject(new Error("getServiceStatuses snapshot timed out")),
+          DOWN_SERVICES_SNAPSHOT_TIMEOUT_MS,
+        ).unref(),
+      ),
+    ]);
   } catch {
     return [];
   }
