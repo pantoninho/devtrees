@@ -11,11 +11,14 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   ERROR_CODES,
   SCHEMA_VERSION,
+  formatDown,
   formatEnv,
   formatError,
   formatLogLine,
   formatLs,
+  formatPrune,
   formatUp,
+  type DownPayload,
   type ErrorCode,
   type LsInstanceRow,
   type LsServiceRow,
@@ -398,6 +401,198 @@ describe("output formatter — formatUp", () => {
 
   it("JSON output ends with a single trailing newline (line-friendly for shell consumers)", () => {
     const result = formatUp(payload, "json");
+    expect(result.stdout.endsWith("\n")).toBe(true);
+    expect(result.stdout.endsWith("\n\n")).toBe(false);
+  });
+});
+
+/**
+ * `formatPrune` — `devtrees prune --json` envelope (issue #34).
+ *
+ * The JSON document lists every orphan the sweep reconciled away under an
+ * `orphans` key, each row carrying the same shape `ls --json` publishes so a
+ * downstream agent can re-use the parser. Human output is unchanged.
+ */
+describe("output formatter — formatPrune", () => {
+  const rows: ReadonlyArray<LsInstanceRow> = [
+    {
+      id: "removed",
+      kind: "worktree",
+      status: "running",
+      ports: { WEB_PORT: 20032 },
+      blockBase: 20032,
+    },
+    {
+      id: "gone",
+      kind: "worktree",
+      status: "stale",
+      ports: {},
+      blockBase: 20064,
+    },
+  ];
+
+  it("in human mode, lists each cleaned orphan with its kind and prior status", () => {
+    const result = formatPrune(rows, "human");
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toContain("removed");
+    expect(result.stdout).toContain("gone");
+    expect(result.stdout).toContain("worktree");
+    expect(result.stdout).toMatch(/was running/);
+    expect(result.stdout).toMatch(/was stale/);
+  });
+
+  it("in human mode with no orphans, prints the existing 'no orphans' line", () => {
+    const result = formatPrune([], "human");
+    expect(result.stdout).toMatch(/no orphan/i);
+  });
+
+  it("in JSON mode, emits {schema_version, orphans:[...]} with the slice-#29 row shape", () => {
+    const result = formatPrune(rows, "json");
+    expect(result.stderr).toBe("");
+    const parsed = JSON.parse(result.stdout) as {
+      schema_version: string;
+      orphans: ReadonlyArray<{
+        id: string;
+        kind: string;
+        status: string;
+        ports: Record<string, number>;
+        services: ReadonlyArray<unknown>;
+        block_base?: number;
+      }>;
+    };
+    expect(parsed.schema_version).toBe(SCHEMA_VERSION);
+    expect(parsed.orphans).toHaveLength(2);
+    expect(parsed.orphans[0]).toEqual({
+      id: "removed",
+      kind: "worktree",
+      status: "running",
+      ports: { WEB_PORT: 20032 },
+      services: [],
+      block_base: 20032,
+    });
+    expect(parsed.orphans[1]).toEqual({
+      id: "gone",
+      kind: "worktree",
+      status: "stale",
+      ports: {},
+      services: [],
+      block_base: 20064,
+    });
+  });
+
+  it("in JSON mode with no orphans, emits {orphans:[]} (not 'no orphans' text)", () => {
+    const result = formatPrune([], "json");
+    const parsed = JSON.parse(result.stdout) as { orphans: unknown[] };
+    expect(parsed.orphans).toEqual([]);
+  });
+
+  it("JSON output ends with a single trailing newline (line-friendly for shell consumers)", () => {
+    const result = formatPrune(rows, "json");
+    expect(result.stdout.endsWith("\n")).toBe(true);
+    expect(result.stdout.endsWith("\n\n")).toBe(false);
+  });
+});
+
+/**
+ * `formatDown` — `devtrees down --json` envelope (issue #34).
+ *
+ * On success, the payload carries the prior state of the instance it stopped
+ * (mirroring `up --json`'s success envelope from slice #30) so an agent has a
+ * record of what was torn down. The human path is unchanged.
+ */
+describe("output formatter — formatDown", () => {
+  const services: ReadonlyArray<LsServiceRow> = [
+    { name: "web", status: "Running", health: "ready", ports: { WEB_PORT: 20512 } },
+  ];
+  const payload: DownPayload = {
+    shared: false,
+    worktreeId: "login",
+    blockBase: 20512,
+    env: { DEVTREES_WORKTREE_ID: "login", WEB_PORT: "20512", DB_PORT: "30000" },
+    services,
+  };
+
+  it("in human mode for a worktree down, emits today's 'worktree instance stopped' line", () => {
+    const result = formatDown(payload, "human");
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toBe("devtrees down: worktree instance stopped.\n");
+  });
+
+  it("in human mode for a shared down, emits today's 'shared instance stopped' line", () => {
+    const result = formatDown({ shared: true }, "human");
+    expect(result.stdout).toBe("devtrees down: shared instance stopped.\n");
+  });
+
+  it("in JSON mode, emits the prior-state envelope: {schema_version, down:{worktree_id, block_base, env, services, shared}}", () => {
+    const result = formatDown(payload, "json");
+    expect(result.stderr).toBe("");
+    const parsed = JSON.parse(result.stdout) as {
+      schema_version: string;
+      down: {
+        worktree_id: string;
+        block_base: number;
+        env: Record<string, string>;
+        services: ReadonlyArray<{
+          name: string;
+          status: string;
+          health: string;
+          ports: Record<string, number>;
+        }>;
+        shared: boolean;
+      };
+    };
+    expect(parsed.schema_version).toBe(SCHEMA_VERSION);
+    expect(parsed.down.worktree_id).toBe("login");
+    expect(parsed.down.block_base).toBe(20512);
+    expect(parsed.down.shared).toBe(false);
+    expect(parsed.down.env).toEqual({
+      DEVTREES_WORKTREE_ID: "login",
+      WEB_PORT: "20512",
+      DB_PORT: "30000",
+    });
+    expect(parsed.down.services).toEqual([
+      { name: "web", status: "Running", health: "ready", ports: { WEB_PORT: 20512 } },
+    ]);
+  });
+
+  it("in JSON mode for a shared down, omits worktree_id (the shared instance is not keyed by a worktree)", () => {
+    const sharedPayload: DownPayload = {
+      shared: true,
+      blockBase: 30000,
+      env: { DB_PORT: "30000" },
+      services: [
+        { name: "postgres", status: "Running", health: "ready", ports: { DB_PORT: 30000 } },
+      ],
+    };
+    const result = formatDown(sharedPayload, "json");
+    const parsed = JSON.parse(result.stdout) as {
+      down: Record<string, unknown> & { shared: boolean };
+    };
+    expect(parsed.down.shared).toBe(true);
+    expect(parsed.down).not.toHaveProperty("worktree_id");
+    expect(parsed.down.block_base).toBe(30000);
+  });
+
+  it("in JSON mode, defaults services to [] and env to {} when the caller didn't populate them", () => {
+    const result = formatDown({ shared: false, worktreeId: "login" }, "json");
+    const parsed = JSON.parse(result.stdout) as {
+      down: { services: unknown[]; env: Record<string, string> };
+    };
+    expect(parsed.down.services).toEqual([]);
+    expect(parsed.down.env).toEqual({});
+  });
+
+  it("in JSON mode, omits block_base when the registry had no entry for the instance", () => {
+    const result = formatDown(
+      { shared: false, worktreeId: "login", env: {}, services: [] },
+      "json",
+    );
+    const parsed = JSON.parse(result.stdout) as { down: Record<string, unknown> };
+    expect(parsed.down).not.toHaveProperty("block_base");
+  });
+
+  it("JSON output ends with a single trailing newline (line-friendly for shell consumers)", () => {
+    const result = formatDown(payload, "json");
     expect(result.stdout.endsWith("\n")).toBe(true);
     expect(result.stdout.endsWith("\n\n")).toBe(false);
   });
