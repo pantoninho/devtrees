@@ -5,7 +5,7 @@
  *
  * Stateless and dependency-free — the allocator injects this seam (`PortFreeProbe`),
  * and tests stub it. Replaces an older `lsof` shell-out so probes are sub-millisecond
- * and the tool no longer needs `lsof` on PATH (see ADR-0002, issue #42).
+ * and the tool no longer needs `lsof` on PATH (see issue #42).
  */
 
 import { createServer } from "node:net";
