@@ -70,21 +70,6 @@ if (cmd === "up") {
   const configPath = flag("-f", "-f");
   const config = parseYaml(readFileSync(configPath, "utf8"));
   const pids = [];
-  for (const proc of Object.values(config.processes ?? {})) {
-    const env = { ...process.env };
-    for (const entry of proc.environment ?? []) {
-      const eq = entry.indexOf("=");
-      env[entry.slice(0, eq)] = entry.slice(eq + 1);
-    }
-    const child = spawn("/bin/sh", ["-c", proc.command], {
-      cwd: proc.working_dir,
-      env,
-      stdio: "ignore",
-      detached: true,
-    });
-    child.unref();
-    pids.push(child.pid);
-  }
 
   // Synchronous reaper: kills every recorded child. Safe to call from
   // signal handlers and the `exit` event (which only runs sync code).
@@ -131,9 +116,27 @@ if (cmd === "up") {
   });
 
   // The control socket doubles as the liveness marker and a record of child pids.
+  // Spawn children only AFTER the UDS is bound — otherwise a fast TCP probe in
+  // a child can become observable before discovery can find this instance via
+  // its socket on disk, and `runLs` races the bind.
   mkdirSync(dirname(socketPath), { recursive: true });
   const server = createServer();
   server.listen(socketPath, () => {
+    for (const proc of Object.values(config.processes ?? {})) {
+      const env = { ...process.env };
+      for (const entry of proc.environment ?? []) {
+        const eq = entry.indexOf("=");
+        env[entry.slice(0, eq)] = entry.slice(eq + 1);
+      }
+      const child = spawn("/bin/sh", ["-c", proc.command], {
+        cwd: proc.working_dir,
+        env,
+        stdio: "ignore",
+        detached: true,
+      });
+      child.unref();
+      pids.push(child.pid);
+    }
     writeFileSync(`${socketPath}.pids`, JSON.stringify(pids));
     // Remember the derived config alongside the socket so `process list` can
     // recover the service set without re-resolving the original path.
