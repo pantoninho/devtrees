@@ -151,7 +151,33 @@ export interface ExecuteDeps {
      */
     services?: ReadonlyArray<LsServiceRow>;
   }>;
-  down: (options: { shared: boolean }) => Promise<void>;
+  down: (options: { shared: boolean }) => Promise<{
+    /**
+     * Id of the stopped instance — present for worktree teardown, absent for
+     * shared (the shared instance is not keyed by a worktree). Optional so
+     * older test stubs that resolved with `undefined` keep working.
+     */
+    worktreeId?: string;
+    /**
+     * Block base the instance was registered with at teardown time. Optional
+     * so a tidy-no-op `down --shared` against an already-stopped instance
+     * (no registry entry) still resolves to a valid envelope.
+     */
+    blockBase?: number;
+    /**
+     * The injected-value map the instance was running with — same shape `up`
+     * returns. Optional so the older up/down-only test stubs that resolve
+     * with `undefined` keep working; JSON output defaults to `{}`.
+     */
+    env?: Record<string, string>;
+    /**
+     * Per-service runtime rows snapshotted just before the teardown — same
+     * shape `ls --json` (issue #29) publishes. Optional so callers that can't
+     * gather them (driver hiccup, already-stopped instance) still produce a
+     * valid envelope; JSON output defaults to `[]`.
+     */
+    services?: ReadonlyArray<LsServiceRow>;
+  } | void>;
   /**
    * Emit the derived process-compose config(s) to disk without starting
    * anything. Optional on the deps so existing call sites (and tests that
@@ -296,8 +322,8 @@ async function handleDown(
   mode: FormatMode,
 ): Promise<RunResult> {
   const shared = rest.includes("--shared");
-  await deps.down({ shared });
-  const out = formatDown({ shared }, mode);
+  const prior = (await deps.down({ shared })) ?? {};
+  const out = formatDown({ ...prior, shared }, mode);
   return { code: 0, stdout: out.stdout, stderr: out.stderr };
 }
 

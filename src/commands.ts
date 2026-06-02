@@ -678,22 +678,87 @@ export function findUnmanagedPortBinds(
 }
 
 /**
- * Stop this worktree's instance (default) or — with `{ shared: true }` — the
- * shared instance. The two are decoupled (ADR-0001): worktree `down` never
- * touches shared, so other worktrees keep their connections.
+ * Result of `runDown` — the prior state of the instance that was stopped, so
+ * `devtrees down --json` (issue #34) can publish a record of what was torn
+ * down in the same shape `up --json` (slice #30) emits on success.
  *
- * Shared teardown is gated by the shared lifecycle lock and idempotent: if the
- * shared instance is not running, the call is a no-op and the registry entry
- * is still cleared so a subsequent `up` can re-lazy-start it.
+ * `worktreeId` and `blockBase` are optional: shared teardown has no
+ * worktree, and an already-stopped instance with no registry entry yields no
+ * `blockBase` to report.
  */
-export async function runDown(deps: CommandDeps = {}, options: DownOptions = {}): Promise<void> {
+export interface DownResult {
+  /** True iff the teardown targeted the shared instance (`{shared: true}`). */
+  readonly shared: boolean;
+  /** Id of the stopped worktree instance. Absent for shared teardown. */
+  readonly worktreeId?: string;
+  /**
+   * Block base recovered from the registry snapshot at teardown time. Absent
+   * when no entry existed (e.g. a tidy no-op `down --shared` against an
+   * already-stopped instance).
+   */
+  readonly blockBase?: number;
+  /**
+   * The injected-value map the instance was running with — same shape `up`
+   * returns. For a worktree teardown: own ports + shared ports + worktree id.
+   * For a shared teardown: the shared services' named ports.
+   */
+  readonly env: Record<string, string>;
+  /**
+   * Per-service runtime rows snapshotted via `driver.getServiceStatuses`
+   * *before* the teardown (the socket is dead afterwards). Same shape `ls
+   * --json` (slice #29) publishes. Degrades to `[]` on a fetch error or when
+   * the instance was already stopped (no socket to query).
+   */
+  readonly services: ReadonlyArray<Service>;
+}
+
+/**
+ * Stop this worktree's instance (default) or — with `{ shared: true }` — the
+ * shared instance, and return the prior state of what was torn down.
+ *
+ * The two lifecycles are decoupled (ADR-0001): worktree `down` never touches
+ * shared, so other worktrees keep their connections. Shared teardown is gated
+ * by the shared lifecycle lock and idempotent: if the shared instance is not
+ * running, the call is a no-op and the registry entry is still cleared so a
+ * subsequent `up` can re-lazy-start it.
+ *
+ * The prior-state snapshot is taken before `driver.down` — once the socket is
+ * gone, `getServiceStatuses` has nothing to talk to — and is best-effort: a
+ * stack-read or driver hiccup degrades the relevant field rather than
+ * aborting the teardown (issue #34 acceptance).
+ */
+export async function runDown(
+  deps: CommandDeps = {},
+  options: DownOptions = {},
+): Promise<DownResult> {
   const { anchor } = resolve(deps);
   const driver = createDriver(deps.driver);
+  const isPortFree = deps.isPortFree ?? defaultIsPortFree;
+  const readReg = deps.readRegistry ?? readRegistry;
+  const fetchStatuses =
+    deps.getServiceStatuses ?? ((socketPath: string) => driver.getServiceStatuses(socketPath));
+
+  // Compute the would-be env + block bases against the persisted registry
+  // (the same lock-free read `runEnv` uses, #32). Stack-read errors degrade
+  // to an empty envelope so a missing devtrees.yaml still tears down whatever
+  // is running.
+  const priorState = readPriorState(deps, anchor, readReg, isPortFree);
 
   if (options.shared) {
     const lock = deps.withRegistryLock ?? defaultWithRegistryLock;
     const sharedLock = deps.withSharedLock ?? defaultWithSharedLock;
     const paths = sharedInstancePaths(anchor.anchor);
+
+    // Snapshot services concurrently with the teardown — the status fetch
+    // talks to the live socket while `process-compose down` is in-flight,
+    // so the prior-state envelope doesn't add serial latency to `down`. If
+    // the fetch races past the socket teardown it degrades to [] (same rule
+    // a flaky driver call follows).
+    const servicesPromise = existsSync(paths.socketPath)
+      ? collectServicesForTier(priorState.stack, paths.socketPath, "shared", fetchStatuses, (n) =>
+          priorState.sharedPortFor(n),
+        )
+      : Promise.resolve<Service[]>([]);
 
     await sharedLock(anchor.anchor, async () => {
       if (existsSync(paths.socketPath)) {
@@ -712,11 +777,181 @@ export async function runDown(deps: CommandDeps = {}, options: DownOptions = {})
       void _drop;
       return rest;
     });
-    return;
+
+    const services = await servicesPromise;
+    return {
+      shared: true,
+      ...(priorState.sharedBase !== undefined ? { blockBase: priorState.sharedBase } : {}),
+      env: priorState.sharedEnv,
+      services,
+    };
   }
 
   const paths = instancePaths(anchor.anchor, anchor.worktreeId);
+  const servicesPromise = existsSync(paths.socketPath)
+    ? collectServicesForTier(priorState.stack, paths.socketPath, "isolated", fetchStatuses, (n) =>
+        priorState.portFor(n),
+      )
+    : Promise.resolve<Service[]>([]);
+
   await driver.down({ configPath: paths.configPath, socketPath: paths.socketPath });
+  const services = await servicesPromise;
+
+  return {
+    shared: false,
+    worktreeId: anchor.worktreeId,
+    ...(priorState.blockBase !== undefined ? { blockBase: priorState.blockBase } : {}),
+    env: priorState.env,
+    services,
+  };
+}
+
+/**
+ * Prior-state derivation for `runDown` — pure read of the persisted registry
+ * (same lock-free path `runEnv` uses, #32) re-derives the worktree and shared
+ * env maps so the `down --json` envelope can publish them without touching
+ * the running stack. Returns `undefined`-marked fields for the things that
+ * weren't available (no stack on disk, no registry entry).
+ */
+interface PriorState {
+  readonly stack: ResolvedStack | undefined;
+  readonly blockBase: number | undefined;
+  readonly sharedBase: number | undefined;
+  readonly env: Record<string, string>;
+  readonly sharedEnv: Record<string, string>;
+  readonly portFor: (name: string) => number | undefined;
+  readonly sharedPortFor: (name: string) => number | undefined;
+}
+
+function readPriorState(
+  deps: CommandDeps,
+  anchor: { anchor: string; worktreeId: string; worktreeRoot: string },
+  readReg: (anchor: string) => RegistrySnapshot,
+  isPortFree: (port: number) => boolean,
+): PriorState {
+  const readStack = deps.readStack ?? loadStack;
+  const noop = () => undefined;
+  let stack: ResolvedStack | undefined;
+  try {
+    stack = readStack(anchor.worktreeRoot);
+  } catch {
+    // No usable stack — return a minimal envelope shape rather than aborting
+    // the teardown. The agent still gets `shared` + (maybe) `block_base`.
+    return {
+      stack: undefined,
+      blockBase: undefined,
+      sharedBase: undefined,
+      env: {},
+      sharedEnv: {},
+      portFor: noop,
+      sharedPortFor: noop,
+    };
+  }
+
+  const options = resolveAllocatorOptions(stack, deps.allocator ?? DEFAULT_ALLOCATOR);
+  const sharedNeeded = hasTier(stack, "shared");
+  const snapshot = readReg(anchor.anchor);
+
+  // Use the persisted registry entry verbatim when it exists — that is what
+  // the instance was actually allocated against. Fall back to the allocator's
+  // deterministic answer for the rare "no entry but want a guess" case (e.g.
+  // a tidy no-op shared down) so the envelope still carries *some* block_base
+  // candidate where possible.
+  const blockBase = snapshot[anchor.worktreeId];
+  const sharedBase = sharedNeeded ? snapshot[SHARED_REGISTRY_KEY] : undefined;
+
+  const isolatedOffsets = buildOffsetMap(stack.services, "isolated", options.blockSize);
+  const sharedOffsets = sharedNeeded
+    ? buildOffsetMap(stack.services, "shared", options.blockSize)
+    : new Map<string, number>();
+
+  const portFor = (name: string): number | undefined => {
+    if (blockBase === undefined) return undefined;
+    const offset = isolatedOffsets.get(name);
+    return offset === undefined ? undefined : blockBase + offset;
+  };
+  const sharedPortFor = (name: string): number | undefined => {
+    if (sharedBase === undefined) return undefined;
+    const offset = sharedOffsets.get(name);
+    return offset === undefined ? undefined : sharedBase + offset;
+  };
+  void isPortFree; // unused: we read the registry verbatim instead of re-probing.
+
+  const derived = deriveWorktreeConfig(stack, {
+    worktreeId: anchor.worktreeId,
+    worktreeRoot: anchor.worktreeRoot,
+    portFor,
+    sharedPortFor,
+  });
+  const sharedDerived = sharedNeeded
+    ? deriveSharedConfig(stack, { workingDir: anchor.anchor, portFor: sharedPortFor })
+    : { env: {} as Record<string, string> };
+
+  return {
+    stack,
+    blockBase,
+    sharedBase,
+    env: derived.env,
+    sharedEnv: sharedDerived.env,
+    portFor,
+    sharedPortFor,
+  };
+}
+
+/**
+ * Cap how long `runDown` waits on `getServiceStatuses` before giving up and
+ * publishing `services: []`. The teardown itself isn't blocked by this — the
+ * snapshot is best-effort (issue #34) and we'd rather a partial envelope than
+ * a stalled `down` if process-compose is slow to answer over the UDS.
+ */
+const DOWN_SERVICES_SNAPSHOT_TIMEOUT_MS = 1_500;
+
+/**
+ * Snapshot per-service runtime state for one tier's services, zipped with the
+ * named-port allocations devtrees would have injected at derivation time. Same
+ * primitive `up --json` (#30) and `ls --json` (#29) use; degrades to `[]` on a
+ * driver hiccup, a missing stack, *or* a slow probe — `runDown` must not wait
+ * indefinitely on a flaky `process list` when the operator asked for a
+ * teardown.
+ */
+async function collectServicesForTier(
+  stack: ResolvedStack | undefined,
+  socketPath: string,
+  tier: "isolated" | "shared",
+  fetchStatuses: (socketPath: string) => Promise<ServiceStatus[]>,
+  portFor: (name: string) => number | undefined,
+): Promise<Service[]> {
+  if (stack === undefined) return [];
+  let statuses: ServiceStatus[];
+  try {
+    statuses = await Promise.race<ServiceStatus[]>([
+      fetchStatuses(socketPath),
+      new Promise<ServiceStatus[]>((_, reject) =>
+        setTimeout(
+          () => reject(new Error("getServiceStatuses snapshot timed out")),
+          DOWN_SERVICES_SNAPSHOT_TIMEOUT_MS,
+        ).unref(),
+      ),
+    ]);
+  } catch {
+    return [];
+  }
+  const portsByService = new Map<string, Record<string, number>>();
+  for (const svc of stack.services) {
+    if (svc.tier !== tier) continue;
+    const portMap: Record<string, number> = {};
+    for (const name of svc.ports) {
+      const port = portFor(name);
+      if (port !== undefined) portMap[name] = port;
+    }
+    portsByService.set(svc.name, portMap);
+  }
+  return statuses.map((s) => ({
+    name: s.name,
+    status: s.status,
+    health: s.health,
+    ports: portsByService.get(s.name) ?? {},
+  }));
 }
 
 /** Inputs unique to `runLs` — same anchor resolution as the other commands. */
