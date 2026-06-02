@@ -179,6 +179,20 @@ export interface UpPayload {
   readonly worktreeId: string;
   readonly env: Readonly<Record<string, string>>;
   readonly sharedStarted: boolean;
+  /**
+   * Base port of this worktree's allocated block (issue #30). Present on every
+   * successful `up`; absent on the older minimal-ack shape some tests still
+   * exercise. JSON output omits the field when undefined so the schema stays
+   * a faithful reflection of what was actually allocated.
+   */
+  readonly blockBase?: number;
+  /**
+   * Runtime per-service rows the driver observed after health was reached
+   * (issue #30) — same shape `ls --json` emits (slice #29). Optional so older
+   * call sites (and unit tests that don't care) keep working; JSON mode
+   * defaults a missing value to `[]` so the field is always present.
+   */
+  readonly services?: ReadonlyArray<LsServiceRow>;
 }
 
 function formatUpHuman(payload: UpPayload): string {
@@ -189,18 +203,27 @@ function formatUpHuman(payload: UpPayload): string {
   return `${sharedNote}devtrees up: '${payload.worktreeId}' is up.\n${ports}\n`;
 }
 
+/**
+ * Render `devtrees up` output.
+ *
+ *   - `human`: today's "is up + KEY=value lines" text, untouched by the
+ *     issue-#30 envelope fields.
+ *   - `json`: the full success-state envelope an agent reads in one call
+ *     (PRD #26 / issue #30): the allocated port block, the per-service
+ *     runtime rows (same shape as `ls --json`'s `services[]`), and the
+ *     injected-value map. The `HEALTH_TIMEOUT` failure envelope is unchanged
+ *     and routed through `formatError`.
+ */
 export function formatUp(payload: UpPayload, mode: FormatMode): OutputResult {
   if (mode === "json") {
-    // Slice #4 lands the full state envelope; until then, JSON mode emits a
-    // minimal acknowledgement so the seam exists and agents can detect success.
-    const doc = {
-      schema_version: SCHEMA_VERSION,
-      up: {
-        worktree_id: payload.worktreeId,
-        env: payload.env,
-        shared_started: payload.sharedStarted,
-      },
+    const up: Record<string, unknown> = {
+      worktree_id: payload.worktreeId,
+      env: payload.env,
+      services: (payload.services ?? []).map(lsServiceJson),
+      shared_started: payload.sharedStarted,
     };
+    if (payload.blockBase !== undefined) up.block_base = payload.blockBase;
+    const doc = { schema_version: SCHEMA_VERSION, up };
     return { stdout: `${JSON.stringify(doc)}\n`, stderr: "" };
   }
   return { stdout: formatUpHuman(payload), stderr: "" };

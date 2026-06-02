@@ -937,6 +937,140 @@ describe("runUp — wait-for-healthy (worktree instance, #28)", () => {
   });
 });
 
+/**
+ * `runUp` — issue #30 state envelope: on success, the result must carry the
+ * allocated port block plus the per-service runtime rows so the CLI can
+ * publish `up --json` in one document without a follow-up `ls --json` /
+ * `env --json` round-trip. Composition seam: services come from the driver
+ * (issue #29 `getServiceStatuses`), zipped with the named-port allocations
+ * already in hand from the deriver.
+ */
+describe("runUp — state envelope on success (#30)", () => {
+  const twoIsolated: ResolvedStack = {
+    services: [
+      isolated("web", "node web.js", ["WEB_PORT"]),
+      isolated("worker", "node worker.js", ["WORKER_PORT"]),
+    ],
+  };
+
+  it("returns the allocated block_base on the up result", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const result = await runUp(stubDeps({ stack: twoIsolated, track }));
+    // block_base is the bottom of this worktree's allocated block: the
+    // first named port (offset 0 within the block) lines up with it, and
+    // every other port falls inside [blockBase, blockBase + blockSize).
+    // The exact number depends on the allocator's hash of the worktree id;
+    // assert the contract, not the hash.
+    expect(result.blockBase).toBe(Number(result.env.WEB_PORT));
+    expect(Number(result.env.WORKER_PORT)).toBeGreaterThanOrEqual(result.blockBase);
+    expect(Number(result.env.WORKER_PORT)).toBeLessThan(result.blockBase + 32);
+  });
+
+  it("populates services[] from the injected getServiceStatuses, zipped with named-port allocations", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const baseDeps = stubDeps({ stack: twoIsolated, track });
+    const seen: string[] = [];
+    const deps: CommandDeps = {
+      ...baseDeps,
+      getServiceStatuses: async (socketPath) => {
+        seen.push(socketPath);
+        return [
+          { name: "web", status: "Running", health: "ready" },
+          { name: "worker", status: "Running", health: "not_ready" },
+        ];
+      },
+    };
+    const result = await runUp(deps);
+    // Called once, against the worktree's own socket.
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatch(/login\.sock$/);
+    expect(result.services).toEqual([
+      {
+        name: "web",
+        status: "Running",
+        health: "ready",
+        ports: { WEB_PORT: Number(result.env.WEB_PORT) },
+      },
+      {
+        name: "worker",
+        status: "Running",
+        health: "not_ready",
+        ports: { WORKER_PORT: Number(result.env.WORKER_PORT) },
+      },
+    ]);
+  });
+
+  it("services[] is the empty array (not undefined) when getServiceStatuses returns nothing", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const deps: CommandDeps = {
+      ...stubDeps({ stack: twoIsolated, track }),
+      getServiceStatuses: async () => [],
+    };
+    const result = await runUp(deps);
+    expect(result.services).toEqual([]);
+  });
+
+  it("a getServiceStatuses failure does not abort `up` — services[] degrades to []", async () => {
+    // Same containment rule `ls --json` uses (issue #29): a flaky driver call
+    // must not turn an otherwise-healthy worktree into a failed `up`. The
+    // stack is running; the envelope just gets the partial answer.
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const deps: CommandDeps = {
+      ...stubDeps({ stack: twoIsolated, track }),
+      getServiceStatuses: async () => {
+        throw new Error("simulated process-compose hiccup");
+      },
+    };
+    const result = await runUp(deps);
+    expect(result.services).toEqual([]);
+    // The rest of the envelope is still well-formed.
+    expect(result.blockBase).toBe(Number(result.env.WEB_PORT));
+    expect(result.env.WEB_PORT).toBeDefined();
+  });
+
+  it("calls getServiceStatuses after the health-wait, never before", async () => {
+    // Order matters: `getServiceStatuses` polls the running stack — calling
+    // it before the wait would return process-compose's transient "starting"
+    // state instead of the healthy snapshot the agent is contracting for.
+    const order: string[] = [];
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const deps: CommandDeps = {
+      ...stubDeps({ stack: twoIsolated, track }),
+      waitForHealth: async () => {
+        order.push("wait");
+      },
+      getServiceStatuses: async () => {
+        order.push("statuses");
+        return [];
+      },
+    };
+    await runUp(deps);
+    expect(order).toEqual(["wait", "statuses"]);
+  });
+
+  it("does not call getServiceStatuses when the health-wait threw HEALTH_TIMEOUT", async () => {
+    // The stack is left running (ADR-0005), but the agent reads the
+    // `HEALTH_TIMEOUT` error envelope, not the success envelope — so the
+    // success-only `services[]` fetch must be skipped.
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    let called = false;
+    const deps: CommandDeps = {
+      ...stubDeps({ stack: twoIsolated, track }),
+      waitForHealth: async () => {
+        const err = new Error("timed out") as Error & { code: string };
+        err.code = "HEALTH_TIMEOUT";
+        throw err;
+      },
+      getServiceStatuses: async () => {
+        called = true;
+        return [];
+      },
+    };
+    await expect(runUp(deps)).rejects.toThrow(/timed out/);
+    expect(called).toBe(false);
+  });
+});
+
 describe("runDown — shared lifecycle is decoupled from worktree lifecycle", () => {
   const mixedStack: ResolvedStack = {
     services: [

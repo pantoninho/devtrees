@@ -27,6 +27,7 @@ import {
   formatUp,
   type FormatMode,
   type LsInstanceRow,
+  type LsServiceRow,
 } from "./output.js";
 import type { LogEvent } from "./driver.js";
 
@@ -137,6 +138,18 @@ export interface ExecuteDeps {
     socketPath: string;
     env: Record<string, string>;
     sharedStarted?: boolean;
+    /**
+     * Base port of this worktree's allocation block (issue #30). Optional so
+     * older test stubs that don't supply it keep working — the JSON envelope
+     * simply omits `block_base` when undefined.
+     */
+    blockBase?: number;
+    /**
+     * Per-service runtime rows the driver observed after the health-wait —
+     * the slice-#29 `LsServiceRow` shape. Optional so the older up/down-only
+     * test stubs continue to type-check; the JSON envelope defaults to `[]`.
+     */
+    services?: ReadonlyArray<LsServiceRow>;
   }>;
   down: (options: { shared: boolean }) => Promise<void>;
   /**
@@ -269,6 +282,8 @@ async function handleUp(
       worktreeId: result.worktreeId,
       env: result.env,
       sharedStarted: result.sharedStarted ?? false,
+      ...(result.blockBase !== undefined ? { blockBase: result.blockBase } : {}),
+      ...(result.services !== undefined ? { services: result.services } : {}),
     },
     mode,
   );

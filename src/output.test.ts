@@ -15,8 +15,11 @@ import {
   formatError,
   formatLogLine,
   formatLs,
+  formatUp,
   type ErrorCode,
   type LsInstanceRow,
+  type LsServiceRow,
+  type UpPayload,
 } from "./output.js";
 
 describe("output formatter — constants", () => {
@@ -298,6 +301,103 @@ describe("output formatter — formatEnv", () => {
 
   it("JSON output ends with a single trailing newline (line-friendly for shell consumers)", () => {
     const result = formatEnv(sample, "json");
+    expect(result.stdout.endsWith("\n")).toBe(true);
+    expect(result.stdout.endsWith("\n\n")).toBe(false);
+  });
+});
+
+/**
+ * `formatUp` — `devtrees up` success envelope (issue #30).
+ *
+ * On `--json` success, an agent must read one document carrying everything it
+ * would otherwise piece together from `ls --json` + `env --json`: the
+ * allocated port block, the per-service runtime rows, and the injected-value
+ * map. The human path stays byte-for-byte unchanged.
+ */
+describe("output formatter — formatUp", () => {
+  const services: ReadonlyArray<LsServiceRow> = [
+    { name: "web", status: "Running", health: "ready", ports: { WEB_PORT: 20512 } },
+    { name: "worker", status: "Running", health: "ready", ports: {} },
+  ];
+  const payload: UpPayload = {
+    worktreeId: "login",
+    env: { DEVTREES_WORKTREE_ID: "login", WEB_PORT: "20512", DB_PORT: "30000" },
+    sharedStarted: true,
+    blockBase: 20512,
+    services,
+  };
+
+  it("in human mode, renders today's text (id + KEY=value lines + optional shared note)", () => {
+    const result = formatUp(payload, "human");
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toContain("'login' is up");
+    expect(result.stdout).toContain("WEB_PORT=20512");
+    expect(result.stdout).toContain("DB_PORT=30000");
+    expect(result.stdout).toContain("shared instance started");
+  });
+
+  it("in human mode, output is byte-for-byte unchanged when block_base/services are added", () => {
+    const withFields = formatUp(payload, "human").stdout;
+    const withoutFields = formatUp(
+      {
+        worktreeId: payload.worktreeId,
+        env: payload.env,
+        sharedStarted: payload.sharedStarted,
+      } as UpPayload,
+      "human",
+    ).stdout;
+    expect(withFields).toBe(withoutFields);
+  });
+
+  it("in JSON mode, emits the full state envelope: schema_version + worktree_id + block_base + env + services + shared_started", () => {
+    const result = formatUp(payload, "json");
+    expect(result.stderr).toBe("");
+    const parsed = JSON.parse(result.stdout) as {
+      schema_version: string;
+      up: {
+        worktree_id: string;
+        block_base: number;
+        env: Record<string, string>;
+        services: ReadonlyArray<{
+          name: string;
+          status: string;
+          health: string;
+          ports: Record<string, number>;
+        }>;
+        shared_started: boolean;
+      };
+    };
+    expect(parsed.schema_version).toBe(SCHEMA_VERSION);
+    expect(parsed.up.worktree_id).toBe("login");
+    expect(parsed.up.block_base).toBe(20512);
+    expect(parsed.up.shared_started).toBe(true);
+    expect(parsed.up.env).toEqual({
+      DEVTREES_WORKTREE_ID: "login",
+      WEB_PORT: "20512",
+      DB_PORT: "30000",
+    });
+    expect(parsed.up.services).toEqual([
+      { name: "web", status: "Running", health: "ready", ports: { WEB_PORT: 20512 } },
+      { name: "worker", status: "Running", health: "ready", ports: {} },
+    ]);
+  });
+
+  it("in JSON mode, defaults services to [] when the caller didn't populate them", () => {
+    const result = formatUp(
+      {
+        worktreeId: "login",
+        env: { WEB_PORT: "20512" },
+        sharedStarted: false,
+        blockBase: 20512,
+      } as UpPayload,
+      "json",
+    );
+    const parsed = JSON.parse(result.stdout) as { up: { services: unknown[] } };
+    expect(parsed.up.services).toEqual([]);
+  });
+
+  it("JSON output ends with a single trailing newline (line-friendly for shell consumers)", () => {
+    const result = formatUp(payload, "json");
     expect(result.stdout.endsWith("\n")).toBe(true);
     expect(result.stdout.endsWith("\n\n")).toBe(false);
   });
