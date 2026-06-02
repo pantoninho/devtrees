@@ -28,6 +28,7 @@ import {
   type FormatMode,
   type LsInstanceRow,
   type LsServiceRow,
+  type PrunedRow,
 } from "./output.js";
 import type { LogEvent } from "./driver.js";
 
@@ -153,30 +154,12 @@ export interface ExecuteDeps {
   }>;
   down: (options: { shared: boolean }) => Promise<{
     /**
-     * Id of the stopped instance — present for worktree teardown, absent for
-     * shared (the shared instance is not keyed by a worktree). Optional so
-     * older test stubs that resolved with `undefined` keep working.
+     * Id of the stopped worktree instance. Present for worktree teardown,
+     * absent for shared (the shared instance is not keyed by a worktree).
+     * Issue #48 trimmed `down --json` to operation-output only; this is the
+     * sole field the envelope renders for a worktree teardown.
      */
     worktreeId?: string;
-    /**
-     * Block base the instance was registered with at teardown time. Optional
-     * so a tidy-no-op `down --shared` against an already-stopped instance
-     * (no registry entry) still resolves to a valid envelope.
-     */
-    blockBase?: number;
-    /**
-     * The injected-value map the instance was running with — same shape `up`
-     * returns. Optional so the older up/down-only test stubs that resolve
-     * with `undefined` keep working; JSON output defaults to `{}`.
-     */
-    env?: Record<string, string>;
-    /**
-     * Per-service runtime rows snapshotted just before the teardown — same
-     * shape `ls --json` (issue #29) publishes. Optional so callers that can't
-     * gather them (driver hiccup, already-stopped instance) still produce a
-     * valid envelope; JSON output defaults to `[]`.
-     */
-    services?: ReadonlyArray<LsServiceRow>;
   } | void>;
   /**
    * Emit the derived process-compose config(s) to disk without starting
@@ -210,7 +193,7 @@ export interface ExecuteDeps {
    * instances. Optional for the same reason as `ls`: existing tests only
    * exercise `up`/`down` and don't have to stub `prune`.
    */
-  prune?: () => Promise<{ anchor: string; pruned: ReadonlyArray<LsInstanceRow> }>;
+  prune?: () => Promise<{ anchor: string; pruned: ReadonlyArray<PrunedRow> }>;
   /**
    * Emit the injected-value map for this worktree (issue #32). Pure read — no
    * driver call, no allocation-registry write, no lock. Optional so existing
@@ -322,8 +305,13 @@ async function handleDown(
   mode: FormatMode,
 ): Promise<RunResult> {
   const shared = rest.includes("--shared");
-  const prior = (await deps.down({ shared })) ?? {};
-  const out = formatDown({ ...prior, shared }, mode);
+  const result = (await deps.down({ shared })) ?? {};
+  // Issue #48: the action envelope carries exactly one of `shared: true` or
+  // `worktreeId: "<id>"`. Worktree teardown reports the id (best-effort: when
+  // the command runner couldn't supply one we still emit a non-empty id so
+  // the envelope is well-formed — an empty string is preferable to violating
+  // the discriminated-union contract).
+  const out = formatDown(shared ? { shared: true } : { worktreeId: result.worktreeId ?? "" }, mode);
   return { code: 0, stdout: out.stdout, stderr: out.stderr };
 }
 

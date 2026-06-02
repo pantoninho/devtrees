@@ -181,11 +181,9 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
       pruned: [
         {
           id: "removed",
-          kind: "worktree",
-          status: "running",
-          socketPath: "/repo/.git/devtrees/run/removed.sock",
-          ports: {},
-          blockBase: 20032,
+          kind: "worktree" as const,
+          status: "running" as const,
+          worktreePath: "/abs/path/.../devtrees-example-removed",
         },
       ],
     });
@@ -700,74 +698,47 @@ describe("devtrees CLI — up non-interactive (#28)", () => {
 });
 
 /**
- * Issue #34 — `devtrees down --json` carries the prior state of the instance
- * it stopped (same shape `up --json` from slice #30 emits on success), so an
- * agent has a structured record of what was torn down. `devtrees prune
- * --json` emits `{schema_version, orphans:[...]}` listing every orphan the
- * sweep reconciled away. Human output for both stays unchanged.
+ * Issue #48 — `devtrees down --json` and `devtrees prune --json` are trimmed
+ * to operation-output only. `down --json` carries exactly one of
+ * `down.shared: true` or `down.worktreeId: "<id>"`. `prune --json` lists
+ * reconciled-away orphans as identity-only entries `{id, kind, worktreePath}`
+ * under `prune.pruned[]`. Human output for both is unchanged.
  */
-describe("devtrees CLI — down/prune --json envelopes (#34)", () => {
-  it("`down --json` emits the prior-state envelope with worktree_id, block_base, env, services, shared:false", async () => {
-    const down = vi.fn().mockResolvedValue({
-      worktreeId: "login",
-      blockBase: 20512,
-      env: { DEVTREES_WORKTREE_ID: "login", WEB_PORT: "20512", DB_PORT: "30000" },
-      services: [{ name: "web", status: "Running", health: "ready", ports: { WEB_PORT: 20512 } }],
-    });
+describe("devtrees CLI — down/prune --json envelopes (#48)", () => {
+  it("`down --json` emits the worktree-teardown envelope: {down:{worktreeId}} and nothing else", async () => {
+    const down = vi.fn().mockResolvedValue({ worktreeId: "login" });
     const result = await execute(["down", "--json"], { up: vi.fn(), down });
     expect(down).toHaveBeenCalledWith({ shared: false });
     expect(result.code).toBe(0);
     expect(result.stderr).toBe("");
     const parsed = JSON.parse(result.stdout) as {
       schema_version: string;
-      down: {
-        worktree_id: string;
-        block_base: number;
-        env: Record<string, string>;
-        services: ReadonlyArray<{ name: string; status: string; health: string }>;
-        shared: boolean;
-      };
+      down: Record<string, unknown>;
     };
     expect(parsed.schema_version).toBeDefined();
-    expect(parsed.down.worktree_id).toBe("login");
-    expect(parsed.down.block_base).toBe(20512);
-    expect(parsed.down.shared).toBe(false);
-    expect(parsed.down.env).toEqual({
-      DEVTREES_WORKTREE_ID: "login",
-      WEB_PORT: "20512",
-      DB_PORT: "30000",
-    });
-    expect(parsed.down.services).toEqual([
-      { name: "web", status: "Running", health: "ready", ports: { WEB_PORT: 20512 } },
-    ]);
+    expect(parsed.down).toEqual({ worktreeId: "login" });
+    expect(parsed.down).not.toHaveProperty("shared");
+    expect(parsed.down).not.toHaveProperty("env");
+    expect(parsed.down).not.toHaveProperty("services");
+    expect(parsed.down).not.toHaveProperty("block_base");
   });
 
-  it("`down --shared --json` emits the shared instance's prior state (no worktree_id, shared:true)", async () => {
-    const down = vi.fn().mockResolvedValue({
-      blockBase: 30000,
-      env: { DB_PORT: "30000" },
-      services: [
-        { name: "postgres", status: "Running", health: "ready", ports: { DB_PORT: 30000 } },
-      ],
-    });
+  it("`down --shared --json` emits the shared-teardown envelope: {down:{shared:true}} and nothing else", async () => {
+    const down = vi.fn().mockResolvedValue({});
     const result = await execute(["down", "--shared", "--json"], { up: vi.fn(), down });
     expect(down).toHaveBeenCalledWith({ shared: true });
     const parsed = JSON.parse(result.stdout) as {
-      down: Record<string, unknown> & { shared: boolean };
+      down: Record<string, unknown>;
     };
-    expect(parsed.down.shared).toBe(true);
-    expect(parsed.down).not.toHaveProperty("worktree_id");
-    expect(parsed.down.block_base).toBe(30000);
-    expect(parsed.down.env).toEqual({ DB_PORT: "30000" });
+    expect(parsed.down).toEqual({ shared: true });
+    expect(parsed.down).not.toHaveProperty("worktreeId");
+    expect(parsed.down).not.toHaveProperty("env");
+    expect(parsed.down).not.toHaveProperty("services");
+    expect(parsed.down).not.toHaveProperty("block_base");
   });
 
   it("`down` without --json is byte-for-byte unchanged from today's text", async () => {
-    const down = vi.fn().mockResolvedValue({
-      worktreeId: "login",
-      blockBase: 20512,
-      env: { WEB_PORT: "20512" },
-      services: [],
-    });
+    const down = vi.fn().mockResolvedValue({ worktreeId: "login" });
     const result = await execute(["down"], { up: vi.fn(), down });
     expect(result.stdout).toBe("devtrees down: worktree instance stopped.\n");
   });
@@ -783,7 +754,7 @@ describe("devtrees CLI — down/prune --json envelopes (#34)", () => {
     expect(result.stderr).toMatch(/no worktree instance is running/);
   });
 
-  it("`prune --json` emits {schema_version, orphans:[...]} with the slice-#29 row shape", async () => {
+  it("`prune --json` emits {schema_version, prune:{pruned:[...]}} with identity-only entries", async () => {
     const prune = vi.fn().mockResolvedValue({
       anchor: "/repo/.git",
       pruned: [
@@ -791,9 +762,7 @@ describe("devtrees CLI — down/prune --json envelopes (#34)", () => {
           id: "removed",
           kind: "worktree" as const,
           status: "running" as const,
-          socketPath: "/repo/.git/devtrees/run/removed.sock",
-          ports: { WEB_PORT: 20032 },
-          blockBase: 20032,
+          worktreePath: "/abs/path/.../devtrees-example-removed",
         },
       ],
     });
@@ -802,19 +771,22 @@ describe("devtrees CLI — down/prune --json envelopes (#34)", () => {
     expect(result.stderr).toBe("");
     const parsed = JSON.parse(result.stdout) as {
       schema_version: string;
-      orphans: ReadonlyArray<{ id: string; kind: string; ports: Record<string, number> }>;
+      prune: { pruned: ReadonlyArray<Record<string, unknown>> };
     };
     expect(parsed.schema_version).toBeDefined();
-    expect(parsed.orphans).toHaveLength(1);
-    expect(parsed.orphans[0]?.id).toBe("removed");
-    expect(parsed.orphans[0]?.ports).toEqual({ WEB_PORT: 20032 });
+    expect(parsed.prune.pruned).toHaveLength(1);
+    expect(parsed.prune.pruned[0]).toEqual({
+      id: "removed",
+      kind: "worktree",
+      worktreePath: "/abs/path/.../devtrees-example-removed",
+    });
   });
 
-  it("`prune --json` with no orphans emits {orphans:[]} (not the 'no orphans' string)", async () => {
+  it("`prune --json` with no orphans emits {prune:{pruned:[]}} (not the 'no orphans' string)", async () => {
     const prune = vi.fn().mockResolvedValue({ anchor: "/repo/.git", pruned: [] });
     const result = await execute(["prune", "--json"], { up: vi.fn(), down: vi.fn(), prune });
-    const parsed = JSON.parse(result.stdout) as { orphans: unknown[] };
-    expect(parsed.orphans).toEqual([]);
+    const parsed = JSON.parse(result.stdout) as { prune: { pruned: unknown[] } };
+    expect(parsed.prune.pruned).toEqual([]);
   });
 
   it("`prune` without --json is byte-for-byte unchanged from today's text (no orphans case)", async () => {
