@@ -44,6 +44,29 @@ export function buildAttachArgs(inst: InstanceRef): string[] {
 }
 
 /**
+ * Hot-reload the running instance's config from `inst.configPath` over its
+ * UDS. Uses process-compose's `project update -f <file>` — present on
+ * recent versions; older builds reject the subcommand, which the driver
+ * surfaces as `not_supported` so `runUp` can fall back to `CONFIG_DRIFT`
+ * (issue #31).
+ */
+export function buildReloadConfigArgs(inst: InstanceRef): string[] {
+  return ["project", "update", "-U", "-u", inst.socketPath, "-f", inst.configPath];
+}
+
+/**
+ * Outcome of a `reloadConfig` call. `ok:true` means process-compose swapped
+ * the running graph in-place; `ok:false` means it refused — either because
+ * the running build does not implement `project update` (`not_supported`)
+ * or because the new config could not be applied (`error`). Both failure
+ * branches route through `runUp` to the `CONFIG_DRIFT` envelope; the
+ * `reason` is preserved for diagnostics only.
+ */
+export type ReloadResult =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly reason: "not_supported" | "error"; readonly message?: string };
+
+/**
  * List the running processes of an instance over its UDS, in JSON. devtrees
  * always asks for JSON — the human table is for operators driving
  * process-compose directly; the driver parses the response.
@@ -273,7 +296,49 @@ export function createDriver(deps: DriverDeps = {}) {
     streamLogs(socketPath: string, opts: StreamLogsOptions): AsyncIterable<LogEvent> {
       return streamLogsImpl(socketPath, opts, { binary, prefix, exists, spawner });
     },
+    /**
+     * Ask the running instance to swap its config in-place from
+     * `inst.configPath`. Returns a structured `ReloadResult` — `ok:true` on a
+     * clean exit, `ok:false` on any failure (missing subcommand, invalid
+     * config, child crashed). Distinguishing the failure cause is best-effort;
+     * both `not_supported` and `error` map to `CONFIG_DRIFT` at the CLI.
+     */
+    reloadConfig(inst: InstanceRef): Promise<ReloadResult> {
+      return reloadConfigImpl(inst, { binary, prefix, exists, spawner });
+    },
   };
+}
+
+async function reloadConfigImpl(
+  inst: InstanceRef,
+  deps: {
+    readonly binary: string;
+    readonly prefix: ReadonlyArray<string>;
+    readonly exists: (binary: string) => Promise<boolean>;
+    readonly spawner: Spawner;
+  },
+): Promise<ReloadResult> {
+  await ensureBinary({ binary: deps.binary, exists: deps.exists });
+  return new Promise<ReloadResult>((resolve) => {
+    const child = deps.spawner(deps.binary, [...deps.prefix, ...buildReloadConfigArgs(inst)], {
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    let stderr = "";
+    child.stderr?.on("data", (chunk: Buffer | string) => {
+      stderr += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+    });
+    child.on("error", (err) =>
+      resolve({ ok: false, reason: "not_supported", message: err.message }),
+    );
+    child.on("exit", (code) => {
+      if (code === 0 || code === null) {
+        resolve({ ok: true });
+        return;
+      }
+      const message = stderr.trim() || `${deps.binary} project update exited with code ${code}`;
+      resolve({ ok: false, reason: "not_supported", message });
+    });
+  });
 }
 
 /**
