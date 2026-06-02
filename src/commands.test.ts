@@ -23,6 +23,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
+import type { SpawnOptions } from "node:child_process";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import {
   findUnmanagedPortBinds,
@@ -2155,5 +2156,226 @@ describe("runLogs — stream service logs without locking", () => {
     const result = await runLogs(deps, { service: "web" });
     await collectLogs(result.events);
     expect(lockCalls).toBe(0);
+  });
+});
+
+/**
+ * `runUp` — issue #31: idempotency + drift detection. A second `up` is a
+ * defensive primitive: an agent that wants to ensure the stack is up can
+ * call `up` regardless of whether it already is. The branch outcomes are:
+ *
+ *  - **Same config, already running** → noop. Re-emit the state envelope
+ *    `up --json` would, but skip `driver.up` and skip any registry write.
+ *  - **Drifted config, reload succeeds** → emit the new state envelope and
+ *    update the stored hash.
+ *  - **Drifted config, reload fails** → throw `CONFIG_DRIFT`; the instance
+ *    keeps running unchanged so the agent can inspect it.
+ */
+describe("runUp — idempotency + drift detection (#31)", () => {
+  const stackA: ResolvedStack = { services: [isolated("web", "node a.js", ["WEB_PORT"])] };
+  const stackB: ResolvedStack = { services: [isolated("web", "node b.js", ["WEB_PORT"])] };
+
+  function hashStore() {
+    const store: Record<string, Record<string, string>> = {};
+    return {
+      read: (anchor: string, id: string): string | undefined => store[anchor]?.[id],
+      write: (anchor: string, id: string, hash: string): void => {
+        store[anchor] ??= {};
+        store[anchor][id] = hash;
+      },
+      raw: store,
+    };
+  }
+
+  it("writes the stack hash to the hash store after a successful first up", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const hashes = hashStore();
+    const deps: CommandDeps = {
+      ...stubDeps({ stack: stackA, track }),
+      readStoredHash: hashes.read,
+      writeStoredHash: hashes.write,
+    };
+    await runUp(deps);
+    // The anchor key in the store is whatever the deps reported; with one
+    // worktree it is the only key.
+    const anchorEntries = Object.values(hashes.raw);
+    expect(anchorEntries).toHaveLength(1);
+    const entry = anchorEntries[0];
+    if (!entry) throw new Error("expected one anchor entry");
+    expect(entry.login).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("a second up against a running instance with unchanged config is a noop: returns the envelope, no driver.up, no registry write", async () => {
+    // The stub spawner pre-creates the socket on the first up, so `existsSync`
+    // sees the instance as running for the second call.
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const hashes = hashStore();
+    const registryRef = { snapshot: {} as RegistrySnapshot };
+    let writeCalls = 0;
+    const deps: CommandDeps = {
+      ...stubDeps({ stack: stackA, track, registryRef }),
+      readStoredHash: hashes.read,
+      writeStoredHash: (anchor, id, h) => {
+        writeCalls++;
+        hashes.write(anchor, id, h);
+      },
+    };
+
+    const first = await runUp(deps);
+    const firstWriteCount = writeCalls;
+    const firstUpInvocations = track.invocations.filter(
+      (i) => !i.socketPath.endsWith("shared.sock"),
+    ).length;
+
+    const second = await runUp(deps);
+
+    // Same envelope shape.
+    expect(second.env).toEqual(first.env);
+    expect(second.blockBase).toBe(first.blockBase);
+    // No additional driver.up spawn.
+    const secondUpInvocations = track.invocations.filter(
+      (i) => !i.socketPath.endsWith("shared.sock"),
+    ).length;
+    expect(secondUpInvocations).toBe(firstUpInvocations);
+    // No additional hash store write.
+    expect(writeCalls).toBe(firstWriteCount);
+  });
+
+  it("noop path populates services[] from getServiceStatuses against the running instance", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const hashes = hashStore();
+    let firstCall = true;
+    const deps: CommandDeps = {
+      ...stubDeps({ stack: stackA, track }),
+      readStoredHash: hashes.read,
+      writeStoredHash: hashes.write,
+      getServiceStatuses: async () => {
+        // First call (in initial up) returns ready; second call (noop) returns the same.
+        return [
+          {
+            name: "web",
+            status: "Running",
+            health: firstCall ? "ready" : ((firstCall = false), "ready"),
+          },
+        ];
+      },
+    };
+    await runUp(deps);
+    firstCall = false;
+    const second = await runUp(deps);
+    expect(second.services).toEqual([
+      { name: "web", status: "Running", health: "ready", ports: { WEB_PORT: second.blockBase } },
+    ]);
+  });
+
+  it("on drift, calls driver.reloadConfig and on success returns the new envelope + updates the stored hash", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const hashes = hashStore();
+
+    // Seed the hash store with the OLD stack's hash so the second up sees drift.
+    const baseDeps = stubDeps({ stack: stackA, track });
+    const innerSpawner = baseDeps.driver?.spawner;
+    if (innerSpawner === undefined) throw new Error("expected stub spawner");
+
+    const reloadCalls: Array<{ args: ReadonlyArray<string> }> = [];
+    const spawner = (binary: string, args: ReadonlyArray<string>, options: SpawnOptions) => {
+      if (args[0] === "project" && args[1] === "update") {
+        reloadCalls.push({ args });
+        return spawnedOk();
+      }
+      return innerSpawner(binary, args, options);
+    };
+    const firstDeps: CommandDeps = {
+      ...baseDeps,
+      driver: { ...baseDeps.driver, spawner },
+      readStoredHash: hashes.read,
+      writeStoredHash: hashes.write,
+    };
+
+    await runUp(firstDeps);
+    const upInvocationsAfterFirst = track.invocations.length;
+
+    // Now swap to a different stack — same worktree/anchor/registry deps —
+    // so the second up sees drift relative to the stored hash.
+    const secondDeps: CommandDeps = { ...firstDeps, readStack: () => stackB };
+    const result = await runUp(secondDeps);
+
+    expect(reloadCalls).toHaveLength(1);
+    // The reload argv targets the worktree's socket and a -f config path.
+    const args = reloadCalls[0]?.args ?? [];
+    expect(args.slice(0, 2)).toEqual(["project", "update"]);
+    // Driver.up was NOT called a second time — reload, not restart.
+    expect(track.invocations.length).toBe(upInvocationsAfterFirst);
+    // Envelope is well-formed.
+    expect(result.env.WEB_PORT).toBeDefined();
+    // Stored hash was updated to the new stack's hash.
+    const anchorStore = Object.values(hashes.raw)[0];
+    if (!anchorStore) throw new Error("expected hash store entry");
+    const { stackHash } = await import("./hash.js");
+    expect(anchorStore.login).toBe(stackHash(stackB));
+  });
+
+  it("on drift, if driver.reloadConfig reports not_supported, throws an Error tagged code:CONFIG_DRIFT and does not update the stored hash", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const hashes = hashStore();
+
+    const baseDeps = stubDeps({ stack: stackA, track });
+    const innerSpawner = baseDeps.driver?.spawner;
+    if (innerSpawner === undefined) throw new Error("expected stub spawner");
+
+    // Reload always returns exit 1 → driver classifies as not_supported.
+    const spawner = (binary: string, args: ReadonlyArray<string>, options: SpawnOptions) => {
+      if (args[0] === "project" && args[1] === "update") {
+        const emitter = new (require("node:events").EventEmitter)();
+        queueMicrotask(() => emitter.emit("exit", 1));
+        return emitter as unknown as SpawnedProcess;
+      }
+      return innerSpawner(binary, args, options);
+    };
+    const firstDeps: CommandDeps = {
+      ...baseDeps,
+      driver: { ...baseDeps.driver, spawner },
+      readStoredHash: hashes.read,
+      writeStoredHash: hashes.write,
+    };
+
+    await runUp(firstDeps);
+    const storedAfterFirst = Object.values(hashes.raw)[0]?.login;
+
+    const secondDeps: CommandDeps = { ...firstDeps, readStack: () => stackB };
+    const err = await runUp(secondDeps).then(
+      () => undefined,
+      (e: unknown) => e as Error & { code?: string },
+    );
+    if (err === undefined) throw new Error("expected runUp to reject");
+    expect(err.code).toBe("CONFIG_DRIFT");
+
+    // Hash store unchanged — the stored hash still reflects stackA.
+    expect(Object.values(hashes.raw)[0]?.login).toBe(storedAfterFirst);
+  });
+
+  it("noop path does NOT call driver.reloadConfig (no process-compose churn when the config matches)", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const hashes = hashStore();
+    const baseDeps = stubDeps({ stack: stackA, track });
+    const innerSpawner = baseDeps.driver?.spawner;
+    if (innerSpawner === undefined) throw new Error("expected stub spawner");
+
+    let reloadCount = 0;
+    const spawner = (binary: string, args: ReadonlyArray<string>, options: SpawnOptions) => {
+      if (args[0] === "project" && args[1] === "update") {
+        reloadCount++;
+      }
+      return innerSpawner(binary, args, options);
+    };
+    const deps: CommandDeps = {
+      ...baseDeps,
+      driver: { ...baseDeps.driver, spawner },
+      readStoredHash: hashes.read,
+      writeStoredHash: hashes.write,
+    };
+    await runUp(deps);
+    await runUp(deps);
+    expect(reloadCount).toBe(0);
   });
 });

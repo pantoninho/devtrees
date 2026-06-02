@@ -39,5 +39,7 @@ function canonicalStack(stack: ResolvedStack): unknown {
 
 /** SHA-256 hex digest of the canonical JSON form of a `ResolvedStack`. */
 export function stackHash(stack: ResolvedStack): string {
-  return createHash("sha256").update(JSON.stringify(canonicalStack(stack))).digest("hex");
+  return createHash("sha256")
+    .update(JSON.stringify(canonicalStack(stack)))
+    .digest("hex");
 }

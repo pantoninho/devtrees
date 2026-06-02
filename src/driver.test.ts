@@ -301,7 +301,10 @@ describe("process-compose driver — reloadConfig", () => {
     expect(args).toContain(inst.configPath);
   });
 
-  function spawnerExiting(code: number, deps: { onArgs?: (args: ReadonlyArray<string>) => void } = {}) {
+  function spawnerExiting(
+    code: number,
+    deps: { onArgs?: (args: ReadonlyArray<string>) => void } = {},
+  ) {
     return (_b: string, args: ReadonlyArray<string>): SpawnedProcess => {
       deps.onArgs?.(args);
       const emitter = new EventEmitter() as EventEmitter & SpawnedProcess;
