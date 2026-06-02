@@ -514,7 +514,15 @@ if (isEntrypoint(import.meta.url, process.argv[1])) {
         ...(options?.attach !== undefined ? { attach: options.attach } : {}),
         ...(options?.waitTimeoutMs !== undefined ? { waitTimeoutMs: options.waitTimeoutMs } : {}),
       }),
-    down: ({ shared }) => runDown({}, { shared }),
+    down: async ({ shared }) => {
+      const r = await runDown({}, { shared });
+      return {
+        ...(r.worktreeId !== undefined ? { worktreeId: r.worktreeId } : {}),
+        ...(r.blockBase !== undefined ? { blockBase: r.blockBase } : {}),
+        env: r.env,
+        services: r.services,
+      };
+    },
     generate: () => runGenerate(),
     ls: () => runLs(),
     attach: ({ shared }) => runAttach({}, { shared }),

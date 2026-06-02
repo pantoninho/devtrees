@@ -1132,6 +1132,180 @@ describe("runDown — shared lifecycle is decoupled from worktree lifecycle", ()
   });
 });
 
+/**
+ * Issue #34 — `devtrees down --json` carries the prior state of the instance it
+ * stopped, same shape `up --json` (slice #30) emits on success. `runDown`
+ * returns a structured `DownResult` (the CLI threads it into `formatDown`),
+ * and the snapshot is taken *before* the driver call so the socket is still
+ * alive to answer `getServiceStatuses`.
+ */
+describe("runDown — prior-state envelope (#34)", () => {
+  const mixedStack: ResolvedStack = {
+    services: [
+      isolated("web", "node server.js", ["WEB_PORT"]),
+      shared("postgres", "postgres", ["DB_PORT"]),
+    ],
+  };
+
+  it("returns the prior state of the worktree instance: worktreeId, blockBase, env, services", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const deps: CommandDeps = {
+      ...stubDeps({ stack: mixedStack, track }),
+      getServiceStatuses: async () => [{ name: "web", status: "Running", health: "ready" }],
+    };
+    const up = await runUp(deps);
+    const result = await runDown(deps);
+    expect(result.shared).toBe(false);
+    expect(result.worktreeId).toBe("login");
+    expect(result.blockBase).toBe(up.blockBase);
+    // env mirrors what runUp injected — own ports + shared ports + worktree id.
+    expect(result.env.WEB_PORT).toBe(up.env.WEB_PORT);
+    expect(result.env.DB_PORT).toBe(up.env.DB_PORT);
+    expect(result.env.DEVTREES_WORKTREE_ID).toBe("login");
+    expect(result.services).toEqual([
+      {
+        name: "web",
+        status: "Running",
+        health: "ready",
+        ports: { WEB_PORT: Number(up.env.WEB_PORT) },
+      },
+    ]);
+  });
+
+  it("returns the prior state of the shared instance on runDown(--shared): blockBase, env, services (no worktreeId)", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const registryRef = { snapshot: {} as RegistrySnapshot };
+    const baseDeps = stubDeps({ stack: mixedStack, track, registryRef });
+    const deps: CommandDeps = {
+      ...baseDeps,
+      getServiceStatuses: async (socketPath) =>
+        socketPath.endsWith("/shared.sock")
+          ? [{ name: "postgres", status: "Running", health: "ready" }]
+          : [],
+    };
+    const up = await runUp(deps);
+
+    // Mimic the real driver: down() removes the socket so the registry
+    // teardown path can verify it later.
+    const downDeps: CommandDeps = {
+      ...deps,
+      driver: {
+        exists: () => Promise.resolve(true),
+        spawner: (_b, args, _o): SpawnedProcess => {
+          const si = args.indexOf("-u");
+          if (args[0] === "down" && si >= 0) {
+            const socketPath = args[si + 1];
+            if (socketPath) rmSync(socketPath, { force: true });
+          }
+          return spawnedOk();
+        },
+      },
+    };
+
+    const result = await runDown(downDeps, { shared: true });
+    expect(result.shared).toBe(true);
+    expect(result.worktreeId).toBeUndefined();
+    expect(result.blockBase).toBeDefined();
+    expect(result.blockBase).toBe(Number(up.env.DB_PORT));
+    expect(result.env).toEqual({ DB_PORT: up.env.DB_PORT });
+    expect(result.services).toEqual([
+      {
+        name: "postgres",
+        status: "Running",
+        health: "ready",
+        ports: { DB_PORT: Number(up.env.DB_PORT) },
+      },
+    ]);
+  });
+
+  it("snapshots services via getServiceStatuses *before* driver.down — the socket is dead afterwards", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const baseDeps = stubDeps({ stack: mixedStack, track });
+    await runUp(baseDeps);
+
+    const order: string[] = [];
+    const deps: CommandDeps = {
+      ...baseDeps,
+      getServiceStatuses: async () => {
+        order.push("statuses");
+        return [{ name: "web", status: "Running", health: "ready" }];
+      },
+      driver: {
+        exists: () => Promise.resolve(true),
+        spawner: (_b, args, _o): SpawnedProcess => {
+          if (args[0] === "down") order.push("down");
+          return spawnedOk();
+        },
+      },
+    };
+
+    await runDown(deps);
+    expect(order).toEqual(["statuses", "down"]);
+  });
+
+  it("a getServiceStatuses failure does not abort `down` — services[] degrades to []", async () => {
+    // Same containment rule `up --json` (#30) and `ls --json` (#29) use: a
+    // flaky driver call must not leave a healthy instance un-stopped.
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const baseDeps = stubDeps({ stack: mixedStack, track });
+    await runUp(baseDeps);
+
+    const deps: CommandDeps = {
+      ...baseDeps,
+      getServiceStatuses: async () => {
+        throw new Error("simulated process-compose hiccup");
+      },
+    };
+    const result = await runDown(deps);
+    expect(result.services).toEqual([]);
+    // The rest of the envelope is still well-formed.
+    expect(result.worktreeId).toBe("login");
+    expect(result.env.WEB_PORT).toBeDefined();
+  });
+
+  it("runDown(--shared) on an already-stopped shared instance returns a minimal envelope (no services snapshot)", async () => {
+    // No prior `up` — the shared socket doesn't exist, so getServiceStatuses
+    // is skipped (would error against a missing UDS). The envelope still
+    // carries `shared: true` and the env that *would* be injected, even if
+    // there's nothing to tear down.
+    let getServiceStatusesCalled = false;
+    const deps: CommandDeps = {
+      ...stubDeps({ stack: mixedStack }),
+      getServiceStatuses: async () => {
+        getServiceStatusesCalled = true;
+        return [];
+      },
+    };
+    const result = await runDown(deps, { shared: true });
+    expect(result.shared).toBe(true);
+    expect(result.services).toEqual([]);
+    expect(getServiceStatusesCalled).toBe(false);
+  });
+
+  it("still calls driver.down so the lifecycle contract (#1 plain runDown stops the worktree instance) holds", async () => {
+    // Regression: the new envelope wiring must not skip the teardown.
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const deps = stubDeps({ stack: mixedStack, track });
+    await runUp(deps);
+    track.invocations.length = 0;
+
+    const downCalls: ReadonlyArray<string>[] = [];
+    const observed: CommandDeps = {
+      ...deps,
+      getServiceStatuses: async () => [],
+      driver: {
+        exists: () => Promise.resolve(true),
+        spawner: (_b, args, _o): SpawnedProcess => {
+          if (args[0] === "down") downCalls.push(args);
+          return spawnedOk();
+        },
+      },
+    };
+    await runDown(observed);
+    expect(downCalls).toHaveLength(1);
+  });
+});
+
 describe("runGenerate — emit derived configs to disk", () => {
   it("writes the worktree-isolated config to <anchor>/devtrees/<worktreeId>.yaml and its YAML matches the deriver's output", async () => {
     const stack: ResolvedStack = {
