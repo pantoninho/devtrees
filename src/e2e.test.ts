@@ -31,7 +31,7 @@ const STUB = fileURLToPath(new URL("../test/stub-process-compose.mjs", import.me
  * sync or async; we run them in LIFO order so a worktree's `runDown` happens
  * before the tmp dir housing its socket is unlinked.
  */
-const cleanups: Array<() => void | Promise<void>> = [];
+const cleanups: Array<() => void | Promise<unknown>> = [];
 afterEach(async () => {
   while (cleanups.length) {
     const fn = cleanups.pop();
@@ -304,7 +304,13 @@ describe("e2e — shared instance lifecycle across two worktrees", () => {
 
     // Acceptance: first up lazy-starts the shared instance.
     const login = await runUp(loginDeps as never);
-    cleanups.push(() => runDown(loginDeps as never));
+    // Register shared tear-down here too: if the test times out before the
+    // second worktree's cleanup gets pushed, this still reaps the shared
+    // stub (otherwise its long-lived parent leaks past the suite).
+    cleanups.push(async () => {
+      await runDown(loginDeps as never).catch(() => {});
+      await runDown(loginDeps as never, { shared: true }).catch(() => {});
+    });
     expect(login.sharedStarted).toBe(true);
     expect(await waitForHttp(Number(login.env.WEB_PORT))).toBe(true);
     expect(await waitForTcp(Number(login.env.DB_PORT))).toBe(true);
@@ -372,7 +378,13 @@ describe("e2e — devtrees ls discovers worktree instances + the shared instance
     const billingDeps = stubDriverDeps(billingWt);
 
     const login = await runUp(loginDeps as never);
-    cleanups.push(() => runDown(loginDeps as never));
+    // Register shared tear-down here too: if the test times out before the
+    // second worktree's cleanup gets pushed, this still reaps the shared
+    // stub (otherwise its long-lived parent leaks past the suite).
+    cleanups.push(async () => {
+      await runDown(loginDeps as never).catch(() => {});
+      await runDown(loginDeps as never, { shared: true }).catch(() => {});
+    });
     const billing = await runUp(billingDeps as never);
     cleanups.push(async () => {
       await runDown(billingDeps as never).catch(() => {});
