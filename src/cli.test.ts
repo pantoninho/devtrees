@@ -332,11 +332,11 @@ describe("devtrees CLI — --json (agent-facing surface)", () => {
     expect(result.stderr).toBe("");
     const parsed = JSON.parse(result.stdout) as {
       schema_version: string;
-      instances: ReadonlyArray<{ id: string; ports: Record<string, number> }>;
+      ls: { instances: ReadonlyArray<{ id: string; ports: Record<string, number> }> };
     };
     expect(parsed.schema_version).toBeDefined();
-    expect(parsed.instances).toHaveLength(2);
-    expect(parsed.instances.find((i) => i.id === "login")?.ports).toEqual({ WEB_PORT: 20512 });
+    expect(parsed.ls.instances).toHaveLength(2);
+    expect(parsed.ls.instances.find((i) => i.id === "login")?.ports).toEqual({ WEB_PORT: 20512 });
   });
 
   it("`--json` is accepted before the command name too (global flag, any position)", async () => {
@@ -423,11 +423,11 @@ describe("devtrees CLI — --json (agent-facing surface)", () => {
     expect(result.stderr).toMatch(/process-compose/);
   });
 
-  it("`ls --json` with no instances emits {instances:[]} (not the 'no instances' string)", async () => {
+  it("`ls --json` with no instances emits {ls:{instances:[]}} (not the 'no instances' string)", async () => {
     const ls = vi.fn().mockResolvedValue({ anchor: "/repo/.git", instances: [] });
     const result = await execute(["ls", "--json"], { up: vi.fn(), down: vi.fn(), ls });
-    const parsed = JSON.parse(result.stdout) as { instances: unknown[] };
-    expect(parsed.instances).toEqual([]);
+    const parsed = JSON.parse(result.stdout) as { ls: { instances: unknown[] } };
+    expect(parsed.ls.instances).toEqual([]);
   });
 
   /**
@@ -459,17 +459,19 @@ describe("devtrees CLI — --json (agent-facing surface)", () => {
     });
     const result = await execute(["ls", "--json"], { up: vi.fn(), down: vi.fn(), ls });
     const parsed = JSON.parse(result.stdout) as {
-      instances: ReadonlyArray<{
-        id: string;
-        services: ReadonlyArray<{
-          name: string;
-          status: string;
-          health: string;
-          ports: Record<string, number>;
+      ls: {
+        instances: ReadonlyArray<{
+          id: string;
+          services: ReadonlyArray<{
+            name: string;
+            status: string;
+            health: string;
+            ports: Record<string, number>;
+          }>;
         }>;
-      }>;
+      };
     };
-    const login = parsed.instances.find((i) => i.id === "login");
+    const login = parsed.ls.instances.find((i) => i.id === "login");
     expect(login?.services).toEqual([
       { name: "web", status: "Running", health: "ready", ports: { WEB_PORT: 20000 } },
       { name: "worker", status: "Running", health: "not_ready", ports: { WORKER_PORT: 20001 } },

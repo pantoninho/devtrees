@@ -105,22 +105,26 @@ describe("output formatter — formatLs", () => {
     expect(result.stdout).toMatch(/no devtrees instances/i);
   });
 
-  it("in JSON mode, emits one document with schema_version and an instances array", () => {
+  it("in JSON mode, wraps the payload under {schema_version, ls:{instances:[...]}}", () => {
     const result = formatLs(rows, "json");
     expect(result.stderr).toBe("");
     const parsed = JSON.parse(result.stdout) as {
       schema_version: string;
-      instances: ReadonlyArray<{
-        id: string;
-        kind: string;
-        status: string;
-        ports: Record<string, number>;
-        block_base?: number;
-      }>;
+      ls: {
+        instances: ReadonlyArray<{
+          id: string;
+          kind: string;
+          status: string;
+          ports: Record<string, number>;
+          block_base?: number;
+        }>;
+      };
     };
     expect(parsed.schema_version).toBe(SCHEMA_VERSION);
-    expect(parsed.instances).toHaveLength(2);
-    expect(parsed.instances[0]).toEqual({
+    // Top-level `instances` is gone — the payload is namespaced under `ls`.
+    expect(parsed).not.toHaveProperty("instances");
+    expect(parsed.ls.instances).toHaveLength(2);
+    expect(parsed.ls.instances[0]).toEqual({
       id: "alpha",
       kind: "shared",
       status: "running",
@@ -128,7 +132,7 @@ describe("output formatter — formatLs", () => {
       services: [],
       block_base: 40001,
     });
-    expect(parsed.instances[1]).toEqual({
+    expect(parsed.ls.instances[1]).toEqual({
       id: "beta",
       kind: "worktree",
       status: "stale",
@@ -138,10 +142,10 @@ describe("output formatter — formatLs", () => {
     });
   });
 
-  it("in JSON mode with no instances, emits an empty array (not 'no instances' text)", () => {
+  it("in JSON mode with no instances, emits {ls:{instances:[]}} (not 'no instances' text)", () => {
     const result = formatLs([], "json");
-    const parsed = JSON.parse(result.stdout) as { instances: unknown[] };
-    expect(parsed.instances).toEqual([]);
+    const parsed = JSON.parse(result.stdout) as { ls: { instances: unknown[] } };
+    expect(parsed.ls.instances).toEqual([]);
   });
 
   it("in JSON mode, omits block_base when the registry has no entry for the socket", () => {
@@ -158,9 +162,9 @@ describe("output formatter — formatLs", () => {
       "json",
     );
     const parsed = JSON.parse(result.stdout) as {
-      instances: ReadonlyArray<Record<string, unknown>>;
+      ls: { instances: ReadonlyArray<Record<string, unknown>> };
     };
-    expect(parsed.instances[0]).not.toHaveProperty("block_base");
+    expect(parsed.ls.instances[0]).not.toHaveProperty("block_base");
   });
 
   it("JSON output ends with a single trailing newline (line-friendly for shell consumers)", () => {
@@ -203,17 +207,19 @@ describe("output formatter — formatLs", () => {
     it("emits one services[] row per service with name, status, health and ports", () => {
       const result = formatLs(rowsWithServices, "json");
       const parsed = JSON.parse(result.stdout) as {
-        instances: ReadonlyArray<{
-          id: string;
-          services: ReadonlyArray<{
-            name: string;
-            status: string;
-            health: string;
-            ports: Record<string, number>;
+        ls: {
+          instances: ReadonlyArray<{
+            id: string;
+            services: ReadonlyArray<{
+              name: string;
+              status: string;
+              health: string;
+              ports: Record<string, number>;
+            }>;
           }>;
-        }>;
+        };
       };
-      expect(parsed.instances[0]?.services).toEqual([
+      expect(parsed.ls.instances[0]?.services).toEqual([
         { name: "web", status: "Running", health: "ready", ports: { WEB_PORT: 20000 } },
         { name: "worker", status: "Running", health: "not_ready", ports: { WORKER_PORT: 20001 } },
       ]);
@@ -234,9 +240,9 @@ describe("output formatter — formatLs", () => {
         "json",
       );
       const parsed = JSON.parse(result.stdout) as {
-        instances: ReadonlyArray<{ services: unknown[] }>;
+        ls: { instances: ReadonlyArray<{ services: unknown[] }> };
       };
-      expect(parsed.instances[0]?.services).toEqual([]);
+      expect(parsed.ls.instances[0]?.services).toEqual([]);
     });
 
     it("defaults services to [] when the row doesn't carry one (back-compat: optional in the row type)", () => {
@@ -245,9 +251,9 @@ describe("output formatter — formatLs", () => {
       // promise is `services[] on every instance entry`.
       const result = formatLs(rows, "json");
       const parsed = JSON.parse(result.stdout) as {
-        instances: ReadonlyArray<{ services?: unknown }>;
+        ls: { instances: ReadonlyArray<{ services?: unknown }> };
       };
-      for (const inst of parsed.instances) expect(inst.services).toEqual([]);
+      for (const inst of parsed.ls.instances) expect(inst.services).toEqual([]);
     });
 
     it("human-mode ls is byte-for-byte unchanged when services are present", () => {

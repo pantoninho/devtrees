@@ -140,11 +140,23 @@ function lsInstanceJson(row: LsInstanceRow): LsInstanceJson {
   return row.blockBase === undefined ? base : { ...base, block_base: row.blockBase };
 }
 
+/**
+ * Render `devtrees ls` output.
+ *
+ *   - `human`: today's `id/kind/status/ports` table, byte-for-byte unchanged.
+ *   - `json`: `{schema_version, ls: {instances: [<lsInstanceJson>, ...]}}`.
+ *     The payload is wrapped under an `ls` key so it matches the convention
+ *     every other JSON-emitting command follows (`up`, `down`, `prune`, `env`):
+ *     one top-level key named after the command, holding the payload (#48,
+ *     #54). The inner `lsInstanceJson` row shape is unchanged. Empty results
+ *     still emit `{ls: {instances: []}}` — never the human "no instances"
+ *     string.
+ */
 export function formatLs(instances: ReadonlyArray<LsInstanceRow>, mode: FormatMode): OutputResult {
   if (mode === "json") {
     const doc = {
       schema_version: SCHEMA_VERSION,
-      instances: instances.map(lsInstanceJson),
+      ls: { instances: instances.map(lsInstanceJson) },
     };
     return { stdout: `${JSON.stringify(doc)}\n`, stderr: "" };
   }
