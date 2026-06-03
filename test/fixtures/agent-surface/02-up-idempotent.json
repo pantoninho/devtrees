@@ -1,0 +1,23 @@
+{
+  "schema_version": "1",
+  "up": {
+    "worktree_id": "<WT>",
+    "env": {
+      "DB_PORT": 0,
+      "DEVTREES_WORKTREE_ID": "<WT>",
+      "WEB_PORT": 0
+    },
+    "services": [
+      {
+        "name": "web",
+        "status": "Running",
+        "health": "unknown",
+        "ports": {
+          "WEB_PORT": 0
+        }
+      }
+    ],
+    "shared_started": false,
+    "block_base": 0
+  }
+}

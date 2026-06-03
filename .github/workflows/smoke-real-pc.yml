@@ -1,0 +1,93 @@
+name: Smoke (real process-compose)
+
+# Real-binary smoke (issue #60). Complements `ci.yml`'s stub-based suite by
+# running the canonical agent surface against the actual `process-compose`
+# binary, so behaviour only the real binary exhibits — probe convergence, OS
+# port binding, hot-reload — is exercised in CI.
+#
+# Gating:
+#   - Triggers on PRs that touch the modules whose contract this smoke exists
+#     to protect; unrelated PRs (docs, build config, lint settings) don't pay
+#     the cost.
+#   - Nightly cron catches process-compose-side regressions without blocking
+#     every PR.
+#   - Does NOT run on every push to `main` — pinned releases land via PR.
+on:
+  pull_request:
+    paths:
+      - "src/commands.ts"
+      - "src/driver.ts"
+      - "src/deriver.ts"
+      - "src/stack.ts"
+      - "src/output.ts"
+      - "src/allocator.ts"
+      - "src/instances.ts"
+      - "src/real-pc.smoke.test.ts"
+      - "test/fixtures/agent-surface/**"
+      - ".github/workflows/smoke-real-pc.yml"
+  schedule:
+    # Nightly at 06:00 UTC (off-peak for both US and EU contributors).
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: smoke-real-pc-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: real-pc smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Vite+ (Node + package manager + cache)
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version: "22"
+          cache: true
+
+      - name: Install dependencies
+        run: vp install
+
+      # ----------------------------------------------------------------------
+      # Install process-compose at a PINNED version. Bumping the pin is an
+      # explicit ritual (the smoke test is the canary for process-compose-
+      # side behaviour changes — if a new release renames a field or changes
+      # probe semantics, this workflow is where we want to see the red).
+      # ----------------------------------------------------------------------
+      - name: Install process-compose (pinned)
+        env:
+          # Pinned so a process-compose release that changes the agent surface
+          # surfaces as a red check here, not silently in production. Bump
+          # deliberately; the smoke test is the canary. Last verified locally
+          # against v1.110.0; we pin to a recent stable tag in CI.
+          PC_VERSION: v1.110.0
+        run: |
+          set -euo pipefail
+          # Download the release tarball directly so the install script's
+          # version-resolution behaviour isn't on the critical path. Linux x86-64
+          # binary lives at the same path on every release.
+          mkdir -p "$HOME/.local/bin"
+          TARBALL="process-compose_linux_amd64.tar.gz"
+          URL="https://github.com/F1bonacc1/process-compose/releases/download/${PC_VERSION}/${TARBALL}"
+          curl -fsSL "$URL" -o "/tmp/${TARBALL}"
+          tar -xzf "/tmp/${TARBALL}" -C "$HOME/.local/bin" process-compose
+          chmod +x "$HOME/.local/bin/process-compose"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/process-compose" version
+
+      # devtrees CLI is bundled to dist/cli.mjs — the smoke spawns it as a
+      # subprocess, so the test depends on `vp run build` having run first.
+      - name: Build devtrees CLI
+        run: vp run build
+
+      - name: Run real-pc smoke
+        env:
+          DEVTREES_REAL_PC_E2E: "1"
+        run: vp test run real-pc.smoke
