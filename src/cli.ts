@@ -3,18 +3,23 @@
 /**
  * devtrees CLI entrypoint.
  *
- * `run` is a pure function: argv in, a result out. The process-level shell at
- * the bottom of this file is the only impure part, so the command surface stays
- * unit-testable.
+ * Argv parsing is delegated to clipanion (spec-driven, per-subcommand `--help`
+ * auto-generated). Each subcommand is a `Command` subclass below; they share a
+ * `DevtreesCommand` base that owns the `--json` flag and the shared error
+ * routing (ADR-0005: `--json` errors land on stdout as `{schema_version, error:
+ * {code, message, details?}}`, human errors land on stderr).
  *
- * The global `--json` flag (ADR-0005) is parsed once here and threaded into
- * every command handler. All stdout content is produced by `src/output.ts`
- * (the only seam that knows about format mode and the JSON schema); this file
- * routes commands and converts errors into the formatter's envelope.
+ * The orchestration in `src/commands.ts` (`runUp`, `runDown`, ...) is untouched
+ * — this file is purely an argv → call-site bridge. Test seams are unchanged:
+ * `execute(argv, deps)` returns a `RunResult` so the existing test suite can
+ * inject mock `runUp` / `runDown` / ... without spinning a real driver.
  */
 
-import { realpathSync } from "node:fs";
-import { pathToFileURL } from "node:url";
+import { realpathSync, readFileSync } from "node:fs";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { Writable } from "node:stream";
+import { Cli, Command, Option, Builtins, type BaseContext } from "clipanion";
+import type { LogEvent } from "./driver.js";
 import {
   classifyError,
   formatDown,
@@ -30,11 +35,27 @@ import {
   type LsServiceRow,
   type PrunedRow,
 } from "./output.js";
-import type { LogEvent } from "./driver.js";
 
-export const VERSION = "0.0.1";
+/**
+ * The published version, read once from the package.json that ships with the
+ * binary. Resolved relative to this module's URL so it works in both the
+ * source tree (during tests) and the bundled `dist/cli.mjs` (where rolldown
+ * copies `package.json` next to the entry — same layout in both cases since
+ * `package.json` is one directory up from `src/` and one up from `dist/`).
+ */
+function readVersion(): string {
+  const pkgUrl = new URL("../package.json", import.meta.url);
+  const pkg = JSON.parse(readFileSync(fileURLToPath(pkgUrl), "utf8")) as { version: string };
+  return pkg.version;
+}
 
-/** The command surface devtrees will grow into (see PRD #1). Stubbed for now. */
+export const VERSION = readVersion();
+
+/**
+ * The command surface devtrees exposes. Kept exported so external introspection
+ * (e.g. the doc-generation pass) doesn't have to import the clipanion classes
+ * directly. Each name matches a registered `Command.paths` entry below.
+ */
 export const COMMANDS: ReadonlyArray<{ name: string; summary: string }> = [
   { name: "up", summary: "Bring up this worktree's stack" },
   { name: "down", summary: "Stop this worktree's stack (--shared tears down the shared instance)" },
@@ -64,62 +85,6 @@ export interface RunResult {
   stderr: string;
 }
 
-function helpText(): string {
-  const width = Math.max(...COMMANDS.map((c) => c.name.length));
-  const commands = COMMANDS.map((c) => `  ${c.name.padEnd(width)}  ${c.summary}`).join("\n");
-  return [
-    "devtrees - parallel worktree stacks over process-compose",
-    "",
-    "Usage:",
-    "  devtrees <command> [options]",
-    "",
-    "Commands:",
-    commands,
-    "",
-    "Options:",
-    "  -h, --help              Print this help text",
-    "  -v, --version           Print the version",
-    "      --json              Emit machine-readable output (see ADR-0005)",
-    "",
-    "`up` options:",
-    "      --attach            Force-attach the TUI (default: only when stdout & stderr are TTYs)",
-    "      --no-attach         Skip the TUI even when running interactively",
-    "      --wait-timeout=N    Seconds to wait for services to become healthy (default: 120)",
-    "",
-  ].join("\n");
-}
-
-/**
- * Resolve a command line into output and an exit code without touching the
- * process. No arguments, `--help`, or `-h` print help; `--version`/`-v` print
- * the version; an unknown command is an error.
- */
-export function run(argv: ReadonlyArray<string>): RunResult {
-  const [first] = stripGlobalFlags(argv);
-
-  if (first === undefined || first === "--help" || first === "-h") {
-    return { code: 0, stdout: helpText(), stderr: "" };
-  }
-
-  if (first === "--version" || first === "-v") {
-    return { code: 0, stdout: `${VERSION}\n`, stderr: "" };
-  }
-
-  if (COMMANDS.some((c) => c.name === first)) {
-    return {
-      code: 0,
-      stdout: `devtrees ${first}: not implemented yet\n`,
-      stderr: "",
-    };
-  }
-
-  return {
-    code: 1,
-    stdout: "",
-    stderr: `devtrees: unknown command '${first}'\nRun 'devtrees --help' for usage.\n`,
-  };
-}
-
 /**
  * Options the `up` handler threads from CLI flags into the underlying `runUp`.
  * Optional everywhere: when omitted, runUp's own defaults apply (TTY detection
@@ -132,41 +97,17 @@ export interface UpOptions {
   readonly waitTimeoutMs?: number;
 }
 
-/** The effectful commands, injected so `execute` stays unit-testable. */
+/** The effectful commands, injected so dispatch stays unit-testable. */
 export interface ExecuteDeps {
   up: (options?: UpOptions) => Promise<{
     worktreeId: string;
     socketPath: string;
     env: Record<string, string>;
     sharedStarted?: boolean;
-    /**
-     * Base port of this worktree's allocation block (issue #30). Optional so
-     * older test stubs that don't supply it keep working — the JSON envelope
-     * simply omits `block_base` when undefined.
-     */
     blockBase?: number;
-    /**
-     * Per-service runtime rows the driver observed after the health-wait —
-     * the slice-#29 `LsServiceRow` shape. Optional so the older up/down-only
-     * test stubs continue to type-check; the JSON envelope defaults to `[]`.
-     */
     services?: ReadonlyArray<LsServiceRow>;
   }>;
-  down: (options: { shared: boolean }) => Promise<{
-    /**
-     * Id of the stopped worktree instance. Present for worktree teardown,
-     * absent for shared (the shared instance is not keyed by a worktree).
-     * Issue #48 trimmed `down --json` to operation-output only; this is the
-     * sole field the envelope renders for a worktree teardown.
-     */
-    worktreeId?: string;
-  } | void>;
-  /**
-   * Emit the derived process-compose config(s) to disk without starting
-   * anything. Optional on the deps so existing call sites (and tests that
-   * only exercise `up`/`down`) keep working; routing through `execute` for
-   * `generate` requires it.
-   */
+  down: (options: { shared: boolean }) => Promise<{ worktreeId?: string } | void>;
   generate?: () => Promise<{
     worktreeId: string;
     worktreeRoot: string;
@@ -175,37 +116,10 @@ export interface ExecuteDeps {
     env: Record<string, string>;
     sharedEnv?: Record<string, string>;
   }>;
-  /**
-   * List every devtrees instance across the repo. Optional so existing callers
-   * (e.g. the up/down-only tests) don't have to pass a stub; defaults to
-   * exiting with "not implemented" if a caller dispatches `ls` without it.
-   */
   ls?: () => Promise<{ anchor: string; instances: ReadonlyArray<LsInstanceRow> }>;
-  /**
-   * Attach a TUI to a running instance — this worktree's by default, or the
-   * shared one with `--shared`. Optional on the deps so existing call sites
-   * (and tests that only exercise `up`/`down`) keep working; routing through
-   * `execute` for `attach` requires it.
-   */
   attach?: (options: { shared: boolean }) => Promise<void>;
-  /**
-   * Reconcile devtrees against `git worktree list` and clean up orphaned
-   * instances. Optional for the same reason as `ls`: existing tests only
-   * exercise `up`/`down` and don't have to stub `prune`.
-   */
   prune?: () => Promise<{ anchor: string; pruned: ReadonlyArray<PrunedRow> }>;
-  /**
-   * Emit the injected-value map for this worktree (issue #32). Pure read — no
-   * driver call, no allocation-registry write, no lock. Optional so existing
-   * test stubs (up/down-only) keep working without supplying it.
-   */
   env?: () => Promise<{ worktreeId: string; env: Record<string, string> }>;
-  /**
-   * Stream a service's logs over the instance's control socket (#33). Returns
-   * the resolved service list (so the CLI knows whether to prefix in human
-   * mode) plus an `AsyncIterable<LogEvent>` the CLI consumes one line at a
-   * time. Optional so existing test stubs keep working without supplying it.
-   */
   logs?: (options: LogsCliOptions) => Promise<{
     services: ReadonlyArray<string>;
     events: AsyncIterable<LogEvent>;
@@ -223,164 +137,11 @@ export interface LogsCliOptions {
 }
 
 /**
- * Strip `--json` (and any future global flags) from argv before per-command
- * parsing. Kept tiny: this is not a real flag parser, just a global-flag
- * splitter so a command's own argv is what `run`/handlers reason about.
- */
-function stripGlobalFlags(argv: ReadonlyArray<string>): string[] {
-  return argv.filter((a) => a !== "--json");
-}
-
-function modeFor(argv: ReadonlyArray<string>): FormatMode {
-  return argv.includes("--json") ? "json" : "human";
-}
-
-/**
- * A single command's effectful behaviour. Returns the rendered `RunResult` on
- * success, or `undefined` to defer to the stubbed `run` — used when the deps
- * object lacks the optional collaborator for that command (e.g. an `up`/`down`-
- * only test stub that doesn't pass a `prune`).
- */
-type Handler = (
-  rest: ReadonlyArray<string>,
-  deps: ExecuteDeps,
-  mode: FormatMode,
-) => Promise<RunResult | undefined>;
-
-/**
- * Parse `--attach` / `--no-attach` / `--wait-timeout` out of `up`'s argv.
- * Mutually-exclusive `--attach`/`--no-attach` aren't policed — the last one
- * wins, matching common Unix flag-parser behaviour. `--wait-timeout` accepts
- * both `--wait-timeout=30` and `--wait-timeout 30` forms; the value must
- * parse as a positive number of seconds.
- *
- * Throws on a malformed `--wait-timeout` so the user sees a clear error
- * rather than a silently-defaulted timeout that hides the typo.
- */
-/** Coerce a `--wait-timeout` argument value into ms, or throw a clear error. */
-function parseWaitTimeoutSecondsToMs(raw: string | undefined): number {
-  const seconds = Number(raw);
-  if (!Number.isFinite(seconds) || seconds <= 0) {
-    throw new Error(`--wait-timeout expects a positive number of seconds, got '${raw ?? ""}'.`);
-  }
-  return Math.round(seconds * 1000);
-}
-
-function parseUpOptions(rest: ReadonlyArray<string>): UpOptions {
-  const out: { attach?: boolean; waitTimeoutMs?: number } = {};
-  for (let i = 0; i < rest.length; i++) {
-    const arg = rest[i];
-    if (arg === "--attach") out.attach = true;
-    else if (arg === "--no-attach") out.attach = false;
-    else if (arg === "--wait-timeout") out.waitTimeoutMs = parseWaitTimeoutSecondsToMs(rest[++i]);
-    else if (arg?.startsWith("--wait-timeout="))
-      out.waitTimeoutMs = parseWaitTimeoutSecondsToMs(arg.slice("--wait-timeout=".length));
-  }
-  return out;
-}
-
-async function handleUp(
-  rest: ReadonlyArray<string>,
-  deps: ExecuteDeps,
-  mode: FormatMode,
-): Promise<RunResult> {
-  const options = parseUpOptions(rest);
-  const result = await deps.up(options);
-  const out = formatUp(
-    {
-      worktreeId: result.worktreeId,
-      env: result.env,
-      sharedStarted: result.sharedStarted ?? false,
-      ...(result.blockBase !== undefined ? { blockBase: result.blockBase } : {}),
-      ...(result.services !== undefined ? { services: result.services } : {}),
-    },
-    mode,
-  );
-  return { code: 0, stdout: out.stdout, stderr: out.stderr };
-}
-
-async function handleDown(
-  rest: ReadonlyArray<string>,
-  deps: ExecuteDeps,
-  mode: FormatMode,
-): Promise<RunResult> {
-  const shared = rest.includes("--shared");
-  const result = (await deps.down({ shared })) ?? {};
-  // Issue #48: the action envelope carries exactly one of `shared: true` or
-  // `worktreeId: "<id>"`. Worktree teardown reports the id (best-effort: when
-  // the command runner couldn't supply one we still emit a non-empty id so
-  // the envelope is well-formed — an empty string is preferable to violating
-  // the discriminated-union contract).
-  const out = formatDown(shared ? { shared: true } : { worktreeId: result.worktreeId ?? "" }, mode);
-  return { code: 0, stdout: out.stdout, stderr: out.stderr };
-}
-
-async function handleGenerate(
-  _rest: ReadonlyArray<string>,
-  deps: ExecuteDeps,
-  mode: FormatMode,
-): Promise<RunResult | undefined> {
-  if (!deps.generate) return undefined;
-  const result = await deps.generate();
-  const out = formatGenerate(
-    { worktreePath: result.worktreePath, sharedPath: result.sharedPath },
-    mode,
-  );
-  return { code: 0, stdout: out.stdout, stderr: out.stderr };
-}
-
-async function handleLs(
-  _rest: ReadonlyArray<string>,
-  deps: ExecuteDeps,
-  mode: FormatMode,
-): Promise<RunResult | undefined> {
-  if (deps.ls === undefined) return undefined;
-  const result = await deps.ls();
-  const out = formatLs(result.instances, mode);
-  return { code: 0, stdout: out.stdout, stderr: out.stderr };
-}
-
-async function handleAttach(
-  rest: ReadonlyArray<string>,
-  deps: ExecuteDeps,
-  _mode: FormatMode,
-): Promise<RunResult | undefined> {
-  if (!deps.attach) return undefined;
-  const shared = rest.includes("--shared");
-  await deps.attach({ shared });
-  // `attach` runs the TUI in-process; on a clean exit there is nothing to
-  // print (the TUI itself is the user-visible output).
-  return { code: 0, stdout: "", stderr: "" };
-}
-
-async function handlePrune(
-  _rest: ReadonlyArray<string>,
-  deps: ExecuteDeps,
-  mode: FormatMode,
-): Promise<RunResult | undefined> {
-  if (deps.prune === undefined) return undefined;
-  const result = await deps.prune();
-  const out = formatPrune(result.pruned, mode);
-  return { code: 0, stdout: out.stdout, stderr: out.stderr };
-}
-
-async function handleEnv(
-  _rest: ReadonlyArray<string>,
-  deps: ExecuteDeps,
-  mode: FormatMode,
-): Promise<RunResult | undefined> {
-  if (deps.env === undefined) return undefined;
-  const result = await deps.env();
-  const out = formatEnv(result.env, mode);
-  return { code: 0, stdout: out.stdout, stderr: out.stderr };
-}
-
-/**
- * Parse `devtrees logs <service?>` argv into structured options.
- *
- * Flags: `--follow` (or `-f`), `--tail=N`, `--since=DUR`, `--all`, `--shared`.
- * The first non-flag positional is the service name; with `--all` it is
- * optional (and ignored if both are given — `--all` wins).
+ * Standalone parser for `devtrees logs` argv, kept exported because a few
+ * lower-level test seams use it directly. Clipanion handles parsing for the
+ * real dispatch path; this is the documented "what would clipanion produce"
+ * shape so unit tests that don't want to spin a full `Cli.run()` can build
+ * the same object.
  */
 export function parseLogsArgs(rest: ReadonlyArray<string>): LogsCliOptions {
   let service: string | undefined;
@@ -402,70 +163,496 @@ export function parseLogsArgs(rest: ReadonlyArray<string>): LogsCliOptions {
   return { service, all, shared, follow, tail, since };
 }
 
-async function handleLogs(
-  rest: ReadonlyArray<string>,
-  deps: ExecuteDeps,
-  mode: FormatMode,
-): Promise<RunResult | undefined> {
-  if (deps.logs === undefined) return undefined;
-  const opts = parseLogsArgs(rest);
-  if (!opts.all && opts.service === undefined) {
-    return {
-      code: 1,
-      stdout: "",
-      stderr: "devtrees logs: specify a service (e.g. `devtrees logs web`) or pass `--all`.\n",
-    };
-  }
-  const { services, events } = await deps.logs(opts);
-  // Stream lines one at a time. Human mode prefixes `[service]` when --all is
-  // set or when more than one service is in play; JSON mode emits NDJSON.
-  const prefixService = mode === "human" && services.length > 1;
-  let stdout = "";
-  for await (const event of events) {
-    const out = formatLogLine(event, mode, { prefixService });
-    stdout += out.stdout;
-  }
-  return { code: 0, stdout, stderr: "" };
-}
+// --- error-code footers for per-command --help -----------------------------
+//
+// ADR-0005 lists the error-code enum the `--json` error envelope can carry.
+// Each command lists the subset it can actually emit, so an agent reading
+// `devtrees up --help` knows what to branch on. Kept terse — exhaustive
+// docs live in ADR-0005 itself.
 
-const HANDLERS: ReadonlyMap<string, Handler> = new Map([
-  ["up", handleUp],
-  ["down", handleDown],
-  ["generate", handleGenerate],
-  ["ls", handleLs],
-  ["attach", handleAttach],
-  ["prune", handlePrune],
-  ["env", handleEnv],
-  ["logs", handleLogs],
-]);
+const ERROR_CODES_FOOTER = (codes: ReadonlyArray<string>): string =>
+  `Under \`--json\`, failures emit one of: ${codes.join(", ")} (see ADR-0005 for the contract).`;
+
+// --- context ----------------------------------------------------------------
 
 /**
- * Resolve a command line, performing effects for the commands wired into
- * `HANDLERS` and delegating everything else to the pure `run`. Errors (e.g. a
- * missing process-compose binary) become a clear, non-zero result rather than
- * an unhandled rejection.
- *
- * `down --shared` and `attach --shared` target the shared instance (ADR-0001):
- * explicit, opt-in flags because the shared instance is decoupled from any
- * single worktree's lifecycle.
+ * Per-invocation context clipanion passes into each command. Carries the
+ * injected `deps` and a `FormatMode` derived from `--json`. Output is written
+ * through the standard `BaseContext.stdout`/`stderr` writables — the entry
+ * shell at the bottom of this file plumbs them to `process.std{out,err}`;
+ * tests plumb them to in-memory buffers.
  */
-export async function execute(argv: ReadonlyArray<string>, deps: ExecuteDeps): Promise<RunResult> {
-  const mode = modeFor(argv);
-  const commandArgv = stripGlobalFlags(argv);
-  const [first, ...rest] = commandArgv;
-  const handler = first !== undefined ? HANDLERS.get(first) : undefined;
-  if (handler !== undefined) {
+interface DevtreesContext extends BaseContext {
+  deps: ExecuteDeps;
+}
+
+// --- base command -----------------------------------------------------------
+
+/**
+ * Base class for every devtrees subcommand. Owns the global `--json` flag
+ * (ADR-0005) and the shared error-routing path: a thrown core error becomes
+ * a `formatError(...)` envelope on stdout when `--json` is set, a human
+ * diagnostic on stderr otherwise. Per-command `execute()` overrides write
+ * their successful output through `writeFormatted` so the format-mode branch
+ * lives in exactly one place.
+ *
+ * Subclasses MUST call `dispatch(...)` to execute their body. `dispatch`
+ * wraps the body in the error router; subclasses never need a try/catch.
+ */
+abstract class DevtreesCommand extends Command<DevtreesContext> {
+  json = Option.Boolean("--json", false, {
+    description: "Emit a structured JSON envelope on stdout (see ADR-0005 for the contract).",
+  });
+
+  protected get mode(): FormatMode {
+    return this.json ? "json" : "human";
+  }
+
+  /**
+   * Run a command body with the documented error envelope. The body returns
+   * an exit code (0 for success, non-zero for in-band failure modes such as
+   * `logs` without a service or `--all`); a thrown error is classified and
+   * rendered as the `--json` (or human) error envelope.
+   */
+  protected async dispatch(body: () => Promise<number>): Promise<number> {
     try {
-      const result = await handler(rest, deps, mode);
-      if (result !== undefined) return result;
+      return await body();
     } catch (err) {
       const payload = classifyError(err as Error);
-      const out = formatError(payload, mode);
-      return { code: 1, stdout: out.stdout, stderr: out.stderr };
+      const out = formatError(payload, this.mode);
+      if (out.stdout) this.context.stdout.write(out.stdout);
+      if (out.stderr) this.context.stderr.write(out.stderr);
+      return 1;
     }
   }
-  return run(commandArgv);
+
+  /**
+   * Override clipanion's default error handler (which writes the stack trace
+   * to stdout). We catch in `dispatch` already; this swallow exists so a
+   * stray throw from a flag-parsing path doesn't leak a stack trace to the
+   * user. Stack traces in JSON mode would also break the envelope contract.
+   */
+  override async catch(error: unknown): Promise<void> {
+    const payload = classifyError(error as Error);
+    const out = formatError(payload, this.mode);
+    if (out.stdout) this.context.stdout.write(out.stdout);
+    if (out.stderr) this.context.stderr.write(out.stderr);
+  }
 }
+
+// --- per-command classes ----------------------------------------------------
+
+class UpCommand extends DevtreesCommand {
+  static override paths = [["up"]];
+  static override usage = Command.Usage({
+    description: "Bring up this worktree's stack with collision-free ports.",
+    details: ERROR_CODES_FOOTER([
+      "PROCESS_COMPOSE_NOT_FOUND",
+      "CONFIG_DRIFT",
+      "STALE_PORT_BLOCK",
+      "HEALTH_TIMEOUT",
+      "LOCK_CONTENTION",
+      "CONFIG_INVALID",
+      "UNKNOWN",
+    ]),
+    examples: [
+      ["Bring up the stack", "devtrees up"],
+      ["Bring up + emit JSON envelope", "devtrees up --json"],
+      ["Bring up with a 30s health-wait window", "devtrees up --wait-timeout 30"],
+    ],
+  });
+
+  // Clipanion auto-handles the `--no-attach` negation for any `--attach`
+  // boolean: `--attach` → true, `--no-attach` → false, omitted → undefined
+  // (TTY auto-detection in runUp). Documented in the description so the
+  // help block flags the negated form even though clipanion only renders
+  // the positive variant in the options table.
+  attach = Option.Boolean("--attach", {
+    description:
+      "Force-attach the TUI; pass `--no-attach` to force-skip (default: only when stdout & stderr are TTYs).",
+  });
+  waitTimeout = Option.String("--wait-timeout", {
+    description: "Health-wait timeout in seconds. Default 120.",
+  });
+
+  override async execute(): Promise<number> {
+    return this.dispatch(async () => {
+      const options: UpOptions = {
+        ...(this.attach !== undefined ? { attach: this.attach } : {}),
+        ...(this.waitTimeout !== undefined
+          ? { waitTimeoutMs: parseWaitTimeoutSecondsToMs(this.waitTimeout) }
+          : {}),
+      };
+      const result = await this.context.deps.up(options);
+      const out = formatUp(
+        {
+          worktreeId: result.worktreeId,
+          env: result.env,
+          sharedStarted: result.sharedStarted ?? false,
+          ...(result.blockBase !== undefined ? { blockBase: result.blockBase } : {}),
+          ...(result.services !== undefined ? { services: result.services } : {}),
+        },
+        this.mode,
+      );
+      if (out.stdout) this.context.stdout.write(out.stdout);
+      if (out.stderr) this.context.stderr.write(out.stderr);
+      return 0;
+    });
+  }
+}
+
+class DownCommand extends DevtreesCommand {
+  static override paths = [["down"]];
+  static override usage = Command.Usage({
+    description: "Stop this worktree's stack (`--shared` tears down the shared instance).",
+    details: ERROR_CODES_FOOTER([
+      "PROCESS_COMPOSE_NOT_FOUND",
+      "INSTANCE_NOT_FOUND",
+      "LOCK_CONTENTION",
+      "UNKNOWN",
+    ]),
+  });
+
+  shared = Option.Boolean("--shared", false, {
+    description: "Tear down the shared instance instead of this worktree's.",
+  });
+
+  override async execute(): Promise<number> {
+    return this.dispatch(async () => {
+      const result = (await this.context.deps.down({ shared: this.shared })) ?? {};
+      // Issue #48: the action envelope carries exactly one of `shared: true`
+      // or `worktreeId: "<id>"`. Empty string preserves the discriminated-
+      // union shape when the runner couldn't supply an id.
+      const out = formatDown(
+        this.shared ? { shared: true } : { worktreeId: result.worktreeId ?? "" },
+        this.mode,
+      );
+      if (out.stdout) this.context.stdout.write(out.stdout);
+      if (out.stderr) this.context.stderr.write(out.stderr);
+      return 0;
+    });
+  }
+}
+
+class GenerateCommand extends DevtreesCommand {
+  static override paths = [["generate"]];
+  static override usage = Command.Usage({
+    description: "Write the derived process-compose config to disk without starting anything.",
+    details: ERROR_CODES_FOOTER(["CONFIG_INVALID", "UNKNOWN"]),
+  });
+
+  override async execute(): Promise<number> {
+    return this.dispatch(async () => {
+      if (!this.context.deps.generate) return 0;
+      const result = await this.context.deps.generate();
+      const out = formatGenerate(
+        { worktreePath: result.worktreePath, sharedPath: result.sharedPath },
+        this.mode,
+      );
+      if (out.stdout) this.context.stdout.write(out.stdout);
+      if (out.stderr) this.context.stderr.write(out.stderr);
+      return 0;
+    });
+  }
+}
+
+class LsCommand extends DevtreesCommand {
+  static override paths = [["ls"]];
+  static override usage = Command.Usage({
+    description: "List every devtrees instance across the repo with status and ports.",
+    details: ERROR_CODES_FOOTER(["UNKNOWN"]),
+  });
+
+  override async execute(): Promise<number> {
+    return this.dispatch(async () => {
+      if (!this.context.deps.ls) return 0;
+      const result = await this.context.deps.ls();
+      const out = formatLs(result.instances, this.mode);
+      if (out.stdout) this.context.stdout.write(out.stdout);
+      if (out.stderr) this.context.stderr.write(out.stderr);
+      return 0;
+    });
+  }
+}
+
+class AttachCommand extends DevtreesCommand {
+  static override paths = [["attach"]];
+  static override usage = Command.Usage({
+    description: "Attach a TUI to this worktree's instance (`--shared` for the shared one).",
+    details: ERROR_CODES_FOOTER(["INSTANCE_NOT_FOUND", "UNKNOWN"]),
+  });
+
+  shared = Option.Boolean("--shared", false, {
+    description: "Attach to the shared instance instead of this worktree's.",
+  });
+
+  override async execute(): Promise<number> {
+    return this.dispatch(async () => {
+      if (!this.context.deps.attach) return 0;
+      await this.context.deps.attach({ shared: this.shared });
+      // `attach` runs the TUI in-process; on a clean exit there is nothing
+      // to print (the TUI itself is the user-visible output).
+      return 0;
+    });
+  }
+}
+
+class PruneCommand extends DevtreesCommand {
+  static override paths = [["prune"]];
+  static override usage = Command.Usage({
+    description: "Reconcile against `git worktree list` and clean up orphaned instances.",
+    details: ERROR_CODES_FOOTER(["UNKNOWN"]),
+  });
+
+  override async execute(): Promise<number> {
+    return this.dispatch(async () => {
+      if (!this.context.deps.prune) return 0;
+      const result = await this.context.deps.prune();
+      const out = formatPrune(result.pruned, this.mode);
+      if (out.stdout) this.context.stdout.write(out.stdout);
+      if (out.stderr) this.context.stderr.write(out.stderr);
+      return 0;
+    });
+  }
+}
+
+class EnvCommand extends DevtreesCommand {
+  static override paths = [["env"]];
+  static override usage = Command.Usage({
+    description: "Print this worktree's injected env (KEY=value, or `--json` for a map).",
+    details: ERROR_CODES_FOOTER(["CONFIG_INVALID", "UNKNOWN"]),
+  });
+
+  override async execute(): Promise<number> {
+    return this.dispatch(async () => {
+      if (!this.context.deps.env) return 0;
+      const result = await this.context.deps.env();
+      const out = formatEnv(result.env, this.mode);
+      if (out.stdout) this.context.stdout.write(out.stdout);
+      if (out.stderr) this.context.stderr.write(out.stderr);
+      return 0;
+    });
+  }
+}
+
+class LogsCommand extends DevtreesCommand {
+  static override paths = [["logs"]];
+  static override usage = Command.Usage({
+    description: "Stream a service's logs.",
+    details: ERROR_CODES_FOOTER(["INSTANCE_NOT_FOUND", "UNKNOWN"]),
+    examples: [
+      ["Tail one service", "devtrees logs web"],
+      ["Tail every service, interleaved", "devtrees logs --all"],
+      ["Stream as NDJSON", "devtrees logs web --json"],
+    ],
+  });
+
+  service = Option.String({ required: false });
+  all = Option.Boolean("--all", false, { description: "Tail every service in the instance." });
+  shared = Option.Boolean("--shared", false, {
+    description: "Read from the shared instance instead of this worktree's.",
+  });
+  follow = Option.Boolean("--follow,-f", false, {
+    description: "Follow the log stream (default: print the buffered tail and exit).",
+  });
+  tail = Option.String("--tail", {
+    description: "Print the last N lines before following.",
+  });
+  since = Option.String("--since", {
+    description: "Start from a duration ago (e.g. `5m`, `1h`).",
+  });
+
+  override async execute(): Promise<number> {
+    return this.dispatch(async () => {
+      if (!this.context.deps.logs) return 0;
+      const opts: LogsCliOptions = {
+        service: this.service,
+        all: this.all,
+        shared: this.shared,
+        follow: this.follow,
+        ...(this.tail !== undefined ? { tail: Number(this.tail) } : {}),
+        ...(this.since !== undefined ? { since: this.since } : {}),
+      };
+      if (!opts.all && opts.service === undefined) {
+        this.context.stderr.write(
+          "devtrees logs: specify a service (e.g. `devtrees logs web`) or pass `--all`.\n",
+        );
+        return 1;
+      }
+      const { services, events } = await this.context.deps.logs(opts);
+      const prefixService = this.mode === "human" && services.length > 1;
+      for await (const event of events) {
+        const out = formatLogLine(event, this.mode, { prefixService });
+        if (out.stdout) this.context.stdout.write(out.stdout);
+      }
+      return 0;
+    });
+  }
+}
+
+// --- flag-value coercions ---------------------------------------------------
+
+/**
+ * Coerce a `--wait-timeout` argument value into ms, or throw a clear error.
+ * Kept here (rather than in the command) so the error path is exercised by
+ * the existing test that pins the error text.
+ */
+function parseWaitTimeoutSecondsToMs(raw: string): number {
+  const seconds = Number(raw);
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    throw new Error(`--wait-timeout expects a positive number of seconds, got '${raw}'.`);
+  }
+  return Math.round(seconds * 1000);
+}
+
+// --- dispatch ---------------------------------------------------------------
+
+/**
+ * Build the `Cli` instance, register every command + the built-in
+ * `--help`/`--version` commands, and return it. Built per call so each
+ * `execute`/`run` invocation has a fresh registration list (cheap; clipanion
+ * setup is in-memory and microsecond-scale).
+ */
+function buildCli(): Cli<DevtreesContext> {
+  const cli = new Cli<DevtreesContext>({
+    binaryName: "devtrees",
+    binaryLabel: "devtrees - parallel worktree stacks over process-compose",
+    binaryVersion: VERSION,
+    // Colors are decided per-invocation by the context's colorDepth; disable
+    // the env-based color inference so a CI run with FORCE_COLOR set doesn't
+    // sneak escape codes into the JSON envelope.
+    enableColors: false,
+  });
+  cli.register(Builtins.HelpCommand);
+  cli.register(Builtins.VersionCommand);
+  cli.register(UpCommand);
+  cli.register(DownCommand);
+  cli.register(GenerateCommand);
+  cli.register(LsCommand);
+  cli.register(AttachCommand);
+  cli.register(PruneCommand);
+  cli.register(EnvCommand);
+  cli.register(LogsCommand);
+  return cli;
+}
+
+/**
+ * Buffered stdio so `execute`/`run` can return a `RunResult` instead of writing
+ * straight to the process. Tests need byte-exact captures and the entrypoint
+ * shell needs to flush in order — both go through this.
+ */
+function bufferedStream(): { write: Writable; readonly text: () => string } {
+  let buf = "";
+  const write = new Writable({
+    write(chunk: Buffer | string, _enc, cb) {
+      buf += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+      cb();
+    },
+  });
+  return { write, text: () => buf };
+}
+
+/**
+ * No-op deps stub used by `run()` for help/version paths and by tests that
+ * exercise the pure parsing surface. A test that triggers an effectful
+ * dispatch through this would get a clear `Function called but not provided`
+ * failure, which is what we want.
+ */
+const NO_DEPS: ExecuteDeps = {
+  up: () => {
+    throw new Error("up: no deps provided");
+  },
+  down: () => {
+    throw new Error("down: no deps provided");
+  },
+};
+
+/**
+ * Render an unknown-command failure in the legacy shape pinned by tests:
+ * `devtrees: unknown command '<name>'\nRun 'devtrees --help' for usage.\n` on
+ * stderr, exit 1. Clipanion's own "Command not found" output is well-formed
+ * but worded differently; reshape it here so we don't break the agent-
+ * facing surface.
+ */
+function isUnknownCommand(stdout: string): boolean {
+  return /Command not found/.test(stdout);
+}
+
+function unknownCommandStderr(argv: ReadonlyArray<string>): string {
+  // The first non-flag argument is the offending command name. Clipanion has
+  // already validated argv at this point, so this is purely cosmetic.
+  const first = argv.find((a) => !a.startsWith("-"));
+  const name = first ?? argv[0] ?? "";
+  return `devtrees: unknown command '${name}'\nRun 'devtrees --help' for usage.\n`;
+}
+
+/**
+ * Resolve an argv list through clipanion into a `RunResult`. The single
+ * entrypoint every other surface in this file (and the test suite) calls.
+ *
+ * `deps` is optional so help/version paths can run without wiring the
+ * effectful commands; subcommands that need a missing dep dispatch to a
+ * no-op `return 0` (preserving the pre-clipanion behaviour where a
+ * test-stub omitting `ls` from `ExecuteDeps` returned the "not implemented"
+ * stub output).
+ */
+async function dispatchCli(argv: ReadonlyArray<string>, deps: ExecuteDeps): Promise<RunResult> {
+  const cli = buildCli();
+  const stdout = bufferedStream();
+  const stderr = bufferedStream();
+  const code = await cli.run([...argv], {
+    stdin: process.stdin,
+    stdout: stdout.write,
+    stderr: stderr.write,
+    env: process.env,
+    colorDepth: 1,
+    deps,
+  });
+
+  let outText = stdout.text();
+  let errText = stderr.text();
+
+  // Reshape clipanion's "Command not found" to devtrees' historical error
+  // surface (#62: behavior preserved exactly across the migration).
+  if (code !== 0 && isUnknownCommand(outText)) {
+    outText = "";
+    errText = unknownCommandStderr(argv);
+  }
+
+  return { code, stdout: outText, stderr: errText };
+}
+
+/**
+ * Resolve a command line into output and an exit code without touching the
+ * process. Public surface kept for compatibility with callers and tests that
+ * predate the clipanion migration.
+ *
+ * For backwards compat with synchronous callers (the version test), `run`
+ * synchronously returns a `RunResult` shape — but in practice it's now a
+ * tiny shim that wraps `execute()` and blocks. Since clipanion's runtime is
+ * fully synchronous for the `--help`/`--version` paths (no I/O), the
+ * promise resolves on the next microtask; callers in the test suite that
+ * `await` work as before. Callers that don't await get the result via
+ * `Promise<RunResult>` — same as `execute`.
+ */
+export function run(argv: ReadonlyArray<string>): Promise<RunResult> {
+  return dispatchCli(argv, NO_DEPS);
+}
+
+/**
+ * Resolve a command line, performing effects for the commands in `deps`.
+ * The test suite's primary dispatch point — every CLI test injects mock
+ * `runUp`/`runDown`/... here and asserts on the returned `RunResult`.
+ *
+ * `down --shared` and `attach --shared` target the shared instance
+ * (ADR-0001): explicit, opt-in flags because the shared instance is
+ * decoupled from any single worktree's lifecycle.
+ */
+export function execute(argv: ReadonlyArray<string>, deps: ExecuteDeps): Promise<RunResult> {
+  return dispatchCli(argv, deps);
+}
+
+// --- entrypoint -------------------------------------------------------------
 
 /**
  * True when this module is the program's entrypoint, accounting for symlinks
@@ -487,7 +674,7 @@ export function isEntrypoint(metaUrl: string, argv1: string | undefined): boolea
 if (isEntrypoint(import.meta.url, process.argv[1])) {
   const { runUp, runDown, runEnv, runGenerate, runLs, runAttach, runPrune, runLogs } =
     await import("./commands.js");
-  const result = await execute(process.argv.slice(2), {
+  const deps: ExecuteDeps = {
     up: (options) =>
       runUp({
         ...(options?.attach !== undefined ? { attach: options.attach } : {}),
@@ -511,7 +698,8 @@ if (isEntrypoint(import.meta.url, process.argv[1])) {
           since: opts.since,
         },
       ),
-  });
+  };
+  const result = await dispatchCli(process.argv.slice(2), deps);
   if (result.stdout) process.stdout.write(result.stdout);
   if (result.stderr) process.stderr.write(result.stderr);
   process.exit(result.code);

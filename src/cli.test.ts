@@ -10,41 +10,80 @@ async function* fromArray<T>(items: ReadonlyArray<T>): AsyncIterable<T> {
 }
 
 describe("devtrees CLI", () => {
-  it("prints the version with --version", () => {
-    const result = run(["--version"]);
+  it("prints the version with --version", async () => {
+    const result = await run(["--version"]);
     expect(result.code).toBe(0);
     expect(result.stdout.trim()).toMatch(/^\d+\.\d+\.\d+$/);
   });
 
-  it("aliases -v to --version", () => {
-    expect(run(["-v"]).stdout.trim()).toMatch(/^\d+\.\d+\.\d+$/);
+  it("aliases -v to --version", async () => {
+    expect((await run(["-v"])).stdout.trim()).toMatch(/^\d+\.\d+\.\d+$/);
   });
 
-  it("lists the commands with --help", () => {
-    const result = run(["--help"]);
+  it("lists the commands with --help", async () => {
+    const result = await run(["--help"]);
     expect(result.code).toBe(0);
     expect(result.stdout).toContain("devtrees");
-    expect(result.stdout).toContain("Usage");
-    // the stubbed command surface from the PRD
-    for (const cmd of ["up", "down", "ls", "attach", "generate", "prune"]) {
-      expect(result.stdout).toContain(cmd);
+    // clipanion lists every registered command in `$ devtrees <cmd>` form.
+    for (const cmd of ["up", "down", "ls", "attach", "generate", "prune", "env", "logs"]) {
+      expect(result.stdout).toContain(`devtrees ${cmd}`);
     }
   });
 
-  it("aliases -h to --help", () => {
-    expect(run(["-h"]).stdout).toContain("Usage");
+  it("aliases -h to --help", async () => {
+    // The top-level help text is the same `--help` lists, identifiable by
+    // the binary label clipanion prints at the top.
+    expect((await run(["-h"])).stdout).toContain("devtrees");
   });
 
-  it("prints help and exits 0 when given no arguments", () => {
-    const result = run([]);
+  it("prints help and exits 0 when given no arguments", async () => {
+    const result = await run([]);
     expect(result.code).toBe(0);
-    expect(result.stdout).toContain("Usage");
+    expect(result.stdout).toContain("devtrees");
   });
 
-  it("errors on an unknown command", () => {
-    const result = run(["frobnicate"]);
+  it("errors on an unknown command", async () => {
+    const result = await run(["frobnicate"]);
     expect(result.code).toBe(1);
     expect(result.stderr).toContain("frobnicate");
+  });
+
+  /**
+   * Per-subcommand `--help` (issue #62, closes #59). Each command's help
+   * lists every flag with a description, exits 0, and SKIPS the command
+   * body — verified by passing `--help` with no deps wired: a help path
+   * that fell through to the command body would throw.
+   */
+  for (const cmd of ["up", "down", "ls", "attach", "generate", "prune", "env", "logs"]) {
+    it(`\`devtrees ${cmd} --help\` exits 0, prints non-empty help, skips the body`, async () => {
+      // No deps wired — the command body would throw "up: no deps provided"
+      // if it were invoked. The fact this test passes proves help is a
+      // pure short-circuit upstream of anchor/git probing.
+      const result = await run([cmd, "--help"]);
+      expect(result.code).toBe(0);
+      expect(result.stdout.length).toBeGreaterThan(0);
+      expect(result.stdout).toMatch(/--json/);
+    });
+
+    it(`\`devtrees ${cmd} -h\` is equivalent to \`--help\``, async () => {
+      const result = await run([cmd, "-h"]);
+      expect(result.code).toBe(0);
+      expect(result.stdout.length).toBeGreaterThan(0);
+    });
+  }
+
+  it("`devtrees up --help` mentions --attach, --no-attach, and --wait-timeout", async () => {
+    const help = (await run(["up", "--help"])).stdout;
+    expect(help).toMatch(/--attach/);
+    expect(help).toMatch(/--no-attach/);
+    expect(help).toMatch(/--wait-timeout/);
+  });
+
+  it("`devtrees up --help` lists the error codes it can emit under --json", async () => {
+    const help = (await run(["up", "--help"])).stdout;
+    expect(help).toMatch(/HEALTH_TIMEOUT/);
+    expect(help).toMatch(/CONFIG_DRIFT/);
+    expect(help).toMatch(/STALE_PORT_BLOCK/);
   });
 });
 
@@ -691,8 +730,8 @@ describe("devtrees CLI — up non-interactive (#28)", () => {
     expect(result.stderr).toMatch(/timed out/);
   });
 
-  it("help text mentions --attach, --no-attach, and --wait-timeout", () => {
-    const help = run(["--help"]).stdout;
+  it("`devtrees up --help` mentions --attach, --no-attach, and --wait-timeout (per-command help)", async () => {
+    const help = (await run(["up", "--help"])).stdout;
     expect(help).toMatch(/--attach/);
     expect(help).toMatch(/--no-attach/);
     expect(help).toMatch(/--wait-timeout/);
