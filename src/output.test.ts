@@ -11,6 +11,7 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   ERROR_CODES,
   SCHEMA_VERSION,
+  classifyError,
   formatDown,
   formatEnv,
   formatError,
@@ -33,9 +34,42 @@ describe("output formatter — constants", () => {
 
   it("includes the error codes the foundation slice promises (PRD §error envelope)", () => {
     // Slice #1 must define at least these two; later slices add HEALTH_TIMEOUT,
-    // CONFIG_DRIFT, LOCK_CONTENTION, CONFIG_INVALID per ADR-0005.
+    // CONFIG_DRIFT, LOCK_CONTENTION, CONFIG_INVALID, STALE_PORT_BLOCK per ADR-0005.
     expect(ERROR_CODES).toContain("PROCESS_COMPOSE_NOT_FOUND");
     expect(ERROR_CODES).toContain("INSTANCE_NOT_FOUND");
+  });
+
+  it("reserves STALE_PORT_BLOCK so #58 routes via classifyError's typed-code short-circuit", () => {
+    expect(ERROR_CODES).toContain("STALE_PORT_BLOCK");
+  });
+});
+
+describe("output formatter — classifyError", () => {
+  it("propagates a typed error's .details object to the envelope (so STALE_PORT_BLOCK can publish its collisions)", () => {
+    const err = Object.assign(new Error("stale block"), {
+      code: "STALE_PORT_BLOCK",
+      details: {
+        block_base: 40256,
+        worktree_id: "login",
+        collisions: [
+          { port_name: "WEB_PORT", port: 40256, pid: 76705, command: "node server.mjs" },
+        ],
+      },
+    });
+    const payload = classifyError(err);
+    expect(payload.code).toBe("STALE_PORT_BLOCK");
+    expect(payload.details).toEqual({
+      block_base: 40256,
+      worktree_id: "login",
+      collisions: [{ port_name: "WEB_PORT", port: 40256, pid: 76705, command: "node server.mjs" }],
+    });
+  });
+
+  it("leaves .details undefined when the typed error doesn't carry one (CONFIG_DRIFT / HEALTH_TIMEOUT today)", () => {
+    const err = Object.assign(new Error("drifted"), { code: "CONFIG_DRIFT" });
+    const payload = classifyError(err);
+    expect(payload.code).toBe("CONFIG_DRIFT");
+    expect(payload.details).toBeUndefined();
   });
 });
 

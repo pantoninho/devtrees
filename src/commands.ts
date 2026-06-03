@@ -23,7 +23,7 @@ import {
   type StreamLogsOptions,
 } from "./driver.js";
 import { readRegistry, withRegistryLock, withSharedLock } from "./registry.js";
-import { defaultIsPortFree } from "./port-probe.js";
+import { defaultIsPortFree, defaultPortHolder, type PortHolderReport } from "./port-probe.js";
 import { stackHash } from "./hash.js";
 import {
   readStoredHash as defaultReadStoredHash,
@@ -99,6 +99,114 @@ class HealthTimeoutError extends Error {
   }
 }
 
+/** One row of `details.collisions[]` in the `STALE_PORT_BLOCK` error envelope. */
+interface PortCollision {
+  readonly port_name: string;
+  readonly port: number;
+  readonly pid: number | null;
+  readonly command: string | null;
+}
+
+/**
+ * Thrown when `up`'s pre-flight check finds foreign listeners squatting on
+ * one or more of the worktree's declared named ports — typically orphaned
+ * child processes from a prior session that survived their parent
+ * process-compose's exit (issue #58). The allocator's stability-first
+ * fast-path returns the registry-recorded block verbatim without
+ * re-probing (by design), so without this check `up` would hand the block
+ * to a fresh process-compose and the stale listener would silently win
+ * EADDRINUSE against the new service.
+ *
+ * The CLI maps this to the `STALE_PORT_BLOCK` error envelope; the
+ * `details.collisions[]` list names each (port_name, port, pid, command)
+ * so the agent can kill the right PIDs before retrying.
+ */
+class StalePortBlockError extends Error {
+  readonly code = "STALE_PORT_BLOCK" as const;
+  readonly details: {
+    readonly block_base: number;
+    readonly worktree_id: string;
+    readonly collisions: ReadonlyArray<PortCollision>;
+  };
+  constructor(
+    message: string,
+    details: {
+      readonly block_base: number;
+      readonly worktree_id: string;
+      readonly collisions: ReadonlyArray<PortCollision>;
+    },
+  ) {
+    super(message);
+    this.name = "StalePortBlockError";
+    this.details = details;
+  }
+}
+
+/**
+ * Probe a concrete port and report who, if anyone, is listening on it.
+ * Default: `defaultPortHolder` (EADDRINUSE bind + best-effort `lsof` for the
+ * PID and command). Injected so unit tests can drive the routing of
+ * `assertBlockPortsFree` without touching the network.
+ */
+export type PortHolderProbe = (port: number) => Promise<PortHolderReport> | PortHolderReport;
+
+/**
+ * Pre-flight: probe each declared named port the worktree owns and throw
+ * `StalePortBlockError` if any of them is held by a foreign process. The
+ * `ownInstanceLive` flag short-circuits the check on the idempotent re-up
+ * path — when our own control socket is already present, the listeners on
+ * those ports ARE our own, so any "in use" report is a false positive that
+ * would break re-runs.
+ *
+ * Only the worktree's *isolated*-tier named ports are probed (not the full
+ * 32-port block — random idle ports in the block don't matter, only declared
+ * ones get bound by the stack).
+ */
+async function assertBlockPortsFree(args: {
+  readonly stack: ResolvedStack;
+  readonly worktreeId: string;
+  readonly blockBase: number;
+  readonly portFor: (name: string) => number | undefined;
+  readonly portHolder: PortHolderProbe;
+  readonly ownInstanceLive: boolean;
+}): Promise<void> {
+  if (args.ownInstanceLive) return;
+  const { stack, worktreeId, blockBase, portFor, portHolder } = args;
+  const collisions = await collectPortCollisions(stack, portFor, portHolder);
+  if (collisions.length === 0) return;
+  throw new StalePortBlockError(
+    `devtrees up: ports in this worktree's allocated block are held by foreign processes — ` +
+      `likely orphaned children from a prior session. Inspect and kill the listed PIDs, then ` +
+      `retry \`devtrees up\`.`,
+    { block_base: blockBase, worktree_id: worktreeId, collisions },
+  );
+}
+
+/**
+ * Walk the stack's declared isolated-tier named ports, probe each via the
+ * `portHolder` seam, and collect a row for every port held by something.
+ * Pure modulo the seam — separated from `assertBlockPortsFree` so the loop
+ * stays cheap to keep in head and the orchestrator's complexity stays low.
+ */
+async function collectPortCollisions(
+  stack: ResolvedStack,
+  portFor: (name: string) => number | undefined,
+  portHolder: PortHolderProbe,
+): Promise<PortCollision[]> {
+  const collisions: PortCollision[] = [];
+  for (const service of stack.services) {
+    if (service.tier !== "isolated") continue;
+    for (const portName of service.ports) {
+      const port = portFor(portName);
+      if (port === undefined) continue;
+      const report = await portHolder(port);
+      if (report.free) continue;
+      collisions.push({ port_name: portName, port, pid: report.pid, command: report.command });
+    }
+  }
+  return collisions;
+}
+
 /** Default health-wait window for the worktree instance — overridable per call. */
 const DEFAULT_WAIT_TIMEOUT_MS = 120_000;
 
@@ -151,6 +259,13 @@ export interface CommandDeps {
   readonly getServiceStatuses?: (socketPath: string) => Promise<ServiceStatus[]>;
   /** Is a concrete port free to bind? Default: probes a real TCP bind. */
   readonly isPortFree?: (port: number) => boolean | Promise<boolean>;
+  /**
+   * Identify the holder of a concrete port — used by `up`'s pre-flight
+   * stale-port-block check (#58). Default: `defaultPortHolder` (bind probe
+   * + best-effort `lsof`). Injected so unit tests can drive the routing
+   * without touching the network.
+   */
+  readonly portHolder?: PortHolderProbe;
   /**
    * Allocator defaults — `port_base` and `block_size`. The stack's `allocator`
    * field overrides these on a field-by-field basis. Default: 20000 / 32.
@@ -359,6 +474,26 @@ async function allocateAndBuildPortMaps(args: {
 }
 
 /**
+ * Resolve every dependency seam `runUp` reads. Centralising the `??` defaults
+ * here keeps the orchestrator's body free of injection plumbing and bounds
+ * its cyclomatic complexity to the genuine domain branches (idempotency,
+ * dropped-edge wait, attach-after-up) rather than counting one extra
+ * decision per nullish-coalesce.
+ */
+function resolveUpSeams(deps: CommandDeps) {
+  return {
+    readStack: deps.readStack ?? loadStack,
+    lock: deps.withRegistryLock ?? defaultWithRegistryLock,
+    sharedLock: deps.withSharedLock ?? defaultWithSharedLock,
+    isPortFree: deps.isPortFree ?? defaultIsPortFree,
+    portHolder: deps.portHolder ?? defaultPortHolder,
+    warn: deps.warn ?? defaultWarn,
+    readHash: deps.readStoredHash ?? defaultReadStoredHash,
+    writeHash: deps.writeStoredHash ?? defaultWriteStoredHash,
+  } as const;
+}
+
+/**
  * Bring up this worktree's isolated stack, idempotently.
  *
  * Three branches (issue #31):
@@ -373,6 +508,17 @@ async function allocateAndBuildPortMaps(args: {
  *    (`not_supported` or otherwise), throw `ConfigDriftError` (code
  *    `CONFIG_DRIFT`) and leave the instance running unchanged.
  *
+ * Pre-flight stale-port-block check (issue #58): when the worktree's
+ * control socket is absent (first up — not the idempotent re-up path),
+ * `runUp` probes each declared named port the worktree owns and throws
+ * `StalePortBlockError` (code `STALE_PORT_BLOCK`) if any of them is held
+ * by a foreign process. The allocator deliberately does NOT re-probe a
+ * registered block (stability-first), so without this check `up` would
+ * hand the block to process-compose and the orphan listener would silently
+ * win EADDRINUSE against the new service, leaving the agent with a
+ * "Completed" service status and no diagnostic. The check is skipped on
+ * the idempotent path because the listeners on those ports are our own.
+ *
  * Shared-tier liveness runs *before* the idempotency dispatch (issue #56).
  * The shared instance is repo-wide and its lifecycle is independent of any
  * one worktree's (ADR-0001), so a prior `down --shared` can leave shared
@@ -384,13 +530,8 @@ async function allocateAndBuildPortMaps(args: {
  */
 export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
   const { anchor } = resolve(deps);
-  const readStack = deps.readStack ?? loadStack;
-  const lock = deps.withRegistryLock ?? defaultWithRegistryLock;
-  const sharedLock = deps.withSharedLock ?? defaultWithSharedLock;
-  const isPortFree = deps.isPortFree ?? defaultIsPortFree;
-  const warn = deps.warn ?? defaultWarn;
-  const readHash = deps.readStoredHash ?? defaultReadStoredHash;
-  const writeHash = deps.writeStoredHash ?? defaultWriteStoredHash;
+  const seams = resolveUpSeams(deps);
+  const { readStack, lock, sharedLock, isPortFree, portHolder, warn, readHash, writeHash } = seams;
 
   const stack = readStack(anchor.worktreeRoot);
   const options = resolveAllocatorOptions(stack, deps.allocator ?? DEFAULT_ALLOCATOR);
@@ -435,6 +576,21 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
   const paths = instancePaths(anchor.anchor, anchor.worktreeId);
   const driver = createDriver(deps.driver);
   const inst = { configPath: paths.configPath, socketPath: paths.socketPath };
+
+  // Pre-flight stale-port-block check (issue #58). Self-gates on the
+  // own-instance-live flag so the idempotent re-up path skips the probe
+  // (those listeners ARE our own); on the first-up path, any listener on a
+  // declared named port is by definition foreign and we abort with
+  // STALE_PORT_BLOCK so the agent sees a discoverable failure instead of a
+  // confusing "Completed" service status downstream of EADDRINUSE.
+  await assertBlockPortsFree({
+    stack,
+    worktreeId: anchor.worktreeId,
+    blockBase,
+    portFor,
+    portHolder,
+    ownInstanceLive: existsSync(paths.socketPath),
+  });
 
   // Lazy-start the shared instance if any shared services are declared. Runs
   // BEFORE the idempotency dispatch (issue #56): the shared tier's lifecycle

@@ -1062,3 +1062,110 @@ describe("e2e — attach to the shared instance", () => {
     expect(existsSync(sharedSock)).toBe(false);
   }, 30000);
 });
+
+/**
+ * Stale-port-block detection (#58). When a foreign process is squatting on one
+ * of the worktree's allocated named ports at start time, `runUp` must abort
+ * with `StalePortBlockError` (code `STALE_PORT_BLOCK`) BEFORE the spawn — so
+ * the error envelope publishes the (port, pid, command) so the agent can act.
+ * The acceptance check binds a TCP listener directly via `net.createServer`,
+ * pins the worktree's allocator to that exact port via the registry, and
+ * asserts the typed-error short-circuit through the CLI's `classifyError`
+ * envelope shape.
+ */
+describe("e2e — STALE_PORT_BLOCK pre-flight (#58)", () => {
+  it("aborts with code STALE_PORT_BLOCK + collisions[] when a leaked listener squats the worktree's named port", async () => {
+    const { createServer } = await import("node:net");
+    const { classifyError, formatError } = await import("./output.js");
+
+    const repo = makeRepo("dt-stale-", ["login"]);
+    cleanups.push(() => rmSync(repo.root, { recursive: true, force: true }));
+    const worktree = repo.worktrees.login;
+    if (worktree === undefined) throw new Error("expected login worktree");
+    writeStackConfig(worktree);
+
+    // Bind an ephemeral port from THIS test process — that's the "foreign"
+    // listener the pre-flight must catch. Pin the allocator to it via the
+    // registry, so `allocateBlock`'s fast-path hands the same port back.
+    const leaker = await new Promise<{ port: number; close: () => Promise<void> }>(
+      (resolve, reject) => {
+        const s = createServer();
+        s.once("error", reject);
+        s.listen(0, "127.0.0.1", () => {
+          const addr = s.address();
+          if (addr === null || typeof addr === "string") {
+            reject(new Error("ephemeral bind returned no address"));
+            return;
+          }
+          resolve({ port: addr.port, close: () => new Promise((r) => s.close(() => r())) });
+        });
+      },
+    );
+    cleanups.push(() => leaker.close());
+
+    // Seed the registry so the allocator's stability fast-path returns this
+    // exact port as the worktree's blockBase. This mirrors the real-world
+    // failure mode: registry hit → no re-probe → spawn → silent EADDRINUSE.
+    const commonDir = git(worktree, "rev-parse", "--git-common-dir");
+    const absCommon = commonDir.startsWith("/") ? commonDir : join(worktree, commonDir);
+    const devtreesDir = join(absCommon, "devtrees");
+    mkdirSync(devtreesDir, { recursive: true });
+    writeFileSync(
+      join(devtreesDir, "registry.json"),
+      JSON.stringify({ login: leaker.port }),
+      "utf8",
+    );
+
+    const deps = stubDriverDeps(worktree);
+
+    // Sanity: socket is absent (first-up path) so the pre-flight DOES run.
+    const socketPath = join(devtreesDir, "run", "login.sock");
+    expect(existsSync(socketPath)).toBe(false);
+
+    const err = await runUp(deps as never).then(
+      () => undefined,
+      (e: unknown) => e as Error & { code?: string; details?: unknown },
+    );
+    if (err === undefined) throw new Error("expected runUp to reject with STALE_PORT_BLOCK");
+    expect(err.code).toBe("STALE_PORT_BLOCK");
+
+    // Verify the CLI's classifier + formatter produce the documented envelope
+    // shape on stdout (ADR-0005: --json errors on stdout, not stderr).
+    const payload = classifyError(err);
+    expect(payload.code).toBe("STALE_PORT_BLOCK");
+    const out = formatError(payload, "json");
+    const parsed = JSON.parse(out.stdout) as {
+      schema_version: string;
+      error: {
+        code: string;
+        message: string;
+        details?: {
+          block_base: number;
+          worktree_id: string;
+          collisions: Array<{
+            port_name: string;
+            port: number;
+            pid: number | null;
+            command: string | null;
+          }>;
+        };
+      };
+    };
+    expect(parsed.error.code).toBe("STALE_PORT_BLOCK");
+    expect(parsed.error.details).toBeDefined();
+    const details = parsed.error.details;
+    if (details === undefined) throw new Error("expected error.details to be present");
+    expect(details.block_base).toBe(leaker.port);
+    expect(details.worktree_id).toBe("login");
+    expect(details.collisions.length).toBeGreaterThanOrEqual(1);
+    const webCollision = details.collisions.find((c) => c.port_name === "WEB_PORT");
+    expect(webCollision).toBeDefined();
+    if (webCollision === undefined) throw new Error("expected a WEB_PORT collision");
+    expect(webCollision.port).toBe(leaker.port);
+    // pid may be null on hosts without lsof; assert it's our own pid only
+    // when lsof actually returned something (graceful degradation rule).
+    if (webCollision.pid !== null) {
+      expect(webCollision.pid).toBe(process.pid);
+    }
+  }, 20000);
+});

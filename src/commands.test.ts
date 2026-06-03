@@ -190,6 +190,11 @@ function stubDeps(opts: {
     readRegistry: () => snapshotRef.snapshot,
     withSharedLock: passThroughSharedLock,
     isPortFree: opts.isPortFree ?? (() => true),
+    // Default port-holder stub mirrors isPortFree's "everything free" default:
+    // the real default (`defaultPortHolder`) does a real TCP bind, which
+    // races against concurrent test workers binding the same port range.
+    // Tests that exercise stale-port-block detection override this.
+    portHolder: async () => ({ free: true as const }),
     warn: opts.warn,
     attach: false,
     // Tests that don't care about the worktree health-wait (#28) get a no-op
@@ -2641,5 +2646,148 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     await runUp(deps);
     await runUp(deps);
     expect(reloadCount).toBe(0);
+  });
+});
+
+/**
+ * Pre-flight stale-port-block detection (#58). When the worktree's allocated
+ * named ports are held by foreign processes at start time, `runUp` must abort
+ * with `StalePortBlockError` (code `STALE_PORT_BLOCK`) BEFORE the spawn — so
+ * the agent gets a discoverable failure instead of process-compose silently
+ * losing EADDRINUSE and reporting "Completed". The check runs only when this
+ * worktree's control socket is absent (first up); on the idempotent re-up
+ * path, the listeners ARE our own, so the check is skipped entirely.
+ */
+describe("runUp — stale port block detection (#58)", () => {
+  const stack: ResolvedStack = {
+    services: [isolated("web", "node server.js", ["WEB_PORT", "METRICS_PORT"])],
+  };
+
+  it("aborts with code STALE_PORT_BLOCK when a declared named port is held by a foreign process at start time", async () => {
+    const heldPorts = new Set<number>();
+    // Stub holder: the first declared port is held by a "foreign" process.
+    const portHolder = async (port: number) => {
+      if (!heldPorts.has(port)) return { free: true as const };
+      return { free: false as const, pid: 12345, command: "node stale.mjs" };
+    };
+    // First, run the deps once to learn the block base, then arm the holder.
+    const probeDeps = stubDeps({ stack });
+    const probeResult = await runUp(probeDeps);
+    const blockBase = probeResult.blockBase;
+    // Reset for a fresh first-up against a clean anchor (separate stubDeps()
+    // call gives us a fresh tmp anchor with no socket present).
+    heldPorts.add(blockBase); // WEB_PORT (offset 0)
+
+    const deps: CommandDeps = {
+      ...stubDeps({ stack, initialRegistry: { login: blockBase } }),
+      portHolder,
+    };
+
+    const err = await runUp(deps).then(
+      () => undefined,
+      (e: unknown) => e as Error & { code?: string; details?: unknown },
+    );
+    if (err === undefined) throw new Error("expected runUp to reject");
+    expect(err.code).toBe("STALE_PORT_BLOCK");
+    const details = err.details as {
+      block_base: number;
+      worktree_id: string;
+      collisions: Array<{
+        port_name: string;
+        port: number;
+        pid: number | null;
+        command: string | null;
+      }>;
+    };
+    expect(details.block_base).toBe(blockBase);
+    expect(details.worktree_id).toBe("login");
+    expect(details.collisions).toHaveLength(1);
+    expect(details.collisions[0]).toEqual({
+      port_name: "WEB_PORT",
+      port: blockBase,
+      pid: 12345,
+      command: "node stale.mjs",
+    });
+  });
+
+  it("collects every collision (not just the first) so the agent can kill all orphans in one pass", async () => {
+    const portHolder = async (port: number) => ({
+      free: false as const,
+      pid: port, // pid = port for easy assertion
+      command: `proc@${port}`,
+    });
+    const deps: CommandDeps = { ...stubDeps({ stack }), portHolder };
+    const err = await runUp(deps).then(
+      () => undefined,
+      (e: unknown) => e as Error & { details?: unknown },
+    );
+    if (err === undefined) throw new Error("expected runUp to reject");
+    const details = err.details as { collisions: Array<{ port_name: string }> };
+    const names = details.collisions.map((c) => c.port_name).sort();
+    expect(names).toEqual(["METRICS_PORT", "WEB_PORT"]);
+  });
+
+  it("reports collision even when the holder probe can't identify the pid/command (lsof missing / degraded)", async () => {
+    const portHolder = async () => ({ free: false as const, pid: null, command: null }) as const;
+    const deps: CommandDeps = { ...stubDeps({ stack }), portHolder };
+    const err = await runUp(deps).then(
+      () => undefined,
+      (e: unknown) => e as Error & { code?: string; details?: unknown },
+    );
+    if (err === undefined) throw new Error("expected runUp to reject");
+    expect(err.code).toBe("STALE_PORT_BLOCK");
+    const details = err.details as {
+      collisions: Array<{ pid: number | null; command: string | null }>;
+    };
+    expect(details.collisions[0]?.pid).toBeNull();
+    expect(details.collisions[0]?.command).toBeNull();
+  });
+
+  it("skips the check on the idempotent re-up path — the listeners on those ports ARE our own", async () => {
+    // touchSocket: true makes the first up create the socket, so a second up
+    // takes the idempotent branch. If the pre-flight ran on that branch it
+    // would trip on our own listener and break re-runs.
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    let holderCalls = 0;
+    const portHolder = async () => {
+      holderCalls++;
+      return { free: false as const, pid: 999, command: "node should-not-trip" };
+    };
+    // First up uses a non-tripping holder to get us into the running state.
+    const deps: CommandDeps = {
+      ...stubDeps({ stack, track }),
+      portHolder: async () => ({ free: true as const }),
+    };
+    await runUp(deps);
+    // Second up: socket present → idempotent path. Swap in the tripping
+    // holder; if the check ran, this call would reject.
+    const drifted: CommandDeps = { ...deps, portHolder };
+    const result = await runUp(drifted);
+    expect(result.worktreeId).toBe("login");
+    expect(holderCalls).toBe(0);
+  });
+
+  it("clean start (no holder reports a collision) does not throw — the happy path is unchanged", async () => {
+    const deps: CommandDeps = {
+      ...stubDeps({ stack }),
+      portHolder: async () => ({ free: true as const }),
+    };
+    const result = await runUp(deps);
+    expect(result.worktreeId).toBe("login");
+    expect(Number(result.env.WEB_PORT)).toBeGreaterThanOrEqual(20000);
+  });
+
+  it("only probes declared named ports — not the full 32-port allocation block (PRD §port block)", async () => {
+    const probed: number[] = [];
+    const portHolder = async (port: number) => {
+      probed.push(port);
+      return { free: true as const };
+    };
+    const deps: CommandDeps = { ...stubDeps({ stack }), portHolder };
+    const result = await runUp(deps);
+    // The stack declares 2 named ports; the block holds 32. The check must
+    // touch only the two.
+    expect(probed).toHaveLength(2);
+    expect(probed.sort((a, b) => a - b)).toEqual([result.blockBase, result.blockBase + 1]);
   });
 });
