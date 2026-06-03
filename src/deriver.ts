@@ -38,6 +38,16 @@ export interface DerivedProcess {
   readonly working_dir: string;
   readonly environment: ReadonlyArray<string>;
   readonly depends_on?: Readonly<Record<string, { condition: string }>>;
+  /**
+   * Opaque process-compose passthrough blocks. devtrees does not validate
+   * their inner shape — whatever the author wrote in `devtrees.yaml` (or its
+   * extends-base) is copied here unchanged so process-compose owns the
+   * schema. Each is present only when the author declared it; no
+   * `undefined` leaks into the derived YAML.
+   */
+  readonly readiness_probe?: Readonly<Record<string, unknown>>;
+  readonly liveness_probe?: Readonly<Record<string, unknown>>;
+  readonly availability?: Readonly<Record<string, unknown>>;
 }
 
 /**
@@ -211,6 +221,9 @@ function buildTierProcesses(input: {
     command: string;
     environment: ReadonlyArray<string>;
     dependsOn: ReadonlyArray<string>;
+    readinessProbe?: Readonly<Record<string, unknown>>;
+    livenessProbe?: Readonly<Record<string, unknown>>;
+    availability?: Readonly<Record<string, unknown>>;
   }>;
   workingDir: string;
   extraEnvLines: ReadonlyArray<string>;
@@ -228,6 +241,11 @@ function buildTierProcesses(input: {
         // Author-declared env first, then devtrees injection (injection wins on
         // duplicate keys because process-compose takes the last occurrence).
         environment: [...service.environment, ...input.extraEnvLines],
+        // Opaque passthrough — only set when present, so the derived YAML
+        // doesn't sprout `readiness_probe: undefined` for plain services.
+        ...(service.readinessProbe !== undefined && { readiness_probe: service.readinessProbe }),
+        ...(service.livenessProbe !== undefined && { liveness_probe: service.livenessProbe }),
+        ...(service.availability !== undefined && { availability: service.availability }),
       },
       partition.kept,
     );

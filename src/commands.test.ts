@@ -1381,6 +1381,90 @@ describe("runGenerate — emit derived configs to disk", () => {
     const upped = await runUp(deps);
     expect(upped.env.WEB_PORT).toBe(generated.env.WEB_PORT);
   });
+
+  it("writes readiness_probe / liveness_probe / availability verbatim into the derived YAML (#50)", async () => {
+    // The proximate bug #50 fixes: an authored probe must reach the derived
+    // process-compose config on disk unchanged, including fields devtrees
+    // doesn't model.
+    const stack: ResolvedStack = {
+      services: [
+        {
+          name: "web",
+          tier: "isolated",
+          command: "node server.js",
+          ports: ["WEB_PORT"],
+          dependsOn: [],
+          environment: [],
+          readinessProbe: {
+            exec: { command: "/bin/true" },
+            initial_delay_seconds: 1,
+            future_field: { nested: true },
+          },
+          livenessProbe: {
+            exec: { command: "/bin/true" },
+            failure_threshold: 3,
+          },
+          availability: {
+            restart: "on_failure",
+            backoff_seconds: 5,
+          },
+        },
+        {
+          name: "postgres",
+          tier: "shared",
+          command: "postgres",
+          ports: ["DB_PORT"],
+          dependsOn: [],
+          environment: [],
+          readinessProbe: { exec: { command: "pg_isready" } },
+          availability: { restart: "always" },
+        },
+      ],
+    };
+    const result = await runGenerate(stubDeps({ stack }));
+
+    const wt = parseYaml(readFileSync(result.worktreePath, "utf8")) as {
+      processes: Record<string, Record<string, unknown>>;
+    };
+    expect(wt.processes.web?.readiness_probe).toEqual({
+      exec: { command: "/bin/true" },
+      initial_delay_seconds: 1,
+      future_field: { nested: true },
+    });
+    expect(wt.processes.web?.liveness_probe).toEqual({
+      exec: { command: "/bin/true" },
+      failure_threshold: 3,
+    });
+    expect(wt.processes.web?.availability).toEqual({
+      restart: "on_failure",
+      backoff_seconds: 5,
+    });
+
+    if (!result.sharedPath) throw new Error("expected sharedPath");
+    const sh = parseYaml(readFileSync(result.sharedPath, "utf8")) as {
+      processes: Record<string, Record<string, unknown>>;
+    };
+    expect(sh.processes.postgres?.readiness_probe).toEqual({
+      exec: { command: "pg_isready" } as unknown,
+    });
+    expect(sh.processes.postgres?.availability).toEqual({ restart: "always" });
+    // No undefined `liveness_probe` leak when the service didn't declare one.
+    expect("liveness_probe" in (sh.processes.postgres ?? {})).toBe(false);
+  });
+
+  it("does not leak `readiness_probe: undefined` (or the other two) into the derived YAML when absent", async () => {
+    // Belt-and-suspenders: a stack with no probes anywhere must produce
+    // process-compose YAML that does not even mention the keys, so older
+    // process-compose builds that error on unknown fields stay happy.
+    const stack: ResolvedStack = {
+      services: [isolated("web", "node x.js", ["WEB_PORT"])],
+    };
+    const result = await runGenerate(stubDeps({ stack }));
+    const raw = readFileSync(result.worktreePath, "utf8");
+    expect(raw).not.toMatch(/readiness_probe/);
+    expect(raw).not.toMatch(/liveness_probe/);
+    expect(raw).not.toMatch(/availability/);
+  });
 });
 
 describe("findUnmanagedPortBinds — heuristic", () => {

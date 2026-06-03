@@ -537,6 +537,97 @@ describe("e2e — devtrees ls discovers worktree instances + the shared instance
   }, 30000);
 });
 
+/**
+ * Issue #50 — devtrees passes process-compose's `readiness_probe`,
+ * `liveness_probe`, and `availability` blocks through verbatim. The fixture
+ * here authors a probe whose inner shape includes a field devtrees doesn't
+ * model (`future_field`) so the test also covers the "no normalization"
+ * acceptance bullet.
+ */
+function writeProbeStack(worktreeRoot: string): void {
+  const server = [
+    "import { createServer } from 'node:http';",
+    "createServer((_, res) => res.end('ok')).listen(Number(process.env.WEB_PORT), '127.0.0.1');",
+  ].join("\n");
+  writeFileSync(join(worktreeRoot, "server.mjs"), server);
+  writeFileSync(
+    join(worktreeRoot, "devtrees.yaml"),
+    [
+      "services:",
+      "  web:",
+      "    tier: isolated",
+      '    command: "node server.mjs"',
+      "    ports: [WEB_PORT]",
+      "    readiness_probe:",
+      "      exec:",
+      '        command: "echo ok"',
+      "      initial_delay_seconds: 1",
+      "      period_seconds: 2",
+      "      future_field:",
+      "        nested: true",
+      "    liveness_probe:",
+      "      exec:",
+      '        command: "echo alive"',
+      "      failure_threshold: 3",
+      "    availability:",
+      "      restart: on_failure",
+      "      backoff_seconds: 5",
+      "",
+    ].join("\n"),
+  );
+}
+
+describe("e2e — readiness_probe / liveness_probe / availability passthrough (#50)", () => {
+  it("writes the three blocks verbatim into the derived YAML and surfaces health: ready", async () => {
+    const repo = makeRepo("dt-probe-", ["login"]);
+    cleanups.push(() => rmSync(repo.root, { recursive: true, force: true }));
+    const worktree = repo.worktrees.login;
+    if (worktree === undefined) throw new Error("expected login worktree");
+    writeProbeStack(worktree);
+
+    const deps = stubDriverDeps(worktree);
+    const up = await runUp(deps as never);
+    cleanups.push(() => runDown(deps as never));
+
+    expect(await waitForHttp(Number(up.env.WEB_PORT))).toBe(true);
+
+    // Acceptance: the derived YAML on disk carries the three blocks unchanged,
+    // including the `future_field` devtrees doesn't model.
+    const commonDir = git(worktree, "rev-parse", "--git-common-dir");
+    const absCommon = commonDir.startsWith("/") ? commonDir : join(worktree, commonDir);
+    const configPath = join(absCommon, "devtrees", `${up.worktreeId}.yaml`);
+    const derived = parseYaml(readFileSync(configPath, "utf8")) as {
+      processes: Record<string, Record<string, unknown>>;
+    };
+    expect(derived.processes.web?.readiness_probe).toEqual({
+      exec: { command: "echo ok" },
+      initial_delay_seconds: 1,
+      period_seconds: 2,
+      future_field: { nested: true },
+    });
+    expect(derived.processes.web?.liveness_probe).toEqual({
+      exec: { command: "echo alive" },
+      failure_threshold: 3,
+    });
+    expect(derived.processes.web?.availability).toEqual({
+      restart: "on_failure",
+      backoff_seconds: 5,
+    });
+
+    // Acceptance: with the probe present, `getServiceStatuses` reports the
+    // service as ready. (Against the real process-compose this is the
+    // converged-probe assertion. Against the stub it's a smoke check that
+    // the driver→stub path returns `is_ready: "Ready"`.)
+    const ls = await runLs({ cwd: worktree, driver: deps.driver });
+    const login = ls.instances.find((i) => i.id === "login");
+    expect(login?.services?.[0]?.name).toBe("web");
+    expect(login?.services?.[0]?.health).toBe("ready");
+
+    await runDown(deps as never);
+    expect(await waitForGone(Number(up.env.WEB_PORT))).toBe(true);
+  }, 20000);
+});
+
 describe("e2e — cross-tier wiring: isolated waits for shared health (ADR-0003)", () => {
   it("an isolated service that depends_on a shared service does not start until shared is healthy", async () => {
     // Isolated `web` depends_on shared `pgstub`. The shared service stalls 500ms

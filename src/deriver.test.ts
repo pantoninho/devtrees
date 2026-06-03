@@ -277,6 +277,138 @@ describe("config deriver — shared instance", () => {
   });
 });
 
+describe("config deriver — probe / availability passthrough", () => {
+  function probeStack(): ResolvedStack {
+    return {
+      services: [
+        {
+          name: "web",
+          tier: "isolated",
+          command: "node server.js",
+          ports: ["WEB_PORT"],
+          dependsOn: [],
+          environment: [],
+          readinessProbe: {
+            exec: { command: "/bin/true" },
+            initial_delay_seconds: 1,
+            future_field: { nested: true },
+          },
+          livenessProbe: { exec: { command: "/bin/true" }, failure_threshold: 2 },
+          availability: { restart: "on_failure", backoff_seconds: 5 },
+        },
+      ],
+    };
+  }
+
+  it("copies readiness_probe verbatim onto the derived isolated process", () => {
+    const derived = deriveWorktreeConfig(probeStack(), {
+      worktreeId: "login",
+      worktreeRoot: "/wt/login",
+      portFor: () => 20512,
+    });
+    const web = derived.config.processes.web;
+    if (!web) throw new Error("expected web");
+    expect(web.readiness_probe).toEqual({
+      exec: { command: "/bin/true" },
+      initial_delay_seconds: 1,
+      future_field: { nested: true },
+    });
+  });
+
+  it("copies liveness_probe verbatim onto the derived isolated process", () => {
+    const derived = deriveWorktreeConfig(probeStack(), {
+      worktreeId: "login",
+      worktreeRoot: "/wt/login",
+      portFor: () => 20512,
+    });
+    expect(derived.config.processes.web?.liveness_probe).toEqual({
+      exec: { command: "/bin/true" },
+      failure_threshold: 2,
+    });
+  });
+
+  it("copies availability verbatim onto the derived isolated process", () => {
+    const derived = deriveWorktreeConfig(probeStack(), {
+      worktreeId: "login",
+      worktreeRoot: "/wt/login",
+      portFor: () => 20512,
+    });
+    expect(derived.config.processes.web?.availability).toEqual({
+      restart: "on_failure",
+      backoff_seconds: 5,
+    });
+  });
+
+  it("omits each probe / availability field when the service didn't declare one", () => {
+    // No leaking `readiness_probe: undefined` into the derived YAML.
+    const plain: ResolvedStack = {
+      services: [
+        {
+          name: "web",
+          tier: "isolated",
+          command: "node server.js",
+          ports: [],
+          dependsOn: [],
+          environment: [],
+        },
+      ],
+    };
+    const derived = deriveWorktreeConfig(plain, {
+      worktreeId: "login",
+      worktreeRoot: "/wt/login",
+      portFor: () => 20512,
+    });
+    const web = derived.config.processes.web;
+    if (!web) throw new Error("expected web");
+    expect("readiness_probe" in web).toBe(false);
+    expect("liveness_probe" in web).toBe(false);
+    expect("availability" in web).toBe(false);
+    const yaml = stringifyYaml(derived.config);
+    expect(yaml).not.toMatch(/readiness_probe/);
+    expect(yaml).not.toMatch(/liveness_probe/);
+    expect(yaml).not.toMatch(/availability/);
+  });
+
+  it("copies the same three fields onto a shared derived process", () => {
+    const stack: ResolvedStack = {
+      services: [
+        {
+          name: "postgres",
+          tier: "shared",
+          command: "postgres",
+          ports: ["DB_PORT"],
+          dependsOn: [],
+          environment: [],
+          readinessProbe: { exec: { command: "pg_isready" } },
+          livenessProbe: { exec: { command: "pg_isready" } },
+          availability: { restart: "always" },
+        },
+      ],
+    };
+    const out = deriveSharedConfig(stack, {
+      workingDir: "/anchor",
+      portFor: () => 19000,
+    });
+    const pg = out.config.processes.postgres;
+    if (!pg) throw new Error("expected postgres");
+    expect(pg.readiness_probe).toEqual({ exec: { command: "pg_isready" } });
+    expect(pg.liveness_probe).toEqual({ exec: { command: "pg_isready" } });
+    expect(pg.availability).toEqual({ restart: "always" });
+  });
+
+  it("serializes the probe block to YAML round-trip without normalization", () => {
+    const derived = deriveWorktreeConfig(probeStack(), {
+      worktreeId: "login",
+      worktreeRoot: "/wt/login",
+      portFor: () => 20512,
+    });
+    const yaml = stringifyYaml(derived.config);
+    expect(yaml).toMatch(/readiness_probe:/);
+    expect(yaml).toMatch(/future_field:/);
+    expect(yaml).toMatch(/initial_delay_seconds: 1/);
+  });
+});
+
 describe("config deriver — cross-tier depends_on handling (ADR-0003)", () => {
   function mixedDepsStack(): ResolvedStack {
     return {

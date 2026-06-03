@@ -216,6 +216,222 @@ services:
   });
 });
 
+describe("stack model — process-compose probe / availability passthrough", () => {
+  it("carries an inline readiness_probe through as an opaque record", () => {
+    // devtrees never models the probe's inner shape — process-compose owns it.
+    // Whatever the author writes under `readiness_probe:` must reach
+    // ResolvedService verbatim, including exotic / unknown keys.
+    const yaml = `
+services:
+  web:
+    command: "node server.js"
+    readiness_probe:
+      exec:
+        command: "/bin/true"
+      initial_delay_seconds: 1
+      period_seconds: 2
+      future_field_devtrees_doesnt_know:
+        nested: true
+`;
+    const stack = parseStack(yaml);
+    expect(stack.services[0]?.readinessProbe).toEqual({
+      exec: { command: "/bin/true" },
+      initial_delay_seconds: 1,
+      period_seconds: 2,
+      future_field_devtrees_doesnt_know: { nested: true },
+    });
+  });
+
+  it("omits readiness_probe from ResolvedService when the author didn't declare one", () => {
+    const yaml = `
+services:
+  web:
+    command: "node server.js"
+`;
+    const stack = parseStack(yaml);
+    const web = stack.services[0];
+    if (!web) throw new Error("expected web");
+    expect("readinessProbe" in web).toBe(false);
+  });
+
+  it("uses the base's readiness_probe when the overlay omits it", () => {
+    const devtrees = `
+extends: ./process-compose.yaml
+services:
+  web:
+    tier: isolated
+    ports: [WEB_PORT]
+`;
+    const base = `
+processes:
+  web:
+    command: "node server.js"
+    readiness_probe:
+      exec:
+        command: "curl -sf http://localhost:8080/"
+`;
+    const stack = parseStack(devtrees, { baseYaml: base });
+    expect(stack.services[0]?.readinessProbe).toEqual({
+      exec: { command: "curl -sf http://localhost:8080/" },
+    });
+  });
+
+  it("lets the overlay override the base's readiness_probe (overlay wins)", () => {
+    const devtrees = `
+extends: ./process-compose.yaml
+services:
+  web:
+    tier: isolated
+    readiness_probe:
+      exec:
+        command: "/usr/local/bin/overlay-check"
+`;
+    const base = `
+processes:
+  web:
+    command: "node server.js"
+    readiness_probe:
+      exec:
+        command: "/base-check"
+`;
+    const stack = parseStack(devtrees, { baseYaml: base });
+    expect(stack.services[0]?.readinessProbe).toEqual({
+      exec: { command: "/usr/local/bin/overlay-check" },
+    });
+  });
+
+  it("carries a liveness_probe through verbatim", () => {
+    const yaml = `
+services:
+  web:
+    command: "node server.js"
+    liveness_probe:
+      exec:
+        command: "/bin/true"
+      failure_threshold: 3
+`;
+    const stack = parseStack(yaml);
+    expect(stack.services[0]?.livenessProbe).toEqual({
+      exec: { command: "/bin/true" },
+      failure_threshold: 3,
+    });
+  });
+
+  it("uses the base's liveness_probe when the overlay omits it; overlay wins when both set", () => {
+    const devtrees = `
+extends: ./process-compose.yaml
+services:
+  api:
+    tier: isolated
+  web:
+    tier: isolated
+    liveness_probe:
+      exec:
+        command: "/overlay-live"
+`;
+    const base = `
+processes:
+  api:
+    command: "node api.js"
+    liveness_probe:
+      exec:
+        command: "/base-api-live"
+  web:
+    command: "node server.js"
+    liveness_probe:
+      exec:
+        command: "/base-web-live"
+`;
+    const stack = parseStack(devtrees, { baseYaml: base });
+    const byName = Object.fromEntries(stack.services.map((s) => [s.name, s]));
+    expect(byName.api?.livenessProbe).toEqual({ exec: { command: "/base-api-live" } });
+    expect(byName.web?.livenessProbe).toEqual({ exec: { command: "/overlay-live" } });
+  });
+
+  it("carries an availability block through verbatim", () => {
+    const yaml = `
+services:
+  web:
+    command: "node server.js"
+    availability:
+      restart: on_failure
+      backoff_seconds: 5
+      max_restarts: 3
+`;
+    const stack = parseStack(yaml);
+    expect(stack.services[0]?.availability).toEqual({
+      restart: "on_failure",
+      backoff_seconds: 5,
+      max_restarts: 3,
+    });
+  });
+
+  it("uses the base's availability when the overlay omits it; overlay wins when both set", () => {
+    const devtrees = `
+extends: ./process-compose.yaml
+services:
+  api:
+    tier: isolated
+  web:
+    tier: isolated
+    availability:
+      restart: always
+`;
+    const base = `
+processes:
+  api:
+    command: "node api.js"
+    availability:
+      restart: on_failure
+  web:
+    command: "node server.js"
+    availability:
+      restart: never
+`;
+    const stack = parseStack(devtrees, { baseYaml: base });
+    const byName = Object.fromEntries(stack.services.map((s) => [s.name, s]));
+    expect(byName.api?.availability).toEqual({ restart: "on_failure" });
+    expect(byName.web?.availability).toEqual({ restart: "always" });
+  });
+
+  it("coexists with the existing five fields", () => {
+    const yaml = `
+services:
+  web:
+    tier: isolated
+    command: "node server.js"
+    ports: [WEB_PORT]
+    depends_on: [api]
+    environment:
+      - LOG_LEVEL=debug
+    readiness_probe:
+      exec:
+        command: "/r"
+    liveness_probe:
+      exec:
+        command: "/l"
+    availability:
+      restart: on_failure
+  api:
+    tier: isolated
+    command: "node api.js"
+`;
+    const stack = parseStack(yaml);
+    const byName = Object.fromEntries(stack.services.map((s) => [s.name, s]));
+    expect(byName.web).toEqual({
+      name: "web",
+      tier: "isolated",
+      command: "node server.js",
+      ports: ["WEB_PORT"],
+      dependsOn: ["api"],
+      environment: ["LOG_LEVEL=debug"],
+      readinessProbe: { exec: { command: "/r" } },
+      livenessProbe: { exec: { command: "/l" } },
+      availability: { restart: "on_failure" },
+    });
+  });
+});
+
 describe("stack model — depends_on parsing (process-compose map form)", () => {
   it("parses depends_on map form (name -> { condition }) into a name list", () => {
     // The canonical process-compose form is a map. Tier-aware deriving needs the
