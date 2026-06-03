@@ -31,6 +31,7 @@ export const ERROR_CODES = [
   "INSTANCE_NOT_FOUND",
   "HEALTH_TIMEOUT",
   "CONFIG_DRIFT",
+  "STALE_PORT_BLOCK",
   "LOCK_CONTENTION",
   "CONFIG_INVALID",
   "UNKNOWN",
@@ -441,12 +442,20 @@ export function formatError(err: ErrorPayload, mode: FormatMode): OutputResult {
  * codes short-circuits the message-based heuristics — that's how typed errors
  * (e.g. `HealthTimeoutError`) surface their code without depending on the
  * exact wording of their message.
+ *
+ * Typed errors may also carry a `.details` field — propagated verbatim to
+ * the JSON envelope. `StalePortBlockError` (#58) uses this to publish the
+ * `{block_base, worktree_id, collisions[]}` payload an agent needs to act
+ * on the failure.
  */
 export function classifyError(err: Error): ErrorPayload {
   const message = err.message;
   const tagged = (err as { code?: unknown }).code;
+  const details = readDetails(err);
   if (typeof tagged === "string" && (ERROR_CODES as ReadonlyArray<string>).includes(tagged)) {
-    return { code: tagged as ErrorCode, message };
+    return details === undefined
+      ? { code: tagged as ErrorCode, message }
+      : { code: tagged as ErrorCode, message, details };
   }
   if (/process-compose.*not found|not found.*process-compose/i.test(message)) {
     return { code: "PROCESS_COMPOSE_NOT_FOUND", message };
@@ -455,4 +464,17 @@ export function classifyError(err: Error): ErrorPayload {
     return { code: "INSTANCE_NOT_FOUND", message };
   }
   return { code: "UNKNOWN", message };
+}
+
+/**
+ * Extract a typed error's `.details` field as a plain object so the JSON
+ * envelope can publish it verbatim. Returns `undefined` (not an empty
+ * object) when no details are present, so `formatError` keeps omitting the
+ * key — preserving the "details only when meaningful" contract tested in
+ * `output.test.ts`.
+ */
+function readDetails(err: Error): Readonly<Record<string, unknown>> | undefined {
+  const raw = (err as { details?: unknown }).details;
+  if (raw === null || typeof raw !== "object") return undefined;
+  return raw as Readonly<Record<string, unknown>>;
 }

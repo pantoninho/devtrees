@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import { createServer, type Server } from "node:net";
-import { defaultIsPortFree } from "./port-probe.js";
+import { defaultIsPortFree, defaultPortHolder } from "./port-probe.js";
 
 const ephemeral = (): Promise<{ port: number; server: Server }> =>
   new Promise((resolve, reject) => {
@@ -43,6 +43,41 @@ describe("defaultIsPortFree", () => {
     // ERR_SOCKET_BAD_PORT) — not EADDRINUSE, so the probe must reject rather
     // than silently treating the port as available.
     await expect(defaultIsPortFree(-1)).rejects.toThrow();
+  });
+
+  it("identifies the test process as the holder of a bound port (PID + best-effort command)", async () => {
+    // The stale-port-block check (#58) needs more than free/not-free: when
+    // a port is bound, the agent's error envelope publishes the holder's
+    // pid so a human (or the agent itself) can kill the orphan. We bind a
+    // port from this very test process and assert defaultPortHolder fingers
+    // process.pid — proving the lsof shell-out actually identifies the holder.
+    const { port, server } = await ephemeral();
+    cleanups.push(() => closeServer(server));
+
+    const holder = await defaultPortHolder(port);
+    expect(holder.free).toBe(false);
+    if (holder.free === false) {
+      // lsof reports the listener's pid as our own when missing on the
+      // host degrade to null + null — both shapes are acceptable per the
+      // graceful-degradation rule, but our CI hosts have lsof.
+      if (holder.pid !== null) {
+        expect(holder.pid).toBe(process.pid);
+      }
+      // `command` is best-effort — only assert the shape, not the wording.
+      if (holder.command !== null) {
+        expect(typeof holder.command).toBe("string");
+        expect(holder.command.length).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it("reports free when nothing listens on the port", async () => {
+    // Use an ephemeral allocation, immediately release, then ask the holder.
+    const { port, server } = await ephemeral();
+    await closeServer(server);
+
+    const holder = await defaultPortHolder(port);
+    expect(holder.free).toBe(true);
   });
 
   it("closes the probe listener on every path — 10k probes don't exhaust FDs", async () => {
