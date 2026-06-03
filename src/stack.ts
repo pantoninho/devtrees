@@ -122,6 +122,35 @@ function asOpaqueRecord(value: unknown): Readonly<Record<string, unknown>> | und
 }
 
 /**
+ * Passthrough fields that devtrees forwards verbatim to process-compose
+ * (CONTEXT.md: opaque passthrough). Encoded once as `[devtreesKey, yamlKey]`
+ * pairs so `parseStack` can resolve them in a single loop without adding a
+ * conditional branch per field.
+ */
+const PASSTHROUGH_FIELDS: ReadonlyArray<readonly [keyof ResolvedService, keyof RawService]> = [
+  ["readinessProbe", "readiness_probe"],
+  ["livenessProbe", "liveness_probe"],
+  ["availability", "availability"],
+];
+
+/**
+ * Resolve the opaque passthrough fields for one service. Overlay wins over
+ * base; absent fields stay absent on the returned record so `"readinessProbe"
+ * in svc` reflects authoring intent (no `undefined` leak in the spread).
+ */
+function resolvePassthrough(
+  over: RawService,
+  base: RawService,
+): Partial<Pick<ResolvedService, "readinessProbe" | "livenessProbe" | "availability">> {
+  const out: Record<string, Readonly<Record<string, unknown>>> = {};
+  for (const [outKey, rawKey] of PASSTHROUGH_FIELDS) {
+    const value = asOpaqueRecord(over[rawKey] ?? base[rawKey]);
+    if (value !== undefined) out[outKey] = value;
+  }
+  return out;
+}
+
+/**
  * Normalize a `depends_on` field into a list of dependency names. Accepts:
  *  - the array shorthand `[a, b]`
  *  - the canonical process-compose map form `{ a: { condition: ... }, b: ... }`
@@ -201,23 +230,17 @@ export function parseStack(yamlText: string, options: ParseStackOptions = {}): R
   const services: ResolvedService[] = names.map((name) => {
     const base = baseProcesses[name] ?? {};
     const over = overlay[name] ?? {};
-    const readinessProbe = asOpaqueRecord(over.readiness_probe ?? base.readiness_probe);
-    const livenessProbe = asOpaqueRecord(over.liveness_probe ?? base.liveness_probe);
-    const availability = asOpaqueRecord(over.availability ?? base.availability);
-    const service: ResolvedService = {
+    return {
       name,
       tier: ((over.tier ?? base.tier) as Tier | undefined) ?? DEFAULT_TIER,
       command: asString(over.command ?? base.command),
       ports: asStringArray(over.ports ?? base.ports),
       dependsOn: asDependencyList(over.depends_on ?? base.depends_on),
       environment: asStringArray(over.environment ?? base.environment),
-      // Pure passthrough — set only when present so `"readinessProbe" in svc`
-      // accurately reflects authoring intent (no `undefined` leak).
-      ...(readinessProbe !== undefined && { readinessProbe }),
-      ...(livenessProbe !== undefined && { livenessProbe }),
-      ...(availability !== undefined && { availability }),
+      // Opaque passthrough fields — only present when authored, so
+      // `"readinessProbe" in svc` reflects intent (no `undefined` leak).
+      ...resolvePassthrough(over, base),
     };
-    return service;
   });
 
   const allocator = parseAllocator(doc);
