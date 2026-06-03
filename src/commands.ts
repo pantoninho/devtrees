@@ -474,6 +474,26 @@ async function allocateAndBuildPortMaps(args: {
 }
 
 /**
+ * Resolve every dependency seam `runUp` reads. Centralising the `??` defaults
+ * here keeps the orchestrator's body free of injection plumbing and bounds
+ * its cyclomatic complexity to the genuine domain branches (idempotency,
+ * dropped-edge wait, attach-after-up) rather than counting one extra
+ * decision per nullish-coalesce.
+ */
+function resolveUpSeams(deps: CommandDeps) {
+  return {
+    readStack: deps.readStack ?? loadStack,
+    lock: deps.withRegistryLock ?? defaultWithRegistryLock,
+    sharedLock: deps.withSharedLock ?? defaultWithSharedLock,
+    isPortFree: deps.isPortFree ?? defaultIsPortFree,
+    portHolder: deps.portHolder ?? defaultPortHolder,
+    warn: deps.warn ?? defaultWarn,
+    readHash: deps.readStoredHash ?? defaultReadStoredHash,
+    writeHash: deps.writeStoredHash ?? defaultWriteStoredHash,
+  } as const;
+}
+
+/**
  * Bring up this worktree's isolated stack, idempotently.
  *
  * Three branches (issue #31):
@@ -510,14 +530,8 @@ async function allocateAndBuildPortMaps(args: {
  */
 export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
   const { anchor } = resolve(deps);
-  const readStack = deps.readStack ?? loadStack;
-  const lock = deps.withRegistryLock ?? defaultWithRegistryLock;
-  const sharedLock = deps.withSharedLock ?? defaultWithSharedLock;
-  const isPortFree = deps.isPortFree ?? defaultIsPortFree;
-  const portHolder = deps.portHolder ?? defaultPortHolder;
-  const warn = deps.warn ?? defaultWarn;
-  const readHash = deps.readStoredHash ?? defaultReadStoredHash;
-  const writeHash = deps.writeStoredHash ?? defaultWriteStoredHash;
+  const seams = resolveUpSeams(deps);
+  const { readStack, lock, sharedLock, isPortFree, portHolder, warn, readHash, writeHash } = seams;
 
   const stack = readStack(anchor.worktreeRoot);
   const options = resolveAllocatorOptions(stack, deps.allocator ?? DEFAULT_ALLOCATOR);
