@@ -18,14 +18,12 @@
     "check": "vp check",
     "dev": "vp pack --watch"
   },
-  "dependencies": {
-    "clipanion": "^4.0.0-rc.4",
-    "typanion": "^3.14.0",
-    "yaml": "^2.9.0"
-  },
   "devDependencies": {
     "@types/node": "^22.19.19",
-    "vite-plus": "0.1.22"
+    "clipanion": "^4.0.0-rc.4",
+    "typanion": "^3.14.0",
+    "vite-plus": "0.1.22",
+    "yaml": "^2.9.0"
   },
   "engines": {
     "node": ">=22"

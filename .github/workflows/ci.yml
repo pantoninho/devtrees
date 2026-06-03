@@ -60,6 +60,28 @@ jobs:
       - name: Build
         run: vp run build
 
+      # Smoke-test the built artifact OUTSIDE the source tree, with no
+      # node_modules in scope. Closes the gap that let PR #63 land broken (see
+      # issue #65): `vp test run` exercises src/ via vitest where local
+      # node_modules is resolvable, so externalised runtime deps (clipanion,
+      # typanion, yaml) silently pass tests but explode when the bundle is
+      # invoked from outside the package. We reproduce the published-install
+      # layout (`<pkg>/dist/cli.mjs` + `<pkg>/package.json`, no node_modules)
+      # under /tmp and assert all three smoke surfaces exit 0 — the failure
+      # mode this is guarding against (`ERR_MODULE_NOT_FOUND`) shows up as a
+      # non-zero exit on the first command.
+      - name: Smoke-test built artifact (no node_modules in scope)
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/devtrees-smoke
+          mkdir -p /tmp/devtrees-smoke/dist
+          cp dist/cli.mjs /tmp/devtrees-smoke/dist/cli.mjs
+          cp package.json /tmp/devtrees-smoke/package.json
+          cd /tmp
+          node /tmp/devtrees-smoke/dist/cli.mjs --help > /dev/null
+          node /tmp/devtrees-smoke/dist/cli.mjs --version > /dev/null
+          node /tmp/devtrees-smoke/dist/cli.mjs up --help > /dev/null
+
   # ---------------------------------------------------------------------------
   # Part 2 — fallow code-quality gate (pull requests only).
   #
