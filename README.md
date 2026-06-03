@@ -66,6 +66,45 @@ vp test run      # run the test suite once
 vp run build     # bundle the CLI (runs `vp pack`; `vp build` is the app build)
 ```
 
+### Smoke testing against real process-compose
+
+Most tests run against the stub `test/stub-process-compose.mjs`. There's also
+a **real-binary smoke suite** (`src/real-pc.smoke.test.ts`, issue #60) that
+drives the built `dist/cli.mjs` against the real `process-compose` binary —
+catching the kind of regressions only the real binary surfaces (probe
+convergence timing, OS `EADDRINUSE`, hot-reload behaviour). It is gated off
+by default so a local `vp test run` is unaffected.
+
+Prerequisites:
+
+- [`process-compose`](https://github.com/F1bonacc1/process-compose) on `PATH`
+  (run `process-compose version` to confirm). The CI workflow installs a
+  pinned release; see [`.github/workflows/smoke-real-pc.yml`](.github/workflows/smoke-real-pc.yml).
+
+Run it locally:
+
+```bash
+vp run build                            # the smoke spawns dist/cli.mjs
+DEVTREES_REAL_PC_E2E=1 vp test run real-pc.smoke
+```
+
+When `DEVTREES_REAL_PC_E2E` is unset or `process-compose` is missing, the
+suite skips with a clear marker line.
+
+Golden envelopes live under [`test/fixtures/agent-surface/`](test/fixtures/agent-surface/).
+The test normalises allocation-dependent fields (port numbers, `block_base`,
+worktree ids) before comparing — see `normaliseEnvelope` in the test file
+for the explicit list. If you intentionally change a `--json` envelope shape,
+update the fixture in the same PR so the smoke catches the change at review
+time.
+
+In CI the smoke runs:
+
+- On PRs touching `src/{commands,driver,deriver,stack,output,allocator,instances}.ts`,
+  the smoke test file itself, or the fixtures. Unrelated PRs skip it.
+- Nightly at 06:00 UTC, so process-compose-side regressions surface within a
+  day even on quiet weeks.
+
 ## CI/CD
 
 CI runs on every push to `main` and on every pull request via
