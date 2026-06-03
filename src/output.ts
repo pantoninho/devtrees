@@ -39,6 +39,30 @@ export const ERROR_CODES = [
 
 export type ErrorCode = (typeof ERROR_CODES)[number];
 
+/**
+ * One-line description per error code, used by the per-subcommand `--help`
+ * footers in `src/cli.ts` so an agent reading the help block sees what each
+ * code means without bouncing through ADR-0005. Kept here (rather than in
+ * `cli.ts`) so the wording stays adjacent to `ERROR_CODES` itself — adding a
+ * new code without a description fails the exhaustive type check.
+ *
+ * Wording mirrors the per-throw-site error messages and ADR-0005's
+ * surrounding prose; the JSON envelope's `error.message` carries the long
+ * form, this is the agent-facing summary.
+ */
+export const ERROR_CODE_DESCRIPTIONS: Readonly<Record<ErrorCode, string>> = {
+  PROCESS_COMPOSE_NOT_FOUND: "The `process-compose` binary is not on PATH.",
+  INSTANCE_NOT_FOUND: "No worktree (or shared) instance is running for this anchor.",
+  HEALTH_TIMEOUT:
+    "Stack started but services did not report healthy before the wait window expired.",
+  CONFIG_DRIFT: "Running config differs from devtrees.yaml and hot-reload failed.",
+  STALE_PORT_BLOCK:
+    "Foreign listeners hold ports in this worktree's allocated block (likely orphans).",
+  LOCK_CONTENTION: "Another devtrees process holds the allocation registry lock.",
+  CONFIG_INVALID: "devtrees.yaml is malformed or rejected by the deriver.",
+  UNKNOWN: "Unclassified failure; consult the error envelope's `message` field.",
+};
+
 export interface ErrorPayload {
   readonly code: ErrorCode;
   readonly message: string;

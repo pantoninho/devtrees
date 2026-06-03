@@ -79,11 +79,90 @@ describe("devtrees CLI", () => {
     expect(help).toMatch(/--wait-timeout/);
   });
 
-  it("`devtrees up --help` lists the error codes it can emit under --json", async () => {
+  /**
+   * Per-subcommand error-code footer (issue #64). Each subcommand's `--help`
+   * lists the ADR-0005 error codes it can emit under `--json`, with a terse
+   * description per code so an agent reading the help block knows what to
+   * branch on. The mapping is derived from `src/commands.ts` throw sites and
+   * `classifyError` in `src/output.ts`.
+   *
+   * String-includes assertions only — exact prose is allowed to drift; the
+   * codes themselves are the contract.
+   */
+  const ERROR_CODES_BY_COMMAND: ReadonlyArray<readonly [string, ReadonlyArray<string>]> = [
+    [
+      "up",
+      [
+        "STALE_PORT_BLOCK",
+        "CONFIG_DRIFT",
+        "HEALTH_TIMEOUT",
+        "PROCESS_COMPOSE_NOT_FOUND",
+        "UNKNOWN",
+      ],
+    ],
+    ["down", ["PROCESS_COMPOSE_NOT_FOUND", "UNKNOWN"]],
+    ["ls", ["UNKNOWN"]],
+    ["attach", ["INSTANCE_NOT_FOUND", "PROCESS_COMPOSE_NOT_FOUND", "UNKNOWN"]],
+    ["generate", ["UNKNOWN"]],
+    ["prune", ["UNKNOWN"]],
+    ["env", ["UNKNOWN"]],
+    ["logs", ["INSTANCE_NOT_FOUND", "UNKNOWN"]],
+  ];
+
+  // Codes RESERVED in `ERROR_CODES` but not currently emitted from any throw
+  // site. Listing them in a footer would mislead an agent into branching on
+  // an envelope that can't actually appear; the footer must omit them until
+  // a real throw site exists.
+  const RESERVED_CODES = ["LOCK_CONTENTION", "CONFIG_INVALID"] as const;
+  const ALL_KNOWN_CODES = [
+    "PROCESS_COMPOSE_NOT_FOUND",
+    "INSTANCE_NOT_FOUND",
+    "HEALTH_TIMEOUT",
+    "CONFIG_DRIFT",
+    "STALE_PORT_BLOCK",
+    "LOCK_CONTENTION",
+    "CONFIG_INVALID",
+    "UNKNOWN",
+  ] as const;
+
+  for (const [cmd, codes] of ERROR_CODES_BY_COMMAND) {
+    it(`\`devtrees ${cmd} --help\` lists every error code it can emit under --json`, async () => {
+      const help = (await run([cmd, "--help"])).stdout;
+      for (const code of codes) {
+        expect(help).toContain(code);
+      }
+      // Don't list codes the command can't actually emit — that would tell
+      // an agent to branch on an envelope it'll never receive.
+      const unexpected = ALL_KNOWN_CODES.filter((c) => !codes.includes(c));
+      for (const code of unexpected) {
+        expect(help).not.toContain(code);
+      }
+      // ADR-0005 is the source of truth for the contract — the footer
+      // points at it so a confused agent finds the canonical doc.
+      expect(help).toContain("ADR-0005");
+    });
+  }
+
+  it("no subcommand --help advertises a reserved-but-unemitted code", () => {
+    // Defence-in-depth: even if the mapping above drifts, never let a
+    // reserved code (currently `LOCK_CONTENTION`, `CONFIG_INVALID`) leak
+    // into a footer until a real throw site emits it.
+    for (const [, codes] of ERROR_CODES_BY_COMMAND) {
+      for (const reserved of RESERVED_CODES) {
+        expect(codes).not.toContain(reserved);
+      }
+    }
+  });
+
+  it("`devtrees up --help` includes a one-line description for at least one error code", async () => {
+    // Wording can drift; this assertion just pins that the footer is more
+    // than a comma-joined name list (i.e. it carries the per-code one-liners
+    // promised by issue #64's acceptance). Match "STALE_PORT_BLOCK" followed
+    // somewhere on the same logical line by a port/foreign/orphan token —
+    // clipanion's markdown reflow can split it across visual lines, so the
+    // regex allows arbitrary intervening characters (including newlines).
     const help = (await run(["up", "--help"])).stdout;
-    expect(help).toMatch(/HEALTH_TIMEOUT/);
-    expect(help).toMatch(/CONFIG_DRIFT/);
-    expect(help).toMatch(/STALE_PORT_BLOCK/);
+    expect(help).toMatch(/STALE_PORT_BLOCK[\s\S]{1,80}?(port|foreign|orphan)/i);
   });
 });
 
