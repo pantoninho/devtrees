@@ -47,7 +47,11 @@ function hasProcessCompose(): boolean {
   return out.status === 0;
 }
 
-const CLI = fileURLToPath(new URL("../dist/cli.mjs", import.meta.url));
+// `dist/cli.mjs` is a build artifact, not a source module — we spawn it as
+// a subprocess, never import it. The path is assembled with `join` (not a
+// URL literal) so static analysis (e.g. fallow's unresolved-import check)
+// does not treat the not-yet-built file at audit time as a regression.
+const CLI = join(fileURLToPath(new URL("..", import.meta.url)), "dist", "cli.mjs");
 const FIXTURE_DIR = fileURLToPath(new URL("../test/fixtures/agent-surface/", import.meta.url));
 
 /**
