@@ -410,6 +410,57 @@ describe("e2e — shared instance lifecycle across two worktrees", () => {
     expect(sharedAfter?.status).toBe("running");
     expect(sharedAfter?.ports.DB_PORT).toBe(Number(first.env.DB_PORT));
   }, 30000);
+
+  /**
+   * Issue #56 — `up` from a worktree whose isolated stack is still running
+   * must lazy-restart shared when a prior `down --shared` killed it. Without
+   * the fix, the idempotency branch in `runUp` short-circuits before the
+   * shared liveness check and returns `shared_started: false` while shared
+   * stays dead — leaving the agent with no `up`-driven recovery path.
+   */
+  it("up → down --shared → up lazy-restarts shared even though the worktree is still running (#56)", async () => {
+    const repo = makeRepo("dt-sh-recover-", ["login"]);
+    cleanups.push(() => rmSync(repo.root, { recursive: true, force: true }));
+
+    const loginWt = repo.worktrees.login;
+    if (loginWt === undefined) throw new Error("expected login worktree");
+    writeMixedTierStack(loginWt);
+
+    const deps = stubDriverDeps(loginWt);
+    const commonDir = git(loginWt, "rev-parse", "--git-common-dir");
+    const absCommon = commonDir.startsWith("/") ? commonDir : join(loginWt, commonDir);
+    const sharedSocket = join(absCommon, "devtrees", "run", "shared.sock");
+
+    const first = await runUp(deps as never);
+    cleanups.push(async () => {
+      await runDown(deps as never).catch(() => {});
+      await runDown(deps as never, { shared: true }).catch(() => {});
+    });
+    expect(first.sharedStarted).toBe(true);
+    expect(await waitForTcp(Number(first.env.DB_PORT))).toBe(true);
+    expect(existsSync(sharedSocket)).toBe(true);
+
+    // Only `down --shared` — the worktree itself stays up so the next `up`
+    // hits the idempotency branch.
+    await runDown(deps as never, { shared: true });
+    expect(await waitForGone(Number(first.env.DB_PORT))).toBe(true);
+    expect(existsSync(sharedSocket)).toBe(false);
+
+    // The worktree's HTTP server is still listening (its instance wasn't
+    // touched). Confirms we really are hitting the idempotency path.
+    expect(await waitForHttp(Number(first.env.WEB_PORT))).toBe(true);
+
+    // Re-`up` from the same (still-running) worktree must lazy-restart
+    // shared, and the envelope must report it (acceptance, #56).
+    const second = await runUp(deps as never);
+    expect(second.sharedStarted).toBe(true);
+    expect(existsSync(sharedSocket)).toBe(true);
+    expect(await waitForTcp(Number(second.env.DB_PORT))).toBe(true);
+    // Shared block survived (registry entry preserved, #51).
+    expect(second.env.DB_PORT).toBe(first.env.DB_PORT);
+    // Worktree env round-trips identically (idempotent branch envelope).
+    expect(second.env.WEB_PORT).toBe(first.env.WEB_PORT);
+  }, 30000);
 });
 
 /**

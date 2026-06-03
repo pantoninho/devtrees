@@ -372,6 +372,15 @@ async function allocateAndBuildPortMaps(args: {
  *    update the stored hash and return the new envelope; on failure
  *    (`not_supported` or otherwise), throw `ConfigDriftError` (code
  *    `CONFIG_DRIFT`) and leave the instance running unchanged.
+ *
+ * Shared-tier liveness runs *before* the idempotency dispatch (issue #56).
+ * The shared instance is repo-wide and its lifecycle is independent of any
+ * one worktree's (ADR-0001), so a prior `down --shared` can leave shared
+ * dead while this worktree's socket is still present. `ensureSharedStarted`
+ * is idempotent (gated by socket-presence + `withSharedLock`), so calling
+ * it from both branches is safe and cheap. The `shared_started` value
+ * threaded into the returned envelope reflects whether THIS call brought
+ * shared up (`true`) or found it already running (`false`).
  */
 export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
   const { anchor } = resolve(deps);
@@ -427,6 +436,19 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
   const driver = createDriver(deps.driver);
   const inst = { configPath: paths.configPath, socketPath: paths.socketPath };
 
+  // Lazy-start the shared instance if any shared services are declared. Runs
+  // BEFORE the idempotency dispatch (issue #56): the shared tier's lifecycle
+  // is independent of this worktree's, so a prior `down --shared` can leave
+  // shared dead while this worktree's socket is still present. The start is
+  // gated by `withSharedLock` and an idempotent socket-presence check so two
+  // simultaneous `up`s never double-start it (acceptance).
+  let sharedStarted = false;
+  if (sharedNeeded) {
+    sharedStarted = await ensureSharedStarted(anchor.anchor, stack, sharedPortFor, sharedLock, {
+      driver,
+    });
+  }
+
   // Idempotency branch (issue #31): if this worktree's control socket is
   // already present, the instance is up. Compare the current resolved-stack
   // hash to the one stored from the previous successful `up`:
@@ -444,22 +466,13 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
       driver,
       readHash,
       writeHash,
+      sharedStarted,
       deps,
     });
   }
 
   mkdirSync(paths.runDir, { recursive: true });
   writeFileSync(paths.configPath, stringifyYaml(derived.config), "utf8");
-
-  // Lazy-start the shared instance if any shared services are declared. The
-  // start is gated by `withSharedLock` and an idempotent socket-presence check
-  // so two simultaneous `up`s never double-start it (acceptance).
-  let sharedStarted = false;
-  if (sharedNeeded) {
-    sharedStarted = await ensureSharedStarted(anchor.anchor, stack, sharedPortFor, sharedLock, {
-      driver,
-    });
-  }
 
   // Shared-health wait: gate the worktree start on the shared services'
   // readiness probes whenever this worktree drops a cross-tier `depends_on`
@@ -1308,6 +1321,13 @@ async function reconcileRunning(args: {
   readonly driver: ReturnType<typeof createDriver>;
   readonly readHash: (anchor: string, id: string) => string | undefined;
   readonly writeHash: (anchor: string, id: string, hash: string) => void;
+  /**
+   * Whether THIS call lazy-started the shared instance (issue #56). The
+   * shared liveness check runs before this dispatch in `runUp`, so the
+   * envelope returned from the idempotency branch must surface the same
+   * value a fresh-start envelope would.
+   */
+  readonly sharedStarted: boolean;
   readonly deps: CommandDeps;
 }): Promise<UpResult> {
   const { stack, anchor, paths, blockBase, portFor, derived, inst, driver } = args;
@@ -1338,7 +1358,7 @@ async function reconcileRunning(args: {
     worktreeId: anchor.worktreeId,
     socketPath: paths.socketPath,
     env: derived.env,
-    sharedStarted: false,
+    sharedStarted: args.sharedStarted,
     blockBase,
     services,
   };

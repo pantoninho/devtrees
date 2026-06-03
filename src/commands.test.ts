@@ -1189,6 +1189,50 @@ describe("runDown — shared lifecycle is decoupled from worktree lifecycle", ()
     await runDown(deps, { shared: true });
     // Nothing thrown; registry still has no shared entry.
   });
+
+  it("up → down --shared → up lazy-restarts shared even though the worktree socket is still present (#56)", async () => {
+    // Issue #56: the idempotency branch in `runUp` short-circuits before ever
+    // checking the shared socket. If a prior `down --shared` killed the shared
+    // tier but the worktree's own instance is still up, the next `up` must
+    // still recover shared (and the envelope must report `shared_started:
+    // true` so an agent can tell shared was just brought back).
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const registryRef = { snapshot: {} as RegistrySnapshot };
+    const deps = stubDeps({ stack: mixedStack, track, registryRef });
+    const first = await runUp(deps);
+    expect(first.sharedStarted).toBe(true);
+    const sharedSpawn = findSharedSpawn(track);
+    expect(existsSync(sharedSpawn.socketPath)).toBe(true);
+
+    // Mimic the real driver: down() removes the socket so the next `up`
+    // observes shared as gone. Note we DO NOT call `runDown` for the worktree
+    // — its socket stays present so the second `up` hits the idempotency
+    // branch.
+    const downDeps: CommandDeps = {
+      ...deps,
+      driver: {
+        exists: () => Promise.resolve(true),
+        spawner: (_b, args, _o): SpawnedProcess => {
+          const si = args.indexOf("-u");
+          if (args[0] === "down" && si >= 0) {
+            const socketPath = args[si + 1];
+            if (socketPath) rmSync(socketPath, { force: true });
+          }
+          return spawnedOk();
+        },
+      },
+    };
+    await runDown(downDeps, { shared: true });
+    expect(existsSync(sharedSpawn.socketPath)).toBe(false);
+
+    // Second `up` from the same (still-running) worktree must lazy-restart
+    // shared — the idempotency branch can no longer skip the shared check.
+    const second = await runUp(deps);
+    expect(second.sharedStarted).toBe(true);
+    expect(existsSync(findSharedSpawn(track).socketPath)).toBe(true);
+    // Shared block stayed the same (registry entry survived the down).
+    expect(second.env.DB_PORT).toBe(first.env.DB_PORT);
+  });
 });
 
 /**
