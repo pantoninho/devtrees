@@ -167,7 +167,6 @@ function devtrees(cwd: string, args: ReadonlyArray<string>): CliResult {
  * non-deterministic field is a conscious decision, not a silent drift.
  */
 const NORMALISED_NUMBER_FIELDS = new Set(["WEB_PORT", "DB_PORT", "block_base"]);
-const ID_KEYS = new Set(["worktree_id", "worktreeId", "id"]);
 
 /** Rewrite an `env` map: port entries to `0`, worktree-id injection to `<WT>`. */
 function normaliseEnv(env: Record<string, string>): Record<string, number | string> {
@@ -187,22 +186,38 @@ function normalisePorts(ports: Record<string, number>): Record<string, number> {
   return out;
 }
 
-function normaliseField(
-  key: string,
-  value: unknown,
-  worktreeId: string,
-): { handled: true; value: unknown } | { handled: false } {
-  if (ID_KEYS.has(key) && value === worktreeId) return { handled: true, value: "<WT>" };
-  if (key === "env" && value && typeof value === "object") {
-    return { handled: true, value: normaliseEnv(value as Record<string, string>) };
-  }
-  if (key === "ports" && value && typeof value === "object") {
-    return { handled: true, value: normalisePorts(value as Record<string, number>) };
-  }
-  if (key === "block_base" || (typeof value === "number" && NORMALISED_NUMBER_FIELDS.has(key))) {
-    return { handled: true, value: 0 };
-  }
-  return { handled: false };
+/** Sentinel returned by field handlers that decline to normalise a value. */
+const PASS = Symbol("normalise-pass");
+type FieldHandler = (value: unknown, worktreeId: string) => unknown;
+
+function handleIdField(value: unknown, worktreeId: string): unknown {
+  return value === worktreeId ? "<WT>" : PASS;
+}
+
+function handleEnvField(value: unknown): unknown {
+  if (!value || typeof value !== "object") return PASS;
+  return normaliseEnv(value as Record<string, string>);
+}
+
+function handlePortsField(value: unknown): unknown {
+  if (!value || typeof value !== "object") return PASS;
+  return normalisePorts(value as Record<string, number>);
+}
+
+const FIELD_HANDLERS: Readonly<Record<string, FieldHandler>> = {
+  worktree_id: handleIdField,
+  worktreeId: handleIdField,
+  id: handleIdField,
+  env: (v) => handleEnvField(v),
+  ports: (v) => handlePortsField(v),
+  block_base: () => 0,
+};
+
+function normaliseField(key: string, value: unknown, worktreeId: string): unknown {
+  const handler = FIELD_HANDLERS[key];
+  if (handler !== undefined) return handler(value, worktreeId);
+  if (typeof value === "number" && NORMALISED_NUMBER_FIELDS.has(key)) return 0;
+  return PASS;
 }
 
 function normaliseEnvelope(value: unknown, worktreeId: string): unknown {
@@ -210,8 +225,8 @@ function normaliseEnvelope(value: unknown, worktreeId: string): unknown {
   if (value === null || typeof value !== "object") return value;
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-    const field = normaliseField(k, v, worktreeId);
-    out[k] = field.handled ? field.value : normaliseEnvelope(v, worktreeId);
+    const handled = normaliseField(k, v, worktreeId);
+    out[k] = handled === PASS ? normaliseEnvelope(v, worktreeId) : handled;
   }
   return out;
 }
