@@ -22,6 +22,7 @@ import { Cli, Command, Option, Builtins, type BaseContext } from "clipanion";
 import type { LogEvent } from "./driver.js";
 import {
   classifyError,
+  ERROR_CODE_DESCRIPTIONS,
   formatDown,
   formatEnv,
   formatError,
@@ -30,6 +31,7 @@ import {
   formatLs,
   formatPrune,
   formatUp,
+  type ErrorCode,
   type FormatMode,
   type LsInstanceRow,
   type LsServiceRow,
@@ -166,12 +168,29 @@ export function parseLogsArgs(rest: ReadonlyArray<string>): LogsCliOptions {
 // --- error-code footers for per-command --help -----------------------------
 //
 // ADR-0005 lists the error-code enum the `--json` error envelope can carry.
-// Each command lists the subset it can actually emit, so an agent reading
-// `devtrees up --help` knows what to branch on. Kept terse — exhaustive
-// docs live in ADR-0005 itself.
+// Each command lists the subset it can actually emit (verified against
+// `src/commands.ts` throw sites + `classifyError` in `src/output.ts`), so an
+// agent reading `devtrees <cmd> --help` knows what to branch on without
+// bouncing through the ADR. Descriptions live in `output.ts`'s
+// `ERROR_CODE_DESCRIPTIONS` map so adding a new code without a one-liner
+// fails the type check.
+//
+// `UNKNOWN` is always the last row — every command can hit it (any non-typed
+// thrown error falls through `classifyError` to `UNKNOWN`), and rendering it
+// last keeps the more interesting codes at the top.
 
-const ERROR_CODES_FOOTER = (codes: ReadonlyArray<string>): string =>
-  `Under \`--json\`, failures emit one of: ${codes.join(", ")} (see ADR-0005 for the contract).`;
+function errorCodeFooter(codes: ReadonlyArray<ErrorCode>): string {
+  // clipanion's `formatMarkdownish` collapses single newlines into spaces but
+  // preserves markdown list items (`- ...`) on their own line. Use a list so
+  // each code-description pair survives the markdown reflow as its own row.
+  // Double-newline separators are required between paragraphs (the intro
+  // line and the first list item) — single newlines would re-flow them.
+  const items = codes.map((code) => `- \`${code}\` — ${ERROR_CODE_DESCRIPTIONS[code]}`);
+  return [
+    "Under `--json`, this command can emit one of these error codes (see ADR-0005):",
+    ...items,
+  ].join("\n\n");
+}
 
 // --- context ----------------------------------------------------------------
 
@@ -246,13 +265,11 @@ class UpCommand extends DevtreesCommand {
   static override paths = [["up"]];
   static override usage = Command.Usage({
     description: "Bring up this worktree's stack with collision-free ports.",
-    details: ERROR_CODES_FOOTER([
-      "PROCESS_COMPOSE_NOT_FOUND",
-      "CONFIG_DRIFT",
+    details: errorCodeFooter([
       "STALE_PORT_BLOCK",
+      "CONFIG_DRIFT",
       "HEALTH_TIMEOUT",
-      "LOCK_CONTENTION",
-      "CONFIG_INVALID",
+      "PROCESS_COMPOSE_NOT_FOUND",
       "UNKNOWN",
     ]),
     examples: [
@@ -305,12 +322,7 @@ class DownCommand extends DevtreesCommand {
   static override paths = [["down"]];
   static override usage = Command.Usage({
     description: "Stop this worktree's stack (`--shared` tears down the shared instance).",
-    details: ERROR_CODES_FOOTER([
-      "PROCESS_COMPOSE_NOT_FOUND",
-      "INSTANCE_NOT_FOUND",
-      "LOCK_CONTENTION",
-      "UNKNOWN",
-    ]),
+    details: errorCodeFooter(["PROCESS_COMPOSE_NOT_FOUND", "UNKNOWN"]),
   });
 
   shared = Option.Boolean("--shared", false, {
@@ -338,7 +350,7 @@ class GenerateCommand extends DevtreesCommand {
   static override paths = [["generate"]];
   static override usage = Command.Usage({
     description: "Write the derived process-compose config to disk without starting anything.",
-    details: ERROR_CODES_FOOTER(["CONFIG_INVALID", "UNKNOWN"]),
+    details: errorCodeFooter(["UNKNOWN"]),
   });
 
   override async execute(): Promise<number> {
@@ -360,7 +372,7 @@ class LsCommand extends DevtreesCommand {
   static override paths = [["ls"]];
   static override usage = Command.Usage({
     description: "List every devtrees instance across the repo with status and ports.",
-    details: ERROR_CODES_FOOTER(["UNKNOWN"]),
+    details: errorCodeFooter(["UNKNOWN"]),
   });
 
   override async execute(): Promise<number> {
@@ -379,7 +391,7 @@ class AttachCommand extends DevtreesCommand {
   static override paths = [["attach"]];
   static override usage = Command.Usage({
     description: "Attach a TUI to this worktree's instance (`--shared` for the shared one).",
-    details: ERROR_CODES_FOOTER(["INSTANCE_NOT_FOUND", "UNKNOWN"]),
+    details: errorCodeFooter(["INSTANCE_NOT_FOUND", "PROCESS_COMPOSE_NOT_FOUND", "UNKNOWN"]),
   });
 
   shared = Option.Boolean("--shared", false, {
@@ -401,7 +413,7 @@ class PruneCommand extends DevtreesCommand {
   static override paths = [["prune"]];
   static override usage = Command.Usage({
     description: "Reconcile against `git worktree list` and clean up orphaned instances.",
-    details: ERROR_CODES_FOOTER(["UNKNOWN"]),
+    details: errorCodeFooter(["UNKNOWN"]),
   });
 
   override async execute(): Promise<number> {
@@ -420,7 +432,7 @@ class EnvCommand extends DevtreesCommand {
   static override paths = [["env"]];
   static override usage = Command.Usage({
     description: "Print this worktree's injected env (KEY=value, or `--json` for a map).",
-    details: ERROR_CODES_FOOTER(["CONFIG_INVALID", "UNKNOWN"]),
+    details: errorCodeFooter(["UNKNOWN"]),
   });
 
   override async execute(): Promise<number> {
@@ -439,7 +451,7 @@ class LogsCommand extends DevtreesCommand {
   static override paths = [["logs"]];
   static override usage = Command.Usage({
     description: "Stream a service's logs.",
-    details: ERROR_CODES_FOOTER(["INSTANCE_NOT_FOUND", "UNKNOWN"]),
+    details: errorCodeFooter(["INSTANCE_NOT_FOUND", "UNKNOWN"]),
     examples: [
       ["Tail one service", "devtrees logs web"],
       ["Tail every service, interleaved", "devtrees logs --all"],
