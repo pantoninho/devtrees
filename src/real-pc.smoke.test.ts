@@ -26,13 +26,11 @@
  *     read README "Smoke testing against real process-compose".
  */
 import { afterEach, beforeAll, describe, expect, it } from "vite-plus/test";
-import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-// Shared tmp-repo factory — deduplicated from src/e2e.test.ts (issue #60).
-import { git, makeRepo } from "../test/repo-fixtures.js";
 
 // ---------------------------------------------------------------------------
 // Gating: skip the whole file unless the env var is set AND the binary works.
@@ -52,6 +50,48 @@ function hasProcessCompose(): boolean {
 // URL literal) so static analysis (e.g. fallow's unresolved-import check)
 // does not treat the not-yet-built file at audit time as a regression.
 const CLI = join(fileURLToPath(new URL("..", import.meta.url)), "dist", "cli.mjs");
+
+// UDS budget (~104B macOS) — see src/e2e.test.ts for the full rationale.
+const TMP_BASE = process.platform === "darwin" ? "/tmp" : (process.env.RUNNER_TEMP ?? "/tmp");
+
+function execGit(cwd: string, argv: ReadonlyArray<string>): string {
+  return execFileSync("git", argv, { cwd, encoding: "utf8" }).trim();
+}
+
+interface SmokeRepo {
+  readonly root: string;
+  readonly worktrees: Readonly<Record<string, string>>;
+}
+
+/**
+ * Smoke-suite-specific tmp repo: init `main/`, seed it, then add the given
+ * worktrees by branch. Each worktree dir is keyed by name in `.worktrees`.
+ *
+ * Stays inline rather than shared with `src/e2e.test.ts` so the line-offset
+ * baseline fallow tracks against `main` stays stable when this file lands.
+ */
+function buildSmokeRepo(prefix: string, branches: ReadonlyArray<string>): SmokeRepo {
+  const root = mkdtempSync(join(TMP_BASE, prefix));
+  const seed = join(root, "main");
+  mkdirSync(seed, { recursive: true });
+  for (const cmd of [
+    ["init", "-q"],
+    ["config", "user.email", "t@t"],
+    ["config", "user.name", "t"],
+  ]) {
+    execGit(seed, cmd);
+  }
+  writeFileSync(join(seed, "README.md"), "x");
+  execGit(seed, ["add", "."]);
+  execGit(seed, ["commit", "-qm", "init"]);
+  const wts: Record<string, string> = {};
+  for (const branch of branches) {
+    const dest = join(root, branch);
+    execGit(seed, ["worktree", "add", "-q", dest, "-b", branch]);
+    wts[branch] = dest;
+  }
+  return { root, worktrees: wts };
+}
 const FIXTURE_DIR = fileURLToPath(new URL("../test/fixtures/agent-surface/", import.meta.url));
 
 /**
@@ -299,9 +339,9 @@ function setupScenario(
     /** Skip the default `down` cleanups (caller registers its own). */
     readonly noDefaultCleanups?: boolean;
   } = {},
-): { wt: string; root: string; worktrees: Record<string, string> } {
+): { wt: string; root: string; worktrees: Readonly<Record<string, string>> } {
   const names = opts.worktrees ?? ["login"];
-  const repo = makeRepo(prefix, names);
+  const repo = buildSmokeRepo(prefix, names);
   currentCtx = { pidNeedle: repo.root, root: repo.root };
   for (const name of names) writeMinimalStack(repo.worktrees[name]!, { withProbe: opts.withProbe });
   const wt = repo.worktrees[names[0]!]!;
@@ -382,7 +422,7 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
     expect(normaliseEnvelope(r.doc, "login")).toEqual(readFixture("01-up-first.json"));
 
     // Real-binary assertion: the worktree socket exists on disk.
-    const commonDir = git(wt, "rev-parse", "--git-common-dir");
+    const commonDir = execGit(wt, ["rev-parse", "--git-common-dir"]);
     const absCommon = commonDir.startsWith("/") ? commonDir : join(wt, commonDir);
     expect(existsSync(join(absCommon, "devtrees", "run", "login.sock"))).toBe(true);
   }, 90_000);
@@ -511,7 +551,7 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
     expect(devtrees(wt, ["generate", "--json"]).code).toBe(0);
 
     // Read back the derived config to find the WEB_PORT this worktree owns.
-    const commonDir = git(wt, "rev-parse", "--git-common-dir");
+    const commonDir = execGit(wt, ["rev-parse", "--git-common-dir"]);
     const absCommon = commonDir.startsWith("/") ? commonDir : join(wt, commonDir);
     const derivedYaml = readFileSync(join(absCommon, "devtrees", "login.yaml"), "utf8");
     const portMatch = derivedYaml.match(/WEB_PORT=(\d+)/);

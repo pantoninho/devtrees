@@ -1,14 +1,25 @@
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 import { runAttach, runDown, runLs, runPrune, runUp } from "./commands.js";
-// SHORT_TMP / git / makeRepo are shared with src/real-pc.smoke.test.ts; living
-// in test/ keeps them out of the production bundle while staying importable
-// from any test file (the loose include glob is `src/**/*.test.ts`).
-import { git, makeRepo } from "../test/repo-fixtures.js";
+
+// Unix domain socket paths are capped (~104 bytes on macOS, ~108 on Linux). The
+// control socket lives at `<git-common-dir>/devtrees/run/<id>.sock`, so the temp
+// repo must be rooted shallowly enough that the socket path fits. The OS tmpdir
+// (e.g. macOS `/var/folders/.../T`) is already deep enough to overflow, so we use
+// a short, fixed base dir instead.
+const SHORT_TMP = process.platform === "darwin" ? "/tmp" : (process.env.RUNNER_TEMP ?? "/tmp");
 
 const STUB = fileURLToPath(new URL("../test/stub-process-compose.mjs", import.meta.url));
 
@@ -32,6 +43,37 @@ afterEach(async () => {
     }
   }
 });
+
+function git(cwd: string, ...args: string[]): string {
+  return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+}
+
+/**
+ * Build a fresh temp repo with `main/` initialised and committed, plus N linked
+ * worktrees. Returns `{ root, main, worktrees }`. The caller is responsible for
+ * registering an rm cleanup against `root`.
+ */
+function makeRepo(
+  prefix: string,
+  worktreeNames: ReadonlyArray<string>,
+): { root: string; main: string; worktrees: Record<string, string> } {
+  const root = mkdtempSync(join(SHORT_TMP, prefix));
+  const main = join(root, "main");
+  mkdirSync(main, { recursive: true });
+  git(main, "init", "-q");
+  git(main, "config", "user.email", "t@t");
+  git(main, "config", "user.name", "t");
+  writeFileSync(join(main, "README.md"), "x");
+  git(main, "add", ".");
+  git(main, "commit", "-qm", "init");
+  const worktrees: Record<string, string> = {};
+  for (const name of worktreeNames) {
+    const path = join(root, name);
+    git(main, "worktree", "add", "-q", path, "-b", name);
+    worktrees[name] = path;
+  }
+  return { root, main, worktrees };
+}
 
 /** The driver config that runs the stub instead of a real process-compose. */
 function stubDriverDeps(worktree: string): {
