@@ -43,3 +43,26 @@ export function stackHash(stack: ResolvedStack): string {
     .update(JSON.stringify(canonicalStack(stack)))
     .digest("hex");
 }
+
+/**
+ * SHA-256 hex digest of the *shared subset* of a stack — the input to
+ * shared-stack drift detection (issue #83).
+ *
+ * Hashes only the `shared`-tier services, sorted by name, so:
+ *  - reordering services in `devtrees.yaml` does NOT register as drift
+ *    (port numbers come from the persisted name→port map, not from
+ *    positional offsets);
+ *  - edits confined to isolated services do NOT register as drift;
+ *  - adding/removing/editing a shared service (or flipping a tier) DOES.
+ *
+ * Allocator overrides are deliberately excluded: the running shared
+ * instance's concrete port numbers are carried by the persisted map, so a
+ * `port_base` change alone does not invalidate what is actually bound.
+ */
+export function sharedStackHash(stack: ResolvedStack): string {
+  const services = stack.services
+    .filter((s) => s.tier === "shared")
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map(canonicalService);
+  return createHash("sha256").update(JSON.stringify({ services })).digest("hex");
+}

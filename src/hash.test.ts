@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vite-plus/test";
-import { stackHash } from "./hash.js";
+import { sharedStackHash, stackHash } from "./hash.js";
 import type { ResolvedStack } from "./stack.js";
 
 const svc = (
@@ -51,5 +51,55 @@ describe("stackHash", () => {
   it("is hex-encoded SHA-256 (64 chars)", () => {
     const h = stackHash({ services: [svc("web", "node x.js")] });
     expect(h).toMatch(/^[0-9a-f]{64}$/);
+  });
+});
+
+describe("sharedStackHash (#83)", () => {
+  const pg = svc("postgres", "postgres -D ./pg", ["DB_PORT"], "shared");
+  const redis = svc("redis", "redis-server", ["CACHE_PORT"], "shared");
+  const web = svc("web", "node server.js", ["WEB_PORT"], "isolated");
+
+  it("is insensitive to service ordering — reordering must not register as drift", () => {
+    const a: ResolvedStack = { services: [pg, redis, web] };
+    const b: ResolvedStack = { services: [web, redis, pg] };
+    expect(sharedStackHash(a)).toBe(sharedStackHash(b));
+  });
+
+  it("ignores isolated services entirely — a branch editing only isolated services must not drift shared", () => {
+    const a: ResolvedStack = { services: [pg, web] };
+    const b: ResolvedStack = {
+      services: [pg, svc("web", "node other.js --flag", ["WEB_PORT", "EXTRA_PORT"], "isolated")],
+    };
+    expect(sharedStackHash(a)).toBe(sharedStackHash(b));
+  });
+
+  it("changes when a shared service is added", () => {
+    const a: ResolvedStack = { services: [pg, web] };
+    const b: ResolvedStack = { services: [pg, redis, web] };
+    expect(sharedStackHash(a)).not.toBe(sharedStackHash(b));
+  });
+
+  it("changes when a shared service's command changes", () => {
+    const a: ResolvedStack = { services: [pg] };
+    const b: ResolvedStack = { services: [svc("postgres", "postgres -D ./other", ["DB_PORT"], "shared")] };
+    expect(sharedStackHash(a)).not.toBe(sharedStackHash(b));
+  });
+
+  it("changes when a service's tier flips isolated -> shared", () => {
+    const a: ResolvedStack = { services: [pg, web] };
+    const b: ResolvedStack = {
+      services: [pg, svc("web", "node server.js", ["WEB_PORT"], "shared")],
+    };
+    expect(sharedStackHash(a)).not.toBe(sharedStackHash(b));
+  });
+
+  it("ignores allocator overrides — port numbers come from the persisted map, not the hash", () => {
+    const a: ResolvedStack = { services: [pg], allocator: { portBase: 20000 } };
+    const b: ResolvedStack = { services: [pg], allocator: { portBase: 30000 } };
+    expect(sharedStackHash(a)).toBe(sharedStackHash(b));
+  });
+
+  it("is hex-encoded SHA-256 (64 chars)", () => {
+    expect(sharedStackHash({ services: [pg] })).toMatch(/^[0-9a-f]{64}$/);
   });
 });
