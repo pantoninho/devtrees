@@ -22,7 +22,7 @@
  * cleanup lives in `commands.ts` (`runPrune`).
  */
 
-import { slugifyWorktreeId } from "./anchor.js";
+import { deriveWorktreeId } from "./anchor.js";
 import type { InstanceInfo } from "./instances.js";
 
 /**
@@ -38,10 +38,10 @@ export function findOrphans(
 }
 
 /**
- * Parse `git worktree list --porcelain` into the set of slug ids devtrees uses
- * to key instances. Each entry's first line is `worktree <abs path>`; we run
- * the path through the same `slugifyWorktreeId` `resolveAnchor` does, so a
- * worktree at `/repo/login` lands as `login` — the same id its instance was
+ * Parse `git worktree list --porcelain` into the set of ids devtrees uses to
+ * key instances. Each entry's first line is `worktree <abs path>`; we run the
+ * path through the same `deriveWorktreeId` `resolveAnchor` does, so a worktree
+ * at `/repo/login` lands as `login-<hash>` — the same id its instance was
  * registered under at `up` time.
  */
 export function parseWorktreeIds(porcelain: string): Set<string> {
@@ -50,7 +50,7 @@ export function parseWorktreeIds(porcelain: string): Set<string> {
     if (!line.startsWith("worktree ")) continue;
     const path = line.slice("worktree ".length).trim();
     if (path === "") continue;
-    ids.add(slugifyWorktreeId(path));
+    ids.add(deriveWorktreeId(path));
   }
   return ids;
 }
