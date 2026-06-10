@@ -12,6 +12,7 @@ import {
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
+import { deriveWorktreeId } from "./anchor.js";
 import { runAttach, runDown, runLs, runPrune, runUp } from "./commands.js";
 
 // Unix domain socket paths are capped (~104 bytes on macOS, ~108 on Linux). The
@@ -165,8 +166,9 @@ describe("e2e smoke — up then down a single isolated service", () => {
     const up = await runUp(deps as never);
     cleanups.push(() => runDown(deps as never));
 
-    // Acceptance: the worktree id is resolved from the directory, not the branch.
-    expect(up.worktreeId).toBe("login");
+    // Acceptance: the worktree id is resolved from the directory, not the
+    // branch — slug prefix of the basename plus a path-hash suffix (#82).
+    expect(up.worktreeId).toMatch(/^login-[0-9a-f]{8}$/);
 
     const port = Number(up.env.WEB_PORT);
     expect(port).toBeGreaterThanOrEqual(20000);
@@ -513,14 +515,14 @@ describe("e2e — devtrees ls discovers worktree instances + the shared instance
     // rather than the real process-compose binary against a stub UDS.
     const lsFromLogin = await runLs({ cwd: loginWt, driver: loginDeps.driver });
     const ids = lsFromLogin.instances.map((i) => i.id).sort();
-    expect(ids).toEqual(["billing", "login", "shared"]);
+    expect(ids).toEqual([billing.worktreeId, login.worktreeId, "shared"].sort());
 
     // Acceptance: every entry shows status + allocated ports.
     for (const inst of lsFromLogin.instances) {
       expect(inst.status).toBe("running");
     }
-    const loginEntry = lsFromLogin.instances.find((i) => i.id === "login");
-    const billingEntry = lsFromLogin.instances.find((i) => i.id === "billing");
+    const loginEntry = lsFromLogin.instances.find((i) => i.id === login.worktreeId);
+    const billingEntry = lsFromLogin.instances.find((i) => i.id === billing.worktreeId);
     const sharedEntry = lsFromLogin.instances.find((i) => i.id === "shared");
     expect(loginEntry?.kind).toBe("worktree");
     expect(billingEntry?.kind).toBe("worktree");
@@ -566,7 +568,7 @@ describe("e2e — devtrees ls discovers worktree instances + the shared instance
     // (otherwise it'd shell out to a non-existent real `process-compose`).
     const ls = await runLs({ cwd: loginWt, driver: deps.driver });
 
-    const login = ls.instances.find((i) => i.id === "login");
+    const login = ls.instances.find((i) => i.id === up.worktreeId);
     const shared = ls.instances.find((i) => i.id === "shared");
     expect(login?.services?.map((s) => s.name)).toEqual(["web"]);
     expect(login?.services?.[0]?.status).toBe("Running");
@@ -670,7 +672,7 @@ describe("e2e — readiness_probe / liveness_probe / availability passthrough (#
     // converged-probe assertion. Against the stub it's a smoke check that
     // the driver→stub path returns `is_ready: "Ready"`.)
     const ls = await runLs({ cwd: worktree, driver: deps.driver });
-    const login = ls.instances.find((i) => i.id === "login");
+    const login = ls.instances.find((i) => i.id === up.worktreeId);
     expect(login?.services?.[0]?.name).toBe("web");
     expect(login?.services?.[0]?.health).toBe("ready");
 
@@ -840,8 +842,8 @@ describe("e2e — devtrees prune reconciles against git worktree list", () => {
     // Pre-state: both instances visible at the anchor.
     const commonDir = git(billingWt, "rev-parse", "--git-common-dir");
     const absCommon = commonDir.startsWith("/") ? commonDir : join(billingWt, commonDir);
-    const loginSocket = join(absCommon, "devtrees", "run", "login.sock");
-    const loginConfig = join(absCommon, "devtrees", "login.yaml");
+    const loginSocket = join(absCommon, "devtrees", "run", `${login.worktreeId}.sock`);
+    const loginConfig = join(absCommon, "devtrees", `${login.worktreeId}.yaml`);
     expect(existsSync(loginSocket)).toBe(true);
     expect(existsSync(loginConfig)).toBe(true);
 
@@ -857,7 +859,7 @@ describe("e2e — devtrees prune reconciles against git worktree list", () => {
     });
 
     // Acceptance: prune reports the orphan, the surviving instance is left alone.
-    expect(result.pruned.map((p) => p.id).sort()).toEqual(["login"]);
+    expect(result.pruned.map((p) => p.id).sort()).toEqual([login.worktreeId]);
 
     // Acceptance: the orphan's anchor state is gone.
     expect(existsSync(loginSocket)).toBe(false);
@@ -865,7 +867,7 @@ describe("e2e — devtrees prune reconciles against git worktree list", () => {
 
     // Acceptance: the surviving instance is still up.
     expect(await waitForHttp(Number(billing.env.WEB_PORT))).toBe(true);
-    const billingSocket = join(absCommon, "devtrees", "run", "billing.sock");
+    const billingSocket = join(absCommon, "devtrees", "run", `${billing.worktreeId}.sock`);
     expect(existsSync(billingSocket)).toBe(true);
 
     // Acceptance: a follow-up prune is a no-op (idempotent).
@@ -1106,20 +1108,23 @@ describe("e2e — STALE_PORT_BLOCK pre-flight (#58)", () => {
     // Seed the registry so the allocator's stability fast-path returns this
     // exact port as the worktree's blockBase. This mirrors the real-world
     // failure mode: registry hit → no re-probe → spawn → silent EADDRINUSE.
+    // The registry is keyed by the derived worktree id (#82), so derive it
+    // from the same toplevel path the anchor resolver will see.
+    const worktreeId = deriveWorktreeId(git(worktree, "rev-parse", "--show-toplevel"));
     const commonDir = git(worktree, "rev-parse", "--git-common-dir");
     const absCommon = commonDir.startsWith("/") ? commonDir : join(worktree, commonDir);
     const devtreesDir = join(absCommon, "devtrees");
     mkdirSync(devtreesDir, { recursive: true });
     writeFileSync(
       join(devtreesDir, "registry.json"),
-      JSON.stringify({ login: leaker.port }),
+      JSON.stringify({ [worktreeId]: leaker.port }),
       "utf8",
     );
 
     const deps = stubDriverDeps(worktree);
 
     // Sanity: socket is absent (first-up path) so the pre-flight DOES run.
-    const socketPath = join(devtreesDir, "run", "login.sock");
+    const socketPath = join(devtreesDir, "run", `${worktreeId}.sock`);
     expect(existsSync(socketPath)).toBe(false);
 
     const err = await runUp(deps as never).then(
@@ -1156,7 +1161,7 @@ describe("e2e — STALE_PORT_BLOCK pre-flight (#58)", () => {
     const details = parsed.error.details;
     if (details === undefined) throw new Error("expected error.details to be present");
     expect(details.block_base).toBe(leaker.port);
-    expect(details.worktree_id).toBe("login");
+    expect(details.worktree_id).toBe(worktreeId);
     expect(details.collisions.length).toBeGreaterThanOrEqual(1);
     const webCollision = details.collisions.find((c) => c.port_name === "WEB_PORT");
     expect(webCollision).toBeDefined();

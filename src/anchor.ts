@@ -3,14 +3,15 @@
  *
  * Maps a working directory to the fixed locations devtrees reasons about:
  * the **anchor** (the git common dir — `<main>/.git` normally, the bare dir for
- * bare-repo layouts), the **worktree root**, a stable **worktree id** slugified
+ * bare-repo layouts), the **worktree root**, a stable **worktree id** derived
  * from the worktree path (not the branch), and whether the repo is bare. See
  * CONTEXT.md and ADR-0001.
  *
  * Git is injected as a `GitProbe` so the pure resolution logic — path joining,
- * slugification — is unit-testable without spawning git.
+ * id derivation — is unit-testable without spawning git.
  */
 
+import { createHash } from "node:crypto";
 import { isAbsolute, join, resolve } from "node:path";
 
 /** Run `git rev-parse <args...>` from the working dir and return trimmed stdout. */
@@ -26,23 +27,35 @@ export interface Anchor {
   readonly isBare: boolean;
 }
 
+/** Hex chars of the path hash appended to the slug. 8 is plenty per repo. */
+const PATH_HASH_LENGTH = 8;
+
 /**
- * Slugify a path's final segment into a stable, filesystem-safe worktree id.
+ * Derive a stable, filesystem-safe, collision-proof worktree id from the
+ * absolute worktree path: a human-readable slug of the path's basename,
+ * suffixed with a short hash of the full path (issue #82).
+ *
+ * The hash suffix is what makes the id collision-proof:
+ * - two worktrees with the same basename at different paths get distinct ids;
+ * - basenames that slug identically (`feature.x` vs `feature-x`) no longer
+ *   alias each other;
+ * - a worktree id always carries a `-<hash>` suffix, so it can never equal the
+ *   reserved `shared` stem (`SHARED_INSTANCE_ID` in `paths.ts`) and alias the
+ *   shared instance's socket/config paths.
  *
  * Exported so `prune` can derive ids from `git worktree list --porcelain`
  * paths the same way an instance's id was derived at `up` time — they must
  * match exactly or prune would false-positive every worktree as an orphan.
  */
-export function slugifyWorktreeId(worktreeRoot: string): string {
-  const base =
-    worktreeRoot
-      .replace(/[/\\]+$/, "")
-      .split(/[/\\]/)
-      .pop() ?? "";
-  return base
+export function deriveWorktreeId(worktreeRoot: string): string {
+  const normalized = worktreeRoot.replace(/[/\\]+$/, "");
+  const base = normalized.split(/[/\\]/).pop() ?? "";
+  const slug = base
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
+  const hash = createHash("sha256").update(normalized).digest("hex").slice(0, PATH_HASH_LENGTH);
+  return `${slug === "" ? "wt" : slug}-${hash}`;
 }
 
 export function resolveAnchor(cwd: string, git: GitProbe): Anchor {
@@ -56,7 +69,7 @@ export function resolveAnchor(cwd: string, git: GitProbe): Anchor {
   return {
     anchor,
     worktreeRoot,
-    worktreeId: slugifyWorktreeId(worktreeRoot),
+    worktreeId: deriveWorktreeId(worktreeRoot),
     isBare,
   };
 }

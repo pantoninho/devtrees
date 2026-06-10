@@ -31,6 +31,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { createServer } from "node:net";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { deriveWorktreeId } from "./anchor.js";
 
 // ---------------------------------------------------------------------------
 // Gating: skip the whole file unless the env var is set AND the binary works.
@@ -372,6 +373,15 @@ function up(wt: string): CliResult {
   return devtrees(wt, ["up", "--json", "--wait-timeout", "30"]);
 }
 
+/**
+ * The id devtrees derives for a worktree (#82): slug of the basename plus a
+ * path-hash suffix. Derived from the same `--show-toplevel` answer the anchor
+ * resolver sees so the test and the binary agree byte-for-byte.
+ */
+function wtId(wt: string): string {
+  return deriveWorktreeId(execGit(wt, ["rev-parse", "--show-toplevel"]));
+}
+
 interface UpDoc {
   readonly up: {
     readonly block_base: number;
@@ -434,12 +444,12 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
     const r = up(wt);
     expect(r.code, `up failed: stderr=${r.stderr} stdout=${r.stdout}`).toBe(0);
     expect(r.doc).toBeDefined();
-    expect(normaliseEnvelope(r.doc, "login")).toEqual(readFixture("01-up-first.json"));
+    expect(normaliseEnvelope(r.doc, wtId(wt))).toEqual(readFixture("01-up-first.json"));
 
     // Real-binary assertion: the worktree socket exists on disk.
     const commonDir = execGit(wt, ["rev-parse", "--git-common-dir"]);
     const absCommon = commonDir.startsWith("/") ? commonDir : join(wt, commonDir);
-    expect(existsSync(join(absCommon, "devtrees", "run", "login.sock"))).toBe(true);
+    expect(existsSync(join(absCommon, "devtrees", "run", `${wtId(wt)}.sock`))).toBe(true);
   }, 90_000);
 
   it("scenario 2: re-up is idempotent — shared_started:false, same block_base", async () => {
@@ -450,7 +460,7 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
     const second = up(wt);
     expect(second.code).toBe(0);
 
-    expect(normaliseEnvelope(second.doc, "login")).toEqual(readFixture("02-up-idempotent.json"));
+    expect(normaliseEnvelope(second.doc, wtId(wt))).toEqual(readFixture("02-up-idempotent.json"));
 
     // Stability: block_base and named ports unchanged across the re-up.
     const firstDoc = first.doc as UpDoc;
@@ -498,7 +508,7 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
 
     // Poll ls --json until the worktree row reports ready (probes need
     // multiple seconds to converge in the real binary).
-    const web = await pollWorktreeService(wt, "login", "web", 30_000);
+    const web = await pollWorktreeService(wt, wtId(wt), "web", 30_000);
     expect(web?.health).toBe("ready");
   }, 90_000);
 
@@ -510,7 +520,7 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
 
     const down = devtrees(wt, ["down", "--json"]);
     expect(down.code).toBe(0);
-    expect(normaliseEnvelope(down.doc, "login")).toEqual(readFixture("06-down-worktree.json"));
+    expect(normaliseEnvelope(down.doc, wtId(wt))).toEqual(readFixture("06-down-worktree.json"));
   }, 90_000);
 
   it("scenario 6b: down --shared --json envelope (#48)", async () => {
@@ -568,7 +578,7 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
     // Read back the derived config to find the WEB_PORT this worktree owns.
     const commonDir = execGit(wt, ["rev-parse", "--git-common-dir"]);
     const absCommon = commonDir.startsWith("/") ? commonDir : join(wt, commonDir);
-    const derivedYaml = readFileSync(join(absCommon, "devtrees", "login.yaml"), "utf8");
+    const derivedYaml = readFileSync(join(absCommon, "devtrees", `${wtId(wt)}.yaml`), "utf8");
     const portMatch = derivedYaml.match(/WEB_PORT=(\d+)/);
     if (!portMatch) throw new Error(`could not find WEB_PORT in derived config: ${derivedYaml}`);
     const port = Number(portMatch[1]);

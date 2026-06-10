@@ -53,7 +53,7 @@ A value devtrees computes and passes into a worktree instance as an environment 
 A port a service declares in its `ports` list as the verbatim env-var name it should be injected as (e.g. `ports: [WEB_PORT]`). Devtrees allocates a number for it — worktree-unique for an isolated service, repo-wide for a shared one — and injects it as exactly that env var. The author references it as `${WEB_PORT}` in commands or reads it straight from the process environment; devtrees imposes no naming convention and does no name mangling.
 
 **Worktree id**:
-A stable per-worktree identifier (a slug) devtrees injects so the author can de-collide otherwise-global names — unix sockets, container names, absolute state paths — that working-directory isolation does not cover.
+A stable per-worktree identifier devtrees injects so the author can de-collide otherwise-global names — unix sockets, container names, absolute state paths — that working-directory isolation does not cover. Derived from the worktree's absolute path: a human-readable slug of the directory basename plus a short path-hash suffix (e.g. `login-3f9c2a1b`), so same-basename worktrees at different paths get distinct ids and no worktree id can ever equal the reserved `shared` stem.
 
 **Port block**:
 The contiguous range of ports allocated to one worktree. Each of the worktree's named ports maps to a fixed offset within its block, so the port numbers are derived from the block base.
