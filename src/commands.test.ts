@@ -1402,7 +1402,10 @@ describe("runGenerate — emit derived configs to disk", () => {
     expect(result.sharedPath).toBeUndefined();
     expect(result.sharedEnv).toBeUndefined();
     // The directory contains only the worktree config, not shared.yaml.
-    const sharedYaml = result.worktreePath.replace(`${deps.expectedWorktreeId}.yaml`, "shared.yaml");
+    const sharedYaml = result.worktreePath.replace(
+      `${deps.expectedWorktreeId}.yaml`,
+      "shared.yaml",
+    );
     expect(existsSync(sharedYaml)).toBe(false);
   });
 
@@ -2106,9 +2109,7 @@ describe("runEnv — pure read of injected env", () => {
     // Seed the registry so the answer is deterministic without an up.
     const loginId = idFor("/wt", "login");
     const initialRegistry: RegistrySnapshot = { [loginId]: 20000, [SHARED_REGISTRY_KEY]: 30000 };
-    const result = await runEnv(
-      stubDeps({ stack, worktreeRootOverride: "/wt", initialRegistry }),
-    );
+    const result = await runEnv(stubDeps({ stack, worktreeRootOverride: "/wt", initialRegistry }));
 
     expect(result.env.DEVTREES_WORKTREE_ID).toBe(loginId);
     expect(result.env.WEB_PORT).toBe("20000");
@@ -2125,9 +2126,7 @@ describe("runEnv — pure read of injected env", () => {
     };
     const loginId = idFor("/wt", "login");
     const initialRegistry: RegistrySnapshot = { [loginId]: 20096, [SHARED_REGISTRY_KEY]: 30016 };
-    const result = await runEnv(
-      stubDeps({ stack, worktreeRootOverride: "/wt", initialRegistry }),
-    );
+    const result = await runEnv(stubDeps({ stack, worktreeRootOverride: "/wt", initialRegistry }));
 
     // The deriver's env is the source of truth; runEnv must reproduce it exactly.
     const expected = deriveWorktreeConfig(stack, {

@@ -123,7 +123,9 @@ describe("parseWorktreeIds", () => {
     // `resolveAnchor` produces, so a worktree at `/repo/Feature_Branch.2`
     // matches the instance id it was registered under at `up` time.
     const porcelain = ["worktree /repo/Feature_Branch.2", "HEAD x", ""].join("\n");
-    expect(parseWorktreeIds(porcelain)).toEqual(new Set([deriveWorktreeId("/repo/Feature_Branch.2")]));
+    expect(parseWorktreeIds(porcelain)).toEqual(
+      new Set([deriveWorktreeId("/repo/Feature_Branch.2")]),
+    );
   });
 
   it("keeps same-basename worktrees at different paths as distinct live ids", () => {
