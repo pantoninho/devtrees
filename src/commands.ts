@@ -1034,10 +1034,16 @@ export async function runDown(
 
   if (options.shared) {
     const sharedLock = deps.withSharedLock ?? defaultWithSharedLock;
+    const probe = deps.probeSocket ?? defaultProbeSocket;
     const paths = sharedInstancePaths(anchor.anchor);
 
     await sharedLock(anchor.anchor, async () => {
-      if (existsSync(paths.socketPath)) {
+      // Probe, don't trust the file (#80): after a SIGKILL the socket file
+      // survives with no listener behind it, and `process-compose down`
+      // against the dead UDS fails. A live instance is signalled through the
+      // driver; a stale socket is unlinked by the probe gate itself, so
+      // either way the call converges to "shared is down" — idempotently.
+      if (await socketIsLive(paths.socketPath, probe)) {
         await driver.down({ configPath: paths.configPath, socketPath: paths.socketPath });
       }
       // Best-effort cleanup of the derived config — a future `up` re-derives it.

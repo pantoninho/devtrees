@@ -3032,3 +3032,75 @@ describe("runUp — crash recovery: stale shared socket (#80)", () => {
     expect(existsSync(sharedSocket)).toBe(true);
   });
 });
+
+/**
+ * `down --shared` against a crashed shared instance (#80). The old check
+ * (`existsSync` → driver.down) signalled a dead socket, which fails; the
+ * stale file must instead be cleaned up and the call must stay an idempotent
+ * no-op.
+ */
+describe("runDown — crash recovery: stale shared socket (#80)", () => {
+  const mixedStack: ResolvedStack = {
+    services: [
+      isolated("web", "node server.js", ["WEB_PORT"]),
+      shared("postgres", "postgres -D ./pgdata", ["DB_PORT"]),
+    ],
+  };
+
+  it("cleans up the stale socket file and no-ops instead of signalling a dead instance", async () => {
+    const tmp = tmpAnchor();
+    const sharedPaths = sharedInstancePaths(tmp.anchor);
+    mkdirSync(sharedPaths.runDir, { recursive: true });
+    writeFileSync(sharedPaths.socketPath, "");
+
+    const downSpawns: string[] = [];
+    const base = stubDeps({
+      stack: mixedStack,
+      anchorOverride: tmp.anchor,
+      worktreeRootOverride: tmp.worktreeRoot,
+      probeSocket: async () => "stale",
+    });
+    const innerSpawner = base.driver?.spawner;
+    if (innerSpawner === undefined) throw new Error("expected stub spawner");
+    const spawner = (binary: string, args: ReadonlyArray<string>, options: SpawnOptions) => {
+      if (args[0] === "down") downSpawns.push(args.join(" "));
+      return innerSpawner(binary, args, options);
+    };
+    const deps: CommandDeps = { ...base, driver: { ...base.driver, spawner } };
+
+    const result = await runDown(deps, { shared: true });
+
+    // Idempotent no-op result, no `process-compose down` against the dead UDS.
+    expect(result).toEqual({ shared: true });
+    expect(downSpawns).toHaveLength(0);
+    // The orphaned socket file was unlinked, so the next up lazy-starts fresh.
+    expect(existsSync(sharedPaths.socketPath)).toBe(false);
+  });
+
+  it("still signals a live shared instance through the driver", async () => {
+    const tmp = tmpAnchor();
+    const sharedPaths = sharedInstancePaths(tmp.anchor);
+    mkdirSync(sharedPaths.runDir, { recursive: true });
+    writeFileSync(sharedPaths.socketPath, "");
+
+    const downSpawns: string[] = [];
+    const base = stubDeps({
+      stack: mixedStack,
+      anchorOverride: tmp.anchor,
+      worktreeRootOverride: tmp.worktreeRoot,
+      probeSocket: async () => "running",
+    });
+    const innerSpawner = base.driver?.spawner;
+    if (innerSpawner === undefined) throw new Error("expected stub spawner");
+    const spawner = (binary: string, args: ReadonlyArray<string>, options: SpawnOptions) => {
+      if (args[0] === "down") downSpawns.push(args.join(" "));
+      return innerSpawner(binary, args, options);
+    };
+    const deps: CommandDeps = { ...base, driver: { ...base.driver, spawner } };
+
+    const result = await runDown(deps, { shared: true });
+
+    expect(result).toEqual({ shared: true });
+    expect(downSpawns).toHaveLength(1);
+  });
+});
