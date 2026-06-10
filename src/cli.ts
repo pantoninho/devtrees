@@ -482,7 +482,7 @@ class LogsCommand extends DevtreesCommand {
         all: this.all,
         shared: this.shared,
         follow: this.follow,
-        ...(this.tail !== undefined ? { tail: Number(this.tail) } : {}),
+        ...(this.tail !== undefined ? { tail: parseTailCount(this.tail) } : {}),
         ...(this.since !== undefined ? { since: this.since } : {}),
       };
       if (!opts.all && opts.service === undefined) {
@@ -516,6 +516,20 @@ function invalidArgsError(message: string): Error {
   const err = new Error(message);
   (err as Error & { code?: string }).code = "INVALID_ARGS";
   return err;
+}
+
+/**
+ * Coerce a `--tail` argument value into a line count, or throw the documented
+ * `INVALID_ARGS` error. Mirrors `parseWaitTimeoutSecondsToMs` below — every
+ * numeric flag validates at the seam instead of letting `NaN` leak into the
+ * driver (#81).
+ */
+function parseTailCount(raw: string): number {
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0) {
+    throw invalidArgsError(`--tail expects a non-negative integer of lines, got '${raw}'.`);
+  }
+  return n;
 }
 
 /**

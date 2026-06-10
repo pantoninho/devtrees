@@ -728,6 +728,43 @@ describe("devtrees CLI — logs (#33)", () => {
     expect(logs).not.toHaveBeenCalled();
   });
 
+  it("rejects `--tail=abc` with a validation error in human mode (exit 1, deps.logs untouched) (#81)", async () => {
+    const logs = vi.fn();
+    const result = await execute(["logs", "web", "--tail=abc"], {
+      up: vi.fn(),
+      down: vi.fn(),
+      logs,
+    });
+    expect(result.code).toBe(1);
+    expect(result.stderr).toMatch(/--tail/);
+    expect(result.stderr).toMatch(/abc/);
+    expect(logs).not.toHaveBeenCalled();
+  });
+
+  it("rejects `--tail=abc` with an INVALID_ARGS envelope in JSON mode (#81)", async () => {
+    const logs = vi.fn();
+    const result = await execute(["logs", "web", "--tail=abc", "--json"], {
+      up: vi.fn(),
+      down: vi.fn(),
+      logs,
+    });
+    expect(result.code).toBe(1);
+    const parsed = JSON.parse(result.stdout) as { error: { code: string; message: string } };
+    expect(parsed.error.code).toBe("INVALID_ARGS");
+    expect(parsed.error.message).toMatch(/--tail/);
+    expect(logs).not.toHaveBeenCalled();
+  });
+
+  it("rejects negative and non-integer --tail values (#81)", async () => {
+    for (const bad of ["--tail=-5", "--tail=2.5", "--tail=NaN"]) {
+      const logs = vi.fn();
+      const result = await execute(["logs", "web", bad], { up: vi.fn(), down: vi.fn(), logs });
+      expect(result.code).toBe(1);
+      expect(result.stderr).toMatch(/--tail/);
+      expect(logs).not.toHaveBeenCalled();
+    }
+  });
+
   it("`logs --json` with no service and no --all emits an INVALID_ARGS envelope on stdout (#81)", async () => {
     const logs = vi.fn();
     const result = await execute(["logs", "--json"], { up: vi.fn(), down: vi.fn(), logs });
