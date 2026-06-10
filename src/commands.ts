@@ -11,7 +11,13 @@
 import { allocateBlock, type AllocatorOptions, type RegistrySnapshot } from "./allocator.js";
 import { resolveAnchor, type GitProbe } from "./anchor.js";
 import { deriveSharedConfig, deriveWorktreeConfig, type DroppedEdge } from "./deriver.js";
-import { discoverInstances, type InstanceInfo, type Service } from "./instances.js";
+import {
+  discoverInstances,
+  probeSocket as defaultProbeSocket,
+  type InstanceInfo,
+  type InstanceStatus,
+  type Service,
+} from "./instances.js";
 import { SHARED_REGISTRY_KEY, instancePaths, sharedInstancePaths } from "./paths.js";
 import { findOrphans, parseWorktreeIds } from "./prune.js";
 import { loadStack, type ResolvedService, type ResolvedStack } from "./stack.js";
@@ -260,6 +266,15 @@ export interface CommandDeps {
   /** Is a concrete port free to bind? Default: probes a real TCP bind. */
   readonly isPortFree?: (port: number) => boolean | Promise<boolean>;
   /**
+   * Probe a control socket for an actual listener (issue #80). The socket
+   * *file* lives in anchor state, which survives `kill -9` and reboots, so
+   * the write paths must not treat its existence as liveness. Default: real
+   * UDS connect probe (`instances.ts`, the same primitive `ls` reports
+   * stale instances with). Injected so unit tests can simulate live/crashed
+   * instances without binding real sockets.
+   */
+  readonly probeSocket?: (socketPath: string) => Promise<InstanceStatus>;
+  /**
    * Identify the holder of a concrete port — used by `up`'s pre-flight
    * stale-port-block check (#58). Default: `defaultPortHolder` (bind probe
    * + best-effort `lsof`). Injected so unit tests can drive the routing
@@ -490,7 +505,26 @@ function resolveUpSeams(deps: CommandDeps) {
     warn: deps.warn ?? defaultWarn,
     readHash: deps.readStoredHash ?? defaultReadStoredHash,
     writeHash: deps.writeStoredHash ?? defaultWriteStoredHash,
+    probe: deps.probeSocket ?? defaultProbeSocket,
   } as const;
+}
+
+/**
+ * Liveness gate for the write paths (issue #80). A control-socket *file* is
+ * not proof of a live instance — it lives in anchor state, which survives
+ * `kill -9` and reboots, so after a crash the file points at nothing. Probe
+ * the UDS: a listener means live; anything else means the file is an orphan,
+ * so unlink it and report "not live" — the caller then falls through to its
+ * fresh-start (or idempotent no-op) path instead of trusting a dead instance.
+ */
+async function socketIsLive(
+  socketPath: string,
+  probe: (socketPath: string) => Promise<InstanceStatus>,
+): Promise<boolean> {
+  if (!existsSync(socketPath)) return false;
+  if ((await probe(socketPath)) === "running") return true;
+  rmSync(socketPath, { force: true });
+  return false;
 }
 
 /**
@@ -577,6 +611,13 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
   const driver = createDriver(deps.driver);
   const inst = { configPath: paths.configPath, socketPath: paths.socketPath };
 
+  // Liveness, not file existence (issue #80): probe the control socket for an
+  // actual listener. A SIGKILLed instance leaves its socket file behind in
+  // anchor state; trusting it would take the already-running branch against a
+  // dead instance AND skip the #58 pre-flight below. A stale file is unlinked
+  // here so this up falls through to the fresh-start path.
+  const ownInstanceLive = await socketIsLive(paths.socketPath, seams.probe);
+
   // Pre-flight stale-port-block check (issue #58). Self-gates on the
   // own-instance-live flag so the idempotent re-up path skips the probe
   // (those listeners ARE our own); on the first-up path, any listener on a
@@ -589,7 +630,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     blockBase,
     portFor,
     portHolder,
-    ownInstanceLive: existsSync(paths.socketPath),
+    ownInstanceLive,
   });
 
   // Lazy-start the shared instance if any shared services are declared. Runs
@@ -605,12 +646,13 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     });
   }
 
-  // Idempotency branch (issue #31): if this worktree's control socket is
-  // already present, the instance is up. Compare the current resolved-stack
-  // hash to the one stored from the previous successful `up`:
+  // Idempotency branch (issue #31): if this worktree's control socket is held
+  // by a live listener (probed above, #80 — file existence alone is not
+  // enough), the instance is up. Compare the current resolved-stack hash to
+  // the one stored from the previous successful `up`:
   //   - match  -> noop, re-emit the envelope (no driver.up, no registry write)
   //   - drift  -> attempt hot-reload via the driver; map failure to CONFIG_DRIFT.
-  if (existsSync(paths.socketPath)) {
+  if (ownInstanceLive) {
     return await reconcileRunning({
       stack,
       anchor,

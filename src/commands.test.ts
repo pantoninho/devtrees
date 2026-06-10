@@ -40,7 +40,7 @@ import { deriveWorktreeId } from "./anchor.js";
 import { deriveSharedConfig, deriveWorktreeConfig } from "./deriver.js";
 import type { RegistrySnapshot } from "./allocator.js";
 import type { SpawnedProcess } from "./driver.js";
-import { SHARED_REGISTRY_KEY } from "./paths.js";
+import { SHARED_REGISTRY_KEY, instancePaths, sharedInstancePaths } from "./paths.js";
 import type { ResolvedStack } from "./stack.js";
 
 const cleanups: Array<() => void> = [];
@@ -174,6 +174,12 @@ function stubDeps(opts: {
   anchorOverride?: string;
   worktreeRootOverride?: string;
   registryRef?: { snapshot: RegistrySnapshot };
+  /**
+   * Liveness verdict for an existing socket file (#80). Default: "running" —
+   * mirrors the pre-#80 "file present ⇒ live" fiction the older tests fake
+   * instances with (a plain file would probe stale against a real UDS connect).
+   */
+  probeSocket?: (socketPath: string) => Promise<"running" | "stale">;
 }): StubbedDeps {
   const tmp = tmpAnchor();
   const anchor = opts.anchorOverride ?? tmp.anchor;
@@ -219,6 +225,9 @@ function stubDeps(opts: {
     // stub — the default polls a real `process-compose` over the UDS, which
     // would hang the unit test. Tests that *do* care override this field.
     waitForHealth: () => Promise.resolve(),
+    // Default verdict "running" preserves the pre-#80 semantics existing
+    // tests fake liveness with (touching a plain file at the socket path).
+    probeSocket: opts.probeSocket ?? (async () => "running" as const),
     // Driver that records every spawn but doesn't actually run anything.
     driver: {
       exists: () => Promise.resolve(true),
@@ -2851,5 +2860,112 @@ describe("runUp — stale port block detection (#58)", () => {
     // touch only the two.
     expect(probed).toHaveLength(2);
     expect(probed.sort((a, b) => a - b)).toEqual([result.blockBase, result.blockBase + 1]);
+  });
+});
+
+/**
+ * Crash recovery via control-socket liveness probing (#80). Socket files live
+ * in anchor state, which survives `kill -9` and reboots — so the write paths
+ * must probe the UDS for an actual listener instead of trusting file
+ * existence. A stale socket is unlinked and `up` falls through to the
+ * fresh-start path, including the #58 pre-flight it used to skip.
+ */
+describe("runUp — crash recovery: stale control socket (#80)", () => {
+  const stack: ResolvedStack = { services: [isolated("web", "node server.js", ["WEB_PORT"])] };
+
+  /** Pre-create an orphaned socket file the way a SIGKILLed instance leaves one. */
+  function orphanSocket(anchor: string, worktreeId = "login"): string {
+    const paths = instancePaths(anchor, worktreeId);
+    mkdirSync(paths.runDir, { recursive: true });
+    writeFileSync(paths.socketPath, "");
+    return paths.socketPath;
+  }
+
+  it("starts a fresh instance when the socket file exists but nothing listens (post-SIGKILL)", async () => {
+    const tmp = tmpAnchor();
+    const socketPath = orphanSocket(tmp.anchor);
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const deps = stubDeps({
+      stack,
+      track,
+      anchorOverride: tmp.anchor,
+      worktreeRootOverride: tmp.worktreeRoot,
+      probeSocket: async () => "stale",
+    });
+
+    const result = await runUp(deps);
+
+    // Not a silent no-op: the driver was spawned against this worktree's socket.
+    const worktreeSpawns = track.invocations.filter((i) => i.socketPath === socketPath);
+    expect(worktreeSpawns).toHaveLength(1);
+    // Normal started envelope, exactly as a first up would return.
+    expect(result.worktreeId).toBe("login");
+    expect(Number(result.env.WEB_PORT)).toBeGreaterThanOrEqual(20000);
+  });
+
+  it("unlinks the stale socket file when detected", async () => {
+    const tmp = tmpAnchor();
+    const socketPath = orphanSocket(tmp.anchor);
+    // touchSocket: false — nothing recreates the file, so its absence after
+    // `runUp` proves the stale file was unlinked, not merely overwritten.
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const deps = stubDeps({
+      stack,
+      track,
+      anchorOverride: tmp.anchor,
+      worktreeRootOverride: tmp.worktreeRoot,
+      probeSocket: async () => "stale",
+    });
+
+    await runUp(deps);
+
+    expect(existsSync(socketPath)).toBe(false);
+  });
+
+  it("a stale socket does not disable the STALE_PORT_BLOCK pre-flight (#58)", async () => {
+    const tmp = tmpAnchor();
+    orphanSocket(tmp.anchor);
+    const deps: CommandDeps = {
+      ...stubDeps({
+        stack,
+        anchorOverride: tmp.anchor,
+        worktreeRootOverride: tmp.worktreeRoot,
+        probeSocket: async () => "stale",
+      }),
+      // An orphaned process still squats this worktree's block.
+      portHolder: async () => ({ free: false as const, pid: 4242, command: "node orphan.mjs" }),
+    };
+
+    const err = await runUp(deps).then(
+      () => undefined,
+      (e: unknown) => e as Error & { code?: string },
+    );
+    if (err === undefined) throw new Error("expected runUp to reject");
+    expect(err.code).toBe("STALE_PORT_BLOCK");
+  });
+
+  it("a live socket (probe says running) still takes the idempotent no-op path", async () => {
+    const tmp = tmpAnchor();
+    const socketPath = orphanSocket(tmp.anchor);
+    const probed: string[] = [];
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const deps = stubDeps({
+      stack,
+      track,
+      anchorOverride: tmp.anchor,
+      worktreeRootOverride: tmp.worktreeRoot,
+      probeSocket: async (p) => {
+        probed.push(p);
+        return "running";
+      },
+    });
+
+    const result = await runUp(deps);
+
+    // No fresh spawn, socket left in place, envelope still emitted.
+    expect(track.invocations).toHaveLength(0);
+    expect(existsSync(socketPath)).toBe(true);
+    expect(result.worktreeId).toBe("login");
+    expect(probed).toContain(socketPath);
   });
 });
