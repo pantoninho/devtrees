@@ -13,6 +13,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer, type Server } from "node:net";
+import { deriveWorktreeId } from "./anchor.js";
 import { discoverInstances } from "./instances.js";
 import { SHARED_INSTANCE_ID, SHARED_REGISTRY_KEY } from "./paths.js";
 import type { ServiceStatus } from "./driver.js";
@@ -126,6 +127,23 @@ describe("discoverInstances", () => {
     expect(instance).toBeDefined();
     expect(instance?.kind).toBe("shared");
     expect(instance?.id).toBe(SHARED_INSTANCE_ID);
+  });
+
+  it("classifies a worktree directory named `shared` as a worktree instance (issue #82)", async () => {
+    // `deriveWorktreeId` suffixes every worktree id with a path hash, so a
+    // worktree at `.../shared` gets a stem like `shared-1a2b3c4d` — never the
+    // bare reserved `shared` stem. Discovery must file it as kind `worktree`.
+    const anchor = tmpAnchor();
+    const id = deriveWorktreeId("/repo/wt/shared");
+    writeRegistry(anchor, { [id]: 20000 });
+    writeDerivedConfig(anchor, id, { web: { ports: [["WEB_PORT", 20000]] } });
+    touchSocketMarker(anchor, id);
+
+    const [instance] = await discoverInstances(anchor);
+    expect(instance).toBeDefined();
+    expect(instance?.kind).toBe("worktree");
+    expect(instance?.id).toBe(id);
+    expect(instance?.blockBase).toBe(20000);
   });
 
   it("marks worktree-id sockets as kind 'worktree'", async () => {

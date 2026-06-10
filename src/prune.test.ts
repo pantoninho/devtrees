@@ -13,6 +13,7 @@
  */
 
 import { describe, expect, it } from "vite-plus/test";
+import { deriveWorktreeId } from "./anchor.js";
 import { findOrphans, parseWorktreeIds } from "./prune.js";
 import type { InstanceInfo } from "./instances.js";
 import { SHARED_INSTANCE_ID } from "./paths.js";
@@ -73,6 +74,16 @@ describe("findOrphans", () => {
     const orphans = findOrphans([running], new Set());
     expect(orphans).toEqual([running]);
   });
+
+  it("reclaims a worktree directory literally named `shared` once it is removed (issue #82)", () => {
+    // The path-hash suffix keeps its id off the reserved `shared` stem, so it
+    // is a plain worktree instance: live while git lists it, orphan after.
+    const id = deriveWorktreeId("/repo/wt/shared");
+    expect(id).not.toBe(SHARED_INSTANCE_ID);
+    const inst = instance(id);
+    expect(findOrphans([inst], new Set([id]))).toEqual([]);
+    expect(findOrphans([inst], new Set())).toEqual([inst]);
+  });
 });
 
 describe("parseWorktreeIds", () => {
@@ -80,10 +91,10 @@ describe("parseWorktreeIds", () => {
     expect(parseWorktreeIds("")).toEqual(new Set());
   });
 
-  it("parses each `worktree <path>` line into the slug id devtrees uses", () => {
+  it("parses each `worktree <path>` line into the id devtrees uses", () => {
     // `git worktree list --porcelain` separates entries by blank lines; each
     // entry's first line is `worktree <abs path>`. devtrees keys instances by
-    // the slug of that path's basename (see `anchor.ts`).
+    // the same `deriveWorktreeId` the anchor resolver applies (see `anchor.ts`).
     const porcelain = [
       "worktree /repo/main",
       "HEAD deadbeef",
@@ -98,21 +109,34 @@ describe("parseWorktreeIds", () => {
       "branch refs/heads/billing",
       "",
     ].join("\n");
-    expect(parseWorktreeIds(porcelain)).toEqual(new Set(["main", "login", "billing"]));
+    expect(parseWorktreeIds(porcelain)).toEqual(
+      new Set([
+        deriveWorktreeId("/repo/main"),
+        deriveWorktreeId("/repo/login"),
+        deriveWorktreeId("/repo/billing"),
+      ]),
+    );
   });
 
-  it("slugifies worktree paths the same way the anchor resolver does", () => {
-    // A path with capitals and punctuation collapses to the same slug shape
+  it("derives ids from worktree paths the same way the anchor resolver does", () => {
+    // A path with capitals and punctuation collapses to the same id shape
     // `resolveAnchor` produces, so a worktree at `/repo/Feature_Branch.2`
-    // matches its instance id `feature-branch-2`.
+    // matches the instance id it was registered under at `up` time.
     const porcelain = ["worktree /repo/Feature_Branch.2", "HEAD x", ""].join("\n");
-    expect(parseWorktreeIds(porcelain)).toEqual(new Set(["feature-branch-2"]));
+    expect(parseWorktreeIds(porcelain)).toEqual(new Set([deriveWorktreeId("/repo/Feature_Branch.2")]));
+  });
+
+  it("keeps same-basename worktrees at different paths as distinct live ids", () => {
+    // The collision the path-hash suffix exists to prevent (issue #82): two
+    // worktrees both named `login` must not collapse into one registry entry.
+    const porcelain = ["worktree /repo/login", "", "worktree /elsewhere/login", ""].join("\n");
+    expect(parseWorktreeIds(porcelain).size).toBe(2);
   });
 
   it("ignores `worktree` lines whose path is empty or whitespace", () => {
     // Defensive — shouldn't happen in practice but we don't want a bad entry
     // to become a phantom live id that masks an orphan.
     const porcelain = ["worktree   ", "", "worktree /repo/login", "HEAD x", ""].join("\n");
-    expect(parseWorktreeIds(porcelain)).toEqual(new Set(["login"]));
+    expect(parseWorktreeIds(porcelain)).toEqual(new Set([deriveWorktreeId("/repo/login")]));
   });
 });
