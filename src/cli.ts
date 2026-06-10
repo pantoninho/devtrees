@@ -609,16 +609,35 @@ const NO_DEPS: ExecuteDeps = {
 };
 
 /**
+ * True when a `cli.process(...)` throw means "no registered command matches
+ * this argv" — as opposed to a syntax error inside a matched command (bad
+ * flag, missing value), which clipanion reports through the same
+ * `UnknownSyntaxError` class but with a non-null `reason` on every candidate.
+ *
+ * Detection keys off the parse-time error object (#81) — never off rendered
+ * command output, so a legitimate runtime failure whose message happens to
+ * contain "Command not found" keeps its envelope. The class is matched by
+ * `name` + structure because clipanion doesn't export `UnknownSyntaxError`
+ * from its top-level entry (and the published bundle inlines clipanion).
+ */
+function isUnknownCommandError(error: unknown): boolean {
+  if (!(error instanceof Error) || error.name !== "UnknownSyntaxError") return false;
+  const candidates = (error as { candidates?: unknown }).candidates;
+  if (!Array.isArray(candidates)) return false;
+  // No candidates: clipanion has no idea what was meant — unknown command.
+  // All-null reasons: every path failed on the command word itself.
+  return candidates.every(
+    (candidate) => (candidate as { reason?: unknown } | null)?.reason == null,
+  );
+}
+
+/**
  * Render an unknown-command failure in the legacy shape pinned by tests:
  * `devtrees: unknown command '<name>'\nRun 'devtrees --help' for usage.\n` on
  * stderr, exit 1. Clipanion's own "Command not found" output is well-formed
  * but worded differently; reshape it here so we don't break the agent-
  * facing surface.
  */
-function isUnknownCommand(stdout: string): boolean {
-  return /Command not found/.test(stdout);
-}
-
 function unknownCommandStderr(argv: ReadonlyArray<string>): string {
   // The first non-flag argument is the offending command name. Clipanion has
   // already validated argv at this point, so this is purely cosmetic.
@@ -641,26 +660,36 @@ async function dispatchCli(argv: ReadonlyArray<string>, deps: ExecuteDeps): Prom
   const cli = buildCli();
   const stdout = bufferedStream();
   const stderr = bufferedStream();
-  const code = await cli.run([...argv], {
+  const context = {
     stdin: process.stdin,
     stdout: stdout.write,
     stderr: stderr.write,
     env: process.env,
     colorDepth: 1,
     deps,
-  });
+  };
 
-  let outText = stdout.text();
-  let errText = stderr.text();
-
-  // Reshape clipanion's "Command not found" to devtrees' historical error
-  // surface (#62: behavior preserved exactly across the migration).
-  if (code !== 0 && isUnknownCommand(outText)) {
-    outText = "";
-    errText = unknownCommandStderr(argv);
+  // Parse before running so unknown-command failures are detected from
+  // clipanion's typed parse error (#81), not by regexing rendered output.
+  // `cli.run` skips re-parsing when handed an already-processed command.
+  let command: Command<DevtreesContext>;
+  try {
+    command = cli.process({ input: [...argv], context });
+  } catch (error) {
+    if (isUnknownCommandError(error)) {
+      // Reshape clipanion's "Command not found" to devtrees' historical
+      // error surface (#62: behavior preserved exactly across the migration).
+      return { code: 1, stdout: "", stderr: unknownCommandStderr(argv) };
+    }
+    // Any other syntax error (bad flag, missing value, ambiguity) renders
+    // exactly as `cli.run([...argv])` always rendered it: clipanion's own
+    // formatting on stdout, exit 1.
+    stdout.write.write(cli.error(error, { colored: false }));
+    return { code: 1, stdout: stdout.text(), stderr: stderr.text() };
   }
 
-  return { code, stdout: outText, stderr: errText };
+  const code = await cli.run(command, context);
+  return { code, stdout: stdout.text(), stderr: stderr.text() };
 }
 
 /**

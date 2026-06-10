@@ -48,6 +48,26 @@ describe("devtrees CLI", () => {
     expect(result.stderr).toContain("frobnicate");
   });
 
+  it("a failure envelope whose message contains 'Command not found' survives intact (#81)", async () => {
+    // Regression: unknown-command detection used to regex the stdout of any
+    // exit-1 run, wiping legitimate envelopes that happened to contain the
+    // phrase. Detection now keys off clipanion's parse-time error, so a
+    // command failure mentioning "Command not found" passes through.
+    const up = vi.fn().mockRejectedValue(new Error("Command not found in PATH: process-compose"));
+    const result = await execute(["up", "--json"], { up, down: vi.fn() });
+    expect(result.code).toBe(1);
+    const parsed = JSON.parse(result.stdout) as { error: { message: string } };
+    expect(parsed.error.message).toContain("Command not found");
+    expect(result.stderr).not.toMatch(/unknown command/);
+  });
+
+  it("an unknown flag on a known command is not reshaped into 'unknown command' (#81)", async () => {
+    const result = await run(["up", "--bogus"]);
+    expect(result.code).toBe(1);
+    expect(result.stderr).not.toMatch(/unknown command/);
+    expect(result.stdout).toMatch(/--bogus/);
+  });
+
   /**
    * Per-subcommand `--help` (issue #62, closes #59). Each command's help
    * lists every flag with a description, exits 0, and SKIPS the command
