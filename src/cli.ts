@@ -138,33 +138,6 @@ export interface LogsCliOptions {
   readonly since?: string;
 }
 
-/**
- * Standalone parser for `devtrees logs` argv, kept exported because a few
- * lower-level test seams use it directly. Clipanion handles parsing for the
- * real dispatch path; this is the documented "what would clipanion produce"
- * shape so unit tests that don't want to spin a full `Cli.run()` can build
- * the same object.
- */
-export function parseLogsArgs(rest: ReadonlyArray<string>): LogsCliOptions {
-  let service: string | undefined;
-  let all = false;
-  let shared = false;
-  let follow = false;
-  let tail: number | undefined;
-  let since: string | undefined;
-  for (const arg of rest) {
-    if (arg === "--all") all = true;
-    else if (arg === "--shared") shared = true;
-    else if (arg === "--follow" || arg === "-f") follow = true;
-    else if (arg.startsWith("--tail=")) {
-      const n = Number(arg.slice("--tail=".length));
-      if (Number.isFinite(n) && n >= 0) tail = n;
-    } else if (arg.startsWith("--since=")) since = arg.slice("--since=".length);
-    else if (!arg.startsWith("-") && service === undefined) service = arg;
-  }
-  return { service, all, shared, follow, tail, since };
-}
-
 // --- error-code footers for per-command --help -----------------------------
 //
 // ADR-0005 lists the error-code enum the `--json` error envelope can carry.
@@ -270,6 +243,7 @@ class UpCommand extends DevtreesCommand {
       "CONFIG_DRIFT",
       "HEALTH_TIMEOUT",
       "PROCESS_COMPOSE_NOT_FOUND",
+      "INVALID_ARGS",
       "UNKNOWN",
     ]),
     examples: [
@@ -451,7 +425,7 @@ class LogsCommand extends DevtreesCommand {
   static override paths = [["logs"]];
   static override usage = Command.Usage({
     description: "Stream a service's logs.",
-    details: errorCodeFooter(["INSTANCE_NOT_FOUND", "UNKNOWN"]),
+    details: errorCodeFooter(["INSTANCE_NOT_FOUND", "INVALID_ARGS", "UNKNOWN"]),
     examples: [
       ["Tail one service", "devtrees logs web"],
       ["Tail every service, interleaved", "devtrees logs --all"],
@@ -482,14 +456,14 @@ class LogsCommand extends DevtreesCommand {
         all: this.all,
         shared: this.shared,
         follow: this.follow,
-        ...(this.tail !== undefined ? { tail: Number(this.tail) } : {}),
+        ...(this.tail !== undefined ? { tail: parseTailCount(this.tail) } : {}),
         ...(this.since !== undefined ? { since: this.since } : {}),
       };
       if (!opts.all && opts.service === undefined) {
-        this.context.stderr.write(
-          "devtrees logs: specify a service (e.g. `devtrees logs web`) or pass `--all`.\n",
-        );
-        return 1;
+        // Thrown (not hand-written to stderr) so `dispatch` routes it through
+        // the documented envelope: `--json` gets `{error: {code: INVALID_ARGS}}`
+        // on stdout (ADR-0005), human mode gets the diagnostic on stderr.
+        throw invalidArgsError("specify a service (e.g. `devtrees logs web`) or pass `--all`.");
       }
       const { services, events } = await this.context.deps.logs(opts);
       const prefixService = this.mode === "human" && services.length > 1;
@@ -505,6 +479,32 @@ class LogsCommand extends DevtreesCommand {
 // --- flag-value coercions ---------------------------------------------------
 
 /**
+ * Build an argv-validation error tagged with the documented `INVALID_ARGS`
+ * code, so `classifyError` routes it into the JSON envelope without falling
+ * back to `UNKNOWN`. These fire before any effect runs — the stack is never
+ * touched when one is thrown.
+ */
+function invalidArgsError(message: string): Error {
+  const err = new Error(message);
+  (err as Error & { code?: string }).code = "INVALID_ARGS";
+  return err;
+}
+
+/**
+ * Coerce a `--tail` argument value into a line count, or throw the documented
+ * `INVALID_ARGS` error. Mirrors `parseWaitTimeoutSecondsToMs` below — every
+ * numeric flag validates at the seam instead of letting `NaN` leak into the
+ * driver (#81).
+ */
+function parseTailCount(raw: string): number {
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0) {
+    throw invalidArgsError(`--tail expects a non-negative integer of lines, got '${raw}'.`);
+  }
+  return n;
+}
+
+/**
  * Coerce a `--wait-timeout` argument value into ms, or throw a clear error.
  * Kept here (rather than in the command) so the error path is exercised by
  * the existing test that pins the error text.
@@ -512,7 +512,7 @@ class LogsCommand extends DevtreesCommand {
 function parseWaitTimeoutSecondsToMs(raw: string): number {
   const seconds = Number(raw);
   if (!Number.isFinite(seconds) || seconds <= 0) {
-    throw new Error(`--wait-timeout expects a positive number of seconds, got '${raw}'.`);
+    throw invalidArgsError(`--wait-timeout expects a positive number of seconds, got '${raw}'.`);
   }
   return Math.round(seconds * 1000);
 }
@@ -580,16 +580,35 @@ const NO_DEPS: ExecuteDeps = {
 };
 
 /**
+ * True when a `cli.process(...)` throw means "no registered command matches
+ * this argv" — as opposed to a syntax error inside a matched command (bad
+ * flag, missing value), which clipanion reports through the same
+ * `UnknownSyntaxError` class but with a non-null `reason` on every candidate.
+ *
+ * Detection keys off the parse-time error object (#81) — never off rendered
+ * command output, so a legitimate runtime failure whose message happens to
+ * contain "Command not found" keeps its envelope. The class is matched by
+ * `name` + structure because clipanion doesn't export `UnknownSyntaxError`
+ * from its top-level entry (and the published bundle inlines clipanion).
+ */
+function isUnknownCommandError(error: unknown): boolean {
+  if (!(error instanceof Error) || error.name !== "UnknownSyntaxError") return false;
+  const candidates = (error as { candidates?: unknown }).candidates;
+  if (!Array.isArray(candidates)) return false;
+  // No candidates: clipanion has no idea what was meant — unknown command.
+  // All-null reasons: every path failed on the command word itself.
+  return candidates.every(
+    (candidate) => (candidate as { reason?: unknown } | null)?.reason == null,
+  );
+}
+
+/**
  * Render an unknown-command failure in the legacy shape pinned by tests:
  * `devtrees: unknown command '<name>'\nRun 'devtrees --help' for usage.\n` on
  * stderr, exit 1. Clipanion's own "Command not found" output is well-formed
  * but worded differently; reshape it here so we don't break the agent-
  * facing surface.
  */
-function isUnknownCommand(stdout: string): boolean {
-  return /Command not found/.test(stdout);
-}
-
 function unknownCommandStderr(argv: ReadonlyArray<string>): string {
   // The first non-flag argument is the offending command name. Clipanion has
   // already validated argv at this point, so this is purely cosmetic.
@@ -612,26 +631,36 @@ async function dispatchCli(argv: ReadonlyArray<string>, deps: ExecuteDeps): Prom
   const cli = buildCli();
   const stdout = bufferedStream();
   const stderr = bufferedStream();
-  const code = await cli.run([...argv], {
+  const context = {
     stdin: process.stdin,
     stdout: stdout.write,
     stderr: stderr.write,
     env: process.env,
     colorDepth: 1,
     deps,
-  });
+  };
 
-  let outText = stdout.text();
-  let errText = stderr.text();
-
-  // Reshape clipanion's "Command not found" to devtrees' historical error
-  // surface (#62: behavior preserved exactly across the migration).
-  if (code !== 0 && isUnknownCommand(outText)) {
-    outText = "";
-    errText = unknownCommandStderr(argv);
+  // Parse before running so unknown-command failures are detected from
+  // clipanion's typed parse error (#81), not by regexing rendered output.
+  // `cli.run` skips re-parsing when handed an already-processed command.
+  let command: Command<DevtreesContext>;
+  try {
+    command = cli.process({ input: [...argv], context });
+  } catch (error) {
+    if (isUnknownCommandError(error)) {
+      // Reshape clipanion's "Command not found" to devtrees' historical
+      // error surface (#62: behavior preserved exactly across the migration).
+      return { code: 1, stdout: "", stderr: unknownCommandStderr(argv) };
+    }
+    // Any other syntax error (bad flag, missing value, ambiguity) renders
+    // exactly as `cli.run([...argv])` always rendered it: clipanion's own
+    // formatting on stdout, exit 1.
+    stdout.write.write(cli.error(error, { colored: false }));
+    return { code: 1, stdout: stdout.text(), stderr: stderr.text() };
   }
 
-  return { code, stdout: outText, stderr: errText };
+  const code = await cli.run(command, context);
+  return { code, stdout: stdout.text(), stderr: stderr.text() };
 }
 
 /**

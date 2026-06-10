@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
-import { execute, isEntrypoint, parseLogsArgs, run } from "./cli.js";
+import { execute, isEntrypoint, run } from "./cli.js";
 
 async function* fromArray<T>(items: ReadonlyArray<T>): AsyncIterable<T> {
   for (const item of items) yield item;
@@ -46,6 +46,26 @@ describe("devtrees CLI", () => {
     const result = await run(["frobnicate"]);
     expect(result.code).toBe(1);
     expect(result.stderr).toContain("frobnicate");
+  });
+
+  it("a failure envelope whose message contains 'Command not found' survives intact (#81)", async () => {
+    // Regression: unknown-command detection used to regex the stdout of any
+    // exit-1 run, wiping legitimate envelopes that happened to contain the
+    // phrase. Detection now keys off clipanion's parse-time error, so a
+    // command failure mentioning "Command not found" passes through.
+    const up = vi.fn().mockRejectedValue(new Error("Command not found in PATH: process-compose"));
+    const result = await execute(["up", "--json"], { up, down: vi.fn() });
+    expect(result.code).toBe(1);
+    const parsed = JSON.parse(result.stdout) as { error: { message: string } };
+    expect(parsed.error.message).toContain("Command not found");
+    expect(result.stderr).not.toMatch(/unknown command/);
+  });
+
+  it("an unknown flag on a known command is not reshaped into 'unknown command' (#81)", async () => {
+    const result = await run(["up", "--bogus"]);
+    expect(result.code).toBe(1);
+    expect(result.stderr).not.toMatch(/unknown command/);
+    expect(result.stdout).toMatch(/--bogus/);
   });
 
   /**
@@ -97,6 +117,7 @@ describe("devtrees CLI", () => {
         "CONFIG_DRIFT",
         "HEALTH_TIMEOUT",
         "PROCESS_COMPOSE_NOT_FOUND",
+        "INVALID_ARGS",
         "UNKNOWN",
       ],
     ],
@@ -106,7 +127,7 @@ describe("devtrees CLI", () => {
     ["generate", ["UNKNOWN"]],
     ["prune", ["UNKNOWN"]],
     ["env", ["UNKNOWN"]],
-    ["logs", ["INSTANCE_NOT_FOUND", "UNKNOWN"]],
+    ["logs", ["INSTANCE_NOT_FOUND", "INVALID_ARGS", "UNKNOWN"]],
   ];
 
   // Codes RESERVED in `ERROR_CODES` but not currently emitted from any throw
@@ -122,6 +143,7 @@ describe("devtrees CLI", () => {
     "STALE_PORT_BLOCK",
     "LOCK_CONTENTION",
     "CONFIG_INVALID",
+    "INVALID_ARGS",
     "UNKNOWN",
   ] as const;
 
@@ -598,30 +620,40 @@ describe("devtrees CLI — --json (agent-facing surface)", () => {
 });
 
 describe("devtrees CLI — logs (#33)", () => {
-  it("parses positional service name and default flags", () => {
-    expect(parseLogsArgs(["web"])).toEqual({
+  // Argv parsing is asserted through `execute` (the real clipanion path) —
+  // the standalone `parseLogsArgs` test seam was deleted in #81 after it
+  // drifted from the actual parser.
+  it("parses positional service name and default flags", async () => {
+    const logs = vi.fn().mockResolvedValue({ services: ["web"], events: fromArray([]) });
+    await execute(["logs", "web"], { up: vi.fn(), down: vi.fn(), logs });
+    expect(logs).toHaveBeenCalledWith({
       service: "web",
       all: false,
       shared: false,
       follow: false,
-      tail: undefined,
-      since: undefined,
     });
   });
 
-  it("parses --follow / -f / --tail=N / --since=DUR / --all / --shared", () => {
-    expect(parseLogsArgs(["web", "--follow", "--tail=25", "--since=5m"])).toMatchObject({
-      service: "web",
-      follow: true,
-      tail: 25,
-      since: "5m",
+  it("parses --follow / -f / --tail=N / --since=DUR / --all / --shared", async () => {
+    const logs = vi.fn().mockResolvedValue({ services: ["web"], events: fromArray([]) });
+    await execute(["logs", "web", "--follow", "--tail=25", "--since=5m"], {
+      up: vi.fn(),
+      down: vi.fn(),
+      logs,
     });
-    expect(parseLogsArgs(["-f", "--all", "--shared"])).toMatchObject({
-      service: undefined,
-      all: true,
-      shared: true,
-      follow: true,
+    expect(logs).toHaveBeenCalledWith(
+      expect.objectContaining({ service: "web", follow: true, tail: 25, since: "5m" }),
+    );
+
+    const logsAll = vi.fn().mockResolvedValue({ services: ["web"], events: fromArray([]) });
+    await execute(["logs", "-f", "--all", "--shared"], {
+      up: vi.fn(),
+      down: vi.fn(),
+      logs: logsAll,
     });
+    expect(logsAll).toHaveBeenCalledWith(
+      expect.objectContaining({ service: undefined, all: true, shared: true, follow: true }),
+    );
   });
 
   it("routes `logs <service>` to deps.logs and writes lines verbatim in human mode", async () => {
@@ -728,6 +760,57 @@ describe("devtrees CLI — logs (#33)", () => {
     expect(logs).not.toHaveBeenCalled();
   });
 
+  it("rejects `--tail=abc` with a validation error in human mode (exit 1, deps.logs untouched) (#81)", async () => {
+    const logs = vi.fn();
+    const result = await execute(["logs", "web", "--tail=abc"], {
+      up: vi.fn(),
+      down: vi.fn(),
+      logs,
+    });
+    expect(result.code).toBe(1);
+    expect(result.stderr).toMatch(/--tail/);
+    expect(result.stderr).toMatch(/abc/);
+    expect(logs).not.toHaveBeenCalled();
+  });
+
+  it("rejects `--tail=abc` with an INVALID_ARGS envelope in JSON mode (#81)", async () => {
+    const logs = vi.fn();
+    const result = await execute(["logs", "web", "--tail=abc", "--json"], {
+      up: vi.fn(),
+      down: vi.fn(),
+      logs,
+    });
+    expect(result.code).toBe(1);
+    const parsed = JSON.parse(result.stdout) as { error: { code: string; message: string } };
+    expect(parsed.error.code).toBe("INVALID_ARGS");
+    expect(parsed.error.message).toMatch(/--tail/);
+    expect(logs).not.toHaveBeenCalled();
+  });
+
+  it("rejects negative and non-integer --tail values (#81)", async () => {
+    for (const bad of ["--tail=-5", "--tail=2.5", "--tail=NaN"]) {
+      const logs = vi.fn();
+      const result = await execute(["logs", "web", bad], { up: vi.fn(), down: vi.fn(), logs });
+      expect(result.code).toBe(1);
+      expect(result.stderr).toMatch(/--tail/);
+      expect(logs).not.toHaveBeenCalled();
+    }
+  });
+
+  it("`logs --json` with no service and no --all emits an INVALID_ARGS envelope on stdout (#81)", async () => {
+    const logs = vi.fn();
+    const result = await execute(["logs", "--json"], { up: vi.fn(), down: vi.fn(), logs });
+    expect(result.code).toBe(1);
+    const parsed = JSON.parse(result.stdout) as {
+      schema_version: string;
+      error: { code: string; message: string };
+    };
+    expect(parsed.schema_version).toBe("1");
+    expect(parsed.error.code).toBe("INVALID_ARGS");
+    expect(parsed.error.message).toMatch(/specify a service|--all/);
+    expect(logs).not.toHaveBeenCalled();
+  });
+
   it("`logs --json` failure (missing socket) → INSTANCE_NOT_FOUND envelope on stdout", async () => {
     const logs = vi
       .fn()
@@ -786,6 +869,16 @@ describe("devtrees CLI — up non-interactive (#28)", () => {
     const up = vi.fn().mockResolvedValue(baseUpResult);
     await execute(["up", "--wait-timeout", "45"], { up, down: vi.fn() });
     expect(up).toHaveBeenCalledWith(expect.objectContaining({ waitTimeoutMs: 45_000 }));
+  });
+
+  it("rejects --wait-timeout values with an INVALID_ARGS envelope under --json (#81)", async () => {
+    const up = vi.fn();
+    const result = await execute(["up", "--wait-timeout=zero", "--json"], { up, down: vi.fn() });
+    expect(result.code).toBe(1);
+    const parsed = JSON.parse(result.stdout) as { error: { code: string; message: string } };
+    expect(parsed.error.code).toBe("INVALID_ARGS");
+    expect(parsed.error.message).toMatch(/--wait-timeout/);
+    expect(up).not.toHaveBeenCalled();
   });
 
   it("rejects --wait-timeout values that aren't a positive number", async () => {
