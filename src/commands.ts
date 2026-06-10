@@ -505,8 +505,16 @@ function resolveUpSeams(deps: CommandDeps) {
     warn: deps.warn ?? defaultWarn,
     readHash: deps.readStoredHash ?? defaultReadStoredHash,
     writeHash: deps.writeStoredHash ?? defaultWriteStoredHash,
-    probe: deps.probeSocket ?? defaultProbeSocket,
+    probe: resolveProbe(deps),
   } as const;
+}
+
+/**
+ * Resolve the #80 socket-liveness probe seam — needed by both `runUp` (via
+ * `resolveUpSeams`) and `runDown`, which doesn't share the up-seam bundle.
+ */
+function resolveProbe(deps: CommandDeps): (socketPath: string) => Promise<InstanceStatus> {
+  return deps.probeSocket ?? defaultProbeSocket;
 }
 
 /**
@@ -1034,7 +1042,7 @@ export async function runDown(
 
   if (options.shared) {
     const sharedLock = deps.withSharedLock ?? defaultWithSharedLock;
-    const probe = deps.probeSocket ?? defaultProbeSocket;
+    const probe = resolveProbe(deps);
     const paths = sharedInstancePaths(anchor.anchor);
 
     await sharedLock(anchor.anchor, async () => {

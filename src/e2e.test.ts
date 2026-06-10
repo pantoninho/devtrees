@@ -1212,26 +1212,56 @@ describe("e2e — crash recovery: stale control sockets (#80)", () => {
     }
   }
 
-  it("up after the worktree instance was SIGKILLed starts a fresh instance, not a silent no-op", async () => {
-    const repo = makeRepo("dt-crash-wt-", ["login"]);
+  /**
+   * Build the repo + stack + driver deps for one crash test, and resolve the
+   * anchor-side path of the control socket the test will SIGKILL. Folding the
+   * common setup keeps each test body down to crash + recovery assertions.
+   */
+  function crashFixture(opts: {
+    prefix: string;
+    writeStack: (worktreeRoot: string) => void;
+    socketName: string;
+  }): { deps: ReturnType<typeof stubDriverDeps>; socketPath: string } {
+    const repo = makeRepo(opts.prefix, ["login"]);
     cleanups.push(() => rmSync(repo.root, { recursive: true, force: true }));
     const worktree = repo.worktrees.login;
     if (worktree === undefined) throw new Error("expected login worktree");
-    writeStackConfig(worktree);
-    const deps = stubDriverDeps(worktree);
+    opts.writeStack(worktree);
+    const commonDir = git(worktree, "rev-parse", "--git-common-dir");
+    const absCommon = commonDir.startsWith("/") ? commonDir : join(worktree, commonDir);
+    return {
+      deps: stubDriverDeps(worktree),
+      socketPath: join(absCommon, "devtrees", "run", opts.socketName),
+    };
+  }
+
+  /** `runUp` for a mixed-tier fixture, registering worktree + shared teardown. */
+  async function upWithSharedTeardown(
+    deps: ReturnType<typeof stubDriverDeps>,
+  ): Promise<Awaited<ReturnType<typeof runUp>>> {
+    const up = await runUp(deps as never);
+    cleanups.push(async () => {
+      await runDown(deps as never).catch(() => {});
+      await runDown(deps as never, { shared: true }).catch(() => {});
+    });
+    return up;
+  }
+
+  it("up after the worktree instance was SIGKILLed starts a fresh instance, not a silent no-op", async () => {
+    const { deps, socketPath } = crashFixture({
+      prefix: "dt-crash-wt-",
+      writeStack: writeStackConfig,
+      socketName: "login.sock",
+    });
 
     const first = await runUp(deps as never);
     cleanups.push(() => runDown(deps as never).catch(() => {}));
     const port = Number(first.env.WEB_PORT);
     expect(await waitForHttp(port)).toBe(true);
 
-    const commonDir = git(worktree, "rev-parse", "--git-common-dir");
-    const absCommon = commonDir.startsWith("/") ? commonDir : join(worktree, commonDir);
-    const sock = join(absCommon, "devtrees", "run", "login.sock");
-
-    await crashInstance(sock);
+    await crashInstance(socketPath);
     // The crash left the socket file behind with no listener — the stale state.
-    expect(existsSync(sock)).toBe(true);
+    expect(existsSync(socketPath)).toBe(true);
     expect(await waitForGone(port)).toBe(true);
 
     // Acceptance: up starts a fresh instance and returns the normal started
@@ -1243,28 +1273,19 @@ describe("e2e — crash recovery: stale control sockets (#80)", () => {
   }, 30000);
 
   it("up after the shared instance was SIGKILLed restarts shared (worktree instance still live)", async () => {
-    const repo = makeRepo("dt-crash-sh-", ["login"]);
-    cleanups.push(() => rmSync(repo.root, { recursive: true, force: true }));
-    const worktree = repo.worktrees.login;
-    if (worktree === undefined) throw new Error("expected login worktree");
-    writeMixedTierStack(worktree);
-    const deps = stubDriverDeps(worktree);
-
-    const first = await runUp(deps as never);
-    cleanups.push(async () => {
-      await runDown(deps as never).catch(() => {});
-      await runDown(deps as never, { shared: true }).catch(() => {});
+    const { deps, socketPath } = crashFixture({
+      prefix: "dt-crash-sh-",
+      writeStack: writeMixedTierStack,
+      socketName: "shared.sock",
     });
+
+    const first = await upWithSharedTeardown(deps);
     expect(first.sharedStarted).toBe(true);
     const dbPort = Number(first.env.DB_PORT);
     expect(await waitForTcp(dbPort)).toBe(true);
 
-    const commonDir = git(worktree, "rev-parse", "--git-common-dir");
-    const absCommon = commonDir.startsWith("/") ? commonDir : join(worktree, commonDir);
-    const sharedSock = join(absCommon, "devtrees", "run", "shared.sock");
-
-    await crashInstance(sharedSock);
-    expect(existsSync(sharedSock)).toBe(true);
+    await crashInstance(socketPath);
+    expect(existsSync(socketPath)).toBe(true);
     expect(await waitForGone(dbPort)).toBe(true);
 
     // Acceptance: the next up restarts the shared instance — even though the
@@ -1276,31 +1297,22 @@ describe("e2e — crash recovery: stale control sockets (#80)", () => {
   }, 30000);
 
   it("down --shared on a stale shared socket cleans up the file and no-ops instead of failing", async () => {
-    const repo = makeRepo("dt-crash-dn-", ["login"]);
-    cleanups.push(() => rmSync(repo.root, { recursive: true, force: true }));
-    const worktree = repo.worktrees.login;
-    if (worktree === undefined) throw new Error("expected login worktree");
-    writeMixedTierStack(worktree);
-    const deps = stubDriverDeps(worktree);
-
-    const up = await runUp(deps as never);
-    cleanups.push(async () => {
-      await runDown(deps as never).catch(() => {});
-      await runDown(deps as never, { shared: true }).catch(() => {});
+    const { deps, socketPath } = crashFixture({
+      prefix: "dt-crash-dn-",
+      writeStack: writeMixedTierStack,
+      socketName: "shared.sock",
     });
+
+    const up = await upWithSharedTeardown(deps);
     expect(await waitForTcp(Number(up.env.DB_PORT))).toBe(true);
 
-    const commonDir = git(worktree, "rev-parse", "--git-common-dir");
-    const absCommon = commonDir.startsWith("/") ? commonDir : join(worktree, commonDir);
-    const sharedSock = join(absCommon, "devtrees", "run", "shared.sock");
-
-    await crashInstance(sharedSock);
-    expect(existsSync(sharedSock)).toBe(true);
+    await crashInstance(socketPath);
+    expect(existsSync(socketPath)).toBe(true);
 
     // Acceptance: an idempotent no-op — resolves cleanly and unlinks the
     // orphaned socket so the next up lazy-starts a fresh shared instance.
     const result = await runDown(deps as never, { shared: true });
     expect(result).toEqual({ shared: true });
-    expect(existsSync(sharedSock)).toBe(false);
+    expect(existsSync(socketPath)).toBe(false);
   }, 30000);
 });
