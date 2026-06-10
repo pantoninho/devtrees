@@ -2969,3 +2969,66 @@ describe("runUp — crash recovery: stale control socket (#80)", () => {
     expect(probed).toContain(socketPath);
   });
 });
+
+/**
+ * Shared-instance crash recovery (#80). The shared instance's socket file is
+ * anchor state too: after a SIGKILL the lazy-start used to see the file,
+ * conclude "already running", and the shared instance could never be
+ * restarted without hand-deleting the socket.
+ */
+describe("runUp — crash recovery: stale shared socket (#80)", () => {
+  const mixedStack: ResolvedStack = {
+    services: [
+      isolated("web", "node server.js", ["WEB_PORT"]),
+      shared("postgres", "postgres -D ./pgdata", ["DB_PORT"]),
+    ],
+  };
+
+  /** Pre-create an orphaned shared socket the way a SIGKILLed instance leaves one. */
+  function orphanSharedSocket(anchor: string): string {
+    const paths = sharedInstancePaths(anchor);
+    mkdirSync(paths.runDir, { recursive: true });
+    writeFileSync(paths.socketPath, "");
+    return paths.socketPath;
+  }
+
+  it("restarts the shared instance when its socket file exists but nothing listens", async () => {
+    const tmp = tmpAnchor();
+    const sharedSocket = orphanSharedSocket(tmp.anchor);
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const deps = stubDeps({
+      stack: mixedStack,
+      track,
+      anchorOverride: tmp.anchor,
+      worktreeRootOverride: tmp.worktreeRoot,
+      // The shared socket is dead; the worktree's own socket doesn't exist yet.
+      probeSocket: async () => "stale",
+    });
+
+    const result = await runUp(deps);
+
+    // The lazy-start actually restarted shared — and reports having done so.
+    const sharedSpawn = findSharedSpawn(track);
+    expect(sharedSpawn.socketPath).toBe(sharedSocket);
+    expect(result.sharedStarted).toBe(true);
+  });
+
+  it("a live shared socket is left alone — lazy start stays idempotent", async () => {
+    const tmp = tmpAnchor();
+    const sharedSocket = orphanSharedSocket(tmp.anchor);
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const deps = stubDeps({
+      stack: mixedStack,
+      track,
+      anchorOverride: tmp.anchor,
+      worktreeRootOverride: tmp.worktreeRoot,
+      probeSocket: async () => "running",
+    });
+
+    const result = await runUp(deps);
+
+    expect(track.invocations.some((i) => i.socketPath === sharedSocket)).toBe(false);
+    expect(result.sharedStarted).toBe(false);
+    expect(existsSync(sharedSocket)).toBe(true);
+  });
+});

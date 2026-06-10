@@ -643,6 +643,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
   if (sharedNeeded) {
     sharedStarted = await ensureSharedStarted(anchor.anchor, stack, sharedPortFor, sharedLock, {
       driver,
+      probe: seams.probe,
     });
   }
 
@@ -876,21 +877,29 @@ export async function runAttach(
 
 /**
  * Idempotently lazy-start the shared instance: under the shared lifecycle lock,
- * if its control socket is already present do nothing; otherwise write a fresh
- * derived shared config and spawn `process-compose` against it. The lock is the
- * gate — two simultaneous callers see a consistent answer and at most one
- * actually starts the instance.
+ * if its control socket is held by a live listener do nothing; otherwise write
+ * a fresh derived shared config and spawn `process-compose` against it. The
+ * lock is the gate — two simultaneous callers see a consistent answer and at
+ * most one actually starts the instance.
+ *
+ * Liveness is probed, not inferred from the socket file (#80): a SIGKILLed
+ * shared instance leaves its socket behind, and trusting the file would make
+ * the shared instance unrestartable without hand-deleting it. A stale socket
+ * is unlinked and we fall through to the fresh start.
  */
 async function ensureSharedStarted(
   anchor: string,
   stack: ResolvedStack,
   sharedPortFor: (name: string) => number | undefined,
   sharedLock: WithSharedLock,
-  deps: { driver: ReturnType<typeof createDriver> },
+  deps: {
+    driver: ReturnType<typeof createDriver>;
+    probe: (socketPath: string) => Promise<InstanceStatus>;
+  },
 ): Promise<boolean> {
   return await sharedLock(anchor, async () => {
     const paths = sharedInstancePaths(anchor);
-    if (existsSync(paths.socketPath)) return false;
+    if (await socketIsLive(paths.socketPath, deps.probe)) return false;
 
     const derived = deriveSharedConfig(stack, {
       workingDir: anchor,
