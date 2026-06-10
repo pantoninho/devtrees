@@ -36,6 +36,7 @@ import {
   type CommandDeps,
   type WithSharedLock,
 } from "./commands.js";
+import { deriveWorktreeId } from "./anchor.js";
 import { deriveSharedConfig, deriveWorktreeConfig } from "./deriver.js";
 import type { RegistrySnapshot } from "./allocator.js";
 import type { SpawnedProcess } from "./driver.js";
@@ -143,6 +144,21 @@ function makeStubSpawner(track: StubSpawn) {
   };
 }
 
+/**
+ * The id `resolveAnchor` derives for a worktree at `<root>/<basename>` — the
+ * slug plus the path-hash suffix (issue #82). Tests that fake git's
+ * `--show-toplevel` with such a path use this to predict the resulting id.
+ */
+function idFor(root: string, basename: string): string {
+  return deriveWorktreeId(join(root, basename));
+}
+
+/**
+ * `CommandDeps` plus the worktree id the stubbed git probe will resolve to,
+ * so tests can assert on ids/paths without re-deriving them by hand.
+ */
+type StubbedDeps = CommandDeps & { readonly expectedWorktreeId: string };
+
 /** Build a `CommandDeps` whose every collaborator is a deterministic stub. */
 function stubDeps(opts: {
   stack: ResolvedStack;
@@ -158,11 +174,12 @@ function stubDeps(opts: {
   anchorOverride?: string;
   worktreeRootOverride?: string;
   registryRef?: { snapshot: RegistrySnapshot };
-}): CommandDeps {
+}): StubbedDeps {
   const tmp = tmpAnchor();
   const anchor = opts.anchorOverride ?? tmp.anchor;
   const worktreeRoot = opts.worktreeRootOverride ?? tmp.worktreeRoot;
   const worktreeId = opts.worktreeId ?? "login";
+  const expectedWorktreeId = idFor(worktreeRoot, worktreeId);
   const snapshotRef =
     opts.registryRef ??
     ({ snapshot: opts.initialRegistry ?? {} } as { snapshot: RegistrySnapshot });
@@ -179,6 +196,7 @@ function stubDeps(opts: {
   const track = opts.track ?? { invocations: [], touchSocket: false };
 
   return {
+    expectedWorktreeId,
     cwd: join(worktreeRoot, worktreeId),
     git,
     readStack: () => opts.stack,
@@ -287,8 +305,14 @@ describe("runUp — lock-guarded persistence", () => {
   });
 
   it("respects an already-registered block from the snapshot (stable across restarts)", async () => {
+    // The registry is keyed by the derived worktree id, so seed it under the
+    // same id the stubbed git probe will resolve to.
     const result = await runUp(
-      stubDeps({ stack: singleWebStack, initialRegistry: { login: 30000 } }),
+      stubDeps({
+        stack: singleWebStack,
+        worktreeRootOverride: "/wt",
+        initialRegistry: { [idFor("/wt", "login")]: 30000 },
+      }),
     );
     expect(result.env.WEB_PORT).toBe("30000");
   });
@@ -723,15 +747,16 @@ describe("runUp — wait-for-healthy (worktree instance, #28)", () => {
   it("passes the worktree's own socket path to the wait — not the shared one", async () => {
     const seen: string[] = [];
     const track: StubSpawn = { invocations: [], touchSocket: false };
+    const base = stubDeps({ stack: twoIsolated, track });
     const deps: CommandDeps = {
-      ...stubDeps({ stack: twoIsolated, track }),
+      ...base,
       waitForHealth: async ({ socketPath }) => {
         seen.push(socketPath);
       },
     };
     await runUp(deps);
     expect(seen).toHaveLength(1);
-    expect(seen[0]).toMatch(/login\.sock$/);
+    expect(seen[0]?.endsWith(`/${base.expectedWorktreeId}.sock`)).toBe(true);
   });
 
   it("threads the timeout from deps to the wait", async () => {
@@ -992,7 +1017,7 @@ describe("runUp — state envelope on success (#30)", () => {
     const result = await runUp(deps);
     // Called once, against the worktree's own socket.
     expect(seen).toHaveLength(1);
-    expect(seen[0]).toMatch(/login\.sock$/);
+    expect(seen[0]?.endsWith(`/${baseDeps.expectedWorktreeId}.sock`)).toBe(true);
     expect(result.services).toEqual([
       {
         name: "web",
@@ -1260,7 +1285,7 @@ describe("runDown — operation-output result (#48)", () => {
     await runUp(deps);
     const result = await runDown(deps);
     expect(result.shared).toBe(false);
-    expect(result.worktreeId).toBe("login");
+    expect(result.worktreeId).toBe(deps.expectedWorktreeId);
   });
 
   it("shared teardown returns {shared: true} and no worktreeId", async () => {
@@ -1327,12 +1352,12 @@ describe("runGenerate — emit derived configs to disk", () => {
     const result = await runGenerate(deps);
 
     // The emitted path is the same one runUp would write (acceptance: runnable with raw process-compose).
-    expect(result.worktreePath).toMatch(/devtrees\/login\.yaml$/);
+    expect(result.worktreePath.endsWith(`/devtrees/${deps.expectedWorktreeId}.yaml`)).toBe(true);
     expect(existsSync(result.worktreePath)).toBe(true);
 
     // Re-derive with the same allocation and assert byte-equivalent content.
     const expected = deriveWorktreeConfig(stack, {
-      worktreeId: "login",
+      worktreeId: deps.expectedWorktreeId,
       worktreeRoot: result.worktreeRoot,
       portFor: (name) => (result.env[name] !== undefined ? Number(result.env[name]) : undefined),
     });
@@ -1371,12 +1396,13 @@ describe("runGenerate — emit derived configs to disk", () => {
     const stack: ResolvedStack = {
       services: [isolated("web", "node x.js", ["WEB_PORT"])],
     };
-    const result = await runGenerate(stubDeps({ stack }));
+    const deps = stubDeps({ stack });
+    const result = await runGenerate(deps);
 
     expect(result.sharedPath).toBeUndefined();
     expect(result.sharedEnv).toBeUndefined();
     // The directory contains only the worktree config, not shared.yaml.
-    const sharedYaml = result.worktreePath.replace(/login\.yaml$/, "shared.yaml");
+    const sharedYaml = result.worktreePath.replace(`${deps.expectedWorktreeId}.yaml`, "shared.yaml");
     expect(existsSync(sharedYaml)).toBe(false);
   });
 
@@ -1424,7 +1450,7 @@ describe("runGenerate — emit derived configs to disk", () => {
     const deps = stubDeps({ stack, registryRef });
 
     const generated = await runGenerate(deps);
-    expect(registryRef.snapshot.login).toBeGreaterThanOrEqual(20000);
+    expect(registryRef.snapshot[deps.expectedWorktreeId]).toBeGreaterThanOrEqual(20000);
 
     // The follow-up `up` against the same registry sees the same block.
     const upped = await runUp(deps);
@@ -1693,9 +1719,10 @@ describe("runAttach — attach to a running instance", () => {
   it("attaches the worktree instance by default — driver receives that socket", async () => {
     const tmp = tmpAnchor();
     const worktreeId = "login";
+    const derivedId = idFor(tmp.worktreeRoot, worktreeId);
     const paths = {
-      configPath: join(tmp.anchor, "devtrees", `${worktreeId}.yaml`),
-      socketPath: join(tmp.anchor, "devtrees", "run", `${worktreeId}.sock`),
+      configPath: join(tmp.anchor, "devtrees", `${derivedId}.yaml`),
+      socketPath: join(tmp.anchor, "devtrees", "run", `${derivedId}.sock`),
     };
     // Mimic a running instance: the control socket file exists.
     mkdtempSync(join(tmpdir(), "dt-noop-")); // (no-op; keep symmetric with other tests)
@@ -1832,7 +1859,10 @@ describe("runPrune — reconcile instances against git worktree list", () => {
     const result = await runPrune({
       cwd: join(tmp.worktreeRoot, "login"),
       git,
-      discover: async () => [instance("login"), instance("billing")],
+      discover: async () => [
+        instance(idFor(tmp.worktreeRoot, "login")),
+        instance(idFor(tmp.worktreeRoot, "billing")),
+      ],
     });
     expect(result.pruned).toEqual([]);
   });
@@ -1886,7 +1916,10 @@ describe("runPrune — reconcile instances against git worktree list", () => {
       cwd: join(tmp.worktreeRoot, "login"),
       git,
       discover: async () => [
-        instance("login", { status: "running", socketPath: "/x/login.sock" }),
+        instance(idFor(tmp.worktreeRoot, "login"), {
+          status: "running",
+          socketPath: "/x/login.sock",
+        }),
         instance("removed", {
           status: "running",
           socketPath: orphanSocket,
@@ -1987,7 +2020,7 @@ describe("runPrune — reconcile instances against git worktree list", () => {
     const result = await runPrune({
       cwd: join(tmp.worktreeRoot, "login"),
       git,
-      discover: async () => [instance("login", { status: "stale" })],
+      discover: async () => [instance(idFor(tmp.worktreeRoot, "login"), { status: "stale" })],
     });
     expect(result.pruned).toEqual([]);
   });
@@ -2071,10 +2104,13 @@ describe("runEnv — pure read of injected env", () => {
       ],
     };
     // Seed the registry so the answer is deterministic without an up.
-    const initialRegistry: RegistrySnapshot = { login: 20000, [SHARED_REGISTRY_KEY]: 30000 };
-    const result = await runEnv(stubDeps({ stack, initialRegistry }));
+    const loginId = idFor("/wt", "login");
+    const initialRegistry: RegistrySnapshot = { [loginId]: 20000, [SHARED_REGISTRY_KEY]: 30000 };
+    const result = await runEnv(
+      stubDeps({ stack, worktreeRootOverride: "/wt", initialRegistry }),
+    );
 
-    expect(result.env.DEVTREES_WORKTREE_ID).toBe("login");
+    expect(result.env.DEVTREES_WORKTREE_ID).toBe(loginId);
     expect(result.env.WEB_PORT).toBe("20000");
     expect(result.env.METRICS_PORT).toBe("20001");
     expect(result.env.DB_PORT).toBe("30000");
@@ -2087,12 +2123,15 @@ describe("runEnv — pure read of injected env", () => {
         shared("postgres", "postgres", ["DB_PORT"]),
       ],
     };
-    const initialRegistry: RegistrySnapshot = { login: 20096, [SHARED_REGISTRY_KEY]: 30016 };
-    const result = await runEnv(stubDeps({ stack, initialRegistry }));
+    const loginId = idFor("/wt", "login");
+    const initialRegistry: RegistrySnapshot = { [loginId]: 20096, [SHARED_REGISTRY_KEY]: 30016 };
+    const result = await runEnv(
+      stubDeps({ stack, worktreeRootOverride: "/wt", initialRegistry }),
+    );
 
     // The deriver's env is the source of truth; runEnv must reproduce it exactly.
     const expected = deriveWorktreeConfig(stack, {
-      worktreeId: "login",
+      worktreeId: loginId,
       worktreeRoot: "ignored",
       portFor: (name) => (name === "WEB_PORT" ? 20096 : undefined),
       sharedPortFor: (name) => (name === "DB_PORT" ? 30016 : undefined),
@@ -2116,10 +2155,12 @@ describe("runEnv — pure read of injected env", () => {
     const stack: ResolvedStack = {
       services: [isolated("web", "node x.js", ["WEB_PORT"])],
     };
-    const registryRef = { snapshot: { login: 20064 } as RegistrySnapshot };
+    const registryRef = {
+      snapshot: { [idFor("/wt", "login")]: 20064 } as RegistrySnapshot,
+    };
     let lockCalls = 0;
     const deps: CommandDeps = {
-      ...stubDeps({ stack, registryRef }),
+      ...stubDeps({ stack, worktreeRootOverride: "/wt", registryRef }),
       // Sentinel lock that records and rejects any acquire — runEnv must not call it.
       withRegistryLock: () => {
         lockCalls++;
@@ -2141,13 +2182,18 @@ describe("runEnv — pure read of injected env", () => {
       services: [isolated("web", "node x.js", ["WEB_PORT"])],
     };
     // Empty registry — runEnv computes the would-be block without writing.
-    const result = await runEnv(stubDeps({ stack, initialRegistry: {} }));
+    // Pin the worktree root so both calls derive the identical worktree id.
+    const result = await runEnv(
+      stubDeps({ stack, worktreeRootOverride: "/wt", initialRegistry: {} }),
+    );
     // The would-be allocation is deterministic; we don't pin the exact number
     // but it must be in the default block range and consistent across calls.
     expect(Number(result.env.WEB_PORT)).toBeGreaterThanOrEqual(20000);
-    expect(result.env.DEVTREES_WORKTREE_ID).toBe("login");
+    expect(result.env.DEVTREES_WORKTREE_ID).toBe(idFor("/wt", "login"));
 
-    const again = await runEnv(stubDeps({ stack, initialRegistry: {} }));
+    const again = await runEnv(
+      stubDeps({ stack, worktreeRootOverride: "/wt", initialRegistry: {} }),
+    );
     expect(again.env.WEB_PORT).toBe(result.env.WEB_PORT);
   });
 
@@ -2155,9 +2201,12 @@ describe("runEnv — pure read of injected env", () => {
     const stack: ResolvedStack = {
       services: [isolated("web", "node x.js", ["WEB_PORT"])],
     };
-    const result = await runEnv(stubDeps({ stack, initialRegistry: { login: 20000 } }));
+    const loginId = idFor("/wt", "login");
+    const result = await runEnv(
+      stubDeps({ stack, worktreeRootOverride: "/wt", initialRegistry: { [loginId]: 20000 } }),
+    );
     expect(result.env.WEB_PORT).toBe("20000");
-    expect(result.env.DEVTREES_WORKTREE_ID).toBe("login");
+    expect(result.env.DEVTREES_WORKTREE_ID).toBe(loginId);
     expect(result.env).not.toHaveProperty("DB_PORT");
   });
 });
@@ -2278,8 +2327,9 @@ describe("runLogs — stream service logs without locking", () => {
   it("streams the worktree instance's named service from its socket", async () => {
     const tmp = tmpAnchor();
     const worktreeId = "login";
-    const socketPath = touchSocket(tmp.anchor, worktreeId);
-    writeDerivedConfig(tmp.anchor, worktreeId, ["web", "worker"]);
+    const stem = idFor(tmp.worktreeRoot, worktreeId);
+    const socketPath = touchSocket(tmp.anchor, stem);
+    writeDerivedConfig(tmp.anchor, stem, ["web", "worker"]);
 
     const invocations: LogsInvocation[] = [];
     const deps = logsDeps({
@@ -2356,8 +2406,9 @@ describe("runLogs — stream service logs without locking", () => {
   it("with { all: true }, enumerates services from the derived config and interleaves them", async () => {
     const tmp = tmpAnchor();
     const worktreeId = "login";
-    touchSocket(tmp.anchor, worktreeId);
-    writeDerivedConfig(tmp.anchor, worktreeId, ["web", "worker"]);
+    const stem = idFor(tmp.worktreeRoot, worktreeId);
+    touchSocket(tmp.anchor, stem);
+    writeDerivedConfig(tmp.anchor, stem, ["web", "worker"]);
 
     const invocations: LogsInvocation[] = [];
     const deps = logsDeps({
@@ -2380,8 +2431,9 @@ describe("runLogs — stream service logs without locking", () => {
   it("forwards follow and tail to the driver's argv", async () => {
     const tmp = tmpAnchor();
     const worktreeId = "login";
-    touchSocket(tmp.anchor, worktreeId);
-    writeDerivedConfig(tmp.anchor, worktreeId, ["web"]);
+    const stem = idFor(tmp.worktreeRoot, worktreeId);
+    touchSocket(tmp.anchor, stem);
+    writeDerivedConfig(tmp.anchor, stem, ["web"]);
 
     const invocations: LogsInvocation[] = [];
     const deps = logsDeps({
@@ -2404,8 +2456,9 @@ describe("runLogs — stream service logs without locking", () => {
   it("does not take the allocation-registry lock (lock-free path)", async () => {
     const tmp = tmpAnchor();
     const worktreeId = "login";
-    touchSocket(tmp.anchor, worktreeId);
-    writeDerivedConfig(tmp.anchor, worktreeId, ["web"]);
+    const stem = idFor(tmp.worktreeRoot, worktreeId);
+    touchSocket(tmp.anchor, stem);
+    writeDerivedConfig(tmp.anchor, stem, ["web"]);
 
     const invocations: LogsInvocation[] = [];
     let lockCalls = 0;
@@ -2459,8 +2512,9 @@ describe("runUp — idempotency + drift detection (#31)", () => {
   it("writes the stack hash to the hash store after a successful first up", async () => {
     const track: StubSpawn = { invocations: [], touchSocket: false };
     const hashes = hashStore();
+    const base = stubDeps({ stack: stackA, track });
     const deps: CommandDeps = {
-      ...stubDeps({ stack: stackA, track }),
+      ...base,
       readStoredHash: hashes.read,
       writeStoredHash: hashes.write,
     };
@@ -2471,7 +2525,7 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     expect(anchorEntries).toHaveLength(1);
     const entry = anchorEntries[0];
     if (!entry) throw new Error("expected one anchor entry");
-    expect(entry.login).toMatch(/^[0-9a-f]{64}$/);
+    expect(entry[base.expectedWorktreeId]).toMatch(/^[0-9a-f]{64}$/);
   });
 
   it("a second up against a running instance with unchanged config is a noop: returns the envelope, no driver.up, no registry write", async () => {
@@ -2581,7 +2635,7 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     const anchorStore = Object.values(hashes.raw)[0];
     if (!anchorStore) throw new Error("expected hash store entry");
     const { stackHash } = await import("./hash.js");
-    expect(anchorStore.login).toBe(stackHash(stackB));
+    expect(anchorStore[baseDeps.expectedWorktreeId]).toBe(stackHash(stackB));
   });
 
   it("on drift, if driver.reloadConfig reports not_supported, throws an Error tagged code:CONFIG_DRIFT and does not update the stored hash", async () => {
@@ -2609,7 +2663,8 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     };
 
     await runUp(firstDeps);
-    const storedAfterFirst = Object.values(hashes.raw)[0]?.login;
+    const storedAfterFirst = Object.values(hashes.raw)[0]?.[baseDeps.expectedWorktreeId];
+    if (storedAfterFirst === undefined) throw new Error("expected a stored hash after first up");
 
     const secondDeps: CommandDeps = { ...firstDeps, readStack: () => stackB };
     const err = await runUp(secondDeps).then(
@@ -2620,7 +2675,7 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     expect(err.code).toBe("CONFIG_DRIFT");
 
     // Hash store unchanged — the stored hash still reflects stackA.
-    expect(Object.values(hashes.raw)[0]?.login).toBe(storedAfterFirst);
+    expect(Object.values(hashes.raw)[0]?.[baseDeps.expectedWorktreeId]).toBe(storedAfterFirst);
   });
 
   it("noop path does NOT call driver.reloadConfig (no process-compose churn when the config matches)", async () => {
@@ -2671,7 +2726,9 @@ describe("runUp — stale port block detection (#58)", () => {
       return { free: false as const, pid: 12345, command: "node stale.mjs" };
     };
     // First, run the deps once to learn the block base, then arm the holder.
-    const probeDeps = stubDeps({ stack });
+    // Pin the worktree root so both stubDeps calls derive the same id.
+    const loginId = idFor("/wt", "login");
+    const probeDeps = stubDeps({ stack, worktreeRootOverride: "/wt" });
     const probeResult = await runUp(probeDeps);
     const blockBase = probeResult.blockBase;
     // Reset for a fresh first-up against a clean anchor (separate stubDeps()
@@ -2679,7 +2736,11 @@ describe("runUp — stale port block detection (#58)", () => {
     heldPorts.add(blockBase); // WEB_PORT (offset 0)
 
     const deps: CommandDeps = {
-      ...stubDeps({ stack, initialRegistry: { login: blockBase } }),
+      ...stubDeps({
+        stack,
+        worktreeRootOverride: "/wt",
+        initialRegistry: { [loginId]: blockBase },
+      }),
       portHolder,
     };
 
@@ -2700,7 +2761,7 @@ describe("runUp — stale port block detection (#58)", () => {
       }>;
     };
     expect(details.block_base).toBe(blockBase);
-    expect(details.worktree_id).toBe("login");
+    expect(details.worktree_id).toBe(loginId);
     expect(details.collisions).toHaveLength(1);
     expect(details.collisions[0]).toEqual({
       port_name: "WEB_PORT",
@@ -2754,8 +2815,9 @@ describe("runUp — stale port block detection (#58)", () => {
       return { free: false as const, pid: 999, command: "node should-not-trip" };
     };
     // First up uses a non-tripping holder to get us into the running state.
+    const base = stubDeps({ stack, track });
     const deps: CommandDeps = {
-      ...stubDeps({ stack, track }),
+      ...base,
       portHolder: async () => ({ free: true as const }),
     };
     await runUp(deps);
@@ -2763,17 +2825,18 @@ describe("runUp — stale port block detection (#58)", () => {
     // holder; if the check ran, this call would reject.
     const drifted: CommandDeps = { ...deps, portHolder };
     const result = await runUp(drifted);
-    expect(result.worktreeId).toBe("login");
+    expect(result.worktreeId).toBe(base.expectedWorktreeId);
     expect(holderCalls).toBe(0);
   });
 
   it("clean start (no holder reports a collision) does not throw — the happy path is unchanged", async () => {
+    const base = stubDeps({ stack });
     const deps: CommandDeps = {
-      ...stubDeps({ stack }),
+      ...base,
       portHolder: async () => ({ free: true as const }),
     };
     const result = await runUp(deps);
-    expect(result.worktreeId).toBe("login");
+    expect(result.worktreeId).toBe(base.expectedWorktreeId);
     expect(Number(result.env.WEB_PORT)).toBeGreaterThanOrEqual(20000);
   });
 
