@@ -270,6 +270,7 @@ class UpCommand extends DevtreesCommand {
       "CONFIG_DRIFT",
       "HEALTH_TIMEOUT",
       "PROCESS_COMPOSE_NOT_FOUND",
+      "INVALID_ARGS",
       "UNKNOWN",
     ]),
     examples: [
@@ -451,7 +452,7 @@ class LogsCommand extends DevtreesCommand {
   static override paths = [["logs"]];
   static override usage = Command.Usage({
     description: "Stream a service's logs.",
-    details: errorCodeFooter(["INSTANCE_NOT_FOUND", "UNKNOWN"]),
+    details: errorCodeFooter(["INSTANCE_NOT_FOUND", "INVALID_ARGS", "UNKNOWN"]),
     examples: [
       ["Tail one service", "devtrees logs web"],
       ["Tail every service, interleaved", "devtrees logs --all"],
@@ -540,7 +541,7 @@ function parseTailCount(raw: string): number {
 function parseWaitTimeoutSecondsToMs(raw: string): number {
   const seconds = Number(raw);
   if (!Number.isFinite(seconds) || seconds <= 0) {
-    throw new Error(`--wait-timeout expects a positive number of seconds, got '${raw}'.`);
+    throw invalidArgsError(`--wait-timeout expects a positive number of seconds, got '${raw}'.`);
   }
   return Math.round(seconds * 1000);
 }

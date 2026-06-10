@@ -97,6 +97,7 @@ describe("devtrees CLI", () => {
         "CONFIG_DRIFT",
         "HEALTH_TIMEOUT",
         "PROCESS_COMPOSE_NOT_FOUND",
+        "INVALID_ARGS",
         "UNKNOWN",
       ],
     ],
@@ -106,7 +107,7 @@ describe("devtrees CLI", () => {
     ["generate", ["UNKNOWN"]],
     ["prune", ["UNKNOWN"]],
     ["env", ["UNKNOWN"]],
-    ["logs", ["INSTANCE_NOT_FOUND", "UNKNOWN"]],
+    ["logs", ["INSTANCE_NOT_FOUND", "INVALID_ARGS", "UNKNOWN"]],
   ];
 
   // Codes RESERVED in `ERROR_CODES` but not currently emitted from any throw
@@ -122,6 +123,7 @@ describe("devtrees CLI", () => {
     "STALE_PORT_BLOCK",
     "LOCK_CONTENTION",
     "CONFIG_INVALID",
+    "INVALID_ARGS",
     "UNKNOWN",
   ] as const;
 
@@ -837,6 +839,16 @@ describe("devtrees CLI — up non-interactive (#28)", () => {
     const up = vi.fn().mockResolvedValue(baseUpResult);
     await execute(["up", "--wait-timeout", "45"], { up, down: vi.fn() });
     expect(up).toHaveBeenCalledWith(expect.objectContaining({ waitTimeoutMs: 45_000 }));
+  });
+
+  it("rejects --wait-timeout values with an INVALID_ARGS envelope under --json (#81)", async () => {
+    const up = vi.fn();
+    const result = await execute(["up", "--wait-timeout=zero", "--json"], { up, down: vi.fn() });
+    expect(result.code).toBe(1);
+    const parsed = JSON.parse(result.stdout) as { error: { code: string; message: string } };
+    expect(parsed.error.code).toBe("INVALID_ARGS");
+    expect(parsed.error.message).toMatch(/--wait-timeout/);
+    expect(up).not.toHaveBeenCalled();
   });
 
   it("rejects --wait-timeout values that aren't a positive number", async () => {
