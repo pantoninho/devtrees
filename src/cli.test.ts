@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
-import { execute, isEntrypoint, parseLogsArgs, run } from "./cli.js";
+import { execute, isEntrypoint, run } from "./cli.js";
 
 async function* fromArray<T>(items: ReadonlyArray<T>): AsyncIterable<T> {
   for (const item of items) yield item;
@@ -620,30 +620,40 @@ describe("devtrees CLI — --json (agent-facing surface)", () => {
 });
 
 describe("devtrees CLI — logs (#33)", () => {
-  it("parses positional service name and default flags", () => {
-    expect(parseLogsArgs(["web"])).toEqual({
+  // Argv parsing is asserted through `execute` (the real clipanion path) —
+  // the standalone `parseLogsArgs` test seam was deleted in #81 after it
+  // drifted from the actual parser.
+  it("parses positional service name and default flags", async () => {
+    const logs = vi.fn().mockResolvedValue({ services: ["web"], events: fromArray([]) });
+    await execute(["logs", "web"], { up: vi.fn(), down: vi.fn(), logs });
+    expect(logs).toHaveBeenCalledWith({
       service: "web",
       all: false,
       shared: false,
       follow: false,
-      tail: undefined,
-      since: undefined,
     });
   });
 
-  it("parses --follow / -f / --tail=N / --since=DUR / --all / --shared", () => {
-    expect(parseLogsArgs(["web", "--follow", "--tail=25", "--since=5m"])).toMatchObject({
-      service: "web",
-      follow: true,
-      tail: 25,
-      since: "5m",
+  it("parses --follow / -f / --tail=N / --since=DUR / --all / --shared", async () => {
+    const logs = vi.fn().mockResolvedValue({ services: ["web"], events: fromArray([]) });
+    await execute(["logs", "web", "--follow", "--tail=25", "--since=5m"], {
+      up: vi.fn(),
+      down: vi.fn(),
+      logs,
     });
-    expect(parseLogsArgs(["-f", "--all", "--shared"])).toMatchObject({
-      service: undefined,
-      all: true,
-      shared: true,
-      follow: true,
+    expect(logs).toHaveBeenCalledWith(
+      expect.objectContaining({ service: "web", follow: true, tail: 25, since: "5m" }),
+    );
+
+    const logsAll = vi.fn().mockResolvedValue({ services: ["web"], events: fromArray([]) });
+    await execute(["logs", "-f", "--all", "--shared"], {
+      up: vi.fn(),
+      down: vi.fn(),
+      logs: logsAll,
     });
+    expect(logsAll).toHaveBeenCalledWith(
+      expect.objectContaining({ service: undefined, all: true, shared: true, follow: true }),
+    );
   });
 
   it("routes `logs <service>` to deps.logs and writes lines verbatim in human mode", async () => {

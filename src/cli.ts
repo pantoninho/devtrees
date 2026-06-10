@@ -138,33 +138,6 @@ export interface LogsCliOptions {
   readonly since?: string;
 }
 
-/**
- * Standalone parser for `devtrees logs` argv, kept exported because a few
- * lower-level test seams use it directly. Clipanion handles parsing for the
- * real dispatch path; this is the documented "what would clipanion produce"
- * shape so unit tests that don't want to spin a full `Cli.run()` can build
- * the same object.
- */
-export function parseLogsArgs(rest: ReadonlyArray<string>): LogsCliOptions {
-  let service: string | undefined;
-  let all = false;
-  let shared = false;
-  let follow = false;
-  let tail: number | undefined;
-  let since: string | undefined;
-  for (const arg of rest) {
-    if (arg === "--all") all = true;
-    else if (arg === "--shared") shared = true;
-    else if (arg === "--follow" || arg === "-f") follow = true;
-    else if (arg.startsWith("--tail=")) {
-      const n = Number(arg.slice("--tail=".length));
-      if (Number.isFinite(n) && n >= 0) tail = n;
-    } else if (arg.startsWith("--since=")) since = arg.slice("--since=".length);
-    else if (!arg.startsWith("-") && service === undefined) service = arg;
-  }
-  return { service, all, shared, follow, tail, since };
-}
-
 // --- error-code footers for per-command --help -----------------------------
 //
 // ADR-0005 lists the error-code enum the `--json` error envelope can carry.
