@@ -463,9 +463,7 @@ class LogsCommand extends DevtreesCommand {
         // Thrown (not hand-written to stderr) so `dispatch` routes it through
         // the documented envelope: `--json` gets `{error: {code: INVALID_ARGS}}`
         // on stdout (ADR-0005), human mode gets the diagnostic on stderr.
-        throw invalidArgsError(
-          "specify a service (e.g. `devtrees logs web`) or pass `--all`.",
-        );
+        throw invalidArgsError("specify a service (e.g. `devtrees logs web`) or pass `--all`.");
       }
       const { services, events } = await this.context.deps.logs(opts);
       const prefixService = this.mode === "human" && services.length > 1;
