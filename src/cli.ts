@@ -486,10 +486,12 @@ class LogsCommand extends DevtreesCommand {
         ...(this.since !== undefined ? { since: this.since } : {}),
       };
       if (!opts.all && opts.service === undefined) {
-        this.context.stderr.write(
-          "devtrees logs: specify a service (e.g. `devtrees logs web`) or pass `--all`.\n",
+        // Thrown (not hand-written to stderr) so `dispatch` routes it through
+        // the documented envelope: `--json` gets `{error: {code: INVALID_ARGS}}`
+        // on stdout (ADR-0005), human mode gets the diagnostic on stderr.
+        throw invalidArgsError(
+          "specify a service (e.g. `devtrees logs web`) or pass `--all`.",
         );
-        return 1;
       }
       const { services, events } = await this.context.deps.logs(opts);
       const prefixService = this.mode === "human" && services.length > 1;
@@ -503,6 +505,18 @@ class LogsCommand extends DevtreesCommand {
 }
 
 // --- flag-value coercions ---------------------------------------------------
+
+/**
+ * Build an argv-validation error tagged with the documented `INVALID_ARGS`
+ * code, so `classifyError` routes it into the JSON envelope without falling
+ * back to `UNKNOWN`. These fire before any effect runs — the stack is never
+ * touched when one is thrown.
+ */
+function invalidArgsError(message: string): Error {
+  const err = new Error(message);
+  (err as Error & { code?: string }).code = "INVALID_ARGS";
+  return err;
+}
 
 /**
  * Coerce a `--wait-timeout` argument value into ms, or throw a clear error.

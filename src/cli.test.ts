@@ -728,6 +728,20 @@ describe("devtrees CLI — logs (#33)", () => {
     expect(logs).not.toHaveBeenCalled();
   });
 
+  it("`logs --json` with no service and no --all emits an INVALID_ARGS envelope on stdout (#81)", async () => {
+    const logs = vi.fn();
+    const result = await execute(["logs", "--json"], { up: vi.fn(), down: vi.fn(), logs });
+    expect(result.code).toBe(1);
+    const parsed = JSON.parse(result.stdout) as {
+      schema_version: string;
+      error: { code: string; message: string };
+    };
+    expect(parsed.schema_version).toBe("1");
+    expect(parsed.error.code).toBe("INVALID_ARGS");
+    expect(parsed.error.message).toMatch(/specify a service|--all/);
+    expect(logs).not.toHaveBeenCalled();
+  });
+
   it("`logs --json` failure (missing socket) → INSTANCE_NOT_FOUND envelope on stdout", async () => {
     const logs = vi
       .fn()

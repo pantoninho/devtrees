@@ -34,6 +34,7 @@ export const ERROR_CODES = [
   "STALE_PORT_BLOCK",
   "LOCK_CONTENTION",
   "CONFIG_INVALID",
+  "INVALID_ARGS",
   "UNKNOWN",
 ] as const;
 
@@ -60,6 +61,7 @@ export const ERROR_CODE_DESCRIPTIONS: Readonly<Record<ErrorCode, string>> = {
     "Foreign listeners hold ports in this worktree's allocated block (likely orphans).",
   LOCK_CONTENTION: "Another devtrees process holds the allocation registry lock.",
   CONFIG_INVALID: "devtrees.yaml is malformed or rejected by the deriver.",
+  INVALID_ARGS: "A flag value or positional argument failed validation before any effect ran.",
   UNKNOWN: "Unclassified failure; consult the error envelope's `message` field.",
 };
 
