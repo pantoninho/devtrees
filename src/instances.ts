@@ -23,6 +23,7 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { connect } from "node:net";
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
+import { DEVTREES_METADATA_KEY } from "./deriver.js";
 import type { ServiceStatus } from "./driver.js";
 import { readRegistry } from "./registry.js";
 import { SHARED_INSTANCE_ID, SHARED_REGISTRY_KEY, instancePaths, stateDir } from "./paths.js";
@@ -51,9 +52,12 @@ export interface Service {
   /** Normalised readiness: ready | not_ready | unknown. */
   readonly health: ServiceStatus["health"];
   /**
-   * Named-port → allocated-number map for this service, parsed from the
-   * process's `environment:` list in the derived config (devtrees writes the
-   * worktree's named ports there at `up` time).
+   * Named-port → allocated-number map for the ports this service *declares*,
+   * read from the derived config's `x-devtrees.ports_by_service` metadata
+   * (issue #110). The process's `environment:` list is no use here — it
+   * carries the whole instance's port map as flat connection-info injection.
+   * `{}` for a portless service, and for instances whose derived config
+   * predates the metadata (the honest "unknown" answer).
    */
   readonly ports: Readonly<Record<string, number>>;
 }
@@ -175,11 +179,7 @@ function parsePortEnvEntry(entry: unknown): readonly [string, number] | undefine
  * same mapping the original `up` injected — without re-running the allocator
  * or the stack loader.
  */
-function readPortsByProcess(configPath: string): Record<string, Record<string, number>> {
-  if (!existsSync(configPath)) return {};
-  const doc = (parseYaml(readFileSync(configPath, "utf8")) ?? {}) as {
-    processes?: Record<string, { environment?: ReadonlyArray<unknown> }>;
-  };
+function readPortsByProcess(doc: DerivedConfigDoc): Record<string, Record<string, number>> {
   const byProc: Record<string, Record<string, number>> = {};
   for (const [name, proc] of Object.entries(doc.processes ?? {})) {
     const ports: Record<string, number> = {};
@@ -190,6 +190,44 @@ function readPortsByProcess(configPath: string): Record<string, Record<string, n
     byProc[name] = ports;
   }
   return byProc;
+}
+
+/** The loose shape discovery reads a derived config back as. */
+interface DerivedConfigDoc {
+  readonly processes?: Record<string, { environment?: ReadonlyArray<unknown> }>;
+  readonly [DEVTREES_METADATA_KEY]?: { ports_by_service?: unknown };
+}
+
+/** Parse a derived config from disk, or `{}` when it isn't there / is empty. */
+function readDerivedConfig(configPath: string): DerivedConfigDoc {
+  if (!existsSync(configPath)) return {};
+  return (parseYaml(readFileSync(configPath, "utf8")) ?? {}) as DerivedConfigDoc;
+}
+
+/**
+ * Read the per-service *declared* port map from the derived config's
+ * `x-devtrees.ports_by_service` metadata (issue #110). Returns `undefined`
+ * when the metadata is absent or malformed — a derived config written before
+ * the metadata existed — so callers can fall back to "unknown" rather than
+ * misreporting the flat env injection as the service's own ports. Non-number
+ * values inside an entry are skipped, same spirit as `parsePortEnvEntry`.
+ */
+function readPortsByService(
+  doc: DerivedConfigDoc,
+): Record<string, Record<string, number>> | undefined {
+  const raw = doc[DEVTREES_METADATA_KEY]?.ports_by_service;
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const byService: Record<string, Record<string, number>> = {};
+  for (const [name, entry] of Object.entries(raw as Record<string, unknown>)) {
+    const ports: Record<string, number> = {};
+    if (entry !== null && typeof entry === "object" && !Array.isArray(entry)) {
+      for (const [portName, value] of Object.entries(entry as Record<string, unknown>)) {
+        if (typeof value === "number" && Number.isFinite(value)) ports[portName] = value;
+      }
+    }
+    byService[name] = ports;
+  }
+  return byService;
 }
 
 /**
@@ -271,12 +309,12 @@ export async function discoverInstances(
       const paths = instancePaths(anchor, stem);
       const status = await probeSocket(paths.socketPath);
       const blockBase = registry[registryKeyFor(stem)];
-      const portsByProc = readPortsByProcess(paths.configPath);
+      const configDoc = readDerivedConfig(paths.configPath);
       const services =
         status === "running" && deps.getServiceStatuses
           ? buildServices(
               await safeGetServiceStatuses(paths.socketPath, deps.getServiceStatuses),
-              portsByProc,
+              readPortsByService(configDoc),
             )
           : [];
       return {
@@ -284,7 +322,7 @@ export async function discoverInstances(
         kind: kindFor(stem),
         status,
         socketPath: paths.socketPath,
-        ports: flattenPorts(portsByProc),
+        ports: flattenPorts(readPortsByProcess(configDoc)),
         blockBase,
         services,
       };
@@ -295,19 +333,21 @@ export async function discoverInstances(
 }
 
 /**
- * Zip a driver's `ServiceStatus[]` with the per-process port allocations from
- * the derived config. Ordering follows the driver's response — that's the
- * order an agent walking the array will naturally see services in. A service
- * the derived config has no port entry for keeps an empty `ports: {}`.
+ * Zip a driver's `ServiceStatus[]` with the per-service *declared* ports from
+ * the derived config's `x-devtrees.ports_by_service` metadata (issue #110).
+ * Ordering follows the driver's response — that's the order an agent walking
+ * the array will naturally see services in. A service the metadata has no
+ * entry for — and every service of a legacy instance whose config predates
+ * the metadata (`portsByService === undefined`) — keeps an empty `ports: {}`.
  */
 function buildServices(
   statuses: ReadonlyArray<ServiceStatus>,
-  portsByProc: Record<string, Record<string, number>>,
+  portsByService: Record<string, Record<string, number>> | undefined,
 ): Service[] {
   return statuses.map((s) => ({
     name: s.name,
     status: s.status,
     health: s.health,
-    ports: portsByProc[s.name] ?? {},
+    ports: portsByService?.[s.name] ?? {},
   }));
 }
