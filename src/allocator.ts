@@ -37,8 +37,11 @@ export type RegistrySnapshot = Readonly<Record<string, number>>;
  */
 export type PortFreeProbe = (port: number) => boolean | Promise<boolean>;
 
+/** PRD defaults; per-repo `devtrees.yaml` overrides replace fields individually. */
+export const DEFAULT_ALLOCATOR: AllocatorOptions = { portBase: 20000, blockSize: 32 };
+
 /** Highest valid TCP port; blocks must fit entirely at or below this. */
-const MAX_PORT = 65535;
+export const MAX_PORT = 65535;
 
 function fnv1a(worktreeId: string): number {
   // FNV-1a — small, stable, dependency-free.
@@ -50,10 +53,14 @@ function fnv1a(worktreeId: string): number {
   return h >>> 0;
 }
 
-/** How many whole blocks fit between `portBase` and the TCP ceiling. */
+/**
+ * How many whole blocks fit between `portBase` and the TCP ceiling. Zero when
+ * `portBase` sits too close to 65535 for even one full block — no clamping,
+ * or the allocator would hand out ports past the valid range.
+ */
 function blockCount(options: AllocatorOptions): number {
   const span = MAX_PORT + 1 - options.portBase;
-  return Math.max(1, Math.floor(span / options.blockSize));
+  return Math.floor(span / options.blockSize);
 }
 
 function makeBlock(base: number): PortBlock {
@@ -66,7 +73,14 @@ async function blockIsAvailable(
   taken: ReadonlySet<number>,
   isFree: PortFreeProbe,
 ): Promise<boolean> {
-  if (taken.has(base)) return false;
+  // Range intersection, not exact base match: a block registered under a
+  // previous port_base/block_size override can sit off the current grid, so
+  // any candidate whose span [base, base+blockSize) crosses a registered
+  // block's span must be skipped. Registered blocks record only their base;
+  // the current blockSize is the best available estimate of their span.
+  for (const takenBase of taken) {
+    if (base < takenBase + blockSize && takenBase < base + blockSize) return false;
+  }
   for (let port = base; port < base + blockSize; port++) {
     if (!(await isFree(port))) return false;
   }
@@ -90,6 +104,15 @@ export async function allocateBlock(
   const { portBase, blockSize } = options;
   const taken = new Set<number>(Object.values(snapshot));
   const blocks = blockCount(options);
+  if (blocks < 1) {
+    // Config validation (stack.ts) rejects this before allocation in normal
+    // flow; kept as a hard invariant so the allocator can never hand out
+    // ports above 65535 regardless of caller.
+    throw new Error(
+      `no full port block fits at or below 65535: port_base ${portBase} with ` +
+        `block_size ${blockSize} would extend past the valid TCP port range`,
+    );
+  }
   const startIndex = fnv1a(worktreeId) % blocks;
 
   for (let step = 0; step < blocks; step++) {

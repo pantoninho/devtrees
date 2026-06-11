@@ -26,6 +26,7 @@
 import { readFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { parse as parseYaml } from "yaml";
+import { DEFAULT_ALLOCATOR, MAX_PORT } from "./allocator.js";
 
 /** A service's tier: where devtrees runs it. Defaults to `isolated`. */
 export type Tier = "isolated" | "shared";
@@ -247,9 +248,31 @@ export function parseStack(yamlText: string, options: ParseStackOptions = {}): R
   });
 
   const allocator = parseAllocator(doc);
+  validateAllocatorBounds(allocator);
   const stack: ResolvedStack = allocator ? { services, allocator } : { services };
   validateStack(stack);
   return stack;
+}
+
+/**
+ * Reject allocator overrides that leave no room for one full port block at or
+ * below 65535 (issue #89). The schema accepts any positive `port_base` /
+ * `block_size`; without this check a base near the TCP ceiling would let the
+ * allocator hand out ports past 65535. Effective values — override or PRD
+ * default — are what must fit, so a lone `block_size: 50000` fails too.
+ */
+function validateAllocatorBounds(allocator: AllocatorOverrides | undefined): void {
+  const portBase = allocator?.portBase ?? DEFAULT_ALLOCATOR.portBase;
+  const blockSize = allocator?.blockSize ?? DEFAULT_ALLOCATOR.blockSize;
+  const topPort = portBase + blockSize - 1;
+  if (topPort > MAX_PORT) {
+    throw new StackConfigError(
+      `port_base ${portBase} with block_size ${blockSize} leaves no room for a full ` +
+        `port block: the first block would span ${portBase}-${topPort}, past the highest ` +
+        `valid TCP port ${MAX_PORT}. Lower port_base (or block_size) so that ` +
+        `port_base + block_size - 1 <= ${MAX_PORT}.`,
+    );
+  }
 }
 
 /**

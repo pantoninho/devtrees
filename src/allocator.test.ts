@@ -34,6 +34,27 @@ describe("port allocator", () => {
     expect(block.base).toBe(natural + 32);
   });
 
+  it("skips a candidate that overlaps an off-grid registered block (range intersection)", async () => {
+    // A block registered under a previous port_base/block_size override can sit
+    // off the current grid. Exact-base matching would miss it; range
+    // intersection must skip every candidate whose span crosses it.
+    const natural = (await allocateBlock("login", {}, OPTS, () => true)).base;
+    // Off-grid: overlaps both the natural candidate [natural, natural+32) and
+    // the next one [natural+32, natural+64).
+    const snapshot = { other: natural + 10 };
+    const block = await allocateBlock("login", snapshot, OPTS, () => true);
+    expect(block.base).toBe(natural + 64);
+  });
+
+  it("skips a candidate whose span an off-grid registered block starts inside of", async () => {
+    const natural = (await allocateBlock("login", {}, OPTS, () => true)).base;
+    // Registered block starts just below the natural candidate; its span
+    // [natural-1, natural+31) reaches into [natural, natural+32).
+    const snapshot = { other: natural - 1 };
+    const block = await allocateBlock("login", snapshot, OPTS, () => true);
+    expect(block.base).toBe(natural + 32);
+  });
+
   it("probes past an in-use port reported by the injected probe", async () => {
     const natural = (await allocateBlock("login", {}, OPTS, () => true)).base;
     const isFree = (port: number) => port < natural || port >= natural + 32;
@@ -47,6 +68,22 @@ describe("port allocator", () => {
       expect(block.base).toBeGreaterThanOrEqual(20000);
       expect(block.portFor(OPTS.blockSize - 1)).toBeLessThanOrEqual(65535);
     }
+  });
+
+  it("refuses to allocate when no full block fits at or below port 65535", async () => {
+    // port_base too close to the TCP ceiling: the old min-one-block clamp
+    // would hand out [65530, 65562), past the valid range.
+    const opts: AllocatorOptions = { portBase: 65530, blockSize: 32 };
+    await expect(allocateBlock("login", {}, opts, () => true)).rejects.toThrow(
+      /no .*block fits|65535/i,
+    );
+  });
+
+  it("allocates the exact-fit block whose top port is 65535", async () => {
+    const opts: AllocatorOptions = { portBase: 65504, blockSize: 32 };
+    const block = await allocateBlock("login", {}, opts, () => true);
+    expect(block.base).toBe(65504);
+    expect(block.portFor(31)).toBe(65535);
   });
 
   it("maps named ports to fixed offsets within the block", async () => {
