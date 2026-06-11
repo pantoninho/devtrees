@@ -50,7 +50,9 @@ import {
 } from "./health.js";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
+import { TARGET_CANDIDATES, fencedBlock, upsertBlock } from "./onboarding.js";
 
 // The health-gate contracts (and their driver-backed defaults) live in the
 // health module (issue #87); re-exported here so `CommandDeps` callers keep a
@@ -1608,6 +1610,64 @@ export async function runEnv(deps: CommandDeps = {}): Promise<EnvResult> {
   });
 
   return { worktreeId: anchor.worktreeId, env: derived.env };
+}
+
+/** Inputs unique to `runInit` — just the directory to write the block into. */
+export interface InitDeps {
+  /**
+   * Directory of the consuming repo to write the agent-instructions file into.
+   * Default: `process.cwd()`. `init --agents` writes into the project the agent
+   * is driving — no anchor / git resolution, since the block is repo-agnostic.
+   */
+  readonly cwd?: string;
+}
+
+/**
+ * Result of `runInit` — what file the block landed in and whether it already
+ * existed (issue #118). `target` is the bare filename (`AGENTS.md` /
+ * `CLAUDE.md`) the CLI envelope names; `path` is its absolute location;
+ * `action` distinguishes a freshly-created file from an in-place update of an
+ * existing one, which the `--json` envelope surfaces as created-vs-updated.
+ */
+export interface InitResult {
+  /** The chosen target filename — `AGENTS.md` or `CLAUDE.md`. */
+  readonly target: string;
+  /** Absolute path of the file written. */
+  readonly path: string;
+  /** `created` when the file did not exist before this run; `updated` otherwise. */
+  readonly action: "created" | "updated";
+}
+
+/**
+ * Write the canonical coding-agent onboarding block into the consuming repo's
+ * agent-instructions file (issue #118).
+ *
+ * Target detection (acceptance): an existing `AGENTS.md` wins, else an existing
+ * `CLAUDE.md`, else `AGENTS.md` is created. The block is written between the
+ * `<!-- devtrees:start -->` / `<!-- devtrees:end -->` markers via `upsertBlock`,
+ * so re-running replaces the managed region in place — never duplicating or
+ * appending it twice — while leaving any surrounding hand-written content
+ * untouched.
+ *
+ * The block text comes from `ONBOARDING_BLOCK` (src/onboarding.ts), the single
+ * source of truth the README also quotes — so the generated file and the README
+ * cannot drift (pinned by `onboarding.test.ts`). Pure I/O: no anchor, no lock,
+ * no spawn.
+ */
+export async function runInit(deps: InitDeps = {}): Promise<InitResult> {
+  const cwd = deps.cwd ?? process.cwd();
+
+  // Prefer the first candidate that already exists; otherwise create the first
+  // candidate (AGENTS.md). `action` reflects whether we created or updated it.
+  const existing = TARGET_CANDIDATES.find((name) => existsSync(join(cwd, name)));
+  const target = existing ?? TARGET_CANDIDATES[0];
+  const path = join(cwd, target);
+  const action: InitResult["action"] = existing === undefined ? "created" : "updated";
+
+  const current = existing === undefined ? "" : readFileSync(path, "utf8");
+  writeFileSync(path, upsertBlock(current, fencedBlock()), "utf8");
+
+  return { target, path, action };
 }
 
 /**
