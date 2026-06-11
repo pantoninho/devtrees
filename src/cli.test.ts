@@ -894,7 +894,9 @@ describe("devtrees CLI — logs (#33)", () => {
   });
 
   it("`logs --json` unknown-service failure → SERVICE_NOT_FOUND envelope with details (#109)", async () => {
-    const err = new Error("unknown service 'nosuchservice' in this worktree's instance.") as Error & {
+    const err = new Error(
+      "unknown service 'nosuchservice' in this worktree's instance.",
+    ) as Error & {
       code?: string;
       details?: Record<string, unknown>;
     };

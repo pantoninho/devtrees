@@ -443,7 +443,12 @@ class LogsCommand extends DevtreesCommand {
   static override paths = [["logs"]];
   static override usage = Command.Usage({
     description: "Stream a service's logs.",
-    details: errorCodeFooter(["INSTANCE_NOT_FOUND", "SERVICE_NOT_FOUND", "INVALID_ARGS", "UNKNOWN"]),
+    details: errorCodeFooter([
+      "INSTANCE_NOT_FOUND",
+      "SERVICE_NOT_FOUND",
+      "INVALID_ARGS",
+      "UNKNOWN",
+    ]),
     examples: [
       ["Tail one service", "devtrees logs web"],
       ["Tail every service, interleaved", "devtrees logs --all"],
