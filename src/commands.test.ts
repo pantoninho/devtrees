@@ -2573,6 +2573,66 @@ describe("runLogs — stream service logs without locking", () => {
     expect(invocations).toEqual([]);
   });
 
+  it("rejects an unknown service with SERVICE_NOT_FOUND before spawning anything (#109)", async () => {
+    const tmp = tmpAnchor();
+    const worktreeId = "login";
+    const stem = idFor(tmp.worktreeRoot, worktreeId);
+    touchSocket(tmp.anchor, stem);
+    writeDerivedConfig(tmp.anchor, stem, ["web", "worker"]);
+
+    const invocations: LogsInvocation[] = [];
+    const deps = logsDeps({
+      anchor: tmp.anchor,
+      worktreeRoot: tmp.worktreeRoot,
+      worktreeId,
+      invocations,
+      linesPerService: {},
+    });
+
+    const err = (await runLogs(deps, { service: "nosuchservice" }).then(
+      () => undefined,
+      (e: unknown) => e,
+    )) as (Error & { code?: string; details?: Record<string, unknown> }) | undefined;
+    expect(err).toBeInstanceOf(Error);
+    expect(err?.code).toBe("SERVICE_NOT_FOUND");
+    // The message names the unknown service and lists the valid ones.
+    expect(err?.message).toContain("nosuchservice");
+    expect(err?.message).toContain("web");
+    expect(err?.message).toContain("worker");
+    expect(err?.details).toEqual({
+      service: "nosuchservice",
+      valid_services: ["web", "worker"],
+    });
+    // Fail-fast: no `process logs` subprocess may have been spawned.
+    expect(invocations).toEqual([]);
+  });
+
+  it("rejects an unknown service on the shared instance the same way (#109)", async () => {
+    const tmp = tmpAnchor();
+    touchSocket(tmp.anchor, "shared");
+    writeDerivedConfig(tmp.anchor, "shared", ["postgres"]);
+
+    const invocations: LogsInvocation[] = [];
+    const deps = logsDeps({
+      anchor: tmp.anchor,
+      worktreeRoot: tmp.worktreeRoot,
+      worktreeId: "login",
+      invocations,
+      linesPerService: {},
+    });
+
+    const err = (await runLogs(deps, { service: "web", shared: true }).then(
+      () => undefined,
+      (e: unknown) => e,
+    )) as (Error & { code?: string; details?: Record<string, unknown> }) | undefined;
+    expect(err).toBeInstanceOf(Error);
+    expect(err?.code).toBe("SERVICE_NOT_FOUND");
+    expect(err?.message).toContain("web");
+    expect(err?.message).toContain("postgres");
+    expect(err?.details).toEqual({ service: "web", valid_services: ["postgres"] });
+    expect(invocations).toEqual([]);
+  });
+
   it("with { all: true }, enumerates services from the derived config and interleaves them", async () => {
     const tmp = tmpAnchor();
     const worktreeId = "login";
