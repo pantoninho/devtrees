@@ -10,9 +10,6 @@ or `shared` (one instance for the whole repo). From inside any worktree,
 ports injected as environment variables. See [the PRD](https://github.com/pantoninho/devtrees/issues/1)
 for the full vision.
 
-> **Status: walking skeleton.** The CLI runs and reports `--help`/`--version`;
-> the commands below are stubbed and not yet implemented.
-
 ## Requirements
 
 - **Node.js** >= 22
@@ -29,19 +26,92 @@ npm install -g devtrees
 ## Usage
 
 ```bash
-devtrees --help      # list commands
-devtrees --version   # print the version
+devtrees --help        # list commands
+devtrees --version     # print the version
+devtrees <cmd> --help  # per-command flags, examples, and emittable error codes
 ```
 
-Planned commands (stubbed today):
+Commands (from the exported `COMMANDS` manifest in [`src/cli.ts`](src/cli.ts)):
 
-| Command             | What it will do                                                       |
-| ------------------- | --------------------------------------------------------------------- |
-| `devtrees up`       | Bring up this worktree's stack                                        |
-| `devtrees down`     | Stop this worktree's stack (`--shared` tears down the shared instance) |
-| `devtrees ls`       | List every instance across the repo with status and ports             |
-| `devtrees attach`   | Attach a TUI to this worktree's instance (`--shared` for the shared one) |
-| `devtrees generate` | Write the derived process-compose config to disk                      |
+| Command             | What it does                                                              |
+| ------------------- | ------------------------------------------------------------------------- |
+| `devtrees up`       | Bring up this worktree's stack                                            |
+| `devtrees down`     | Stop this worktree's stack (`--shared` tears down the shared instance)    |
+| `devtrees ls`       | List every instance across the repo with status and ports                 |
+| `devtrees attach`   | Attach a TUI to this worktree's instance (`--shared` for the shared one)  |
+| `devtrees generate` | Write the derived process-compose config to disk                          |
+| `devtrees prune`    | Reconcile against `git worktree list` and clean up orphaned instances     |
+| `devtrees env`      | Print this worktree's injected env (KEY=value, or `--json` for a map)     |
+| `devtrees logs`     | Stream a service's logs (`--follow`, `--tail=N`, `--since=DUR`, `--all`, `--shared`) |
+
+Flag highlights (run `devtrees <cmd> --help` for the full per-command surface):
+
+- `devtrees up` accepts `--attach` / `--no-attach` (default: attach only when
+  stdout & stderr are TTYs) and `--wait-timeout <seconds>` (health-wait window,
+  default 120s).
+- `devtrees logs` takes a service name positionally (`devtrees logs web`) or
+  `--all` to interleave every service; `--follow`/`-f` keeps streaming,
+  `--tail <N>` prints the last N lines, `--since <DUR>` filters by age
+  (e.g. `30s`, `5m`, `1h`).
+- `down`, `attach`, and `logs` accept `--shared` to target the shared instance
+  instead of this worktree's.
+- Every command accepts `--json` (see below).
+
+## Agent surface (`--json`)
+
+devtrees treats coding agents as first-class users
+([ADR-0005](docs/adr/0005-agent-friendly-cli-by-default.md)). Every command
+accepts a `--json` flag that emits a single JSON document on stdout with a
+top-level `schema_version` (currently `"1"`):
+
+```bash
+$ devtrees env --json
+{"schema_version":"1","env":{"WEB_PORT":"5180","DB_PORT":"5176","DEVTREES_WORKTREE_ID":"login-3f9c2a1b"}}
+```
+
+On failure, the same stream carries an error envelope and the process exits
+non-zero:
+
+```json
+{"schema_version":"1","error":{"code":"HEALTH_TIMEOUT","message":"...","details":{}}}
+```
+
+Two deliberate departures from Unix habit, recorded in ADR-0005:
+
+- **`--json` errors land on stdout, not stderr** — the agent reads one stream,
+  parses one document, and branches on `error.code`. Stderr still carries the
+  human-readable diagnostic line.
+- **`devtrees up` leaves the stack running on `HEALTH_TIMEOUT`** so
+  `devtrees logs <service>` and `devtrees ls --json` keep working and the
+  agent can debug why startup failed before deciding to retry or `down`.
+
+One exception to the single-document shape: `devtrees logs --json` streams
+NDJSON — one `{ts, service, stream, line}` object per log event, with no
+top-level wrapper.
+
+### Error codes
+
+The full enum the error envelope can carry, defined in
+[`src/output.ts`](src/output.ts) (`ERROR_CODES`). Each subcommand's `--help`
+footer lists the subset that command can actually emit.
+
+| Code                        | Meaning                                                                             |
+| --------------------------- | ----------------------------------------------------------------------------------- |
+| `PROCESS_COMPOSE_NOT_FOUND` | The `process-compose` binary is not on PATH.                                        |
+| `INSTANCE_NOT_FOUND`        | No worktree (or shared) instance is running for this anchor.                        |
+| `HEALTH_TIMEOUT`            | Stack started but services did not report healthy before the wait window expired.   |
+| `CONFIG_DRIFT`              | Running config differs from devtrees.yaml and hot-reload failed.                    |
+| `SHARED_DRIFT`              | This worktree's shared services diverge from the running shared instance; bring shared down and up again. |
+| `STALE_PORT_BLOCK`          | Foreign listeners hold ports in this worktree's allocated block (likely orphans).   |
+| `LOCK_CONTENTION`           | Another devtrees process holds the allocation registry lock.                        |
+| `CONFIG_INVALID`            | devtrees.yaml is malformed or rejected by the deriver.                              |
+| `INVALID_ARGS`              | A flag value or positional argument failed validation before any effect ran.        |
+| `UNKNOWN`                   | Unclassified failure; consult the error envelope's `message` field.                 |
+
+New codes are additive; renames are breaking and require a `schema_version`
+bump once the agent surface is declared stable — see
+[ADR-0005](docs/adr/0005-agent-friendly-cli-by-default.md) for the
+versioning policy.
 
 ## Development
 
