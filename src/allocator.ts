@@ -50,10 +50,14 @@ function fnv1a(worktreeId: string): number {
   return h >>> 0;
 }
 
-/** How many whole blocks fit between `portBase` and the TCP ceiling. */
+/**
+ * How many whole blocks fit between `portBase` and the TCP ceiling. Zero when
+ * `portBase` sits too close to 65535 for even one full block — no clamping,
+ * or the allocator would hand out ports past the valid range.
+ */
 function blockCount(options: AllocatorOptions): number {
   const span = MAX_PORT + 1 - options.portBase;
-  return Math.max(1, Math.floor(span / options.blockSize));
+  return Math.floor(span / options.blockSize);
 }
 
 function makeBlock(base: number): PortBlock {
@@ -97,6 +101,15 @@ export async function allocateBlock(
   const { portBase, blockSize } = options;
   const taken = new Set<number>(Object.values(snapshot));
   const blocks = blockCount(options);
+  if (blocks < 1) {
+    // Config validation (stack.ts) rejects this before allocation in normal
+    // flow; kept as a hard invariant so the allocator can never hand out
+    // ports above 65535 regardless of caller.
+    throw new Error(
+      `no full port block fits at or below 65535: port_base ${portBase} with ` +
+        `block_size ${blockSize} would extend past the valid TCP port range`,
+    );
+  }
   const startIndex = fnv1a(worktreeId) % blocks;
 
   for (let step = 0; step < blocks; step++) {

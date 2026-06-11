@@ -70,6 +70,22 @@ describe("port allocator", () => {
     }
   });
 
+  it("refuses to allocate when no full block fits at or below port 65535", async () => {
+    // port_base too close to the TCP ceiling: the old min-one-block clamp
+    // would hand out [65530, 65562), past the valid range.
+    const opts: AllocatorOptions = { portBase: 65530, blockSize: 32 };
+    await expect(allocateBlock("login", {}, opts, () => true)).rejects.toThrow(
+      /no .*block fits|65535/i,
+    );
+  });
+
+  it("allocates the exact-fit block whose top port is 65535", async () => {
+    const opts: AllocatorOptions = { portBase: 65504, blockSize: 32 };
+    const block = await allocateBlock("login", {}, opts, () => true);
+    expect(block.base).toBe(65504);
+    expect(block.portFor(31)).toBe(65535);
+  });
+
   it("maps named ports to fixed offsets within the block", async () => {
     const block = await allocateBlock("login", {}, OPTS, () => true);
     expect(block.portFor(0)).toBe(block.base);
