@@ -843,13 +843,15 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     // (a stack with shared services nobody isolated depends on doesn't need it).
     if (derived.droppedEdges.length > 0) {
       const sharedPaths = sharedInstancePaths(anchor.anchor);
-      const sharedNames = stack.services.filter((s) => s.tier === "shared").map((s) => s.name);
+      const sharedServices = stack.services.filter((s) => s.tier === "shared");
+      const sharedNames = sharedServices.map((s) => s.name);
       warn(formatHealthWaitNotice(sharedNames));
       const wait = deps.waitForSharedHealth ?? createWaitForSharedHealth(driver);
       await wait({
         anchor: anchor.anchor,
         socketPath: sharedPaths.socketPath,
         sharedServiceNames: sharedNames,
+        probedServiceNames: probedNames(sharedServices),
       });
     }
 
@@ -1917,11 +1919,23 @@ async function waitForWorktreeHealth(
   driver: { getServiceStatuses(socketPath: string): Promise<ServiceStatus[]> },
 ): Promise<void> {
   const wait = deps.waitForHealth ?? createWaitForHealth(driver);
+  const isolated = stack.services.filter((s) => s.tier === "isolated");
   await wait({
     socketPath,
-    serviceNames: stack.services.filter((s) => s.tier === "isolated").map((s) => s.name),
+    serviceNames: isolated.map((s) => s.name),
+    probedServiceNames: probedNames(isolated),
     timeoutMs: deps.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS,
   });
+}
+
+/**
+ * The names of the services in `services` that declare a readiness probe.
+ * The health waits gate these on `health === "ready"` instead of bare process
+ * state — process-compose keeps a probed service's status at `Running` while
+ * the probe verdict arrives in the separate readiness field (issue #108).
+ */
+function probedNames(services: ReadonlyArray<ResolvedService>): string[] {
+  return services.filter((s) => s.readinessProbe !== undefined).map((s) => s.name);
 }
 
 /** Explicit `attach`/`no-attach` override wins; otherwise consult `isTTY()`. */

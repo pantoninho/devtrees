@@ -832,6 +832,66 @@ describe("runUp — wait-for-healthy (worktree instance, #28)", () => {
     expect(seen[0]?.endsWith(`/${base.expectedWorktreeId}.sock`)).toBe(true);
   });
 
+  it("threads the probed-service subset from the resolved stack to the wait (#108)", async () => {
+    // The orchestration layer knows which services declare a readiness probe;
+    // the wait needs that set to gate them on health:ready instead of Running.
+    const probedStack: ResolvedStack = {
+      services: [
+        { ...isolated("web", "node server.js", ["WEB_PORT"]), readinessProbe: { exec: {} } },
+        isolated("worker", "node worker.js"),
+      ],
+    };
+    let observed: { serviceNames: string[]; probedServiceNames: string[] } | undefined;
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const deps: CommandDeps = {
+      ...stubDeps({ stack: probedStack, track }),
+      waitForHealth: async ({ serviceNames, probedServiceNames }) => {
+        observed = {
+          serviceNames: [...serviceNames].sort(),
+          probedServiceNames: [...probedServiceNames],
+        };
+      },
+    };
+    await runUp(deps);
+    expect(observed).toEqual({ serviceNames: ["web", "worker"], probedServiceNames: ["web"] });
+  });
+
+  it("threads the probed shared subset to the shared-health wait (#108)", async () => {
+    const probedCrossTier: ResolvedStack = {
+      services: [
+        {
+          name: "web",
+          tier: "isolated",
+          command: "node server.js",
+          ports: ["WEB_PORT"],
+          dependsOn: ["postgres"],
+          environment: [],
+        },
+        {
+          ...shared("postgres", "postgres -D ./pgdata", ["DB_PORT"]),
+          readinessProbe: { exec: {} },
+        },
+        shared("cache", "redis-server"),
+      ],
+    };
+    let observed: { sharedServiceNames: string[]; probedServiceNames: string[] } | undefined;
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const deps: CommandDeps = {
+      ...stubDeps({ stack: probedCrossTier, track }),
+      waitForSharedHealth: async ({ sharedServiceNames, probedServiceNames }) => {
+        observed = {
+          sharedServiceNames: [...sharedServiceNames].sort(),
+          probedServiceNames: [...probedServiceNames],
+        };
+      },
+    };
+    await runUp(deps);
+    expect(observed).toEqual({
+      sharedServiceNames: ["cache", "postgres"],
+      probedServiceNames: ["postgres"],
+    });
+  });
+
   it("threads the timeout from deps to the wait", async () => {
     let observed: number | undefined;
     const track: StubSpawn = { invocations: [], touchSocket: false };

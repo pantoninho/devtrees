@@ -604,7 +604,9 @@ describe("e2e — devtrees ls discovers worktree instances + the shared instance
     const shared = ls.instances.find((i) => i.id === "shared");
     expect(login?.services?.map((s) => s.name)).toEqual(["web"]);
     expect(login?.services?.[0]?.status).toBe("Running");
-    expect(login?.services?.[0]?.health).toBe("ready");
+    // No readiness_probe on `web`: readiness is never observed, so health
+    // stays `unknown` (the real binary reports `is_ready: "-"`; #108).
+    expect(login?.services?.[0]?.health).toBe("unknown");
     // Web sees its own WEB_PORT plus the shared DB_PORT (cross-tier
     // connection-info injection). The worktree-id env var lives alongside
     // these but is filtered out — only `KEY=NUMBER` entries qualify as ports.
@@ -615,7 +617,7 @@ describe("e2e — devtrees ls discovers worktree instances + the shared instance
 
     expect(shared?.services?.map((s) => s.name)).toEqual(["pgstub"]);
     expect(shared?.services?.[0]?.status).toBe("Running");
-    expect(shared?.services?.[0]?.health).toBe("ready");
+    expect(shared?.services?.[0]?.health).toBe("unknown");
     expect(shared?.services?.[0]?.ports).toEqual({
       DB_PORT: Number(up.env.DB_PORT),
     });
