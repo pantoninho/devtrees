@@ -104,7 +104,7 @@ footer lists the subset that command can actually emit.
 | `SHARED_DRIFT`              | This worktree's shared services diverge from the running shared instance; bring shared down and up again. |
 | `SHARED_START_FAILED`       | The lazy-started shared instance died before binding its control socket.            |
 | `STALE_PORT_BLOCK`          | Foreign listeners hold ports in this worktree's allocated block (likely orphans).   |
-| `LOCK_CONTENTION`           | Another devtrees process holds the allocation registry lock.                        |
+| `LOCK_CONTENTION`           | Another devtrees process holds a devtrees lock (allocation registry or an instance's lifecycle lock). |
 | `CONFIG_INVALID`            | devtrees.yaml is malformed or rejected by the deriver.                              |
 | `INVALID_ARGS`              | A flag value or positional argument failed validation before any effect ran.        |
 | `UNKNOWN`                   | Unclassified failure; consult the error envelope's `message` field.                 |
