@@ -14,7 +14,14 @@
  * `port_base` per repo, not coordinated through this module.
  */
 
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import type { RegistrySnapshot } from "./allocator.js";
 
@@ -111,8 +118,23 @@ function releaseLock(anchor: string): void {
   releaseLockAt(lockFile(anchor));
 }
 
+/**
+ * Persist the snapshot via temp-file + atomic rename. `env` and instance
+ * discovery read the registry lock-free, so an in-place truncate-write would
+ * expose a window where a reader sees an empty or half-written file — and a
+ * crash inside that window would leave permanently corrupt JSON. `rename(2)`
+ * within the same directory is atomic on POSIX: readers see either the old
+ * complete file or the new complete file, never anything in between.
+ */
 function writeSnapshot(anchor: string, snapshot: RegistrySnapshot): void {
-  writeFileSync(registryFile(anchor), `${JSON.stringify(snapshot, null, 2)}\n`, "utf8");
+  writeAtomic(registryFile(anchor), `${JSON.stringify(snapshot, null, 2)}\n`);
+}
+
+/** Write `content` to `file` atomically (same-directory temp file + rename). */
+export function writeAtomic(file: string, content: string): void {
+  const tmp = `${file}.${process.pid}.tmp`;
+  writeFileSync(tmp, content, "utf8");
+  renameSync(tmp, file);
 }
 
 /**

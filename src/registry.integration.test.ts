@@ -61,7 +61,81 @@ function runWorker(workerPath: string, anchor: string, key: string, base: number
   });
 }
 
+// Worker for the atomic-write test: rewrites the full WIDE-key snapshot many
+// times in a row so a concurrent lock-free reader gets plenty of chances to
+// catch a truncated/partial file if writes are not atomic.
+const REWRITER_SOURCE = `
+import { withRegistryLock } from ${JSON.stringify(
+  fileURLToPath(new URL("./registry.ts", import.meta.url)),
+)};
+
+const [, , anchor, widthStr, iterationsStr] = process.argv;
+const width = Number(widthStr);
+const iterations = Number(iterationsStr);
+
+for (let i = 0; i < iterations; i++) {
+  await withRegistryLock(anchor, () => {
+    const next = {};
+    for (let k = 0; k < width; k++) next["key-" + String(k).padStart(5, "0")] = 20000 + i;
+    return next;
+  });
+}
+`;
+
 describe("registry store — integration", () => {
+  it("a lock-free reader never observes a truncated/partial registry while a writer rewrites it", async () => {
+    const anchor = makeAnchor();
+    const WIDTH = 4000;
+    const ITERATIONS = 150;
+
+    // Seed a full-width snapshot so the reader has a complete file from t=0.
+    const workerPath = join(anchor, "rewriter.mjs");
+    execFileSync(process.execPath, [
+      "-e",
+      `import('node:fs').then(({writeFileSync}) => writeFileSync(${JSON.stringify(workerPath)}, ${JSON.stringify(REWRITER_SOURCE)}))`,
+    ]);
+    const seed = spawn(process.execPath, [workerPath, anchor, String(WIDTH), "1"], {
+      stdio: "inherit",
+    });
+    await new Promise<void>((resolve, reject) => {
+      seed.on("error", reject);
+      seed.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`seed exited ${code}`))));
+    });
+
+    // Writer child rewrites the whole snapshot ITERATIONS times while we read
+    // lock-free in a tight loop. Truncate-in-place writes would let us observe
+    // an empty file (0 keys) or partial JSON (parse throw); atomic rename must
+    // always yield a complete snapshot of WIDTH keys.
+    let writerDone = false;
+    const writer = new Promise<void>((resolve, reject) => {
+      const child = spawn(
+        process.execPath,
+        [workerPath, anchor, String(WIDTH), String(ITERATIONS)],
+        { stdio: "inherit" },
+      );
+      child.on("error", reject);
+      child.on("exit", (code) => {
+        writerDone = true;
+        if (code === 0) resolve();
+        else reject(new Error(`writer exited ${code}`));
+      });
+    });
+    // If the reader assertion below throws, the writer rejection (killed by
+    // the cleanup rmSync) must not surface as an unhandled rejection.
+    writer.catch(() => {});
+
+    let reads = 0;
+    while (!writerDone) {
+      const snapshot = readRegistry(anchor);
+      expect(Object.keys(snapshot)).toHaveLength(WIDTH);
+      reads++;
+      // Yield so the child's exit event can be observed.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    await writer;
+    expect(reads).toBeGreaterThan(0);
+  }, 30000);
+
   it("serializes N concurrent worker processes; every appended key survives", async () => {
     const anchor = makeAnchor();
 
