@@ -216,18 +216,27 @@ function readPortsByService(
   doc: DerivedConfigDoc,
 ): Record<string, Record<string, number>> | undefined {
   const raw = doc[DEVTREES_METADATA_KEY]?.ports_by_service;
-  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  if (!isPlainRecord(raw)) return undefined;
   const byService: Record<string, Record<string, number>> = {};
-  for (const [name, entry] of Object.entries(raw as Record<string, unknown>)) {
-    const ports: Record<string, number> = {};
-    if (entry !== null && typeof entry === "object" && !Array.isArray(entry)) {
-      for (const [portName, value] of Object.entries(entry as Record<string, unknown>)) {
-        if (typeof value === "number" && Number.isFinite(value)) ports[portName] = value;
-      }
-    }
-    byService[name] = ports;
+  for (const [name, entry] of Object.entries(raw)) {
+    byService[name] = parseDeclaredPortMap(entry);
   }
   return byService;
+}
+
+/** True for a plain mapping (non-null, non-array object) — the YAML dict shape. */
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/** Coerce one `ports_by_service` entry into `{port name → number}`; junk → `{}`. */
+function parseDeclaredPortMap(entry: unknown): Record<string, number> {
+  const ports: Record<string, number> = {};
+  if (!isPlainRecord(entry)) return ports;
+  for (const [portName, value] of Object.entries(entry)) {
+    if (typeof value === "number" && Number.isFinite(value)) ports[portName] = value;
+  }
+  return ports;
 }
 
 /**
