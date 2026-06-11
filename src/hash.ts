@@ -21,6 +21,11 @@ function canonicalService(s: ResolvedService): unknown {
     ports: [...s.ports],
     dependsOn: [...s.dependsOn],
     environment: [...s.environment],
+    // Opaque passthrough blocks flow into the derived config, so an edit to
+    // any of them must register as drift (#86). Absent blocks hash as null.
+    readinessProbe: s.readinessProbe ?? null,
+    livenessProbe: s.livenessProbe ?? null,
+    availability: s.availability ?? null,
   };
 }
 
