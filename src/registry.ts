@@ -222,6 +222,45 @@ export async function withRegistryLock(
   }
 }
 
+/** Block the calling thread for `ms` without spinning (no event loop needed). */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Synchronous counterpart of the lock acquire, for callers whose critical
+ * section never awaits (the hashes store's read-modify-write). Safe to block
+ * the event loop here: a sync-only critical section can never be mid-hold in
+ * this process while we wait (single thread), so the only possible holder is
+ * another process, which releases independently. Same stale-steal behavior as
+ * the async path.
+ */
+function acquireLockSync(path: string, options: LockOptions): void {
+  const retries = options.retries ?? DEFAULT_RETRIES;
+  const delay = options.retryDelayMs ?? DEFAULT_DELAY_MS;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    if (tryWxCreate(path) === "acquired") return;
+    if (stealIfStale(path) && tryWxCreate(path) === "acquired") return;
+    if (attempt === retries) throw new RegistryLockedError(path);
+    sleepSync(delay);
+  }
+}
+
+/**
+ * Run a synchronous critical section under `path` as a lockfile. The callback
+ * MUST NOT await — see `acquireLockSync`. Exported for the hashes store, whose
+ * whole-file read-modify-write otherwise races concurrent `up`s in different
+ * worktrees (issue #85).
+ */
+export function withFileLockSync<T>(path: string, fn: () => T, options: LockOptions = {}): T {
+  acquireLockSync(path, options);
+  try {
+    return fn();
+  } finally {
+    releaseLockAt(path);
+  }
+}
+
 /**
  * Serialize shared-instance lifecycle operations (lazy start, teardown) across
  * processes. Held over an async callback so the driver's binary probe + spawn

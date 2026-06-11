@@ -1,8 +1,18 @@
 import { describe, expect, it } from "vite-plus/test";
-import { mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import {
+  mkdtempSync,
+  rmSync,
+  readFileSync,
+  readdirSync,
+  existsSync,
+  mkdirSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readStoredHash, writeStoredHash, deleteStoredHash } from "./hashes.js";
+import { RegistryLockedError } from "./registry.js";
 
 function tmpAnchor(): string {
   return mkdtempSync(join(tmpdir(), "dt-hashes-"));
@@ -59,6 +69,48 @@ describe("stored hashes (per-worktree, anchor-local)", () => {
       // The file is JSON and contains the slug.
       const parsed = JSON.parse(readFileSync(join(anchor, "devtrees", "hashes.json"), "utf8"));
       expect(parsed).toEqual({ login: "x" });
+    } finally {
+      rmSync(anchor, { recursive: true, force: true });
+    }
+  });
+
+  it("releases hashes.lock and leaves no temp files after a write", () => {
+    const anchor = tmpAnchor();
+    try {
+      writeStoredHash(anchor, "login", "x");
+      deleteStoredHash(anchor, "login");
+      const entries = readdirSync(join(anchor, "devtrees"));
+      expect(entries).not.toContain("hashes.lock");
+      expect(entries.filter((e) => e.endsWith(".tmp"))).toEqual([]);
+    } finally {
+      rmSync(anchor, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses to write while hashes.lock is held by a live process", () => {
+    const anchor = tmpAnchor();
+    try {
+      mkdirSync(join(anchor, "devtrees"), { recursive: true });
+      writeFileSync(join(anchor, "devtrees", "hashes.lock"), `${process.pid}\n`, { flag: "wx" });
+      expect(() => writeStoredHash(anchor, "login", "x", { retries: 0 })).toThrow(
+        RegistryLockedError,
+      );
+    } finally {
+      rmSync(anchor, { recursive: true, force: true });
+    }
+  });
+
+  it("steals hashes.lock when its recorded holder pid is dead", () => {
+    const anchor = tmpAnchor();
+    try {
+      mkdirSync(join(anchor, "devtrees"), { recursive: true });
+      const dead = spawnSync(process.execPath, ["-e", ""]);
+      if (dead.pid === undefined) throw new Error("could not spawn throwaway process");
+      writeFileSync(join(anchor, "devtrees", "hashes.lock"), `${dead.pid}\n`, { flag: "wx" });
+
+      writeStoredHash(anchor, "login", "x", { retries: 0 });
+      expect(readStoredHash(anchor, "login")).toBe("x");
+      expect(existsSync(join(anchor, "devtrees", "hashes.lock"))).toBe(false);
     } finally {
       rmSync(anchor, { recursive: true, force: true });
     }
