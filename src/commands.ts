@@ -30,11 +30,12 @@ import {
 } from "./driver.js";
 import { readRegistry, withRegistryLock, withSharedLock } from "./registry.js";
 import { defaultIsPortFree, defaultPortHolder, type PortHolderReport } from "./port-probe.js";
-import { stackHash } from "./hash.js";
+import { sharedStackHash, stackHash } from "./hash.js";
 import {
   readStoredHash as defaultReadStoredHash,
   writeStoredHash as defaultWriteStoredHash,
 } from "./hashes.js";
+import { readSharedState, writeSharedState, type SharedState } from "./shared-state.js";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
@@ -53,6 +54,80 @@ class ConfigDriftError extends Error {
     super(message);
     this.name = "ConfigDriftError";
   }
+}
+
+/**
+ * Thrown when this worktree's shared subset (its `shared`-tier services)
+ * diverges from what the running shared instance was started with
+ * (issue #83) — typically a branch that added, removed, or edited a shared
+ * service. Injecting this worktree's recomputed numbers would not match the
+ * ports the shared instance actually bound, so `up`/`env` fail loudly with
+ * the `SHARED_DRIFT` envelope instead of silently injecting wrong
+ * connection info. Remediation mirrors the worktree-level `CONFIG_DRIFT`
+ * UX: `devtrees down --shared && devtrees up` restarts shared from this
+ * worktree's config and re-persists the new map.
+ */
+class SharedDriftError extends Error {
+  readonly code = "SHARED_DRIFT" as const;
+  readonly details: {
+    readonly worktree_id: string;
+    readonly running_hash: string;
+    readonly local_hash: string;
+  };
+  constructor(
+    message: string,
+    details: {
+      readonly worktree_id: string;
+      readonly running_hash: string;
+      readonly local_hash: string;
+    },
+  ) {
+    super(message);
+    this.name = "SharedDriftError";
+    this.details = details;
+  }
+}
+
+/**
+ * Compare this worktree's shared subset against the persisted identity of
+ * the running shared instance; throw `SharedDriftError` on mismatch. The
+ * hash is order-insensitive (`sharedStackHash`), so pure reordering in
+ * `devtrees.yaml` never trips it — only semantic divergence does.
+ */
+function assertSharedSubsetMatches(
+  stack: ResolvedStack,
+  state: SharedState,
+  worktreeId: string,
+): void {
+  const localHash = sharedStackHash(stack);
+  if (localHash === state.hash) return;
+  throw new SharedDriftError(
+    `devtrees: this worktree's shared services diverge from what the running shared instance ` +
+      `was started with (likely a branch that added, removed, or edited a shared service). ` +
+      `Refusing to inject port numbers the shared instance never bound. ` +
+      `Run \`devtrees down --shared && devtrees up\` to restart shared from this worktree's config.`,
+    { worktree_id: worktreeId, running_hash: state.hash, local_hash: localHash },
+  );
+}
+
+/**
+ * The name→port map the shared instance binds: every shared service's
+ * declared named port, resolved through the repo-wide shared block. This is
+ * what gets persisted at shared start and injected into every worktree.
+ */
+function collectSharedPorts(
+  stack: ResolvedStack,
+  sharedPortFor: (name: string) => number | undefined,
+): Record<string, number> {
+  const ports: Record<string, number> = {};
+  for (const service of stack.services) {
+    if (service.tier !== "shared") continue;
+    for (const name of service.ports) {
+      const port = sharedPortFor(name);
+      if (port !== undefined) ports[name] = port;
+    }
+  }
+  return ports;
 }
 
 const DEFAULT_ALLOCATOR: AllocatorOptions = { portBase: 20000, blockSize: 32 };
@@ -595,24 +670,10 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     isPortFree,
   });
 
-  const derived = deriveWorktreeConfig(stack, {
-    worktreeId: anchor.worktreeId,
-    worktreeRoot: anchor.worktreeRoot,
-    portFor,
-    sharedPortFor,
-  });
-
   // Warn for any port literal in a service command that is outside this
   // worktree's block — a hardcoded number devtrees did not allocate (PRD US-24).
   for (const warning of findUnmanagedPortBinds(stack, blockBase, options.blockSize)) {
     warn(warning);
-  }
-
-  // Surface every cross-tier `depends_on` edge devtrees just dropped. Silent
-  // dropping would make the orchestration-layer wiring a mystery (ADR-0003
-  // "Consequences").
-  for (const edge of derived.droppedEdges) {
-    warn(formatDroppedEdgeWarning(edge));
   }
 
   const paths = instancePaths(anchor.anchor, anchor.worktreeId);
@@ -647,12 +708,43 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
   // shared dead while this worktree's socket is still present. The start is
   // gated by `withSharedLock` and an idempotent socket-presence check so two
   // simultaneous `up`s never double-start it (acceptance).
+  //
+  // The call also resolves the authoritative shared name→port map (issue
+  // #83): when the instance is already running, the map *it* persisted at
+  // start wins over this worktree's positional recomputation, so branch
+  // divergence (reordered services) cannot skew the injected numbers — and
+  // semantic divergence fails with SHARED_DRIFT before anything is derived
+  // or spawned for this worktree.
   let sharedStarted = false;
+  let effectiveSharedPortFor = sharedPortFor;
   if (sharedNeeded) {
-    sharedStarted = await ensureSharedStarted(anchor.anchor, stack, sharedPortFor, sharedLock, {
-      driver,
-      probe: seams.probe,
-    });
+    const ensured = await ensureSharedStarted(
+      anchor.anchor,
+      stack,
+      anchor.worktreeId,
+      sharedPortFor,
+      sharedLock,
+      { driver, probe: seams.probe },
+    );
+    sharedStarted = ensured.started;
+    if (ensured.ports !== undefined) {
+      const ports = ensured.ports;
+      effectiveSharedPortFor = (name) => ports[name];
+    }
+  }
+
+  const derived = deriveWorktreeConfig(stack, {
+    worktreeId: anchor.worktreeId,
+    worktreeRoot: anchor.worktreeRoot,
+    portFor,
+    sharedPortFor: effectiveSharedPortFor,
+  });
+
+  // Surface every cross-tier `depends_on` edge devtrees just dropped. Silent
+  // dropping would make the orchestration-layer wiring a mystery (ADR-0003
+  // "Consequences").
+  for (const edge of derived.droppedEdges) {
+    warn(formatDroppedEdgeWarning(edge));
   }
 
   // Idempotency branch (issue #31): if this worktree's control socket is held
@@ -884,6 +976,18 @@ export async function runAttach(
 }
 
 /**
+ * Outcome of `ensureSharedStarted`: whether THIS call lazy-started the shared
+ * instance, and the authoritative name→port map worktrees must inject for
+ * shared services (issue #83). `ports` is `undefined` only on the legacy
+ * fallback — a shared instance started by a pre-#83 devtrees whose anchor
+ * state has no persisted map; the caller falls back to positional offsets.
+ */
+interface EnsuredShared {
+  readonly started: boolean;
+  readonly ports?: Readonly<Record<string, number>>;
+}
+
+/**
  * Idempotently lazy-start the shared instance: under the shared lifecycle lock,
  * if its control socket is held by a live listener do nothing; otherwise write
  * a fresh derived shared config and spawn `process-compose` against it. The
@@ -894,20 +998,37 @@ export async function runAttach(
  * shared instance leaves its socket behind, and trusting the file would make
  * the shared instance unrestartable without hand-deleting it. A stale socket
  * is unlinked and we fall through to the fresh start.
+ *
+ * The running instance is the source of truth for shared ports (issue #83):
+ *
+ *  - On start, the name→port map it binds and the shared-subset hash it was
+ *    derived from are persisted in anchor state (`shared-state.json`).
+ *  - On the already-running branch, this worktree's shared subset is checked
+ *    against that persisted hash — divergence throws `SharedDriftError`
+ *    (`SHARED_DRIFT`) instead of letting the caller inject numbers the
+ *    instance never bound — and the persisted map is returned for injection.
  */
 async function ensureSharedStarted(
   anchor: string,
   stack: ResolvedStack,
+  worktreeId: string,
   sharedPortFor: (name: string) => number | undefined,
   sharedLock: WithSharedLock,
   deps: {
     driver: ReturnType<typeof createDriver>;
     probe: (socketPath: string) => Promise<InstanceStatus>;
   },
-): Promise<boolean> {
+): Promise<EnsuredShared> {
   return await sharedLock(anchor, async () => {
     const paths = sharedInstancePaths(anchor);
-    if (await socketIsLive(paths.socketPath, deps.probe)) return false;
+    if (await socketIsLive(paths.socketPath, deps.probe)) {
+      const state = readSharedState(anchor);
+      // Legacy fallback: a pre-#83 shared instance left no persisted map.
+      // Positional computation is all we have — same behaviour as before.
+      if (state === undefined) return { started: false };
+      assertSharedSubsetMatches(stack, state, worktreeId);
+      return { started: false, ports: state.ports };
+    }
 
     const derived = deriveSharedConfig(stack, {
       workingDir: anchor,
@@ -924,7 +1045,13 @@ async function ensureSharedStarted(
     // doesn't race a second stub against ours (the loser's exit-time cleanup
     // would unlink the winner's socket).
     await waitForSocket(paths.socketPath);
-    return true;
+
+    // Make the running instance the source of truth: persist what it was
+    // started with so every subsequent `up`/`env` — on any branch — injects
+    // these numbers, not its own positional recomputation (issue #83).
+    const ports = collectSharedPorts(stack, sharedPortFor);
+    writeSharedState(anchor, { hash: sharedStackHash(stack), ports });
+    return { started: true, ports };
   });
 }
 
@@ -1350,11 +1477,28 @@ export async function runEnv(deps: CommandDeps = {}): Promise<EnvResult> {
     return offset === undefined ? undefined : sharedBlock.base + offset;
   };
 
+  // Shared ports come from the running instance, not positional offsets
+  // (issue #83): when the shared socket is live and a persisted map exists,
+  // report the numbers the instance actually bound — and fail with
+  // SHARED_DRIFT when this worktree's shared subset diverges, exactly as
+  // `up` would, instead of reporting connection info that is wrong. With no
+  // running instance, a future `up` would lazy-start shared from THIS
+  // worktree's stack, so the positional computation is the right prediction.
+  let effectiveSharedPortFor = sharedPortFor;
+  if (sharedNeeded && existsSync(sharedInstancePaths(anchor.anchor).socketPath)) {
+    const state = readSharedState(anchor.anchor);
+    if (state !== undefined) {
+      assertSharedSubsetMatches(stack, state, anchor.worktreeId);
+      const ports = state.ports;
+      effectiveSharedPortFor = (name) => ports[name];
+    }
+  }
+
   const derived = deriveWorktreeConfig(stack, {
     worktreeId: anchor.worktreeId,
     worktreeRoot: anchor.worktreeRoot,
     portFor,
-    sharedPortFor,
+    sharedPortFor: effectiveSharedPortFor,
   });
 
   return { worktreeId: anchor.worktreeId, env: derived.env };

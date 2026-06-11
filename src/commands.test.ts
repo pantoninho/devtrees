@@ -41,6 +41,8 @@ import { deriveSharedConfig, deriveWorktreeConfig } from "./deriver.js";
 import type { RegistrySnapshot } from "./allocator.js";
 import type { SpawnedProcess } from "./driver.js";
 import { SHARED_REGISTRY_KEY, instancePaths, sharedInstancePaths } from "./paths.js";
+import { sharedStackHash } from "./hash.js";
+import { readSharedState } from "./shared-state.js";
 import type { ResolvedStack } from "./stack.js";
 
 const cleanups: Array<() => void> = [];
@@ -3106,5 +3108,202 @@ describe("runDown — crash recovery: stale shared socket (#80)", () => {
 
     expect(result).toEqual({ shared: true });
     expect(downSpawns).toHaveLength(1);
+  });
+});
+
+/**
+ * Shared instance as source of truth for shared ports (#83).
+ *
+ * The running shared instance persists its name→port map (and a hash of the
+ * shared subset it was derived from) in anchor state at start. Worktrees
+ * inject shared connection info from that map instead of recomputing
+ * positional offsets against their own devtrees.yaml — so branch divergence
+ * (reordering, added services) can never silently inject port numbers the
+ * shared instance did not bind. A semantically-diverged shared subset fails
+ * with `SHARED_DRIFT` instead.
+ */
+describe("runUp / runEnv — shared port map persistence & drift (#83)", () => {
+  // The shared subset as worktree A's branch declares it.
+  const stackA: ResolvedStack = {
+    services: [
+      shared("postgres", "postgres -D ./pgdata", ["DB_PORT"]),
+      shared("redis", "redis-server", ["CACHE_PORT"]),
+      isolated("web", "node server.js", ["WEB_PORT"]),
+    ],
+  };
+  // Worktree B's branch lists the same services in a different order —
+  // positional offsets would swap DB_PORT and CACHE_PORT.
+  const stackBReordered: ResolvedStack = {
+    services: [
+      isolated("web", "node server.js", ["WEB_PORT"]),
+      shared("redis", "redis-server", ["CACHE_PORT"]),
+      shared("postgres", "postgres -D ./pgdata", ["DB_PORT"]),
+    ],
+  };
+  // Worktree B's branch adds a shared service — a semantic divergence.
+  const stackBDivergent: ResolvedStack = {
+    services: [...stackA.services, shared("mq", "rabbitmq-server", ["MQ_PORT"])],
+  };
+
+  /** deps for one worktree against a common anchor/registry fixture. */
+  function worktreeDeps(
+    fixture: { sharedAnchor: string; wtRoot: string; registryRef: { snapshot: RegistrySnapshot } },
+    stack: ResolvedStack,
+    worktreeId: string,
+    track?: StubSpawn,
+  ): CommandDeps {
+    return stubDeps({
+      stack,
+      worktreeId,
+      anchorOverride: fixture.sharedAnchor,
+      worktreeRootOverride: fixture.wtRoot,
+      registryRef: fixture.registryRef,
+      track: track ?? { invocations: [], touchSocket: true },
+    });
+  }
+
+  /** Spawner that mimics the real driver's `down` removing the control socket. */
+  function socketRemovingDownDeps(deps: CommandDeps): CommandDeps {
+    return {
+      ...deps,
+      driver: {
+        exists: () => Promise.resolve(true),
+        spawner: (_b, args, _o): SpawnedProcess => {
+          const si = args.indexOf("-u");
+          if (args[0] === "down" && si >= 0) {
+            const socketPath = args[si + 1];
+            if (socketPath) rmSync(socketPath, { force: true });
+          }
+          return spawnedOk();
+        },
+      },
+    };
+  }
+
+  it("persists the shared name→port map + subset hash in anchor state when shared starts", async () => {
+    const fixture = multiWorktreeFixture("dt-map-");
+    const result = await runUp(worktreeDeps(fixture, stackA, "login"));
+
+    const state = readSharedState(fixture.sharedAnchor);
+    expect(state).toBeDefined();
+    expect(state?.hash).toBe(sharedStackHash(stackA));
+    expect(state?.ports).toEqual({
+      DB_PORT: Number(result.env.DB_PORT),
+      CACHE_PORT: Number(result.env.CACHE_PORT),
+    });
+  });
+
+  it("injects the running instance's ports into a worktree whose branch reorders services", async () => {
+    // A starts shared from its ordering; B's branch reverses the list. With
+    // positional offsets B would swap DB_PORT/CACHE_PORT — the persisted map
+    // must win so both worktrees see identical shared connection info.
+    const fixture = multiWorktreeFixture("dt-reorder-");
+    const a = await runUp(worktreeDeps(fixture, stackA, "login"));
+    const b = await runUp(worktreeDeps(fixture, stackBReordered, "billing"));
+
+    expect(b.sharedStarted).toBe(false);
+    expect(b.env.DB_PORT).toBe(a.env.DB_PORT);
+    expect(b.env.CACHE_PORT).toBe(a.env.CACHE_PORT);
+  });
+
+  it("does not flag drift when the shared subsets are identical (no false positives)", async () => {
+    const fixture = multiWorktreeFixture("dt-same-");
+    const a = await runUp(worktreeDeps(fixture, stackA, "login"));
+    // Structurally-equal but distinct stack object — same branch, fresh parse.
+    const sameStack: ResolvedStack = JSON.parse(JSON.stringify(stackA)) as ResolvedStack;
+    const b = await runUp(worktreeDeps(fixture, sameStack, "billing"));
+    expect(b.env.DB_PORT).toBe(a.env.DB_PORT);
+    expect(b.env.CACHE_PORT).toBe(a.env.CACHE_PORT);
+  });
+
+  it("fails with SHARED_DRIFT when a worktree's shared subset diverges from the running instance", async () => {
+    const fixture = multiWorktreeFixture("dt-drift-");
+    await runUp(worktreeDeps(fixture, stackA, "login"));
+
+    const err = await runUp(worktreeDeps(fixture, stackBDivergent, "billing")).then(
+      () => undefined,
+      (e: unknown) => e as Error & { code?: string },
+    );
+    if (err === undefined) throw new Error("expected runUp to reject with shared drift");
+    expect(err.code).toBe("SHARED_DRIFT");
+    // The remediation is explicit: bring shared down and up again.
+    expect(err.message).toMatch(/down --shared/);
+  });
+
+  it("drift does not spawn the divergent worktree's instance (no partial up)", async () => {
+    const fixture = multiWorktreeFixture("dt-drift-spawn-");
+    await runUp(worktreeDeps(fixture, stackA, "login"));
+
+    const trackB: StubSpawn = { invocations: [], touchSocket: true };
+    await expect(
+      runUp(worktreeDeps(fixture, stackBDivergent, "billing", trackB)),
+    ).rejects.toThrow();
+    expect(trackB.invocations).toEqual([]);
+  });
+
+  it("down --shared followed by up from the divergent worktree succeeds and re-persists the new map", async () => {
+    const fixture = multiWorktreeFixture("dt-repersist-");
+    await runUp(worktreeDeps(fixture, stackA, "login"));
+
+    const bDeps = worktreeDeps(fixture, stackBDivergent, "billing");
+    await expect(runUp(bDeps)).rejects.toThrow(/down --shared/);
+
+    await runDown(socketRemovingDownDeps(bDeps), { shared: true });
+
+    const b = await runUp(bDeps);
+    expect(b.sharedStarted).toBe(true);
+    expect(b.env.MQ_PORT).toBeDefined();
+
+    const state = readSharedState(fixture.sharedAnchor);
+    expect(state?.hash).toBe(sharedStackHash(stackBDivergent));
+    expect(state?.ports).toEqual({
+      DB_PORT: Number(b.env.DB_PORT),
+      CACHE_PORT: Number(b.env.CACHE_PORT),
+      MQ_PORT: Number(b.env.MQ_PORT),
+    });
+  });
+
+  it("falls back to positional offsets when shared is running but no state was persisted (pre-#83 instance)", async () => {
+    const fixture = multiWorktreeFixture("dt-legacy-");
+    // Simulate a shared instance started by an older devtrees: socket on
+    // disk, no shared-state.json.
+    const runDir = join(fixture.sharedAnchor, "devtrees", "run");
+    mkdirSync(runDir, { recursive: true });
+    writeFileSync(join(runDir, "shared.sock"), "");
+
+    const result = await runUp(worktreeDeps(fixture, stackA, "login"));
+    expect(result.sharedStarted).toBe(false);
+    expect(result.env.DB_PORT).toBeDefined();
+    expect(result.env.CACHE_PORT).toBeDefined();
+  });
+
+  it("runEnv reads the persisted map so a reordered branch sees what shared actually bound", async () => {
+    const fixture = multiWorktreeFixture("dt-env-map-");
+    const a = await runUp(worktreeDeps(fixture, stackA, "login"));
+
+    const env = await runEnv(worktreeDeps(fixture, stackBReordered, "billing"));
+    expect(env.env.DB_PORT).toBe(a.env.DB_PORT);
+    expect(env.env.CACHE_PORT).toBe(a.env.CACHE_PORT);
+  });
+
+  it("runEnv fails with SHARED_DRIFT for a divergent worktree instead of reporting wrong ports", async () => {
+    const fixture = multiWorktreeFixture("dt-env-drift-");
+    await runUp(worktreeDeps(fixture, stackA, "login"));
+
+    const err = await runEnv(worktreeDeps(fixture, stackBDivergent, "billing")).then(
+      () => undefined,
+      (e: unknown) => e as Error & { code?: string },
+    );
+    if (err === undefined) throw new Error("expected runEnv to reject with shared drift");
+    expect(err.code).toBe("SHARED_DRIFT");
+  });
+
+  it("runEnv computes positional would-be ports when the shared instance is not running", async () => {
+    // No shared socket: a future `up` would lazy-start shared from this
+    // worktree's own stack, so env predicts the positional computation.
+    const fixture = multiWorktreeFixture("dt-env-down-");
+    const env = await runEnv(worktreeDeps(fixture, stackA, "login"));
+    expect(Number(env.env.DB_PORT)).toBeGreaterThanOrEqual(20000);
+    expect(Number(env.env.CACHE_PORT)).toBe(Number(env.env.DB_PORT) + 1);
   });
 });
