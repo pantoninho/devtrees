@@ -219,11 +219,11 @@ export function parseStack(yamlText: string, options: ParseStackOptions = {}): R
   const overlay = doc.services ?? {};
 
   const baseProcesses: Record<string, RawService> = options.baseYaml
-    ? (
+    ? ((
         (parseYamlConfig(options.baseYaml, "the extends base file") ?? {}) as {
           processes?: Record<string, RawService>;
         }
-      ).processes ?? {}
+      ).processes ?? {})
     : {};
 
   // Union of names: base contributes the process body, overlay contributes
