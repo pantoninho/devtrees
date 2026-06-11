@@ -141,7 +141,7 @@ function assertSharedSubsetMatches(
   const localHash = sharedStackHash(stack);
   if (localHash === state.hash) return;
   throw new SharedDriftError(
-    `devtrees: this worktree's shared services diverge from what the running shared instance ` +
+    `this worktree's shared services diverge from what the running shared instance ` +
       `was started with (likely a branch that added, removed, or edited a shared service). ` +
       `Refusing to inject port numbers the shared instance never bound. ` +
       `Run \`devtrees down --shared && devtrees up\` to restart shared from this worktree's config.`,
