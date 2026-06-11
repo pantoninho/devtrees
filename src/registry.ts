@@ -64,13 +64,26 @@ function sharedLockFile(anchor: string): string {
   return join(devtreesDir(anchor), "shared.lock");
 }
 
-/** Read the persisted snapshot for this anchor; empty object if none exists yet. */
+/**
+ * Read the persisted snapshot for this anchor; empty object if none exists yet.
+ *
+ * Parse-tolerant: a corrupt or non-object file (e.g. left behind by a crash
+ * that predates the atomic-rename writes) degrades to the empty snapshot
+ * instead of throwing on every subsequent command. The next locked write
+ * replaces the corrupt file with valid JSON, so the store self-heals.
+ */
 export function readRegistry(anchor: string): RegistrySnapshot {
   const file = registryFile(anchor);
   if (!existsSync(file)) return {};
   const text = readFileSync(file, "utf8");
   if (text.trim() === "") return {};
-  return JSON.parse(text) as RegistrySnapshot;
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return parsed as RegistrySnapshot;
+  } catch {
+    return {};
+  }
 }
 
 /** Outcome of one `wx`-create attempt. */

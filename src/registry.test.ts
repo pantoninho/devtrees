@@ -43,6 +43,39 @@ describe("registry store — lock + persistence", () => {
     expect(readFileSync(file, "utf8")).toBe(beforeMtime);
   });
 
+  it("falls back to an empty snapshot when the registry file is corrupt JSON", () => {
+    const anchor = newAnchor();
+    mkdirSync(join(anchor, "devtrees"), { recursive: true });
+    // A pre-atomic-write crash could leave a half-written file like this.
+    writeFileSync(join(anchor, "devtrees", "registry.json"), '{"login": 205', "utf8");
+    expect(readRegistry(anchor)).toEqual({});
+  });
+
+  it("falls back to an empty snapshot when the registry file holds non-object JSON", () => {
+    const anchor = newAnchor();
+    mkdirSync(join(anchor, "devtrees"), { recursive: true });
+    for (const junk of ["null", '"hi"', "[1,2]"]) {
+      writeFileSync(join(anchor, "devtrees", "registry.json"), junk, "utf8");
+      expect(readRegistry(anchor)).toEqual({});
+    }
+  });
+
+  it("self-heals a corrupt registry on the next locked write", async () => {
+    const anchor = newAnchor();
+    mkdirSync(join(anchor, "devtrees"), { recursive: true });
+    writeFileSync(join(anchor, "devtrees", "registry.json"), "{corrupt", "utf8");
+    // The mutate callback sees the safe fallback, not a crash …
+    await withRegistryLock(anchor, (snapshot) => {
+      expect(snapshot).toEqual({});
+      return { ...snapshot, login: 20512 };
+    });
+    // … and the write replaces the corrupt file with valid JSON.
+    expect(readRegistry(anchor)).toEqual({ login: 20512 });
+    expect(JSON.parse(readFileSync(join(anchor, "devtrees", "registry.json"), "utf8"))).toEqual({
+      login: 20512,
+    });
+  });
+
   it("refuses to acquire the lock if another holder is already there", async () => {
     const anchor = newAnchor();
     // Simulate another process holding the lock.
