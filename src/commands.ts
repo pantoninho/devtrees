@@ -1112,8 +1112,8 @@ export function findUnmanagedPortBinds(
  * dropped it.
  */
 export type DownResult =
-  | { readonly shared: true; readonly worktreeId?: undefined }
-  | { readonly shared: false; readonly worktreeId: string };
+  | { readonly shared: true; readonly worktreeId?: undefined; readonly stopped: boolean }
+  | { readonly shared: false; readonly worktreeId: string; readonly stopped: boolean };
 
 /**
  * Stop this worktree's instance (default) or — with `{ shared: true }` — the
@@ -1149,17 +1149,19 @@ export async function runDown(
     const probe = resolveProbe(deps);
     const paths = sharedInstancePaths(anchor.anchor);
 
-    await sharedLock(anchor.anchor, async () => {
+    const stopped = await sharedLock(anchor.anchor, async () => {
       // Probe, don't trust the file (#80): after a SIGKILL the socket file
       // survives with no listener behind it, and `process-compose down`
       // against the dead UDS fails. A live instance is signalled through the
       // driver; a stale socket is unlinked by the probe gate itself, so
       // either way the call converges to "shared is down" — idempotently.
-      if (await socketIsLive(paths.socketPath, probe)) {
+      const live = await socketIsLive(paths.socketPath, probe);
+      if (live) {
         await driver.down({ configPath: paths.configPath, socketPath: paths.socketPath });
       }
       // Best-effort cleanup of the derived config — a future `up` re-derives it.
       rmSync(paths.configPath, { force: true });
+      return live;
     });
 
     // Keep the `__shared__` registry entry across the teardown (issue #51).
@@ -1169,13 +1171,22 @@ export async function runDown(
     // from socket presence (instances.ts), not the registry, so dropping the
     // entry was tidy theatre at the cost of port stability.
 
-    return { shared: true };
+    return { shared: true, stopped };
   }
 
+  // Worktree branch mirrors the shared branch's idempotency (issue #92): a
+  // `down` with nothing running used to shell out unconditionally and surface
+  // a raw "process-compose down exited with code N" as UNKNOWN. Probe first
+  // (#80 — a stale socket file is unlinked by the gate itself) and skip the
+  // driver when no live instance answers; the caller renders the no-op notice
+  // from `stopped: false` and still exits 0.
   const paths = instancePaths(anchor.anchor, anchor.worktreeId);
-  await driver.down({ configPath: paths.configPath, socketPath: paths.socketPath });
+  const live = await socketIsLive(paths.socketPath, resolveProbe(deps));
+  if (live) {
+    await driver.down({ configPath: paths.configPath, socketPath: paths.socketPath });
+  }
 
-  return { shared: false, worktreeId: anchor.worktreeId };
+  return { shared: false, worktreeId: anchor.worktreeId, stopped: live };
 }
 
 /** Inputs unique to `runLs` — same anchor resolution as the other commands. */

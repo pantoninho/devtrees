@@ -1355,6 +1355,104 @@ describe("runDown — operation-output result (#48)", () => {
   });
 });
 
+/**
+ * Issue #92 — worktree `down` with nothing running is an idempotent no-op,
+ * matching the `--shared` branch: no unconditional driver call (which used to
+ * surface "process-compose down exited with code N" as UNKNOWN), exit 0, and
+ * a `stopped: false` field in the result so the CLI can render the notice.
+ */
+describe("runDown — idempotent no-op when nothing is running (#92)", () => {
+  const mixedStack: ResolvedStack = {
+    services: [
+      isolated("web", "node server.js", ["WEB_PORT"]),
+      shared("postgres", "postgres", ["DB_PORT"]),
+    ],
+  };
+
+  /** Wrap deps with a spawner that records `down` invocations. */
+  function recordingDownDeps(deps: CommandDeps): {
+    deps: CommandDeps;
+    downCalls: ReadonlyArray<string>[];
+  } {
+    const downCalls: ReadonlyArray<string>[] = [];
+    return {
+      downCalls,
+      deps: {
+        ...deps,
+        driver: {
+          exists: () => Promise.resolve(true),
+          spawner: (_b, args, _o): SpawnedProcess => {
+            if (args[0] === "down") downCalls.push(args);
+            return spawnedOk();
+          },
+        },
+      },
+    };
+  }
+
+  it("worktree down with no instance running skips the driver and returns stopped: false", async () => {
+    // No prior `up` — the worktree's control socket does not exist.
+    const { deps, downCalls } = recordingDownDeps(stubDeps({ stack: mixedStack }));
+    const result = await runDown(deps);
+    expect(downCalls).toHaveLength(0);
+    expect(result.shared).toBe(false);
+    expect(result.stopped).toBe(false);
+  });
+
+  it("worktree down against a live instance calls the driver and returns stopped: true", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const baseDeps = stubDeps({ stack: mixedStack, track });
+    await runUp(baseDeps);
+    const { deps, downCalls } = recordingDownDeps(baseDeps);
+    const result = await runDown(deps);
+    expect(downCalls).toHaveLength(1);
+    expect(result.stopped).toBe(true);
+    expect(result.worktreeId).toBe(baseDeps.expectedWorktreeId);
+  });
+
+  it("worktree down against a stale socket file (dead listener) is a no-op that unlinks the orphan", async () => {
+    // Mimic a SIGKILLed instance: the socket *file* survives in anchor state
+    // but no listener answers (#80). `down` must not shell out against the
+    // dead UDS — that's the raw "exited with code N" UNKNOWN the issue fixes.
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const baseDeps = stubDeps({
+      stack: mixedStack,
+      track,
+      probeSocket: async () => "stale" as const,
+    });
+    await runUp({ ...baseDeps, probeSocket: async () => "running" as const });
+    const worktreeSpawn = track.invocations.find((i) => !i.socketPath.endsWith("/shared.sock"));
+    if (worktreeSpawn === undefined) throw new Error("expected a worktree spawn");
+    expect(existsSync(worktreeSpawn.socketPath)).toBe(true);
+
+    const { deps, downCalls } = recordingDownDeps(baseDeps);
+    const result = await runDown(deps);
+    expect(downCalls).toHaveLength(0);
+    expect(result.stopped).toBe(false);
+    // The probe gate unlinked the orphaned socket file on the way through.
+    expect(existsSync(worktreeSpawn.socketPath)).toBe(false);
+  });
+
+  it("shared down reports stopped: true when it actually tore the instance down", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const baseDeps = stubDeps({ stack: mixedStack, track });
+    await runUp(baseDeps);
+    const { deps, downCalls } = recordingDownDeps(baseDeps);
+    const result = await runDown(deps, { shared: true });
+    expect(downCalls).toHaveLength(1);
+    expect(result.shared).toBe(true);
+    expect(result.stopped).toBe(true);
+  });
+
+  it("shared down no-op reports stopped: false", async () => {
+    const { deps, downCalls } = recordingDownDeps(stubDeps({ stack: mixedStack }));
+    const result = await runDown(deps, { shared: true });
+    expect(downCalls).toHaveLength(0);
+    expect(result.shared).toBe(true);
+    expect(result.stopped).toBe(false);
+  });
+});
+
 describe("runGenerate — emit derived configs to disk", () => {
   it("writes the worktree-isolated config to <anchor>/devtrees/<worktreeId>.yaml and its YAML matches the deriver's output", async () => {
     const stack: ResolvedStack = {
@@ -3232,7 +3330,7 @@ describe("runDown — crash recovery: stale shared socket (#80)", () => {
     const result = await runDown(deps, { shared: true });
 
     // Idempotent no-op result, no `process-compose down` against the dead UDS.
-    expect(result).toEqual({ shared: true });
+    expect(result).toEqual({ shared: true, stopped: false });
     expect(downSpawns).toHaveLength(0);
     // The orphaned socket file was unlinked, so the next up lazy-starts fresh.
     expect(existsSync(sharedPaths.socketPath)).toBe(false);
@@ -3261,7 +3359,7 @@ describe("runDown — crash recovery: stale shared socket (#80)", () => {
 
     const result = await runDown(deps, { shared: true });
 
-    expect(result).toEqual({ shared: true });
+    expect(result).toEqual({ shared: true, stopped: true });
     expect(downSpawns).toHaveLength(1);
   });
 });

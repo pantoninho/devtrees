@@ -573,7 +573,7 @@ describe("output formatter — formatDown", () => {
       down: Record<string, unknown>;
     };
     expect(parsed.schema_version).toBe(SCHEMA_VERSION);
-    expect(parsed.down).toEqual({ worktreeId: "login" });
+    expect(parsed.down).toEqual({ worktreeId: "login", stopped: true });
     expect(parsed.down).not.toHaveProperty("shared");
     expect(parsed.down).not.toHaveProperty("env");
     expect(parsed.down).not.toHaveProperty("services");
@@ -588,11 +588,34 @@ describe("output formatter — formatDown", () => {
       down: Record<string, unknown>;
     };
     expect(parsed.schema_version).toBe(SCHEMA_VERSION);
-    expect(parsed.down).toEqual({ shared: true });
+    expect(parsed.down).toEqual({ shared: true, stopped: true });
     expect(parsed.down).not.toHaveProperty("worktreeId");
     expect(parsed.down).not.toHaveProperty("env");
     expect(parsed.down).not.toHaveProperty("services");
     expect(parsed.down).not.toHaveProperty("block_base");
+  });
+
+  /**
+   * Issue #92 — `down` with nothing running is an idempotent no-op. The
+   * payload's `stopped: false` renders a "nothing to do" notice in human mode
+   * and a `stopped: false` field in the JSON envelope; the exit stays 0 in
+   * both modes (the caller owns the exit code and sees no error).
+   */
+  it("in human mode for a worktree no-op, emits the idempotent notice (#92)", () => {
+    const result = formatDown({ worktreeId: "login", stopped: false }, "human");
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toBe("devtrees down: no worktree instance running; nothing to do.\n");
+  });
+
+  it("in human mode for a shared no-op, emits the idempotent notice (#92)", () => {
+    const result = formatDown({ shared: true, stopped: false }, "human");
+    expect(result.stdout).toBe("devtrees down: shared instance not running; nothing to do.\n");
+  });
+
+  it("in JSON mode a no-op down carries stopped: false (#92)", () => {
+    const result = formatDown({ worktreeId: "login", stopped: false }, "json");
+    const parsed = JSON.parse(result.stdout) as { down: Record<string, unknown> };
+    expect(parsed.down).toEqual({ worktreeId: "login", stopped: false });
   });
 
   it("JSON output ends with a single trailing newline (line-friendly for shell consumers)", () => {
