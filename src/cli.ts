@@ -432,6 +432,7 @@ class LogsCommand extends DevtreesCommand {
       ["Tail one service", "devtrees logs web"],
       ["Tail every service, interleaved", "devtrees logs --all"],
       ["Stream as NDJSON", "devtrees logs web --json"],
+      ["Follow, keeping only the last 5 minutes of events", "devtrees logs web -f --since 5m"],
     ],
   });
 
