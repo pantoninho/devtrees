@@ -315,16 +315,23 @@ class UpCommand extends DevtreesCommand {
       );
       if (out.stdout) this.context.stdout.write(out.stdout);
       if (out.stderr) this.context.stderr.write(out.stderr);
-      // Agent-onboarding hint (issue #119): emitted on `up` only, at most once,
-      // to STDERR — never the `--json` stdout envelope (the stdout document is
-      // written above and stays byte-for-byte unaffected). The gating decision
-      // (agent context + no agent-doc referencing devtrees) lives in the
-      // injected `initHint` thunk; here we only forward the line it hands back.
-      // Wrapped in a guard so a hint never changes the exit code or blocks.
-      const hint = this.context.deps.initHint?.();
-      if (hint) this.context.stderr.write(`${hint}\n`);
+      this.emitInitHint();
       return 0;
     });
+  }
+
+  /**
+   * Agent-onboarding hint (issue #119): emitted on `up` only, at most once, to
+   * STDERR — never the `--json` stdout envelope (the stdout document is already
+   * written by the time we get here and stays byte-for-byte unaffected). The
+   * gating decision (agent context + no agent-doc referencing devtrees) lives
+   * in the injected `initHint` thunk; this only forwards the line it hands
+   * back, so a hint never changes the exit code or blocks. Extracted from
+   * `execute` so the dispatch body stays a flat sequence.
+   */
+  private emitInitHint(): void {
+    const hint = this.context.deps.initHint?.();
+    if (hint) this.context.stderr.write(`${hint}\n`);
   }
 }
 
