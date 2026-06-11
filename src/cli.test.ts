@@ -118,26 +118,28 @@ describe("devtrees CLI", () => {
         "STALE_PORT_BLOCK",
         "CONFIG_DRIFT",
         "SHARED_DRIFT",
+        "CONFIG_INVALID",
+        "LOCK_CONTENTION",
         "HEALTH_TIMEOUT",
         "PROCESS_COMPOSE_NOT_FOUND",
         "INVALID_ARGS",
         "UNKNOWN",
       ],
     ],
-    ["down", ["PROCESS_COMPOSE_NOT_FOUND", "UNKNOWN"]],
+    // `down --shared` serializes on the shared lifecycle lock → LOCK_CONTENTION.
+    ["down", ["PROCESS_COMPOSE_NOT_FOUND", "LOCK_CONTENTION", "UNKNOWN"]],
     ["ls", ["UNKNOWN"]],
     ["attach", ["INSTANCE_NOT_FOUND", "PROCESS_COMPOSE_NOT_FOUND", "UNKNOWN"]],
-    ["generate", ["UNKNOWN"]],
-    ["prune", ["UNKNOWN"]],
-    ["env", ["SHARED_DRIFT", "UNKNOWN"]],
+    // `generate` loads devtrees.yaml and allocates under the registry lock.
+    ["generate", ["CONFIG_INVALID", "LOCK_CONTENTION", "UNKNOWN"]],
+    // `prune` drops orphan registry entries under the registry lock.
+    ["prune", ["LOCK_CONTENTION", "UNKNOWN"]],
+    // `env` loads devtrees.yaml (CONFIG_INVALID) and reports shared-tier
+    // divergence (SHARED_DRIFT, #83) but is lock-free (pure registry read).
+    ["env", ["SHARED_DRIFT", "CONFIG_INVALID", "UNKNOWN"]],
     ["logs", ["INSTANCE_NOT_FOUND", "INVALID_ARGS", "UNKNOWN"]],
   ];
 
-  // Codes RESERVED in `ERROR_CODES` but not currently emitted from any throw
-  // site. Listing them in a footer would mislead an agent into branching on
-  // an envelope that can't actually appear; the footer must omit them until
-  // a real throw site exists.
-  const RESERVED_CODES = ["LOCK_CONTENTION", "CONFIG_INVALID"] as const;
   const ALL_KNOWN_CODES = [
     "PROCESS_COMPOSE_NOT_FOUND",
     "INSTANCE_NOT_FOUND",
@@ -169,14 +171,13 @@ describe("devtrees CLI", () => {
     });
   }
 
-  it("no subcommand --help advertises a reserved-but-unemitted code", () => {
-    // Defence-in-depth: even if the mapping above drifts, never let a
-    // reserved code (currently `LOCK_CONTENTION`, `CONFIG_INVALID`) leak
-    // into a footer until a real throw site emits it.
-    for (const [, codes] of ERROR_CODES_BY_COMMAND) {
-      for (const reserved of RESERVED_CODES) {
-        expect(codes).not.toContain(reserved);
-      }
+  it("every documented code is emittable by at least one command (no reserved leftovers)", () => {
+    // Issue #84 closed the reserved set: every code in ERROR_CODES now has a
+    // real throw site. A code documented in `output.ts` but absent from every
+    // footer would mean the enum drifted ahead of the throw sites again.
+    const advertised = new Set(ERROR_CODES_BY_COMMAND.flatMap(([, codes]) => [...codes]));
+    for (const code of ALL_KNOWN_CODES) {
+      expect(advertised).toContain(code);
     }
   });
 

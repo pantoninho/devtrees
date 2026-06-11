@@ -242,6 +242,8 @@ class UpCommand extends DevtreesCommand {
       "STALE_PORT_BLOCK",
       "CONFIG_DRIFT",
       "SHARED_DRIFT",
+      "CONFIG_INVALID",
+      "LOCK_CONTENTION",
       "HEALTH_TIMEOUT",
       "PROCESS_COMPOSE_NOT_FOUND",
       "INVALID_ARGS",
@@ -297,7 +299,8 @@ class DownCommand extends DevtreesCommand {
   static override paths = [["down"]];
   static override usage = Command.Usage({
     description: "Stop this worktree's stack (`--shared` tears down the shared instance).",
-    details: errorCodeFooter(["PROCESS_COMPOSE_NOT_FOUND", "UNKNOWN"]),
+    // `--shared` serializes on the shared lifecycle lock → LOCK_CONTENTION.
+    details: errorCodeFooter(["PROCESS_COMPOSE_NOT_FOUND", "LOCK_CONTENTION", "UNKNOWN"]),
   });
 
   shared = Option.Boolean("--shared", false, {
@@ -325,7 +328,9 @@ class GenerateCommand extends DevtreesCommand {
   static override paths = [["generate"]];
   static override usage = Command.Usage({
     description: "Write the derived process-compose config to disk without starting anything.",
-    details: errorCodeFooter(["UNKNOWN"]),
+    // Loads devtrees.yaml (CONFIG_INVALID) and allocates ports under the
+    // registry lock (LOCK_CONTENTION) — see `runGenerate` in src/commands.ts.
+    details: errorCodeFooter(["CONFIG_INVALID", "LOCK_CONTENTION", "UNKNOWN"]),
   });
 
   override async execute(): Promise<number> {
@@ -388,7 +393,8 @@ class PruneCommand extends DevtreesCommand {
   static override paths = [["prune"]];
   static override usage = Command.Usage({
     description: "Reconcile against `git worktree list` and clean up orphaned instances.",
-    details: errorCodeFooter(["UNKNOWN"]),
+    // Drops orphan registry entries under the registry lock → LOCK_CONTENTION.
+    details: errorCodeFooter(["LOCK_CONTENTION", "UNKNOWN"]),
   });
 
   override async execute(): Promise<number> {
@@ -407,7 +413,10 @@ class EnvCommand extends DevtreesCommand {
   static override paths = [["env"]];
   static override usage = Command.Usage({
     description: "Print this worktree's injected env (KEY=value, or `--json` for a map).",
-    details: errorCodeFooter(["SHARED_DRIFT", "UNKNOWN"]),
+    // Loads devtrees.yaml (CONFIG_INVALID) and reports shared-tier divergence
+    // (SHARED_DRIFT, #83) but is lock-free — `runEnv` is a pure registry
+    // read, so LOCK_CONTENTION cannot occur here.
+    details: errorCodeFooter(["SHARED_DRIFT", "CONFIG_INVALID", "UNKNOWN"]),
   });
 
   override async execute(): Promise<number> {
