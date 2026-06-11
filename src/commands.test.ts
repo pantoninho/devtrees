@@ -35,8 +35,10 @@ import {
   runLogs,
   runUp,
   type CommandDeps,
+  type WithLifecycleLock,
   type WithSharedLock,
 } from "./commands.js";
+import { withLifecycleLock } from "./registry.js";
 import { deriveWorktreeId } from "./anchor.js";
 import { deriveSharedConfig, deriveWorktreeConfig } from "./deriver.js";
 import type { RegistrySnapshot } from "./allocator.js";
@@ -231,6 +233,10 @@ function stubDeps(opts: {
     // Default verdict "running" preserves the pre-#80 semantics existing
     // tests fake liveness with (touching a plain file at the socket path).
     probeSocket: opts.probeSocket ?? (async () => "running" as const),
+    // The stub spawner with touchSocket: false never binds a socket, so the
+    // real post-spawn socket poll (#91) would burn its full timeout in most
+    // tests. Tests that care about the socket-wait override this field.
+    waitForSocketFile: () => Promise.resolve(),
     // Driver that records every spawn but doesn't actually run anything.
     driver: {
       exists: () => Promise.resolve(true),
@@ -3690,5 +3696,174 @@ describe("runUp / runEnv — shared port map persistence & drift (#83)", () => {
     const env = await runEnv(worktreeDeps(fixture, stackA, "login"));
     expect(Number(env.env.DB_PORT)).toBeGreaterThanOrEqual(20000);
     expect(Number(env.env.CACHE_PORT)).toBe(Number(env.env.DB_PORT) + 1);
+  });
+});
+
+/**
+ * `runUp` — issue #91: per-worktree lifecycle lock. Two concurrent `up`s in
+ * the same worktree (human + agent) both passing the liveness gate would each
+ * write the derived config and spawn process-compose against the same socket
+ * and port block — the loser's exit-time cleanup then unlinks the winner's
+ * socket. The lock generalizes the shared-instance start gate: held across
+ * the liveness-check → config-write → spawn → socket-wait window, so the
+ * loser observes the winner's live instance and takes the idempotency path.
+ */
+describe("runUp — per-worktree lifecycle lock (issue #91)", () => {
+  const oneIsolated: ResolvedStack = {
+    services: [isolated("web", "node server.js", ["WEB_PORT"])],
+  };
+
+  /** A pass-through lock that records its acquire/release into `events`. */
+  function makeSpyLock(events: string[]): WithLifecycleLock {
+    return async (_anchor, instanceId, fn) => {
+      events.push(`acquire:${instanceId}`);
+      try {
+        return await fn();
+      } finally {
+        events.push(`release:${instanceId}`);
+      }
+    };
+  }
+
+  it("holds the worktree's lock across spawn and socket-wait, releasing only after both", async () => {
+    const events: string[] = [];
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const base = stubDeps({ stack: oneIsolated, track });
+    const inner = base.driver?.spawner;
+    if (inner === undefined) throw new Error("expected stub spawner");
+
+    const deps: CommandDeps = {
+      ...base,
+      withLifecycleLock: makeSpyLock(events),
+      waitForSocketFile: async () => {
+        events.push("socket-wait");
+      },
+      driver: {
+        ...base.driver,
+        spawner: (binary, args, options) => {
+          if (args[0] === "up") events.push("spawn");
+          return inner(binary, args, options);
+        },
+      },
+    };
+
+    await runUp(deps);
+
+    const id = base.expectedWorktreeId;
+    // The full check→spawn→socket-ready window runs inside one hold: spawn
+    // AND the socket-observable wait both precede the release. A lock
+    // released right after `driver.up` returned would let a concurrent up's
+    // liveness gate run before the socket exists — and double-spawn.
+    expect(events).toEqual([`acquire:${id}`, "spawn", "socket-wait", `release:${id}`]);
+  });
+
+  it("runs the already-up liveness gate + reconciliation inside the lock window", async () => {
+    const events: string[] = [];
+    const tmp = tmpAnchor();
+    const base = stubDeps({
+      stack: oneIsolated,
+      anchorOverride: tmp.anchor,
+      worktreeRootOverride: tmp.worktreeRoot,
+      probeSocket: async () => {
+        events.push("probe");
+        return "running" as const;
+      },
+    });
+    // Fake an already-live instance: socket file present + probe says running.
+    const socketPath = instancePaths(tmp.anchor, base.expectedWorktreeId).socketPath;
+    mkdirSync(join(tmp.anchor, "devtrees", "run"), { recursive: true });
+    writeFileSync(socketPath, "");
+
+    const currentHashStore: Record<string, string> = {};
+    const deps: CommandDeps = {
+      ...base,
+      withLifecycleLock: makeSpyLock(events),
+      readStoredHash: (_a, id) => currentHashStore[id],
+      writeStoredHash: (_a, id, h) => {
+        events.push("hash-write");
+        currentHashStore[id] = h;
+      },
+      getServiceStatuses: async () => [],
+    };
+
+    await runUp(deps);
+
+    const id = base.expectedWorktreeId;
+    // Liveness probe inside the hold; reconcile (here: drift-path hash write,
+    // since no hash was stored) also inside; no spawn anywhere.
+    expect(events).toEqual([`acquire:${id}`, "probe", "hash-write", `release:${id}`]);
+  });
+
+  it("two concurrent ups in the same worktree spawn exactly one instance; the loser reports already-up", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const base = stubDeps({ stack: oneIsolated, track });
+    const store: Record<string, string> = {};
+    // No `withLifecycleLock` injection: the REAL per-worktree lockfile under
+    // the temp anchor is the mechanism under test here.
+    const deps: CommandDeps = {
+      ...base,
+      readStoredHash: (_a, id) => store[id],
+      writeStoredHash: (_a, id, h) => {
+        store[id] = h;
+      },
+      getServiceStatuses: async () => [],
+    };
+
+    const [a, b] = await Promise.all([runUp(deps), runUp(deps)]);
+
+    const worktreeSpawns = track.invocations.filter((i) => !i.socketPath.endsWith("/shared.sock"));
+    expect(worktreeSpawns).toHaveLength(1);
+    // The loser reconciled against the winner's live instance: same envelope.
+    expect(b.env).toEqual(a.env);
+    expect(b.blockBase).toBe(a.blockBase);
+    expect(a.worktreeId).toBe(b.worktreeId);
+  });
+
+  it("releases the lock when the spawn throws, so a follow-up up is not bricked", async () => {
+    const tmp = tmpAnchor();
+    const base = stubDeps({
+      stack: oneIsolated,
+      anchorOverride: tmp.anchor,
+      worktreeRootOverride: tmp.worktreeRoot,
+    });
+    const deps: CommandDeps = {
+      ...base,
+      driver: {
+        exists: () => Promise.resolve(true),
+        spawner: () => {
+          throw new Error("spawn failed");
+        },
+      },
+    };
+
+    await expect(runUp(deps)).rejects.toThrow("spawn failed");
+
+    // The real default lifecycle lock was used; a leaked lockfile here would
+    // brick every subsequent `up` in this worktree until hand-deleted.
+    const lockPath = join(tmp.anchor, "devtrees", `${base.expectedWorktreeId}.lock`);
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it("surfaces LOCK_CONTENTION when the lock is held by a live process beyond the wait budget", async () => {
+    const tmp = tmpAnchor();
+    const base = stubDeps({
+      stack: oneIsolated,
+      anchorOverride: tmp.anchor,
+      worktreeRootOverride: tmp.worktreeRoot,
+    });
+    // A live holder (our own pid — never stolen) already owns this worktree's lock.
+    mkdirSync(join(tmp.anchor, "devtrees"), { recursive: true });
+    writeFileSync(
+      join(tmp.anchor, "devtrees", `${base.expectedWorktreeId}.lock`),
+      `${process.pid}\n`,
+      { flag: "wx" },
+    );
+    const deps: CommandDeps = {
+      ...base,
+      // Zero retries: exercise the budget-exhausted path without the default wait.
+      withLifecycleLock: (anchor, id, fn) => withLifecycleLock(anchor, id, fn, { retries: 0 }),
+    };
+
+    await expect(runUp(deps)).rejects.toMatchObject({ code: "LOCK_CONTENTION" });
   });
 });

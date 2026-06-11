@@ -26,24 +26,34 @@ import { join } from "node:path";
 import type { RegistrySnapshot } from "./allocator.js";
 
 /**
- * Raised when the registry lock is already held and retries are exhausted.
- * Carries the documented `LOCK_CONTENTION` code (issue #84) so the CLI's
- * `classifyError` (src/output.ts) maps it into the `--json` error envelope —
- * an agent seeing it knows the failure is "retry later", not "fix something".
+ * Mirrors `SHARED_INSTANCE_ID` in src/paths.ts (not imported: the
+ * registry.test.ts / registry.integration.test.ts child-process workers load
+ * this module under raw node, whose type stripping cannot resolve a local
+ * `./paths.js` specifier from TS source — type-only imports are fine, runtime
+ * ones are not).
+ */
+const SHARED_INSTANCE_ID = "shared";
+
+/**
+ * Raised when a devtrees lock (allocation registry or an instance's lifecycle
+ * lock) is already held and retries are exhausted. Carries the documented
+ * `LOCK_CONTENTION` code (issue #84) so the CLI's `classifyError`
+ * (src/output.ts) maps it into the `--json` error envelope — an agent seeing
+ * it knows the failure is "retry later", not "fix something".
  *
  * Internal, like the other tagged error classes (`HealthTimeoutError`,
  * `SharedDriftError`, ... in src/commands.ts): callers match on `.code`
  * (or message text), never on the constructor.
  */
-class RegistryLockedError extends Error {
+class LockContentionError extends Error {
   readonly code = "LOCK_CONTENTION" as const;
   constructor(lockPath: string) {
     super(
-      `another devtrees process is holding the allocation registry lock at ${lockPath}. ` +
+      `another devtrees process is holding the lock at ${lockPath}. ` +
         `Locks held by dead processes are reclaimed automatically, so the holder is ` +
         `still alive — wait for it to finish (or, if it is stuck, kill it) and retry.`,
     );
-    this.name = "RegistryLockedError";
+    this.name = "LockContentionError";
   }
 }
 
@@ -70,9 +80,14 @@ function lockFile(anchor: string): string {
   return join(devtreesDir(anchor), "registry.lock");
 }
 
-/** Path of the shared-instance lifecycle lock, sibling of registry.lock. */
-function sharedLockFile(anchor: string): string {
-  return join(devtreesDir(anchor), "shared.lock");
+/**
+ * Path of an instance's lifecycle lock, sibling of registry.lock. Keyed by
+ * instance id (a worktree id, or the reserved `shared`), so locks for distinct
+ * instances never contend — the shared instance's lock stays at the
+ * pre-#91 `shared.lock` path because its instance id IS `shared`.
+ */
+function lifecycleLockFile(anchor: string, instanceId: string): string {
+  return join(devtreesDir(anchor), `${instanceId}.lock`);
 }
 
 /**
@@ -153,7 +168,17 @@ function stealIfStale(path: string): boolean {
 }
 
 /**
- * Acquire a lockfile by `wx`-creating it; throws RegistryLockedError on timeout.
+ * One full acquire attempt: a `wx`-create, then — on contention — a steal of
+ * a dead holder's lock followed by an immediate re-create. Shared by the
+ * async and sync acquire loops so the attempt semantics cannot drift apart.
+ */
+function tryAcquireOnce(path: string): boolean {
+  if (tryWxCreate(path) === "acquired") return true;
+  return stealIfStale(path) && tryWxCreate(path) === "acquired";
+}
+
+/**
+ * Acquire a lockfile by `wx`-creating it; throws LockContentionError on timeout.
  * Uses `setTimeout` between retries so other tasks (including the current
  * holder's `finally` release) can run. On contention, a lock whose recorded
  * holder pid is dead is stolen immediately instead of being waited out.
@@ -162,9 +187,8 @@ async function acquireLockAtAsync(path: string, options: LockOptions): Promise<v
   const retries = options.retries ?? DEFAULT_RETRIES;
   const delay = options.retryDelayMs ?? DEFAULT_DELAY_MS;
   for (let attempt = 0; attempt <= retries; attempt++) {
-    if (tryWxCreate(path) === "acquired") return;
-    if (stealIfStale(path) && tryWxCreate(path) === "acquired") return;
-    if (attempt === retries) throw new RegistryLockedError(path);
+    if (tryAcquireOnce(path)) return;
+    if (attempt === retries) throw new LockContentionError(path);
     await new Promise<void>((resolve) => setTimeout(resolve, delay));
   }
 }
@@ -249,9 +273,8 @@ function acquireLockSync(path: string, options: LockOptions): void {
   const retries = options.retries ?? DEFAULT_RETRIES;
   const delay = options.retryDelayMs ?? DEFAULT_DELAY_MS;
   for (let attempt = 0; attempt <= retries; attempt++) {
-    if (tryWxCreate(path) === "acquired") return;
-    if (stealIfStale(path) && tryWxCreate(path) === "acquired") return;
-    if (attempt === retries) throw new RegistryLockedError(path);
+    if (tryAcquireOnce(path)) return;
+    if (attempt === retries) throw new LockContentionError(path);
     sleepSync(delay);
   }
 }
@@ -272,27 +295,46 @@ export function withFileLockSync<T>(path: string, fn: () => T, options: LockOpti
 }
 
 /**
- * Serialize shared-instance lifecycle operations (lazy start, teardown) across
- * processes. Held over an async callback so the driver's binary probe + spawn
- * can both run inside the critical section — two simultaneous `devtrees up`s
- * therefore see a consistent "is it already running?" answer and at most one
- * goes on to start the shared instance (PRD US-32 extended to shared).
+ * Serialize lifecycle operations (start, teardown) for ONE instance across
+ * processes (issue #91). Held over an async callback so the whole
+ * liveness-check → config-write → spawn → socket-wait window can run inside
+ * the critical section — two simultaneous `devtrees up`s targeting the same
+ * instance therefore see a consistent "is it already running?" answer and at
+ * most one goes on to spawn; the loser observes the winner's live socket and
+ * takes the idempotency path.
  *
- * This is a separate lockfile from the allocation registry's: the registry
- * lock is held for short, sync read-modify-writes, while the lifecycle lock
- * may briefly cover spawning a child process.
+ * Locks are per-instance (`<anchor>/devtrees/<instanceId>.lock`): concurrent
+ * `up`s in *different* worktrees never contend here. This is a separate
+ * lockfile from the allocation registry's: the registry lock is held for
+ * short read-modify-writes, while a lifecycle lock may cover spawning a
+ * child process and waiting for its control socket.
  */
-export async function withSharedLock<T>(
+export async function withLifecycleLock<T>(
   anchor: string,
+  instanceId: string,
   fn: () => Promise<T>,
   options: LockOptions = {},
 ): Promise<T> {
   mkdirSync(devtreesDir(anchor), { recursive: true });
-  const path = sharedLockFile(anchor);
+  const path = lifecycleLockFile(anchor, instanceId);
   await acquireLockAtAsync(path, options);
   try {
     return await fn();
   } finally {
     releaseLockAt(path);
   }
+}
+
+/**
+ * The shared instance's lifecycle lock — `withLifecycleLock` under the
+ * reserved `shared` instance id. Kept as a named export because the shared
+ * instance has a fixed identity at the anchor (src/paths.ts) and several
+ * call sites (lazy start, `down --shared`) want that spelled out.
+ */
+export async function withSharedLock<T>(
+  anchor: string,
+  fn: () => Promise<T>,
+  options: LockOptions = {},
+): Promise<T> {
+  return withLifecycleLock(anchor, SHARED_INSTANCE_ID, fn, options);
 }
