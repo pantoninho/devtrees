@@ -65,7 +65,7 @@ The per-repo record, kept at the anchor, mapping each worktree to its port block
 The unix domain socket a process-compose instance exposes its API on, at a path derived from the instance's id under the anchor's run dir (e.g. `<anchor>/.devtrees/run/<worktree-id>.sock`, plus a fixed `shared.sock`). Clients and devtrees talk to an instance through it; enumerating the run dir is how devtrees discovers every running instance and detects stale ones.
 
 **Anchor state**:
-A `devtrees/` directory *inside* the anchor (the git common dir) — i.e. `<git-common-dir>/devtrees/` — where devtrees keeps everything it needs to reason about the whole repo's running state: the allocation registry, the per-instance control sockets, and the derived configs. Because it lives inside the git dir it is never part of the working tree, so it needs no `.gitignore` entry and works identically for normal and bare repos.
+A `devtrees/` directory *inside* the anchor (the git common dir) — i.e. `<git-common-dir>/devtrees/` — where devtrees keeps everything it needs to reason about the whole repo's running state: the allocation registry, the per-instance control sockets, the derived configs, and the shared instance's persisted name→port map (what the running shared instance actually bound, plus a hash of the shared subset it was started from — worktrees inject shared connection info from this map rather than recomputing it, and a worktree whose shared subset diverges from it fails with `SHARED_DRIFT`). Because it lives inside the git dir it is never part of the working tree, so it needs no `.gitignore` entry and works identically for normal and bare repos.
 
 ## Flagged ambiguities
 

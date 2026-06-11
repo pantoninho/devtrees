@@ -81,7 +81,9 @@ describe("sharedStackHash (#83)", () => {
 
   it("changes when a shared service's command changes", () => {
     const a: ResolvedStack = { services: [pg] };
-    const b: ResolvedStack = { services: [svc("postgres", "postgres -D ./other", ["DB_PORT"], "shared")] };
+    const b: ResolvedStack = {
+      services: [svc("postgres", "postgres -D ./other", ["DB_PORT"], "shared")],
+    };
     expect(sharedStackHash(a)).not.toBe(sharedStackHash(b));
   });
 

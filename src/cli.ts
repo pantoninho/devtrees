@@ -241,6 +241,7 @@ class UpCommand extends DevtreesCommand {
     details: errorCodeFooter([
       "STALE_PORT_BLOCK",
       "CONFIG_DRIFT",
+      "SHARED_DRIFT",
       "HEALTH_TIMEOUT",
       "PROCESS_COMPOSE_NOT_FOUND",
       "INVALID_ARGS",
@@ -406,7 +407,7 @@ class EnvCommand extends DevtreesCommand {
   static override paths = [["env"]];
   static override usage = Command.Usage({
     description: "Print this worktree's injected env (KEY=value, or `--json` for a map).",
-    details: errorCodeFooter(["UNKNOWN"]),
+    details: errorCodeFooter(["SHARED_DRIFT", "UNKNOWN"]),
   });
 
   override async execute(): Promise<number> {
