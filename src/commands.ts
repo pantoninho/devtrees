@@ -629,8 +629,9 @@ async function socketIsLive(
  *  - **Already up, drifted config** (socket present, stored hash differs):
  *    write the new derived config, call `driver.reloadConfig`. On success,
  *    update the stored hash and return the new envelope; on failure
- *    (`not_supported` or otherwise), throw `ConfigDriftError` (code
- *    `CONFIG_DRIFT`) and leave the instance running unchanged.
+ *    (`not_supported` or otherwise), restore the previous on-disk config
+ *    (issue #92) and throw `ConfigDriftError` (code `CONFIG_DRIFT`), leaving
+ *    the instance running unchanged.
  *
  * Pre-flight stale-port-block check (issue #58): when the worktree's
  * control socket is absent (first up — not the idempotent re-up path),
@@ -1691,8 +1692,10 @@ function readDerivedServices(configPath: string): string[] {
  *    a fresh `up` would (issue-#30 contract).
  *  - **Drift** -> write the new derived config and call `driver.reloadConfig`.
  *    On success, persist the new hash and return the new envelope; on any
- *    failure, throw `ConfigDriftError` so the CLI emits the `CONFIG_DRIFT`
- *    envelope and the instance keeps running (ADR-0005).
+ *    failure, restore the previous on-disk config (issue #92 — the file must
+ *    keep matching the still-running instance, `ls` reads ports from it) and
+ *    throw `ConfigDriftError` so the CLI emits the `CONFIG_DRIFT` envelope
+ *    and the instance keeps running (ADR-0005).
  */
 async function reconcileRunning(args: {
   readonly stack: ResolvedStack;
@@ -1722,10 +1725,21 @@ async function reconcileRunning(args: {
   const currentHash = stackHash(stack);
   const storedHash = args.readHash(anchor.anchor, anchor.worktreeId);
   if (storedHash !== currentHash) {
+    // The on-disk derived config must always describe the *running* instance
+    // (issue #92) — `ls` reads its ports from this file. `driver.reloadConfig`
+    // re-reads the config from disk, so the new one has to be written before
+    // the attempt; snapshot the old bytes first and restore them on failure
+    // so a failed reload never leaves the file describing config the instance
+    // is not running.
     mkdirSync(paths.runDir, { recursive: true });
+    const previousConfig = existsSync(paths.configPath)
+      ? readFileSync(paths.configPath, "utf8")
+      : undefined;
     writeFileSync(paths.configPath, stringifyYaml(derived.config), "utf8");
     const reload = await driver.reloadConfig(inst);
     if (!reload.ok) {
+      if (previousConfig === undefined) rmSync(paths.configPath, { force: true });
+      else writeFileSync(paths.configPath, previousConfig, "utf8");
       throw new ConfigDriftError(
         `devtrees up: config drift detected for '${anchor.worktreeId}' and the running ` +
           `process-compose could not hot-reload the new config` +

@@ -2996,6 +2996,83 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     expect(Object.values(hashes.raw)[0]?.[baseDeps.expectedWorktreeId]).toBe(storedAfterFirst);
   });
 
+  it("on failed reload, the on-disk derived config is restored to match the running instance (#92)", async () => {
+    // The drift path used to write the new config before attempting the
+    // reload; on failure the on-disk config no longer matched the running
+    // instance, so `ls` (which reads ports from the derived config) reported
+    // ports that were never bound.
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const hashes = hashStore();
+
+    const baseDeps = stubDeps({ stack: stackA, track });
+    const innerSpawner = baseDeps.driver?.spawner;
+    if (innerSpawner === undefined) throw new Error("expected stub spawner");
+
+    // Reload always exits 1 → reloadConfig reports failure.
+    const spawner = (binary: string, args: ReadonlyArray<string>, options: SpawnOptions) => {
+      if (args[0] === "project" && args[1] === "update") {
+        const emitter = new EventEmitter();
+        queueMicrotask(() => emitter.emit("exit", 1));
+        return emitter as unknown as SpawnedProcess;
+      }
+      return innerSpawner(binary, args, options);
+    };
+    const firstDeps: CommandDeps = {
+      ...baseDeps,
+      driver: { ...baseDeps.driver, spawner },
+      readStoredHash: hashes.read,
+      writeStoredHash: hashes.write,
+    };
+
+    await runUp(firstDeps);
+    const worktreeSpawn = track.invocations.find((i) => !i.socketPath.endsWith("/shared.sock"));
+    if (worktreeSpawn === undefined) throw new Error("expected a worktree spawn");
+    const configBefore = readFileSync(worktreeSpawn.configPath, "utf8");
+
+    const secondDeps: CommandDeps = { ...firstDeps, readStack: () => stackB };
+    await expect(runUp(secondDeps)).rejects.toThrow(/drift/i);
+
+    // The on-disk derived config still describes what the instance is
+    // actually running (stackA), byte-for-byte.
+    expect(readFileSync(worktreeSpawn.configPath, "utf8")).toBe(configBefore);
+    const parsed = parseYaml(readFileSync(worktreeSpawn.configPath, "utf8")) as {
+      processes: Record<string, { command: string }>;
+    };
+    expect(parsed.processes.web?.command).toBe("node a.js");
+  });
+
+  it("on successful reload, the new derived config is on disk (#92)", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const hashes = hashStore();
+
+    const baseDeps = stubDeps({ stack: stackA, track });
+    const innerSpawner = baseDeps.driver?.spawner;
+    if (innerSpawner === undefined) throw new Error("expected stub spawner");
+
+    const spawner = (binary: string, args: ReadonlyArray<string>, options: SpawnOptions) => {
+      if (args[0] === "project" && args[1] === "update") return spawnedOk();
+      return innerSpawner(binary, args, options);
+    };
+    const firstDeps: CommandDeps = {
+      ...baseDeps,
+      driver: { ...baseDeps.driver, spawner },
+      readStoredHash: hashes.read,
+      writeStoredHash: hashes.write,
+    };
+
+    await runUp(firstDeps);
+    const worktreeSpawn = track.invocations.find((i) => !i.socketPath.endsWith("/shared.sock"));
+    if (worktreeSpawn === undefined) throw new Error("expected a worktree spawn");
+
+    const secondDeps: CommandDeps = { ...firstDeps, readStack: () => stackB };
+    await runUp(secondDeps);
+
+    const parsed = parseYaml(readFileSync(worktreeSpawn.configPath, "utf8")) as {
+      processes: Record<string, { command: string }>;
+    };
+    expect(parsed.processes.web?.command).toBe("node b.js");
+  });
+
   it("noop path does NOT call driver.reloadConfig (no process-compose churn when the config matches)", async () => {
     const track: StubSpawn = { invocations: [], touchSocket: true };
     const hashes = hashStore();
