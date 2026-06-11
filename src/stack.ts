@@ -211,7 +211,7 @@ function parseAllocator(doc: {
  * leaving the base file untouched on disk.
  */
 export function parseStack(yamlText: string, options: ParseStackOptions = {}): ResolvedStack {
-  const doc = (parseYaml(yamlText) ?? {}) as {
+  const doc = (parseYamlConfig(yamlText, "devtrees.yaml") ?? {}) as {
     services?: Record<string, RawService>;
     port_base?: unknown;
     block_size?: unknown;
@@ -219,8 +219,11 @@ export function parseStack(yamlText: string, options: ParseStackOptions = {}): R
   const overlay = doc.services ?? {};
 
   const baseProcesses: Record<string, RawService> = options.baseYaml
-    ? (((parseYaml(options.baseYaml) ?? {}) as { processes?: Record<string, RawService> })
-        .processes ?? {})
+    ? ((
+        (parseYamlConfig(options.baseYaml, "the extends base file") ?? {}) as {
+          processes?: Record<string, RawService>;
+        }
+      ).processes ?? {})
     : {};
 
   // Union of names: base contributes the process body, overlay contributes
@@ -250,15 +253,37 @@ export function parseStack(yamlText: string, options: ParseStackOptions = {}): R
 }
 
 /**
- * Raised when `devtrees.yaml` declares a structurally-impossible dependency,
- * e.g. a shared service depending on an isolated one (ADR-0003). The class is
- * internal — callers match on the message text, not the constructor — but the
- * named subclass makes stack traces and `instanceof` debugging clearer.
+ * Raised when `devtrees.yaml` is rejected — either structurally impossible
+ * (e.g. a shared service depending on an isolated one, ADR-0003) or not
+ * parseable as YAML at all. The class is internal — callers match on the
+ * message text, not the constructor — but the named subclass makes stack
+ * traces and `instanceof` debugging clearer.
+ *
+ * Carries the documented `CONFIG_INVALID` code (issue #84) so the CLI's
+ * `classifyError` (src/output.ts) maps it into the `--json` error envelope
+ * instead of falling through to `UNKNOWN` — same pattern as
+ * `HealthTimeoutError` / `StalePortBlockError` in src/commands.ts.
  */
 class StackConfigError extends Error {
+  readonly code = "CONFIG_INVALID" as const;
   constructor(message: string) {
     super(message);
     this.name = "StackConfigError";
+  }
+}
+
+/**
+ * Parse YAML text, rethrowing any parser failure as a `StackConfigError` so a
+ * syntax error in `devtrees.yaml` (or its extends-base) classifies as
+ * `CONFIG_INVALID` rather than `UNKNOWN` (issue #84). The underlying parser
+ * diagnostic (line/column, what was expected) is preserved in the message —
+ * that's what lets the author actually fix the file.
+ */
+function parseYamlConfig(yamlText: string, sourceLabel: string): unknown {
+  try {
+    return parseYaml(yamlText);
+  } catch (err) {
+    throw new StackConfigError(`${sourceLabel} is not valid YAML: ${(err as Error).message}`);
   }
 }
 
@@ -302,8 +327,12 @@ export function loadStack(dir: string): ResolvedStack {
   return parseStack(text, { baseYaml });
 }
 
-/** Peek at `extends:` without committing to a full parse contract. */
+/**
+ * Peek at `extends:` without committing to a full parse contract. Runs before
+ * `parseStack` on the `loadStack` path, so it wraps parse failures the same
+ * way — a malformed file fails here first and must still be CONFIG_INVALID.
+ */
 function readExtendsPath(yamlText: string): string | undefined {
-  const doc = (parseYaml(yamlText) ?? {}) as { extends?: unknown };
+  const doc = (parseYamlConfig(yamlText, "devtrees.yaml") ?? {}) as { extends?: unknown };
   return typeof doc.extends === "string" ? doc.extends : undefined;
 }

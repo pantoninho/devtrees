@@ -1,9 +1,11 @@
-import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { execute, isEntrypoint, run } from "./cli.js";
+import { withRegistryLock } from "./registry.js";
+import { parseStack } from "./stack.js";
 
 async function* fromArray<T>(items: ReadonlyArray<T>): AsyncIterable<T> {
   for (const item of items) yield item;
@@ -116,26 +118,28 @@ describe("devtrees CLI", () => {
         "STALE_PORT_BLOCK",
         "CONFIG_DRIFT",
         "SHARED_DRIFT",
+        "CONFIG_INVALID",
+        "LOCK_CONTENTION",
         "HEALTH_TIMEOUT",
         "PROCESS_COMPOSE_NOT_FOUND",
         "INVALID_ARGS",
         "UNKNOWN",
       ],
     ],
-    ["down", ["PROCESS_COMPOSE_NOT_FOUND", "UNKNOWN"]],
+    // `down --shared` serializes on the shared lifecycle lock → LOCK_CONTENTION.
+    ["down", ["PROCESS_COMPOSE_NOT_FOUND", "LOCK_CONTENTION", "UNKNOWN"]],
     ["ls", ["UNKNOWN"]],
     ["attach", ["INSTANCE_NOT_FOUND", "PROCESS_COMPOSE_NOT_FOUND", "UNKNOWN"]],
-    ["generate", ["UNKNOWN"]],
-    ["prune", ["UNKNOWN"]],
-    ["env", ["SHARED_DRIFT", "UNKNOWN"]],
+    // `generate` loads devtrees.yaml and allocates under the registry lock.
+    ["generate", ["CONFIG_INVALID", "LOCK_CONTENTION", "UNKNOWN"]],
+    // `prune` drops orphan registry entries under the registry lock.
+    ["prune", ["LOCK_CONTENTION", "UNKNOWN"]],
+    // `env` loads devtrees.yaml (CONFIG_INVALID) and reports shared-tier
+    // divergence (SHARED_DRIFT, #83) but is lock-free (pure registry read).
+    ["env", ["SHARED_DRIFT", "CONFIG_INVALID", "UNKNOWN"]],
     ["logs", ["INSTANCE_NOT_FOUND", "INVALID_ARGS", "UNKNOWN"]],
   ];
 
-  // Codes RESERVED in `ERROR_CODES` but not currently emitted from any throw
-  // site. Listing them in a footer would mislead an agent into branching on
-  // an envelope that can't actually appear; the footer must omit them until
-  // a real throw site exists.
-  const RESERVED_CODES = ["LOCK_CONTENTION", "CONFIG_INVALID"] as const;
   const ALL_KNOWN_CODES = [
     "PROCESS_COMPOSE_NOT_FOUND",
     "INSTANCE_NOT_FOUND",
@@ -167,14 +171,13 @@ describe("devtrees CLI", () => {
     });
   }
 
-  it("no subcommand --help advertises a reserved-but-unemitted code", () => {
-    // Defence-in-depth: even if the mapping above drifts, never let a
-    // reserved code (currently `LOCK_CONTENTION`, `CONFIG_INVALID`) leak
-    // into a footer until a real throw site emits it.
-    for (const [, codes] of ERROR_CODES_BY_COMMAND) {
-      for (const reserved of RESERVED_CODES) {
-        expect(codes).not.toContain(reserved);
-      }
+  it("every documented code is emittable by at least one command (no reserved leftovers)", () => {
+    // Issue #84 closed the reserved set: every code in ERROR_CODES now has a
+    // real throw site. A code documented in `output.ts` but absent from every
+    // footer would mean the enum drifted ahead of the throw sites again.
+    const advertised = new Set(ERROR_CODES_BY_COMMAND.flatMap(([, codes]) => [...codes]));
+    for (const code of ALL_KNOWN_CODES) {
+      expect(advertised).toContain(code);
     }
   });
 
@@ -967,6 +970,80 @@ describe("devtrees CLI — up non-interactive (#28)", () => {
     expect(help).toMatch(/--attach/);
     expect(help).toMatch(/--no-attach/);
     expect(help).toMatch(/--wait-timeout/);
+  });
+});
+
+/**
+ * Issue #84: CONFIG_INVALID and LOCK_CONTENTION must be reachable envelopes.
+ * Both tests throw the REAL error objects the core raises (the actual
+ * `parseStack` rejection and an actually-contended `withRegistryLock`) — not
+ * fabricated `{code}` stand-ins — so they pin the whole chain: throw site
+ * tag → `classifyError` → `--json` envelope.
+ */
+describe("devtrees CLI — CONFIG_INVALID / LOCK_CONTENTION envelopes (#84)", () => {
+  /** Capture the real error `parseStack` raises for a malformed devtrees.yaml. */
+  function realStackConfigError(yamlText: string): Error {
+    try {
+      parseStack(yamlText);
+    } catch (err) {
+      return err as Error;
+    }
+    throw new Error("expected parseStack to reject the fixture");
+  }
+
+  /** Capture the real error a contended registry lock raises. */
+  async function realRegistryLockedError(): Promise<Error> {
+    const anchor = mkdtempSync(join(tmpdir(), "dt-cli-lock-"));
+    try {
+      mkdirSync(join(anchor, "devtrees"), { recursive: true });
+      writeFileSync(join(anchor, "devtrees", "registry.lock"), `${process.pid}\n`, { flag: "wx" });
+      await withRegistryLock(anchor, (s) => s, { retries: 0 });
+    } catch (err) {
+      return err as Error;
+    } finally {
+      rmSync(anchor, { recursive: true, force: true });
+    }
+    throw new Error("expected withRegistryLock to reject");
+  }
+
+  it("`up --json` with a malformed devtrees.yaml (parse error) → code:CONFIG_INVALID", async () => {
+    const up = vi.fn().mockRejectedValue(realStackConfigError("services: [unclosed"));
+    const result = await execute(["up", "--json"], { up, down: vi.fn() });
+    expect(result.code).not.toBe(0);
+    const parsed = JSON.parse(result.stdout) as { error: { code: string; message: string } };
+    expect(parsed.error.code).toBe("CONFIG_INVALID");
+    expect(parsed.error.message).toMatch(/devtrees\.yaml/i);
+  });
+
+  it("`up --json` with a schema-invalid devtrees.yaml (validation error) → code:CONFIG_INVALID", async () => {
+    const invalid = [
+      "services:",
+      "  db:",
+      "    tier: shared",
+      "    command: postgres",
+      "    depends_on: [web]",
+      "  web:",
+      "    tier: isolated",
+      "    command: node server.js",
+      "",
+    ].join("\n");
+    const up = vi.fn().mockRejectedValue(realStackConfigError(invalid));
+    const result = await execute(["up", "--json"], { up, down: vi.fn() });
+    expect(result.code).not.toBe(0);
+    const parsed = JSON.parse(result.stdout) as { error: { code: string; message: string } };
+    expect(parsed.error.code).toBe("CONFIG_INVALID");
+    expect(parsed.error.message).toMatch(/shared.*depends_on.*isolated/i);
+  });
+
+  it("`up --json` with a contended registry lock → code:LOCK_CONTENTION", async () => {
+    const up = vi.fn().mockRejectedValue(await realRegistryLockedError());
+    const result = await execute(["up", "--json"], { up, down: vi.fn() });
+    expect(result.code).not.toBe(0);
+    const parsed = JSON.parse(result.stdout) as { error: { code: string; message: string } };
+    expect(parsed.error.code).toBe("LOCK_CONTENTION");
+    expect(parsed.error.message).toMatch(/registry\.lock/);
+    // Human diagnostic still lands on stderr alongside the JSON envelope.
+    expect(result.stderr).toMatch(/lock/i);
   });
 });
 

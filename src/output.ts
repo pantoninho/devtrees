@@ -21,10 +21,10 @@
 export const SCHEMA_VERSION = "1";
 
 /**
- * The error-code enum the JSON error envelope carries. Slice #1 (this issue)
- * promises at least `PROCESS_COMPOSE_NOT_FOUND` and `INSTANCE_NOT_FOUND`; the
- * remaining codes are reserved here so later slices add cases without breaking
- * the type's exhaustiveness.
+ * The error-code enum the JSON error envelope carries (ADR-0005). Every code
+ * listed here has a real throw site as of issue #84 (`CONFIG_INVALID` from
+ * the stack loader, `LOCK_CONTENTION` from the registry locks closed the
+ * formerly-reserved set); new codes are additive, renames are breaking.
  */
 export const ERROR_CODES = [
   "PROCESS_COMPOSE_NOT_FOUND",

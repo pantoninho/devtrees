@@ -12,7 +12,6 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readStoredHash, writeStoredHash, deleteStoredHash } from "./hashes.js";
-import { RegistryLockedError } from "./registry.js";
 
 function tmpAnchor(): string {
   return mkdtempSync(join(tmpdir(), "dt-hashes-"));
@@ -92,8 +91,10 @@ describe("stored hashes (per-worktree, anchor-local)", () => {
     try {
       mkdirSync(join(anchor, "devtrees"), { recursive: true });
       writeFileSync(join(anchor, "devtrees", "hashes.lock"), `${process.pid}\n`, { flag: "wx" });
+      // The lock error class is internal (issue #84) — match on the message,
+      // the same contract `classifyError` keys off via `.code`.
       expect(() => writeStoredHash(anchor, "login", "x", { retries: 0 })).toThrow(
-        RegistryLockedError,
+        /holding the allocation registry lock/,
       );
     } finally {
       rmSync(anchor, { recursive: true, force: true });
