@@ -95,6 +95,20 @@ describe("registry store — lock + persistence", () => {
     );
   });
 
+  it("tags the contended-lock error with code LOCK_CONTENTION (issue #84)", async () => {
+    // The CLI's classifyError (src/output.ts) maps a `.code`-tagged error
+    // into the documented --json envelope; without the tag a contended lock
+    // would classify as UNKNOWN and an agent couldn't tell "retry later"
+    // apart from a real failure.
+    const anchor = newAnchor();
+    mkdirSync(join(anchor, "devtrees"), { recursive: true });
+    writeFileSync(join(anchor, "devtrees", "registry.lock"), `${process.pid}\n`, { flag: "wx" });
+
+    await expect(withRegistryLock(anchor, (s) => s, { retries: 0 })).rejects.toMatchObject({
+      code: "LOCK_CONTENTION",
+    });
+  });
+
   it("serializes concurrent withRegistryLock calls so neither loses an update (lock holds)", async () => {
     const anchor = newAnchor();
     // Two interleaved callers: each reads, then adds its own key. If the lock holds,
@@ -188,6 +202,19 @@ describe("withSharedLock — async lifecycle lock", () => {
     );
     expect(ran).toBe(true);
     expect(existsSync(join(anchor, "devtrees", "shared.lock"))).toBe(false);
+  });
+
+  it("tags the contended shared-lock error with code LOCK_CONTENTION (issue #84)", async () => {
+    const anchor = newAnchor();
+    mkdirSync(join(anchor, "devtrees"), { recursive: true });
+    writeFileSync(join(anchor, "devtrees", "shared.lock"), `${process.pid}\n`, { flag: "wx" });
+    const err = await withSharedLock(anchor, async () => {}, { retries: 0 }).then(
+      () => {
+        throw new Error("expected withSharedLock to reject");
+      },
+      (e: unknown) => e as Error & { code?: string },
+    );
+    expect(err.code).toBe("LOCK_CONTENTION");
   });
 
   it("serialises overlapping callers — the second runs only after the first releases", async () => {

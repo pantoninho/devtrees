@@ -25,8 +25,14 @@ import {
 import { join } from "node:path";
 import type { RegistrySnapshot } from "./allocator.js";
 
-/** Raised when the registry lock is already held and retries are exhausted. */
+/**
+ * Raised when the registry lock is already held and retries are exhausted.
+ * Carries the documented `LOCK_CONTENTION` code (issue #84) so the CLI's
+ * `classifyError` (src/output.ts) maps it into the `--json` error envelope —
+ * an agent seeing it knows the failure is "retry later", not "fix something".
+ */
 export class RegistryLockedError extends Error {
+  readonly code = "LOCK_CONTENTION" as const;
   constructor(lockPath: string) {
     super(
       `another devtrees process is holding the allocation registry lock at ${lockPath}. ` +
