@@ -115,6 +115,7 @@ describe("devtrees CLI", () => {
       [
         "STALE_PORT_BLOCK",
         "CONFIG_DRIFT",
+        "SHARED_DRIFT",
         "HEALTH_TIMEOUT",
         "PROCESS_COMPOSE_NOT_FOUND",
         "INVALID_ARGS",
@@ -126,7 +127,7 @@ describe("devtrees CLI", () => {
     ["attach", ["INSTANCE_NOT_FOUND", "PROCESS_COMPOSE_NOT_FOUND", "UNKNOWN"]],
     ["generate", ["UNKNOWN"]],
     ["prune", ["UNKNOWN"]],
-    ["env", ["UNKNOWN"]],
+    ["env", ["SHARED_DRIFT", "UNKNOWN"]],
     ["logs", ["INSTANCE_NOT_FOUND", "INVALID_ARGS", "UNKNOWN"]],
   ];
 
@@ -140,6 +141,7 @@ describe("devtrees CLI", () => {
     "INSTANCE_NOT_FOUND",
     "HEALTH_TIMEOUT",
     "CONFIG_DRIFT",
+    "SHARED_DRIFT",
     "STALE_PORT_BLOCK",
     "LOCK_CONTENTION",
     "CONFIG_INVALID",

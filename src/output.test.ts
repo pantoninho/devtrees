@@ -42,6 +42,10 @@ describe("output formatter — constants", () => {
   it("reserves STALE_PORT_BLOCK so #58 routes via classifyError's typed-code short-circuit", () => {
     expect(ERROR_CODES).toContain("STALE_PORT_BLOCK");
   });
+
+  it("declares SHARED_DRIFT so #83's shared-subset drift routes via the typed-code short-circuit", () => {
+    expect(ERROR_CODES).toContain("SHARED_DRIFT");
+  });
 });
 
 describe("output formatter — classifyError", () => {
