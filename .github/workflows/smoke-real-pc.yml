@@ -15,6 +15,12 @@ name: Smoke (real process-compose)
 on:
   pull_request:
     paths:
+      # The smoke drives the BUILT CLI, so the entrypoint (envelope routing,
+      # error-classification dispatch) and the bundler config (a bundling
+      # regression broke the artifact once — issue #65/#66) are in scope, as
+      # is the port-probe module (probe convergence against real OS port
+      # binding is what this smoke exists to catch). Issue #93.
+      - "src/cli.ts"
       - "src/commands.ts"
       - "src/driver.ts"
       - "src/deriver.ts"
@@ -22,8 +28,10 @@ on:
       - "src/output.ts"
       - "src/allocator.ts"
       - "src/instances.ts"
+      - "src/port-probe.ts"
       - "src/real-pc.smoke.test.ts"
       - "test/fixtures/agent-surface/**"
+      - "vite.config.ts"
       - ".github/workflows/smoke-real-pc.yml"
   schedule:
     # Nightly at 06:00 UTC (off-peak for both US and EU contributors).
