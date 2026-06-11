@@ -429,6 +429,51 @@ describe("built CLI e2e — argv→commands wiring over the stub process-compose
     }
   }, 30_000);
 
+  describe("up init-hint over dist/cli.mjs (#119)", () => {
+    it("non-TTY up with no agent-doc referencing devtrees writes the hint to stderr; --json stdout unaffected", () => {
+      // setupScenario's worktree has no AGENTS.md/CLAUDE.md, so onboarding
+      // looks absent; a spawned subprocess has piped (non-TTY) stdio, so the
+      // agent-context gate is satisfied — the hint must fire on stderr.
+      const { wt } = setupScenario("dt-hint1-");
+
+      const up = devtrees(wt, ["up", "--json", "--wait-timeout", "30"]);
+      expect(up.code, `up failed: stderr=${up.stderr} stdout=${up.stdout}`).toBe(0);
+      // The hint lands on stderr, naming the command to run.
+      expect(up.stderr).toContain("devtrees init --agents");
+      // ...and exactly once.
+      expect(up.stderr.split("devtrees init --agents").length - 1).toBe(1);
+      // The stdout document is still a single clean JSON envelope — the hint
+      // added no field and no stray bytes (acceptance: schema stays clean).
+      expect(up.stdout.startsWith("{")).toBe(true);
+      const doc = JSON.parse(up.stdout) as UpDoc;
+      expect(doc.schema_version).toBe("1");
+      expect("hint" in doc).toBe(false);
+      expect("hint" in doc.up).toBe(false);
+    }, 60_000);
+
+    it("stays silent in a TTY (human) context", () => {
+      const { wt } = setupScenario("dt-hint2-");
+
+      const up = devtrees(wt, ["up", "--json", "--wait-timeout", "30"], {
+        env: { DEVTREES_ASSUME_TTY: "1" },
+      });
+      expect(up.code, `up failed: ${up.stderr}`).toBe(0);
+      expect(up.stderr).not.toContain("init --agents");
+    }, 60_000);
+
+    it("stays silent when an agent-doc already carries the devtrees block", () => {
+      const { wt } = setupScenario("dt-hint3-");
+      // Onboard the repo first; the marker mentions devtrees, so the gate's
+      // "no agent-doc references devtrees" condition is now false.
+      const init = devtrees(wt, ["init", "--agents", "--json"]);
+      expect(init.code, `init failed: ${init.stderr}`).toBe(0);
+
+      const up = devtrees(wt, ["up", "--json", "--wait-timeout", "30"]);
+      expect(up.code, `up failed: ${up.stderr}`).toBe(0);
+      expect(up.stderr).not.toContain("init --agents");
+    }, 60_000);
+  });
+
   it("init --agents creates AGENTS.md, then re-runs idempotently through dist/cli.mjs (#118)", () => {
     const dir = mkdtempSync(join(SHORT_TMP, "dt-bc5-"));
     cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
