@@ -342,6 +342,52 @@ async function reloadConfigImpl(
 }
 
 /**
+ * Merge N async iterables into one. Races each iterator's `next()` and yields
+ * whichever event arrives first; finishes when every iterator is done. On
+ * consumer break/throw, the `return()` calls cascade to each underlying
+ * iterator so the spawned children are killed (the `streamLogs` `finally`
+ * block). Lives next to `streamLogs` because its callers merge per-service
+ * log streams (issue #87 moved it out of the orchestration module).
+ */
+export async function* mergeAsyncIterables<T>(
+  iterables: ReadonlyArray<AsyncIterable<T>>,
+): AsyncIterable<T> {
+  if (iterables.length === 0) return;
+  if (iterables.length === 1) {
+    const only = iterables[0];
+    if (only === undefined) return;
+    yield* only;
+    return;
+  }
+  type Live = {
+    it: AsyncIterator<T>;
+    pending: Promise<{ live: Live; result: IteratorResult<T> }>;
+  };
+  const lives: Live[] = [];
+  for (const iterable of iterables) {
+    const it = iterable[Symbol.asyncIterator]();
+    const slot: Live = { it, pending: Promise.resolve() as unknown as Live["pending"] };
+    slot.pending = it.next().then((result) => ({ live: slot, result }));
+    lives.push(slot);
+  }
+
+  try {
+    while (lives.length > 0) {
+      const { live, result } = await Promise.race(lives.map((l) => l.pending));
+      if (result.done) {
+        const idx = lives.indexOf(live);
+        if (idx >= 0) lives.splice(idx, 1);
+        continue;
+      }
+      yield result.value;
+      live.pending = live.it.next().then((r) => ({ live, result: r }));
+    }
+  } finally {
+    await Promise.allSettled(lives.map((l) => Promise.resolve(l.it.return?.(undefined))));
+  }
+}
+
+/**
  * Implementation of `streamLogs`. Kept as a top-level async generator so the
  * `createDriver` factory body stays a flat object literal — the closure over
  * `binary`/`prefix`/`exists`/`spawner` is threaded in explicitly.

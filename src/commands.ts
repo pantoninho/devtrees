@@ -23,6 +23,7 @@ import { findOrphans, parseWorktreeIds } from "./prune.js";
 import { loadStack, type ResolvedService, type ResolvedStack } from "./stack.js";
 import {
   createDriver,
+  mergeAsyncIterables,
   type DriverDeps,
   type LogEvent,
   type ServiceStatus,
@@ -36,9 +37,20 @@ import {
   writeStoredHash as defaultWriteStoredHash,
 } from "./hashes.js";
 import { readSharedState, writeSharedState, type SharedState } from "./shared-state.js";
+import {
+  createWaitForHealth,
+  createWaitForSharedHealth,
+  type WaitForHealth,
+  type WaitForSharedHealth,
+} from "./health.js";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
+
+// The health-gate contracts (and their driver-backed defaults) live in the
+// health module (issue #87); re-exported here so `CommandDeps` callers keep a
+// single import site.
+export type { WaitForHealth, WaitForSharedHealth } from "./health.js";
 
 /**
  * Thrown when `up` detects config drift against a running instance and the
@@ -140,45 +152,6 @@ export type WithRegistryLock = (
 
 /** Type of the async lifecycle lock the caller passes for testability. */
 export type WithSharedLock = <T>(anchor: string, fn: () => Promise<T>) => Promise<T>;
-
-/**
- * Wait until every shared service is healthy enough that an isolated service
- * depending on it can be started. Called between starting the shared instance
- * and starting the worktree instance whenever the worktree has cross-tier
- * `depends_on` edges (ADR-0003). The default polls process-compose over the
- * shared instance's UDS; tests stub it.
- */
-export type WaitForSharedHealth = (args: {
-  readonly anchor: string;
-  readonly socketPath: string;
-  readonly sharedServiceNames: ReadonlyArray<string>;
-}) => Promise<void>;
-
-/**
- * Wait until every named service in an instance is healthy. Called after the
- * worktree instance starts so `up` only returns 0 when the stack can actually
- * serve traffic (PRD #26, ADR-0005). On timeout, implementations must throw a
- * `HealthTimeoutError` — left running, not torn down, so the agent can inspect
- * the failure with `devtrees logs <service>` afterwards.
- */
-export type WaitForHealth = (args: {
-  readonly socketPath: string;
-  readonly serviceNames: ReadonlyArray<string>;
-  readonly timeoutMs: number;
-}) => Promise<void>;
-
-/**
- * Throw on health-wait timeout; carries the `HEALTH_TIMEOUT` error code so the
- * CLI's error classifier routes it to the documented `--json` envelope without
- * pattern-matching on the message.
- */
-class HealthTimeoutError extends Error {
-  readonly code = "HEALTH_TIMEOUT" as const;
-  constructor(message: string) {
-    super(message);
-    this.name = "HealthTimeoutError";
-  }
-}
 
 /** One row of `details.collisions[]` in the `STALE_PORT_BLOCK` error envelope. */
 interface PortCollision {
@@ -318,15 +291,16 @@ export interface CommandDeps {
   /**
    * Wait for shared services to be healthy before bringing the worktree
    * instance up — orchestration-layer stand-in for the dropped cross-tier
-   * `depends_on` edges (ADR-0003). Default: polls `process-compose process
-   * list` over the shared UDS. Injected so tests can stub it.
+   * `depends_on` edges (ADR-0003). Default: polls the driver's
+   * `getServiceStatuses` over the shared UDS (issue #87). Injected so tests
+   * can stub it.
    */
   readonly waitForSharedHealth?: WaitForSharedHealth;
   /**
    * Wait for the worktree instance's services to be healthy after `driver.up`
    * — the gate that turns "up returned" into "the stack is serving traffic"
-   * (PRD #26, ADR-0005). Default polls process-compose over the worktree
-   * instance's UDS; injected so tests stub it.
+   * (PRD #26, ADR-0005). Default: polls the driver's `getServiceStatuses`
+   * over the worktree instance's UDS (issue #87); injected so tests stub it.
    */
   readonly waitForHealth?: WaitForHealth;
   /** Health-wait window for the worktree instance. Default: 120s. */
@@ -782,7 +756,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     const sharedPaths = sharedInstancePaths(anchor.anchor);
     const sharedNames = stack.services.filter((s) => s.tier === "shared").map((s) => s.name);
     warn(formatHealthWaitNotice(sharedNames));
-    const wait = deps.waitForSharedHealth ?? defaultWaitForSharedHealth;
+    const wait = deps.waitForSharedHealth ?? createWaitForSharedHealth(driver);
     await wait({
       anchor: anchor.anchor,
       socketPath: sharedPaths.socketPath,
@@ -792,7 +766,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
 
   await driver.up(inst);
 
-  await waitForWorktreeHealth(stack, paths.socketPath, deps);
+  await waitForWorktreeHealth(stack, paths.socketPath, deps, driver);
 
   // After the health-wait, snapshot the per-service runtime rows so the
   // issue-#30 `up --json` envelope can publish them without a follow-up
@@ -1648,50 +1622,6 @@ function readDerivedServices(configPath: string): string[] {
 }
 
 /**
- * Merge N async iterables into one. Races each iterator's `next()` and yields
- * whichever event arrives first; finishes when every iterator is done. On
- * consumer break/throw, the `return()` calls cascade to each underlying
- * iterator so the spawned children are killed (the driver's `finally` block).
- */
-async function* mergeAsyncIterables<T>(
-  iterables: ReadonlyArray<AsyncIterable<T>>,
-): AsyncIterable<T> {
-  if (iterables.length === 0) return;
-  if (iterables.length === 1) {
-    const only = iterables[0];
-    if (only === undefined) return;
-    yield* only;
-    return;
-  }
-  type Live = {
-    it: AsyncIterator<T>;
-    pending: Promise<{ live: Live; result: IteratorResult<T> }>;
-  };
-  const lives: Live[] = [];
-  for (const iterable of iterables) {
-    const it = iterable[Symbol.asyncIterator]();
-    const slot: Live = { it, pending: Promise.resolve() as unknown as Live["pending"] };
-    slot.pending = it.next().then((result) => ({ live: slot, result }));
-    lives.push(slot);
-  }
-
-  try {
-    while (lives.length > 0) {
-      const { live, result } = await Promise.race(lives.map((l) => l.pending));
-      if (result.done) {
-        const idx = lives.indexOf(live);
-        if (idx >= 0) lives.splice(idx, 1);
-        continue;
-      }
-      yield result.value;
-      live.pending = live.it.next().then((r) => ({ live, result: r }));
-    }
-  } finally {
-    await Promise.allSettled(lives.map((l) => Promise.resolve(l.it.return?.(undefined))));
-  }
-}
-
-/**
  * Idempotency / drift dispatch for a `runUp` whose worktree instance is
  * already running. Two outcomes:
  *
@@ -1796,8 +1726,9 @@ async function waitForWorktreeHealth(
   stack: ResolvedStack,
   socketPath: string,
   deps: CommandDeps,
+  driver: { getServiceStatuses(socketPath: string): Promise<ServiceStatus[]> },
 ): Promise<void> {
-  const wait = deps.waitForHealth ?? defaultWaitForHealth;
+  const wait = deps.waitForHealth ?? createWaitForHealth(driver);
   await wait({
     socketPath,
     serviceNames: stack.services.filter((s) => s.tier === "isolated").map((s) => s.name),
@@ -1830,104 +1761,4 @@ function formatHealthWaitNotice(sharedNames: ReadonlyArray<string>): string {
     `devtrees: waiting for shared services to be healthy ` +
     `[${sharedNames.join(", ")}] before starting this worktree's instance...`
   );
-}
-
-/**
- * Default shared-health wait: shells out to `process-compose process list`
- * over the shared instance's UDS and polls until every shared service reports
- * a healthy state ('Running'/'Ready'/'Completed') or the timeout expires.
- *
- * "Healthy enough to start a depender" = the process is up. Services with a
- * readiness probe report `Ready`; services without one report `Running`; one-shot
- * jobs may have already moved to `Completed` — all three are fine to depend on.
- * Anything else (`Pending`, `Restarting`, `Failed`) means we keep waiting.
- */
-const SHARED_HEALTH_TIMEOUT_MS = 30_000;
-const SHARED_HEALTH_POLL_MS = 200;
-const HEALTHY_STATES = new Set(["running", "ready", "completed"]);
-
-const defaultWaitForSharedHealth: WaitForSharedHealth = async ({
-  socketPath,
-  sharedServiceNames,
-}) => {
-  if (sharedServiceNames.length === 0) return;
-  const deadline = Date.now() + SHARED_HEALTH_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    const states = readProcessStates(socketPath);
-    if (states !== undefined) {
-      const allHealthy = sharedServiceNames.every((name) => {
-        const status = states.get(name)?.toLowerCase();
-        return status !== undefined && HEALTHY_STATES.has(status);
-      });
-      if (allHealthy) return;
-    }
-    await new Promise<void>((resolve) => setTimeout(resolve, SHARED_HEALTH_POLL_MS));
-  }
-  throw new Error(
-    `timed out waiting for shared services to be healthy [${sharedServiceNames.join(", ")}] ` +
-      `after ${SHARED_HEALTH_TIMEOUT_MS}ms. Check the shared instance's logs (\`devtrees attach --shared\`).`,
-  );
-};
-
-/**
- * Default worktree health-wait: same poll loop as the shared variant — the
- * mechanics are identical (poll `process-compose process list` over the
- * instance's UDS until every named service reports a healthy state) and only
- * the socket path, service set, and timeout differ. On timeout, throws
- * `HealthTimeoutError` so the CLI maps it to the documented `HEALTH_TIMEOUT`
- * envelope without pattern-matching on the message (ADR-0005).
- *
- * A zero-service wait returns immediately so a stack with no isolated services
- * does not synthesize a timeout out of thin air.
- */
-const defaultWaitForHealth: WaitForHealth = async ({ socketPath, serviceNames, timeoutMs }) => {
-  if (serviceNames.length === 0) return;
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const states = readProcessStates(socketPath);
-    if (states !== undefined) {
-      const allHealthy = serviceNames.every((name) => {
-        const status = states.get(name)?.toLowerCase();
-        return status !== undefined && HEALTHY_STATES.has(status);
-      });
-      if (allHealthy) return;
-    }
-    await new Promise<void>((resolve) => setTimeout(resolve, SHARED_HEALTH_POLL_MS));
-  }
-  throw new HealthTimeoutError(
-    `timed out waiting for services to be healthy [${serviceNames.join(", ")}] ` +
-      `after ${timeoutMs}ms. The worktree instance is still running — ` +
-      `inspect it with \`devtrees logs <service>\` or \`devtrees ls --json\`.`,
-  );
-};
-
-/**
- * Run `process-compose process list -U -u <socket> -o json` and return a
- * `name -> status` map. Returns `undefined` when the socket isn't reachable
- * yet (the shared instance is still starting), so the caller treats it as
- * "not ready, keep polling".
- */
-function readProcessStates(socketPath: string): Map<string, string> | undefined {
-  try {
-    const out = execFileSync(
-      "process-compose",
-      ["process", "list", "-U", "-u", socketPath, "-o", "json"],
-      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
-    );
-    interface RawProc {
-      readonly name?: string;
-      readonly status?: string;
-    }
-    const parsed: unknown = JSON.parse(out);
-    const items: ReadonlyArray<RawProc> = Array.isArray(parsed)
-      ? (parsed as ReadonlyArray<RawProc>)
-      : ((parsed as { processes?: ReadonlyArray<RawProc> }).processes ?? []);
-    const map = new Map<string, string>();
-    for (const item of items) {
-      if (item.name && item.status) map.set(item.name, item.status);
-    }
-    return map;
-  } catch {
-    return undefined;
-  }
 }

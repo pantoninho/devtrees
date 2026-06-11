@@ -10,6 +10,7 @@ import {
   buildProcessListArgs,
   buildReloadConfigArgs,
   createDriver,
+  mergeAsyncIterables,
   parseServiceStatuses,
   type LogEvent,
   type SpawnedProcess,
@@ -381,5 +382,44 @@ describe("process-compose driver — missing binary", () => {
       driver.up({ configPath: "/x.yaml", socketPath: "/x.sock" }),
     ).rejects.toBeInstanceOf(MissingProcessComposeError);
     expect(spawned).toBe(false);
+  });
+});
+
+describe("process-compose driver — mergeAsyncIterables", () => {
+  async function* fromArray<T>(items: T[]): AsyncIterable<T> {
+    for (const item of items) yield item;
+  }
+
+  it("yields every event from every iterable, finishing when all are done", async () => {
+    const merged = mergeAsyncIterables([fromArray([1, 3]), fromArray([2, 4])]);
+    const out: number[] = [];
+    for await (const v of merged) out.push(v);
+    expect(out.sort((a, b) => a - b)).toEqual([1, 2, 3, 4]);
+  });
+
+  it("returns immediately for zero iterables", async () => {
+    const out: number[] = [];
+    for await (const v of mergeAsyncIterables<number>([])) out.push(v);
+    expect(out).toEqual([]);
+  });
+
+  it("cascades consumer break to each underlying iterator's return()", async () => {
+    let returned = 0;
+    function endless(): AsyncIterable<number> {
+      return {
+        [Symbol.asyncIterator]: () => ({
+          next: () => Promise.resolve({ value: 1, done: false }),
+          return: () => {
+            returned += 1;
+            return Promise.resolve({ value: undefined, done: true as const });
+          },
+        }),
+      };
+    }
+    for await (const v of mergeAsyncIterables([endless(), endless()])) {
+      expect(v).toBe(1);
+      break;
+    }
+    expect(returned).toBe(2);
   });
 });
