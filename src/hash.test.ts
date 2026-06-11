@@ -88,6 +88,34 @@ describe("stackHash", () => {
       expect(stackHash(a)).not.toBe(stackHash(b));
     });
 
+    it("is insensitive to key ordering inside a block — unchanged configs must not drift", () => {
+      const a: ResolvedStack = {
+        services: [
+          {
+            ...svc("web", "node x.js"),
+            readinessProbe: {
+              http_get: { path: "/health", port: 8080 },
+              period_seconds: 5,
+              failure_threshold: 3,
+            },
+          },
+        ],
+      };
+      const b: ResolvedStack = {
+        services: [
+          {
+            ...svc("web", "node x.js"),
+            readinessProbe: {
+              failure_threshold: 3,
+              period_seconds: 5,
+              http_get: { port: 8080, path: "/health" },
+            },
+          },
+        ],
+      };
+      expect(stackHash(a)).toBe(stackHash(b));
+    });
+
     it("changes when availability is edited", () => {
       const a: ResolvedStack = {
         services: [{ ...svc("web", "node x.js"), availability: { restart: "on_failure" } }],
