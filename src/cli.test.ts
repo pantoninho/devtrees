@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { execute, isEntrypoint, run } from "./cli.js";
+import { RegistryLockedError } from "./registry.js";
+import { parseStack } from "./stack.js";
 
 async function* fromArray<T>(items: ReadonlyArray<T>): AsyncIterable<T> {
   for (const item of items) yield item;
@@ -909,6 +911,66 @@ describe("devtrees CLI — up non-interactive (#28)", () => {
     expect(help).toMatch(/--attach/);
     expect(help).toMatch(/--no-attach/);
     expect(help).toMatch(/--wait-timeout/);
+  });
+});
+
+/**
+ * Issue #84: CONFIG_INVALID and LOCK_CONTENTION must be reachable envelopes.
+ * Both tests throw the REAL error objects the core raises (the actual
+ * `parseStack` rejection and a real `RegistryLockedError`) — not fabricated
+ * `{code}` stand-ins — so they pin the whole chain: throw site tag →
+ * `classifyError` → `--json` envelope.
+ */
+describe("devtrees CLI — CONFIG_INVALID / LOCK_CONTENTION envelopes (#84)", () => {
+  /** Capture the real error `parseStack` raises for a malformed devtrees.yaml. */
+  function realStackConfigError(yamlText: string): Error {
+    try {
+      parseStack(yamlText);
+    } catch (err) {
+      return err as Error;
+    }
+    throw new Error("expected parseStack to reject the fixture");
+  }
+
+  it("`up --json` with a malformed devtrees.yaml (parse error) → code:CONFIG_INVALID", async () => {
+    const up = vi.fn().mockRejectedValue(realStackConfigError("services: [unclosed"));
+    const result = await execute(["up", "--json"], { up, down: vi.fn() });
+    expect(result.code).not.toBe(0);
+    const parsed = JSON.parse(result.stdout) as { error: { code: string; message: string } };
+    expect(parsed.error.code).toBe("CONFIG_INVALID");
+    expect(parsed.error.message).toMatch(/devtrees\.yaml/i);
+  });
+
+  it("`up --json` with a schema-invalid devtrees.yaml (validation error) → code:CONFIG_INVALID", async () => {
+    const invalid = [
+      "services:",
+      "  db:",
+      "    tier: shared",
+      "    command: postgres",
+      "    depends_on: [web]",
+      "  web:",
+      "    tier: isolated",
+      "    command: node server.js",
+      "",
+    ].join("\n");
+    const up = vi.fn().mockRejectedValue(realStackConfigError(invalid));
+    const result = await execute(["up", "--json"], { up, down: vi.fn() });
+    expect(result.code).not.toBe(0);
+    const parsed = JSON.parse(result.stdout) as { error: { code: string; message: string } };
+    expect(parsed.error.code).toBe("CONFIG_INVALID");
+    expect(parsed.error.message).toMatch(/shared.*depends_on.*isolated/i);
+  });
+
+  it("`up --json` with a contended registry lock → code:LOCK_CONTENTION", async () => {
+    const err = new RegistryLockedError("/anchor/devtrees/registry.lock");
+    const up = vi.fn().mockRejectedValue(err);
+    const result = await execute(["up", "--json"], { up, down: vi.fn() });
+    expect(result.code).not.toBe(0);
+    const parsed = JSON.parse(result.stdout) as { error: { code: string; message: string } };
+    expect(parsed.error.code).toBe("LOCK_CONTENTION");
+    expect(parsed.error.message).toMatch(/registry\.lock/);
+    // Human diagnostic still lands on stderr alongside the JSON envelope.
+    expect(result.stderr).toMatch(/lock/i);
   });
 });
 
