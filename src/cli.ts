@@ -27,6 +27,7 @@ import {
   formatEnv,
   formatError,
   formatGenerate,
+  formatInit,
   formatLogLine,
   formatLs,
   formatPrune,
@@ -79,6 +80,10 @@ export const COMMANDS: ReadonlyArray<{ name: string; summary: string }> = [
     name: "logs",
     summary: "Stream a service's logs (--follow, --tail=N, --since=DUR, --all, --shared)",
   },
+  {
+    name: "init",
+    summary: "Write the coding-agent onboarding block into AGENTS.md/CLAUDE.md (--agents)",
+  },
 ];
 
 export interface RunResult {
@@ -127,6 +132,11 @@ export interface ExecuteDeps {
   logs?: (options: LogsCliOptions) => Promise<{
     services: ReadonlyArray<string>;
     events: AsyncIterable<LogEvent>;
+  }>;
+  init?: () => Promise<{
+    target: string;
+    path: string;
+    action: "created" | "updated";
   }>;
 }
 
@@ -502,6 +512,48 @@ class LogsCommand extends DevtreesCommand {
   }
 }
 
+class InitCommand extends DevtreesCommand {
+  static override paths = [["init"]];
+  static override usage = Command.Usage({
+    description:
+      "Write the coding-agent onboarding block into this repo's agent-instructions file.",
+    // Pure filesystem write: validates the required `--agents` flag
+    // (INVALID_ARGS) and can surface a write error (UNKNOWN). No anchor
+    // resolution, no lock, no spawn — so none of the lifecycle codes apply.
+    details: errorCodeFooter(["INVALID_ARGS", "UNKNOWN"]),
+    examples: [
+      ["Write the onboarding block (creates AGENTS.md if absent)", "devtrees init --agents"],
+      ["Write it + emit the created-vs-updated JSON envelope", "devtrees init --agents --json"],
+    ],
+  });
+
+  // `--agents` selects the onboarding-block writer. It's the only mode `init`
+  // supports today, but it is required (not defaulted) so the command's intent
+  // is explicit at the call site and a bare `devtrees init` fails loudly with
+  // INVALID_ARGS rather than silently doing something — leaving room for future
+  // `init` modes without a behaviour change.
+  agents = Option.Boolean("--agents", false, {
+    description: "Write the canonical coding-agent onboarding block into AGENTS.md / CLAUDE.md.",
+  });
+
+  override async execute(): Promise<number> {
+    return this.dispatch(async () => {
+      if (!this.agents) {
+        throw invalidArgsError("`devtrees init` requires `--agents` (the only mode today).");
+      }
+      if (!this.context.deps.init) return 0;
+      const result = await this.context.deps.init();
+      const out = formatInit(
+        { target: result.target, path: result.path, action: result.action },
+        this.mode,
+      );
+      if (out.stdout) this.context.stdout.write(out.stdout);
+      if (out.stderr) this.context.stderr.write(out.stderr);
+      return 0;
+    });
+  }
+}
+
 // --- flag-value coercions ---------------------------------------------------
 
 /**
@@ -602,6 +654,7 @@ function buildCli(): Cli<DevtreesContext> {
   cli.register(PruneCommand);
   cli.register(EnvCommand);
   cli.register(LogsCommand);
+  cli.register(InitCommand);
   return cli;
 }
 
@@ -770,7 +823,7 @@ export function isEntrypoint(metaUrl: string, argv1: string | undefined): boolea
 }
 
 if (isEntrypoint(import.meta.url, process.argv[1])) {
-  const { runUp, runDown, runEnv, runGenerate, runLs, runAttach, runPrune, runLogs } =
+  const { runUp, runDown, runEnv, runGenerate, runLs, runAttach, runPrune, runLogs, runInit } =
     await import("./commands.js");
   const deps: ExecuteDeps = {
     up: (options) =>
@@ -796,6 +849,7 @@ if (isEntrypoint(import.meta.url, process.argv[1])) {
           sinceMs: opts.sinceMs,
         },
       ),
+    init: () => runInit(),
   };
   const result = await dispatchCli(process.argv.slice(2), deps);
   if (result.stdout) process.stdout.write(result.stdout);
