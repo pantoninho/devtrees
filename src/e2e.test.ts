@@ -589,9 +589,9 @@ describe("e2e — devtrees ls discovers worktree instances + the shared instance
 
     const deps = stubDriverDeps(loginWt);
     const up = await runUp(deps as never);
-    cleanups.push(() => {
-      void runDown(deps as never).catch(() => {});
-      void runDown(deps as never, { shared: true }).catch(() => {});
+    cleanups.push(async () => {
+      await runDown(deps as never).catch(() => {});
+      await runDown(deps as never, { shared: true }).catch(() => {});
     });
     expect(await waitForHttp(Number(up.env.WEB_PORT))).toBe(true);
 
@@ -1060,6 +1060,74 @@ describe("e2e — teardown-leak invariant: stub parents and children are reaped 
     const survivors = await waitForReaped(ourPids, 4000);
     expect(survivors).toEqual([]);
   }, 15000);
+
+  /**
+   * Ordering regression for #122. The `services[]` scenario (and any peer)
+   * registers its `runDown` teardown as a `cleanups.push` callback, and the
+   * worktree-`rmSync` cleanup sits *below* it on the LIFO stack. `afterEach`
+   * drains with `await fn()` — so if the `runDown` cleanup is a synchronous
+   * arrow that `void`-discards the promise (the #122 bug), the await resolves
+   * immediately, the `rmSync` cleanup pops next and unlinks the socket dir
+   * before the stub is signalled, and the stub's detached children orphan.
+   *
+   * This test reconstructs that exact cleanup pair (shared-tier stack, so both
+   * a worktree and a shared stub are spawned) and drains it through the same
+   * `await fn()` LIFO contract `afterEach` uses, then asserts every spawned
+   * pid is reaped. The fire-and-forget shape loses the race here and leaves
+   * survivors; only an awaited `runDown` cleanup passes.
+   */
+  it("a void-discarding runDown cleanup loses the rmSync race — awaited cleanups reap before the tmp dir is unlinked", async () => {
+    const repo = makeRepo("dt-svc-leak-", ["login"]);
+    const worktree = repo.worktrees.login;
+    if (worktree === undefined) throw new Error("expected login worktree");
+    writeMixedTierStack(worktree);
+    const deps = stubDriverDeps(worktree);
+
+    const up = await runUp(deps as never);
+    expect(await waitForHttp(Number(up.env.WEB_PORT))).toBe(true);
+
+    // Snapshot the stub parents (worktree + shared) and every recorded service
+    // child, before any teardown runs. Socket argv (`-u <socket>`) uniquely
+    // tags each stub parent; the stub records its service pids next to it.
+    const commonDir = git(worktree, "rev-parse", "--git-common-dir");
+    const absCommon = commonDir.startsWith("/") ? commonDir : join(worktree, commonDir);
+    const runDir = join(absCommon, "devtrees", "run");
+    const wtSock = join(runDir, `${up.worktreeId}.sock`);
+    const sharedSock = join(runDir, "shared.sock");
+    const childPids = [
+      ...(JSON.parse(readFileSync(`${wtSock}.pids`, "utf8")) as number[]),
+      ...(JSON.parse(readFileSync(`${sharedSock}.pids`, "utf8")) as number[]),
+    ];
+    const stubParents = [...pgrepFull(wtSock), ...pgrepFull(sharedSock)];
+    const ourPids = Array.from(new Set([...stubParents, ...childPids]));
+    expect(stubParents.length).toBeGreaterThan(0);
+    expect(ourPids.length).toBeGreaterThan(0);
+
+    // Reconstruct the scenario's teardown pair in registration order: the
+    // worktree `rmSync` first (so it sits at the BOTTOM of the LIFO stack),
+    // then the `runDown` cleanup on top — exactly how the `services[]` test
+    // registers them. Drain through the same `await fn()` LIFO loop afterEach
+    // uses; the await-vs-void distinction in the runDown cleanup is what's
+    // under test here.
+    const localCleanups: Array<() => void | Promise<unknown>> = [];
+    localCleanups.push(() => rmSync(repo.root, { recursive: true, force: true }));
+    localCleanups.push(async () => {
+      await runDown(deps as never).catch(() => {});
+      await runDown(deps as never, { shared: true }).catch(() => {});
+    });
+    while (localCleanups.length) {
+      const fn = localCleanups.pop();
+      if (!fn) continue;
+      try {
+        await fn();
+      } catch {
+        // best-effort, mirrors afterEach
+      }
+    }
+
+    const survivors = await waitForReaped(ourPids, 4000);
+    expect(survivors).toEqual([]);
+  }, 30000);
 });
 
 describe("e2e — attach to the shared instance", () => {
