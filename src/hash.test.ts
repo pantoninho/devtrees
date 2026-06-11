@@ -178,4 +178,24 @@ describe("sharedStackHash (#83)", () => {
   it("is hex-encoded SHA-256 (64 chars)", () => {
     expect(sharedStackHash({ services: [pg] })).toMatch(/^[0-9a-f]{64}$/);
   });
+
+  it("changes when a shared service's readiness_probe is edited (#86)", () => {
+    const a: ResolvedStack = {
+      services: [{ ...pg, readinessProbe: { exec: { command: "pg_isready" } } }],
+    };
+    const b: ResolvedStack = {
+      services: [{ ...pg, readinessProbe: { exec: { command: "pg_isready -q" } } }],
+    };
+    expect(sharedStackHash(a)).not.toBe(sharedStackHash(b));
+  });
+
+  it("ignores probe edits on isolated services (#86)", () => {
+    const a: ResolvedStack = {
+      services: [pg, { ...web, livenessProbe: { exec: { command: "ok" } } }],
+    };
+    const b: ResolvedStack = {
+      services: [pg, { ...web, livenessProbe: { exec: { command: "nope" } } }],
+    };
+    expect(sharedStackHash(a)).toBe(sharedStackHash(b));
+  });
 });
