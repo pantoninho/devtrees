@@ -214,6 +214,49 @@ services:
     const stack = parseStack(yaml);
     expect(stack.allocator).toEqual({ portBase: 25000 });
   });
+
+  it("rejects a port_base too close to 65535 for one full block (default block_size)", () => {
+    const yaml = `
+port_base: 65530
+services:
+  web:
+    command: "node server.js"
+`;
+    expect(() => parseStack(yaml)).toThrow(/port_base 65530.*65535/s);
+  });
+
+  it("rejects a port_base/block_size pair whose first block would cross 65535", () => {
+    const yaml = `
+port_base: 65000
+block_size: 1000
+services:
+  web:
+    command: "node server.js"
+`;
+    expect(() => parseStack(yaml)).toThrow(/65535/);
+  });
+
+  it("rejects a block_size too large for the default port_base", () => {
+    const yaml = `
+block_size: 50000
+services:
+  web:
+    command: "node server.js"
+`;
+    expect(() => parseStack(yaml)).toThrow(/65535/);
+  });
+
+  it("accepts the exact-fit port_base whose single block ends at 65535", () => {
+    const yaml = `
+port_base: 65504
+block_size: 32
+services:
+  web:
+    command: "node server.js"
+`;
+    const stack = parseStack(yaml);
+    expect(stack.allocator).toEqual({ portBase: 65504, blockSize: 32 });
+  });
 });
 
 describe("stack model — process-compose probe / availability passthrough", () => {

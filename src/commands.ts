@@ -8,7 +8,12 @@
  * an e2e against a temp git repo + stub process-compose.
  */
 
-import { allocateBlock, type AllocatorOptions, type RegistrySnapshot } from "./allocator.js";
+import {
+  allocateBlock,
+  type AllocatorOptions,
+  DEFAULT_ALLOCATOR,
+  type RegistrySnapshot,
+} from "./allocator.js";
 import { resolveAnchor, type GitProbe } from "./anchor.js";
 import { deriveSharedConfig, deriveWorktreeConfig, type DroppedEdge } from "./deriver.js";
 import {
@@ -129,8 +134,6 @@ function collectSharedPorts(
   }
   return ports;
 }
-
-const DEFAULT_ALLOCATOR: AllocatorOptions = { portBase: 20000, blockSize: 32 };
 
 /** Type of the lock-guarded mutator the caller passes for testability. */
 export type WithRegistryLock = (

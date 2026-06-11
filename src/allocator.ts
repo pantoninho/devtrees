@@ -37,8 +37,11 @@ export type RegistrySnapshot = Readonly<Record<string, number>>;
  */
 export type PortFreeProbe = (port: number) => boolean | Promise<boolean>;
 
+/** PRD defaults; per-repo `devtrees.yaml` overrides replace fields individually. */
+export const DEFAULT_ALLOCATOR: AllocatorOptions = { portBase: 20000, blockSize: 32 };
+
 /** Highest valid TCP port; blocks must fit entirely at or below this. */
-const MAX_PORT = 65535;
+export const MAX_PORT = 65535;
 
 function fnv1a(worktreeId: string): number {
   // FNV-1a — small, stable, dependency-free.
