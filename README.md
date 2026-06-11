@@ -115,6 +115,78 @@ bump once the agent surface is declared stable — see
 [ADR-0005](docs/adr/0005-agent-friendly-cli-by-default.md) for the
 versioning policy.
 
+## Using devtrees from a coding agent
+
+A coding agent dropped into a consuming repo learns that repo's workflow from
+its `AGENTS.md` (or `CLAUDE.md`, or whatever convention the agent reads), not
+from devtrees' README. If your project uses devtrees to isolate per-worktree
+stacks, paste the block below into your project's agent instructions so any
+agent can drive the stack non-interactively.
+
+The block is agent-agnostic — it's plain instructions about the devtrees CLI,
+valid as `AGENTS.md` / `CLAUDE.md` content for any coding agent.
+
+> A `devtrees init --agents` command that generates this block for you is a
+> possible follow-up; it does not exist yet, so copy the block manually.
+
+````markdown
+## Running the stack with devtrees
+
+This worktree's services run under [devtrees](https://github.com/pantoninho/devtrees),
+which gives every git worktree its own collision-free port block. Drive it
+non-interactively — never attach the TUI:
+
+```bash
+# 1. Bring the stack up and wait for health. In a non-TTY context (an agent
+#    shell) `up` skips the TUI and blocks until every probed service reports
+#    health: ready, then exits. `--json` prints the success envelope — the
+#    allocated ports, per-service rows, and the injected env map — on stdout.
+devtrees up --json
+
+# 2. Load this worktree's injected ports/URLs into the environment. `devtrees
+#    env` prints `KEY=value` lines (use `--json` for a map); eval makes them
+#    available to your test command.
+eval "$(devtrees env)"
+
+# 3. Run the project's tests/build against the running stack.
+<your test command>   # e.g. npm test
+
+# 4. On failure, read a service's recent logs. Without `--follow`, `logs`
+#    prints the buffered tail and exits — safe in a non-interactive shell.
+devtrees logs <service> --tail=200
+
+# 5. Tear the stack down when done. Re-running `down` on an already-stopped
+#    instance is a no-op and still exits 0.
+devtrees down
+```
+
+`devtrees up` is idempotent: calling it when the stack is already running
+reconciles config (hot-reloading on change) instead of erroring, so it's safe
+to call defensively before every test run rather than tracking whether the
+stack is up.
+
+### Handling failures
+
+With `--json`, every command emits a single JSON document on **stdout** and
+exits non-zero on failure: `{"error":{"code":"…","message":"…","details":{…}}}`.
+Branch on `error.code`:
+
+| Code                        | What it means and what to do                                                                 |
+| --------------------------- | -------------------------------------------------------------------------------------------- |
+| `LOCK_CONTENTION`           | Another devtrees process holds a lock. Wait briefly and **retry** `up`/`down`.               |
+| `HEALTH_TIMEOUT`            | A service never reported ready. The stack is **left running** — read `devtrees logs <service> --tail=N` to see why, then retry or `down`. |
+| `STALE_PORT_BLOCK`          | Foreign listeners hold this worktree's ports. `details.collisions[]` lists `{port_name, port, pid, command}`; kill the orphans and retry. |
+| `SHARED_DRIFT`              | This worktree's shared services diverge from the running shared instance. Follow the message: `devtrees down --shared && devtrees up`. |
+| `CONFIG_DRIFT`              | The running config differs from `devtrees.yaml` and hot-reload failed. Follow the message — usually `devtrees down && devtrees up`. |
+| `SERVICE_NOT_FOUND`         | You named a service that isn't in the instance. `details.valid_services` lists the real names; pick one. |
+| `INSTANCE_NOT_FOUND`        | No instance is running for this worktree. Run `devtrees up` first.                            |
+| `PROCESS_COMPOSE_NOT_FOUND` | The `process-compose` binary is missing. **Surface this to the human** — it's an environment setup gap you can't fix.   |
+| `CONFIG_INVALID` / `INVALID_ARGS` | The config or your arguments are malformed. Fix the input; don't retry blindly.        |
+
+For the full error enum and the per-command subset each can emit, run
+`devtrees <cmd> --help` or see devtrees' README.
+````
+
 ## Development
 
 devtrees is built with [Vite+](https://viteplus.dev/) (the `vp` CLI), per
