@@ -1174,3 +1174,147 @@ describe("e2e — STALE_PORT_BLOCK pre-flight (#58)", () => {
     }
   }, 20000);
 });
+
+/**
+ * Crash recovery (#80). Control-socket files live in anchor state, which
+ * survives `kill -9` — so the write paths must probe the UDS for a live
+ * listener rather than trusting file existence. These tests SIGKILL the stub
+ * parent (bypassing its cleanup trap, exactly like a real crash) so the
+ * socket file is left orphaned on disk, then prove `up` / `down --shared`
+ * recover instead of trusting the corpse.
+ */
+describe("e2e — crash recovery: stale control sockets (#80)", () => {
+  /**
+   * Simulate a `kill -9` crash of a stub instance: SIGKILL its long-lived
+   * parent (its trap never fires, so the socket file survives — the stale
+   * state under test) and SIGKILL the recorded service children so the
+   * block's ports are genuinely free for the restart.
+   */
+  async function crashInstance(socketPath: string): Promise<void> {
+    const parentPid = Number(readFileSync(`${socketPath}.parent-pid`, "utf8"));
+    const childPids = JSON.parse(readFileSync(`${socketPath}.pids`, "utf8")) as number[];
+    process.kill(parentPid, "SIGKILL");
+    for (const pid of childPids) {
+      // Detached children are process-group leaders; -pid addresses the group.
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // already gone
+        }
+      }
+    }
+    const survivors = await waitForReaped([parentPid, ...childPids], 4000);
+    if (survivors.length > 0) {
+      throw new Error(`crash helper left pids alive: ${survivors.join(", ")}`);
+    }
+  }
+
+  /**
+   * Build the repo + stack + driver deps for one crash test, and resolve the
+   * anchor-side path of the control socket the test will SIGKILL. Folding the
+   * common setup keeps each test body down to crash + recovery assertions.
+   */
+  function crashFixture(opts: {
+    prefix: string;
+    writeStack: (worktreeRoot: string) => void;
+    /** Fixed socket file name (`shared.sock`); omit to derive the login worktree's. */
+    socketName?: string;
+  }): { deps: ReturnType<typeof stubDriverDeps>; socketPath: string } {
+    const repo = makeRepo(opts.prefix, ["login"]);
+    cleanups.push(() => rmSync(repo.root, { recursive: true, force: true }));
+    const worktree = repo.worktrees.login;
+    if (worktree === undefined) throw new Error("expected login worktree");
+    opts.writeStack(worktree);
+    const commonDir = git(worktree, "rev-parse", "--git-common-dir");
+    const absCommon = commonDir.startsWith("/") ? commonDir : join(worktree, commonDir);
+    const socketName =
+      opts.socketName ?? `${deriveWorktreeId(git(worktree, "rev-parse", "--show-toplevel"))}.sock`;
+    return {
+      deps: stubDriverDeps(worktree),
+      socketPath: join(absCommon, "devtrees", "run", socketName),
+    };
+  }
+
+  /** `runUp` for a mixed-tier fixture, registering worktree + shared teardown. */
+  async function upWithSharedTeardown(
+    deps: ReturnType<typeof stubDriverDeps>,
+  ): Promise<Awaited<ReturnType<typeof runUp>>> {
+    const up = await runUp(deps as never);
+    cleanups.push(async () => {
+      await runDown(deps as never).catch(() => {});
+      await runDown(deps as never, { shared: true }).catch(() => {});
+    });
+    return up;
+  }
+
+  it("up after the worktree instance was SIGKILLed starts a fresh instance, not a silent no-op", async () => {
+    const { deps, socketPath } = crashFixture({
+      prefix: "dt-crash-wt-",
+      writeStack: writeStackConfig,
+    });
+
+    const first = await runUp(deps as never);
+    cleanups.push(() => runDown(deps as never).catch(() => {}));
+    const port = Number(first.env.WEB_PORT);
+    expect(await waitForHttp(port)).toBe(true);
+
+    await crashInstance(socketPath);
+    // The crash left the socket file behind with no listener — the stale state.
+    expect(existsSync(socketPath)).toBe(true);
+    expect(await waitForGone(port)).toBe(true);
+
+    // Acceptance: up starts a fresh instance and returns the normal started
+    // envelope — the service is genuinely serving again on its stable block.
+    const second = await runUp(deps as never);
+    expect(second.worktreeId).toBe(first.worktreeId);
+    expect(Number(second.env.WEB_PORT)).toBe(port);
+    expect(await waitForHttp(port)).toBe(true);
+  }, 30000);
+
+  it("up after the shared instance was SIGKILLed restarts shared (worktree instance still live)", async () => {
+    const { deps, socketPath } = crashFixture({
+      prefix: "dt-crash-sh-",
+      writeStack: writeMixedTierStack,
+      socketName: "shared.sock",
+    });
+
+    const first = await upWithSharedTeardown(deps);
+    expect(first.sharedStarted).toBe(true);
+    const dbPort = Number(first.env.DB_PORT);
+    expect(await waitForTcp(dbPort)).toBe(true);
+
+    await crashInstance(socketPath);
+    expect(existsSync(socketPath)).toBe(true);
+    expect(await waitForGone(dbPort)).toBe(true);
+
+    // Acceptance: the next up restarts the shared instance — even though the
+    // worktree's own instance is still live and takes the idempotent branch.
+    const second = await runUp(deps as never);
+    expect(second.sharedStarted).toBe(true);
+    expect(Number(second.env.DB_PORT)).toBe(dbPort);
+    expect(await waitForTcp(dbPort)).toBe(true);
+  }, 30000);
+
+  it("down --shared on a stale shared socket cleans up the file and no-ops instead of failing", async () => {
+    const { deps, socketPath } = crashFixture({
+      prefix: "dt-crash-dn-",
+      writeStack: writeMixedTierStack,
+      socketName: "shared.sock",
+    });
+
+    const up = await upWithSharedTeardown(deps);
+    expect(await waitForTcp(Number(up.env.DB_PORT))).toBe(true);
+
+    await crashInstance(socketPath);
+    expect(existsSync(socketPath)).toBe(true);
+
+    // Acceptance: an idempotent no-op — resolves cleanly and unlinks the
+    // orphaned socket so the next up lazy-starts a fresh shared instance.
+    const result = await runDown(deps as never, { shared: true });
+    expect(result).toEqual({ shared: true });
+    expect(existsSync(socketPath)).toBe(false);
+  }, 30000);
+});

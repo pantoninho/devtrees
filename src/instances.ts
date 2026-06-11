@@ -124,8 +124,13 @@ function listSocketStems(anchor: string): string[] {
  * the same UDS process-compose serves its API on, so anything that accepts the
  * connection — even before reading a byte — is a live instance. Anything else
  * (ENOENT, ECONNREFUSED, timeout) means the file is orphaned.
+ *
+ * Exported because liveness is a repo-wide concern, not just `ls`'s: the
+ * write paths (`up`, the shared lazy-start, `down --shared`) must not trust
+ * socket-file existence — the file lives in anchor state and survives
+ * `kill -9` and reboots (issue #80).
  */
-async function probeSocket(socketPath: string): Promise<InstanceStatus> {
+export async function probeSocket(socketPath: string): Promise<InstanceStatus> {
   return new Promise<InstanceStatus>((resolve) => {
     const socket = connect(socketPath);
     let settled = false;

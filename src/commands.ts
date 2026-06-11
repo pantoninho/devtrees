@@ -11,7 +11,13 @@
 import { allocateBlock, type AllocatorOptions, type RegistrySnapshot } from "./allocator.js";
 import { resolveAnchor, type GitProbe } from "./anchor.js";
 import { deriveSharedConfig, deriveWorktreeConfig, type DroppedEdge } from "./deriver.js";
-import { discoverInstances, type InstanceInfo, type Service } from "./instances.js";
+import {
+  discoverInstances,
+  probeSocket as defaultProbeSocket,
+  type InstanceInfo,
+  type InstanceStatus,
+  type Service,
+} from "./instances.js";
 import { SHARED_REGISTRY_KEY, instancePaths, sharedInstancePaths } from "./paths.js";
 import { findOrphans, parseWorktreeIds } from "./prune.js";
 import { loadStack, type ResolvedService, type ResolvedStack } from "./stack.js";
@@ -260,6 +266,15 @@ export interface CommandDeps {
   /** Is a concrete port free to bind? Default: probes a real TCP bind. */
   readonly isPortFree?: (port: number) => boolean | Promise<boolean>;
   /**
+   * Probe a control socket for an actual listener (issue #80). The socket
+   * *file* lives in anchor state, which survives `kill -9` and reboots, so
+   * the write paths must not treat its existence as liveness. Default: real
+   * UDS connect probe (`instances.ts`, the same primitive `ls` reports
+   * stale instances with). Injected so unit tests can simulate live/crashed
+   * instances without binding real sockets.
+   */
+  readonly probeSocket?: (socketPath: string) => Promise<InstanceStatus>;
+  /**
    * Identify the holder of a concrete port — used by `up`'s pre-flight
    * stale-port-block check (#58). Default: `defaultPortHolder` (bind probe
    * + best-effort `lsof`). Injected so unit tests can drive the routing
@@ -490,7 +505,34 @@ function resolveUpSeams(deps: CommandDeps) {
     warn: deps.warn ?? defaultWarn,
     readHash: deps.readStoredHash ?? defaultReadStoredHash,
     writeHash: deps.writeStoredHash ?? defaultWriteStoredHash,
+    probe: resolveProbe(deps),
   } as const;
+}
+
+/**
+ * Resolve the #80 socket-liveness probe seam — needed by both `runUp` (via
+ * `resolveUpSeams`) and `runDown`, which doesn't share the up-seam bundle.
+ */
+function resolveProbe(deps: CommandDeps): (socketPath: string) => Promise<InstanceStatus> {
+  return deps.probeSocket ?? defaultProbeSocket;
+}
+
+/**
+ * Liveness gate for the write paths (issue #80). A control-socket *file* is
+ * not proof of a live instance — it lives in anchor state, which survives
+ * `kill -9` and reboots, so after a crash the file points at nothing. Probe
+ * the UDS: a listener means live; anything else means the file is an orphan,
+ * so unlink it and report "not live" — the caller then falls through to its
+ * fresh-start (or idempotent no-op) path instead of trusting a dead instance.
+ */
+async function socketIsLive(
+  socketPath: string,
+  probe: (socketPath: string) => Promise<InstanceStatus>,
+): Promise<boolean> {
+  if (!existsSync(socketPath)) return false;
+  if ((await probe(socketPath)) === "running") return true;
+  rmSync(socketPath, { force: true });
+  return false;
 }
 
 /**
@@ -577,6 +619,13 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
   const driver = createDriver(deps.driver);
   const inst = { configPath: paths.configPath, socketPath: paths.socketPath };
 
+  // Liveness, not file existence (issue #80): probe the control socket for an
+  // actual listener. A SIGKILLed instance leaves its socket file behind in
+  // anchor state; trusting it would take the already-running branch against a
+  // dead instance AND skip the #58 pre-flight below. A stale file is unlinked
+  // here so this up falls through to the fresh-start path.
+  const ownInstanceLive = await socketIsLive(paths.socketPath, seams.probe);
+
   // Pre-flight stale-port-block check (issue #58). Self-gates on the
   // own-instance-live flag so the idempotent re-up path skips the probe
   // (those listeners ARE our own); on the first-up path, any listener on a
@@ -589,7 +638,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     blockBase,
     portFor,
     portHolder,
-    ownInstanceLive: existsSync(paths.socketPath),
+    ownInstanceLive,
   });
 
   // Lazy-start the shared instance if any shared services are declared. Runs
@@ -602,15 +651,17 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
   if (sharedNeeded) {
     sharedStarted = await ensureSharedStarted(anchor.anchor, stack, sharedPortFor, sharedLock, {
       driver,
+      probe: seams.probe,
     });
   }
 
-  // Idempotency branch (issue #31): if this worktree's control socket is
-  // already present, the instance is up. Compare the current resolved-stack
-  // hash to the one stored from the previous successful `up`:
+  // Idempotency branch (issue #31): if this worktree's control socket is held
+  // by a live listener (probed above, #80 — file existence alone is not
+  // enough), the instance is up. Compare the current resolved-stack hash to
+  // the one stored from the previous successful `up`:
   //   - match  -> noop, re-emit the envelope (no driver.up, no registry write)
   //   - drift  -> attempt hot-reload via the driver; map failure to CONFIG_DRIFT.
-  if (existsSync(paths.socketPath)) {
+  if (ownInstanceLive) {
     return await reconcileRunning({
       stack,
       anchor,
@@ -834,21 +885,29 @@ export async function runAttach(
 
 /**
  * Idempotently lazy-start the shared instance: under the shared lifecycle lock,
- * if its control socket is already present do nothing; otherwise write a fresh
- * derived shared config and spawn `process-compose` against it. The lock is the
- * gate — two simultaneous callers see a consistent answer and at most one
- * actually starts the instance.
+ * if its control socket is held by a live listener do nothing; otherwise write
+ * a fresh derived shared config and spawn `process-compose` against it. The
+ * lock is the gate — two simultaneous callers see a consistent answer and at
+ * most one actually starts the instance.
+ *
+ * Liveness is probed, not inferred from the socket file (#80): a SIGKILLed
+ * shared instance leaves its socket behind, and trusting the file would make
+ * the shared instance unrestartable without hand-deleting it. A stale socket
+ * is unlinked and we fall through to the fresh start.
  */
 async function ensureSharedStarted(
   anchor: string,
   stack: ResolvedStack,
   sharedPortFor: (name: string) => number | undefined,
   sharedLock: WithSharedLock,
-  deps: { driver: ReturnType<typeof createDriver> },
+  deps: {
+    driver: ReturnType<typeof createDriver>;
+    probe: (socketPath: string) => Promise<InstanceStatus>;
+  },
 ): Promise<boolean> {
   return await sharedLock(anchor, async () => {
     const paths = sharedInstancePaths(anchor);
-    if (existsSync(paths.socketPath)) return false;
+    if (await socketIsLive(paths.socketPath, deps.probe)) return false;
 
     const derived = deriveSharedConfig(stack, {
       workingDir: anchor,
@@ -983,10 +1042,16 @@ export async function runDown(
 
   if (options.shared) {
     const sharedLock = deps.withSharedLock ?? defaultWithSharedLock;
+    const probe = resolveProbe(deps);
     const paths = sharedInstancePaths(anchor.anchor);
 
     await sharedLock(anchor.anchor, async () => {
-      if (existsSync(paths.socketPath)) {
+      // Probe, don't trust the file (#80): after a SIGKILL the socket file
+      // survives with no listener behind it, and `process-compose down`
+      // against the dead UDS fails. A live instance is signalled through the
+      // driver; a stale socket is unlinked by the probe gate itself, so
+      // either way the call converges to "shared is down" — idempotently.
+      if (await socketIsLive(paths.socketPath, probe)) {
         await driver.down({ configPath: paths.configPath, socketPath: paths.socketPath });
       }
       // Best-effort cleanup of the derived config — a future `up` re-derives it.
