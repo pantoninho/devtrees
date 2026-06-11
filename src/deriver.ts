@@ -63,9 +63,29 @@ export interface DroppedEdge {
   readonly toTier: Tier;
 }
 
+/**
+ * Devtrees-owned metadata embedded in the derived config under a
+ * compose-spec-style `x-` extension key. process-compose ignores it (verified
+ * against v1.110.0, including `is_strict: true`); devtrees reads it back at
+ * `ls` time.
+ *
+ * `ports_by_service` exists because the per-process `environment:` lines are
+ * a flat injection — every process carries every named port as connection
+ * info — so the env alone cannot recover which ports a service *declares*
+ * (issue #110). One entry per process in this instance; a portless service
+ * gets an explicit `{}`.
+ */
+export interface DerivedMetadata {
+  readonly ports_by_service: Readonly<Record<string, Readonly<Record<string, number>>>>;
+}
+
+/** Well-known key the derived config stores `DerivedMetadata` under. */
+export const DEVTREES_METADATA_KEY = "x-devtrees";
+
 /** The clean process-compose config for one instance. */
 export interface DerivedConfig {
   readonly processes: Record<string, DerivedProcess>;
+  readonly [DEVTREES_METADATA_KEY]: DerivedMetadata;
 }
 
 /** Resolves a declared named port to its allocated number, or undefined. */
@@ -121,6 +141,29 @@ function collectPortEnv(
 }
 
 /**
+ * Build the per-service declared-port map for one instance's services: each
+ * service's own `ports` list resolved to numbers. Unresolvable names are
+ * skipped (the deriver does not invent numbers); a portless service keeps an
+ * explicit `{}` so readers can distinguish "declares nothing" from "unknown
+ * service".
+ */
+function collectPortsByService(
+  services: ReadonlyArray<{ readonly name: string; readonly ports: ReadonlyArray<string> }>,
+  resolve: PortResolver,
+): Record<string, Record<string, number>> {
+  const byService: Record<string, Record<string, number>> = {};
+  for (const service of services) {
+    const ports: Record<string, number> = {};
+    for (const portName of service.ports) {
+      const port = resolve(portName);
+      if (port !== undefined) ports[portName] = port;
+    }
+    byService[service.name] = ports;
+  }
+  return byService;
+}
+
+/**
  * Derive the worktree instance's config + env injection from the stack and this
  * worktree's allocation. Only `isolated` services land in the worktree instance;
  * shared services' named ports are still injected as connection info.
@@ -152,7 +195,14 @@ export function deriveWorktreeConfig(stack: ResolvedStack, ctx: DeriveContext): 
     extraEnvLines: envLines(env),
   });
 
-  return { config: { processes }, env, droppedEdges };
+  return {
+    config: {
+      processes,
+      [DEVTREES_METADATA_KEY]: { ports_by_service: collectPortsByService(isolated, ctx.portFor) },
+    },
+    env,
+    droppedEdges,
+  };
 }
 
 /** Context for the shared instance: the anchor (working dir) and the repo-wide port resolver. */
@@ -198,7 +248,14 @@ export function deriveSharedConfig(stack: ResolvedStack, ctx: SharedDeriveContex
     extraEnvLines: envLines(env),
   });
 
-  return { config: { processes }, env, droppedEdges };
+  return {
+    config: {
+      processes,
+      [DEVTREES_METADATA_KEY]: { ports_by_service: collectPortsByService(shared, ctx.portFor) },
+    },
+    env,
+    droppedEdges,
+  };
 }
 
 /** Flatten an env map into the `KEY=VALUE` lines process-compose's `environment` accepts. */

@@ -568,3 +568,85 @@ describe("config deriver — cross-tier depends_on handling (ADR-0003)", () => {
     expect("depends_on" in web).toBe(false);
   });
 });
+
+describe("config deriver — per-service port metadata (`x-devtrees`, issue #110)", () => {
+  // The derived config flat-injects every named port into every process's
+  // environment (connection info), so the env lines alone cannot tell `ls`
+  // which ports a service *declares*. The deriver records that mapping under
+  // a compose-spec-style `x-` extension key process-compose ignores (verified
+  // against v1.110.0, including `is_strict: true`).
+  const mixedStack: ResolvedStack = {
+    services: [
+      {
+        name: "web",
+        tier: "isolated",
+        command: "node server.js",
+        ports: ["WEB_PORT"],
+        dependsOn: [],
+        environment: [],
+      },
+      {
+        name: "worker",
+        tier: "isolated",
+        command: "node worker.js",
+        ports: [],
+        dependsOn: [],
+        environment: [],
+      },
+      {
+        name: "db",
+        tier: "shared",
+        command: "postgres",
+        ports: ["DB_PORT"],
+        dependsOn: [],
+        environment: [],
+      },
+    ],
+  };
+
+  const derived = deriveWorktreeConfig(mixedStack, {
+    worktreeId: "login",
+    worktreeRoot: "/wt/login",
+    portFor: (name) => (name === "WEB_PORT" ? 20512 : undefined),
+    sharedPortFor: (name) => (name === "DB_PORT" ? 30000 : undefined),
+  });
+
+  it("records each isolated service's declared ports, resolved, per service", () => {
+    expect(derived.config["x-devtrees"]?.ports_by_service.web).toEqual({ WEB_PORT: 20512 });
+  });
+
+  it("records `{}` for a portless service — present, not omitted", () => {
+    expect(derived.config["x-devtrees"]?.ports_by_service.worker).toEqual({});
+  });
+
+  it("never copies the instance-wide injection (shared DB_PORT) into a service's entry", () => {
+    expect(derived.config["x-devtrees"]?.ports_by_service.web).not.toHaveProperty("DB_PORT");
+  });
+
+  it("excludes other-instance (shared) services from the worktree metadata", () => {
+    expect(derived.config["x-devtrees"]?.ports_by_service).not.toHaveProperty("db");
+  });
+
+  it("skips declared ports the resolver cannot resolve — no invented numbers", () => {
+    const noPorts = deriveWorktreeConfig(mixedStack, {
+      worktreeId: "login",
+      worktreeRoot: "/wt/login",
+      portFor: () => undefined,
+    });
+    expect(noPorts.config["x-devtrees"]?.ports_by_service.web).toEqual({});
+  });
+
+  it("records the shared services' declared ports in the shared instance's config", () => {
+    const shared = deriveSharedConfig(mixedStack, {
+      workingDir: "/repo/.git",
+      portFor: (name) => (name === "DB_PORT" ? 30000 : undefined),
+    });
+    expect(shared.config["x-devtrees"]?.ports_by_service).toEqual({ db: { DB_PORT: 30000 } });
+  });
+
+  it("survives a YAML round-trip under the `x-devtrees` key", () => {
+    const yaml = stringifyYaml(derived.config);
+    expect(yaml).toContain("x-devtrees:");
+    expect(yaml).toContain("WEB_PORT: 20512");
+  });
+});
