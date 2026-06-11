@@ -99,9 +99,8 @@ describe("registry store — lock + persistence", () => {
     // The CLI's classifyError (src/output.ts) maps a `.code`-tagged error
     // into the documented --json envelope; without the tag a contended lock
     // would classify as UNKNOWN and an agent couldn't tell "retry later"
-    // apart from a real failure. The error class itself is internal (like
-    // the other tagged errors) — the code IS the contract, so that's what
-    // we assert on.
+    // apart from a real failure. The code is the agent-facing contract, so
+    // that's what we assert on (direct property access, not toMatchObject).
     const anchor = newAnchor();
     mkdirSync(join(anchor, "devtrees"), { recursive: true });
     writeFileSync(join(anchor, "devtrees", "registry.lock"), `${process.pid}\n`, { flag: "wx" });
@@ -145,7 +144,7 @@ describe("registry store — lock + persistence", () => {
     writeFileSync(join(anchor, "devtrees", "registry.lock"), "not-a-pid\n", { flag: "wx" });
 
     await expect(withRegistryLock(anchor, (s) => s, { retries: 0 })).rejects.toThrow(
-      RegistryLockedError,
+      /holding the allocation registry lock/,
     );
   });
 
