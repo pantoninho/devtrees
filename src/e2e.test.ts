@@ -1220,7 +1220,8 @@ describe("e2e — crash recovery: stale control sockets (#80)", () => {
   function crashFixture(opts: {
     prefix: string;
     writeStack: (worktreeRoot: string) => void;
-    socketName: string;
+    /** Fixed socket file name (`shared.sock`); omit to derive the login worktree's. */
+    socketName?: string;
   }): { deps: ReturnType<typeof stubDriverDeps>; socketPath: string } {
     const repo = makeRepo(opts.prefix, ["login"]);
     cleanups.push(() => rmSync(repo.root, { recursive: true, force: true }));
@@ -1229,9 +1230,11 @@ describe("e2e — crash recovery: stale control sockets (#80)", () => {
     opts.writeStack(worktree);
     const commonDir = git(worktree, "rev-parse", "--git-common-dir");
     const absCommon = commonDir.startsWith("/") ? commonDir : join(worktree, commonDir);
+    const socketName =
+      opts.socketName ?? `${deriveWorktreeId(git(worktree, "rev-parse", "--show-toplevel"))}.sock`;
     return {
       deps: stubDriverDeps(worktree),
-      socketPath: join(absCommon, "devtrees", "run", opts.socketName),
+      socketPath: join(absCommon, "devtrees", "run", socketName),
     };
   }
 
@@ -1251,7 +1254,6 @@ describe("e2e — crash recovery: stale control sockets (#80)", () => {
     const { deps, socketPath } = crashFixture({
       prefix: "dt-crash-wt-",
       writeStack: writeStackConfig,
-      socketName: "login.sock",
     });
 
     const first = await runUp(deps as never);
@@ -1267,7 +1269,7 @@ describe("e2e — crash recovery: stale control sockets (#80)", () => {
     // Acceptance: up starts a fresh instance and returns the normal started
     // envelope — the service is genuinely serving again on its stable block.
     const second = await runUp(deps as never);
-    expect(second.worktreeId).toBe("login");
+    expect(second.worktreeId).toBe(first.worktreeId);
     expect(Number(second.env.WEB_PORT)).toBe(port);
     expect(await waitForHttp(port)).toBe(true);
   }, 30000);

@@ -2873,9 +2873,13 @@ describe("runUp — stale port block detection (#58)", () => {
 describe("runUp — crash recovery: stale control socket (#80)", () => {
   const stack: ResolvedStack = { services: [isolated("web", "node server.js", ["WEB_PORT"])] };
 
-  /** Pre-create an orphaned socket file the way a SIGKILLed instance leaves one. */
-  function orphanSocket(anchor: string, worktreeId = "login"): string {
-    const paths = instancePaths(anchor, worktreeId);
+  /**
+   * Pre-create an orphaned socket file the way a SIGKILLed instance leaves
+   * one — at the path-hash-suffixed id (#82) the resolver will derive for
+   * `<worktreeRoot>/login`.
+   */
+  function orphanSocket(anchor: string, worktreeRoot: string): string {
+    const paths = instancePaths(anchor, idFor(worktreeRoot, "login"));
     mkdirSync(paths.runDir, { recursive: true });
     writeFileSync(paths.socketPath, "");
     return paths.socketPath;
@@ -2883,7 +2887,7 @@ describe("runUp — crash recovery: stale control socket (#80)", () => {
 
   it("starts a fresh instance when the socket file exists but nothing listens (post-SIGKILL)", async () => {
     const tmp = tmpAnchor();
-    const socketPath = orphanSocket(tmp.anchor);
+    const socketPath = orphanSocket(tmp.anchor, tmp.worktreeRoot);
     const track: StubSpawn = { invocations: [], touchSocket: true };
     const deps = stubDeps({
       stack,
@@ -2899,13 +2903,13 @@ describe("runUp — crash recovery: stale control socket (#80)", () => {
     const worktreeSpawns = track.invocations.filter((i) => i.socketPath === socketPath);
     expect(worktreeSpawns).toHaveLength(1);
     // Normal started envelope, exactly as a first up would return.
-    expect(result.worktreeId).toBe("login");
+    expect(result.worktreeId).toBe(deps.expectedWorktreeId);
     expect(Number(result.env.WEB_PORT)).toBeGreaterThanOrEqual(20000);
   });
 
   it("unlinks the stale socket file when detected", async () => {
     const tmp = tmpAnchor();
-    const socketPath = orphanSocket(tmp.anchor);
+    const socketPath = orphanSocket(tmp.anchor, tmp.worktreeRoot);
     // touchSocket: false — nothing recreates the file, so its absence after
     // `runUp` proves the stale file was unlinked, not merely overwritten.
     const track: StubSpawn = { invocations: [], touchSocket: false };
@@ -2924,7 +2928,7 @@ describe("runUp — crash recovery: stale control socket (#80)", () => {
 
   it("a stale socket does not disable the STALE_PORT_BLOCK pre-flight (#58)", async () => {
     const tmp = tmpAnchor();
-    orphanSocket(tmp.anchor);
+    orphanSocket(tmp.anchor, tmp.worktreeRoot);
     const deps: CommandDeps = {
       ...stubDeps({
         stack,
@@ -2946,7 +2950,7 @@ describe("runUp — crash recovery: stale control socket (#80)", () => {
 
   it("a live socket (probe says running) still takes the idempotent no-op path", async () => {
     const tmp = tmpAnchor();
-    const socketPath = orphanSocket(tmp.anchor);
+    const socketPath = orphanSocket(tmp.anchor, tmp.worktreeRoot);
     const probed: string[] = [];
     const track: StubSpawn = { invocations: [], touchSocket: false };
     const deps = stubDeps({
@@ -2965,7 +2969,7 @@ describe("runUp — crash recovery: stale control socket (#80)", () => {
     // No fresh spawn, socket left in place, envelope still emitted.
     expect(track.invocations).toHaveLength(0);
     expect(existsSync(socketPath)).toBe(true);
-    expect(result.worktreeId).toBe("login");
+    expect(result.worktreeId).toBe(deps.expectedWorktreeId);
     expect(probed).toContain(socketPath);
   });
 });
