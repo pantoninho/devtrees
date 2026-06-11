@@ -10,7 +10,7 @@
 
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import { execFileSync, spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -80,6 +80,40 @@ for (let i = 0; i < iterations; i++) {
     return next;
   });
 }
+`;
+
+// Worker for the concurrent-up race (issue #91): an up-shaped critical
+// section under the per-worktree lifecycle lock. Each worker runs the same
+// liveness-check → spawn → socket-wait window `runUp` does: probe the
+// instance's "socket", and only when absent dwell (a real spawn takes time
+// before the child binds its UDS) and then create it. Without the lock at
+// least two workers would pass the liveness gate during the dwell and both
+// "spawn"; with it exactly one spawns and every loser observes the winner's
+// live instance — the idempotency outcome the acceptance criteria demand.
+const UP_RACE_WORKER_SOURCE = `
+import { existsSync, writeFileSync } from "node:fs";
+import { withLifecycleLock } from ${JSON.stringify(
+  fileURLToPath(new URL("./registry.ts", import.meta.url)),
+)};
+
+const [, , anchor, key] = process.argv;
+const socketPath = anchor + "/devtrees/login-3f9c2a1b.sock";
+
+const outcome = await withLifecycleLock(
+  anchor,
+  "login-3f9c2a1b",
+  async () => {
+    if (existsSync(socketPath)) return "already-up";
+    // Fire-and-forget spawn: the socket only becomes observable a beat later.
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    writeFileSync(socketPath, "");
+    return "spawned";
+  },
+  // Generous budget: N workers serialized at ~30ms each plus process startup
+  // stagger must never exhaust it on a slow CI runner.
+  { retries: 200, retryDelayMs: 20 },
+);
+writeFileSync(anchor + "/outcome-" + key, outcome);
 `;
 
 describe("registry store — integration", () => {
@@ -164,5 +198,25 @@ describe("registry store — integration", () => {
       expect(snapshot[w.key]).toBe(w.base);
     }
     expect(Object.keys(snapshot)).toHaveLength(workers.length);
+  }, 15000);
+
+  it("concurrent-up race (issue #91): N processes racing the same worktree's lifecycle lock spawn exactly once", async () => {
+    const anchor = makeAnchor();
+
+    const workerPath = join(anchor, "up-race-worker.mjs");
+    execFileSync(process.execPath, [
+      "-e",
+      `import('node:fs').then(({writeFileSync}) => writeFileSync(${JSON.stringify(workerPath)}, ${JSON.stringify(UP_RACE_WORKER_SOURCE)}))`,
+    ]);
+
+    const keys = ["alpha", "bravo", "charlie", "delta", "echo"];
+    await Promise.all(keys.map((key) => runWorker(workerPath, anchor, key, 0)));
+
+    const outcomes = keys.map((key) => readFileSync(join(anchor, `outcome-${key}`), "utf8"));
+    // Exactly one worker won the check-then-spawn window; every other process
+    // observed the winner's live instance and took the already-up path —
+    // never a second spawn against the same socket (acceptance, issue #91).
+    expect(outcomes.filter((o) => o === "spawned")).toHaveLength(1);
+    expect(outcomes.filter((o) => o === "already-up")).toHaveLength(keys.length - 1);
   }, 15000);
 });
