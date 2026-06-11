@@ -35,6 +35,12 @@ export type WaitForSharedHealth = (args: {
   readonly anchor: string;
   readonly socketPath: string;
   readonly sharedServiceNames: ReadonlyArray<string>;
+  /**
+   * The subset of `sharedServiceNames` that declares a readiness probe in the
+   * resolved stack. These gate on `health === "ready"` instead of process
+   * state (issue #108) — see `allHealthy`.
+   */
+  readonly probedServiceNames: ReadonlyArray<string>;
 }) => Promise<void>;
 
 /**
@@ -47,6 +53,12 @@ export type WaitForSharedHealth = (args: {
 export type WaitForHealth = (args: {
   readonly socketPath: string;
   readonly serviceNames: ReadonlyArray<string>;
+  /**
+   * The subset of `serviceNames` that declares a readiness probe in the
+   * resolved stack. These gate on `health === "ready"` instead of process
+   * state (issue #108) — see `allHealthy`.
+   */
+  readonly probedServiceNames: ReadonlyArray<string>;
   readonly timeoutMs: number;
 }) => Promise<void>;
 
@@ -66,11 +78,18 @@ class HealthTimeoutError extends Error {
 }
 
 /**
- * "Healthy enough to start a depender" = the process is up. Services with a
- * readiness probe report `Ready`; services without one report `Running`;
- * one-shot jobs may have already moved to `Completed` — all three are fine to
- * depend on. Anything else (`Pending`, `Restarting`, `Failed`) means we keep
- * waiting.
+ * "Healthy enough" for a service WITHOUT a readiness probe = the process is
+ * up: `Running`, or `Completed` for one-shot jobs (`Ready` is kept for
+ * forward-compatibility with status vocabularies that fold readiness into the
+ * status string). Anything else (`Pending`, `Restarting`, `Failed`) means we
+ * keep waiting.
+ *
+ * Services WITH a readiness probe never gate on this set. Empirically
+ * process-compose keeps their `status` at `Running` while the probe verdict
+ * arrives in the separate `is_ready` field (the driver normalises it into
+ * `ServiceStatus.health`), so a status-only gate would pass the instant the
+ * process spawns — before the first probe can fire (issue #108). Probed
+ * services are healthy only when `health === "ready"`.
  */
 const HEALTHY_STATES = new Set(["running", "ready", "completed"]);
 
@@ -87,14 +106,17 @@ export interface PollerTuning {
 
 /**
  * One poll: read the instance's per-service state through the driver and
- * report whether every named service is healthy. A failed read (socket not
- * reachable yet — the instance is still starting) is "not ready, keep polling",
- * never an error.
+ * report whether every named service is healthy. Probed services (those in
+ * `probedServiceNames`) require `health === "ready"`; the rest gate on
+ * process state (`HEALTHY_STATES`). A failed read (socket not reachable yet —
+ * the instance is still starting) is "not ready, keep polling", never an
+ * error.
  */
 async function allHealthy(
   source: ServiceStatusSource,
   socketPath: string,
   serviceNames: ReadonlyArray<string>,
+  probedServiceNames: ReadonlyArray<string>,
 ): Promise<boolean> {
   let statuses: ServiceStatus[];
   try {
@@ -102,10 +124,13 @@ async function allHealthy(
   } catch {
     return false;
   }
-  const states = new Map(statuses.map((s) => [s.name, s.status.toLowerCase()]));
+  const probed = new Set(probedServiceNames);
+  const rows = new Map(statuses.map((s) => [s.name, s]));
   return serviceNames.every((name) => {
-    const status = states.get(name);
-    return status !== undefined && HEALTHY_STATES.has(status);
+    const row = rows.get(name);
+    if (row === undefined) return false;
+    if (probed.has(name)) return row.health === "ready";
+    return HEALTHY_STATES.has(row.status.toLowerCase());
   });
 }
 
@@ -124,11 +149,11 @@ export function createWaitForSharedHealth(
 ): WaitForSharedHealth {
   const pollMs = tuning.pollMs ?? HEALTH_POLL_MS;
   const timeoutMs = tuning.timeoutMs ?? SHARED_HEALTH_TIMEOUT_MS;
-  return async ({ socketPath, sharedServiceNames }) => {
+  return async ({ socketPath, sharedServiceNames, probedServiceNames }) => {
     if (sharedServiceNames.length === 0) return;
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      if (await allHealthy(source, socketPath, sharedServiceNames)) return;
+      if (await allHealthy(source, socketPath, sharedServiceNames, probedServiceNames)) return;
       await sleep(pollMs);
     }
     throw new Error(
@@ -151,11 +176,11 @@ export function createWaitForHealth(
   tuning: PollerTuning = {},
 ): WaitForHealth {
   const pollMs = tuning.pollMs ?? HEALTH_POLL_MS;
-  return async ({ socketPath, serviceNames, timeoutMs }) => {
+  return async ({ socketPath, serviceNames, probedServiceNames, timeoutMs }) => {
     if (serviceNames.length === 0) return;
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      if (await allHealthy(source, socketPath, serviceNames)) return;
+      if (await allHealthy(source, socketPath, serviceNames, probedServiceNames)) return;
       await sleep(pollMs);
     }
     throw new HealthTimeoutError(

@@ -23,8 +23,12 @@ function sourceFromQueue(
   };
 }
 
-function row(name: string, status: string): ServiceStatus {
-  return { name, status, health: "unknown" };
+function row(
+  name: string,
+  status: string,
+  health: ServiceStatus["health"] = "unknown",
+): ServiceStatus {
+  return { name, status, health };
 }
 
 describe("health — createWaitForHealth (worktree instance gate)", () => {
@@ -35,7 +39,12 @@ describe("health — createWaitForHealth (worktree instance gate)", () => {
     ]);
     const wait = createWaitForHealth(source, { pollMs: 1 });
     await expect(
-      wait({ socketPath: "/run/x.sock", serviceNames: ["web", "worker"], timeoutMs: 1000 }),
+      wait({
+        socketPath: "/run/x.sock",
+        serviceNames: ["web", "worker"],
+        probedServiceNames: [],
+        timeoutMs: 1000,
+      }),
     ).resolves.toBeUndefined();
   });
 
@@ -48,6 +57,7 @@ describe("health — createWaitForHealth (worktree instance gate)", () => {
       wait({
         socketPath: "/run/x.sock",
         serviceNames: ["web", "migrate", "worker"],
+        probedServiceNames: [],
         timeoutMs: 1000,
       }),
     ).resolves.toBeUndefined();
@@ -60,7 +70,12 @@ describe("health — createWaitForHealth (worktree instance gate)", () => {
     ]);
     const wait = createWaitForHealth(source, { pollMs: 1 });
     await expect(
-      wait({ socketPath: "/run/x.sock", serviceNames: ["web"], timeoutMs: 1000 }),
+      wait({
+        socketPath: "/run/x.sock",
+        serviceNames: ["web"],
+        probedServiceNames: [],
+        timeoutMs: 1000,
+      }),
     ).resolves.toBeUndefined();
   });
 
@@ -70,6 +85,7 @@ describe("health — createWaitForHealth (worktree instance gate)", () => {
     const err = await wait({
       socketPath: "/run/x.sock",
       serviceNames: ["web"],
+      probedServiceNames: [],
       timeoutMs: 10,
     }).then(
       () => undefined,
@@ -86,7 +102,12 @@ describe("health — createWaitForHealth (worktree instance gate)", () => {
     const calls = { count: 0 };
     const source = sourceFromQueue([[]], calls);
     const wait = createWaitForHealth(source, { pollMs: 1 });
-    await wait({ socketPath: "/run/x.sock", serviceNames: [], timeoutMs: 10 });
+    await wait({
+      socketPath: "/run/x.sock",
+      serviceNames: [],
+      probedServiceNames: [],
+      timeoutMs: 10,
+    });
     expect(calls.count).toBe(0);
   });
 
@@ -94,7 +115,85 @@ describe("health — createWaitForHealth (worktree instance gate)", () => {
     const source = sourceFromQueue([[row("web", "Running")]]);
     const wait = createWaitForHealth(source, { pollMs: 1 });
     await expect(
-      wait({ socketPath: "/run/x.sock", serviceNames: ["web", "ghost"], timeoutMs: 10 }),
+      wait({
+        socketPath: "/run/x.sock",
+        serviceNames: ["web", "ghost"],
+        probedServiceNames: [],
+        timeoutMs: 10,
+      }),
+    ).rejects.toMatchObject({ code: "HEALTH_TIMEOUT" });
+  });
+
+  // Issue #108: process-compose keeps a probed service's status at "Running"
+  // while readiness arrives in the separate is_ready field. A Running-but-not-
+  // ready probed service must NOT satisfy the gate, or `up` exits 0 before the
+  // first probe can fire.
+  it("a probed service that is Running but not ready keeps the wait unhealthy until timeout", async () => {
+    const source = sourceFromQueue([[row("web", "Running", "not_ready")]]);
+    const wait = createWaitForHealth(source, { pollMs: 1 });
+    await expect(
+      wait({
+        socketPath: "/run/x.sock",
+        serviceNames: ["web"],
+        probedServiceNames: ["web"],
+        timeoutMs: 10,
+      }),
+    ).rejects.toMatchObject({ code: "HEALTH_TIMEOUT" });
+  });
+
+  it("resolves once a probed service reports health:ready (status stays Running)", async () => {
+    const source = sourceFromQueue([
+      [row("web", "Running", "not_ready")],
+      [row("web", "Running", "ready")],
+    ]);
+    const wait = createWaitForHealth(source, { pollMs: 1 });
+    await expect(
+      wait({
+        socketPath: "/run/x.sock",
+        serviceNames: ["web"],
+        probedServiceNames: ["web"],
+        timeoutMs: 1000,
+      }),
+    ).resolves.toBeUndefined();
+  });
+
+  it("mixed stack: unprobed services pass on Running while a probed sibling still gates", async () => {
+    const source = sourceFromQueue([
+      [row("web", "Running", "not_ready"), row("worker", "Running")],
+      [row("web", "Running", "ready"), row("worker", "Running")],
+    ]);
+    const calls = { count: 0 };
+    const counted: ServiceStatusSource = {
+      getServiceStatuses: (s) => {
+        calls.count += 1;
+        return source.getServiceStatuses(s);
+      },
+    };
+    const wait = createWaitForHealth(counted, { pollMs: 1 });
+    await expect(
+      wait({
+        socketPath: "/run/x.sock",
+        serviceNames: ["web", "worker"],
+        probedServiceNames: ["web"],
+        timeoutMs: 1000,
+      }),
+    ).resolves.toBeUndefined();
+    // The first poll (web not ready) must not have satisfied the gate.
+    expect(calls.count).toBeGreaterThan(1);
+  });
+
+  it("a probed service with health:unknown does not satisfy the gate", async () => {
+    // e.g. process-compose returned a row before the probe machinery
+    // initialised — readiness has not been observed, so keep waiting.
+    const source = sourceFromQueue([[row("web", "Running", "unknown")]]);
+    const wait = createWaitForHealth(source, { pollMs: 1 });
+    await expect(
+      wait({
+        socketPath: "/run/x.sock",
+        serviceNames: ["web"],
+        probedServiceNames: ["web"],
+        timeoutMs: 10,
+      }),
     ).rejects.toMatchObject({ code: "HEALTH_TIMEOUT" });
   });
 });
@@ -104,7 +203,12 @@ describe("health — createWaitForSharedHealth (cross-tier gate)", () => {
     const source = sourceFromQueue([[row("db", "Pending")], [row("db", "Running")]]);
     const wait = createWaitForSharedHealth(source, { pollMs: 1 });
     await expect(
-      wait({ anchor: "/a", socketPath: "/run/shared.sock", sharedServiceNames: ["db"] }),
+      wait({
+        anchor: "/a",
+        socketPath: "/run/shared.sock",
+        sharedServiceNames: ["db"],
+        probedServiceNames: [],
+      }),
     ).resolves.toBeUndefined();
   });
 
@@ -112,7 +216,12 @@ describe("health — createWaitForSharedHealth (cross-tier gate)", () => {
     const calls = { count: 0 };
     const source = sourceFromQueue([[]], calls);
     const wait = createWaitForSharedHealth(source, { pollMs: 1 });
-    await wait({ anchor: "/a", socketPath: "/run/shared.sock", sharedServiceNames: [] });
+    await wait({
+      anchor: "/a",
+      socketPath: "/run/shared.sock",
+      sharedServiceNames: [],
+      probedServiceNames: [],
+    });
     expect(calls.count).toBe(0);
   });
 
@@ -123,6 +232,7 @@ describe("health — createWaitForSharedHealth (cross-tier gate)", () => {
       anchor: "/a",
       socketPath: "/run/shared.sock",
       sharedServiceNames: ["db"],
+      probedServiceNames: [],
     }).then(
       () => undefined,
       (e: unknown) => e,
@@ -130,6 +240,33 @@ describe("health — createWaitForSharedHealth (cross-tier gate)", () => {
     expect(err).toBeInstanceOf(Error);
     expect((err as Error).message).toContain("db");
     expect((err as { code?: string }).code).toBeUndefined();
+  });
+
+  // Issue #108: the shared gate has the same probed-service semantics as the
+  // worktree gate — a Running-but-not-ready probed shared service must hold
+  // back dependent worktree starts until its probe passes.
+  it("a probed shared service gates on readiness, not on Running", async () => {
+    const source = sourceFromQueue([
+      [row("db", "Running", "not_ready")],
+      [row("db", "Running", "ready")],
+    ]);
+    const calls = { count: 0 };
+    const counted: ServiceStatusSource = {
+      getServiceStatuses: (s) => {
+        calls.count += 1;
+        return source.getServiceStatuses(s);
+      },
+    };
+    const wait = createWaitForSharedHealth(counted, { pollMs: 1 });
+    await expect(
+      wait({
+        anchor: "/a",
+        socketPath: "/run/shared.sock",
+        sharedServiceNames: ["db"],
+        probedServiceNames: ["db"],
+      }),
+    ).resolves.toBeUndefined();
+    expect(calls.count).toBeGreaterThan(1);
   });
 });
 
@@ -165,7 +302,12 @@ describe("health — default waits go through the driver (issue #87)", () => {
 
     const wait = createWaitForHealth(driver, { pollMs: 1 });
     await expect(
-      wait({ socketPath: "/run/x.sock", serviceNames: ["web"], timeoutMs: 1000 }),
+      wait({
+        socketPath: "/run/x.sock",
+        serviceNames: ["web"],
+        probedServiceNames: [],
+        timeoutMs: 1000,
+      }),
     ).resolves.toBeUndefined();
 
     expect(spawnedWith.length).toBeGreaterThan(0);
