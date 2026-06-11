@@ -34,7 +34,7 @@ import {
   type ServiceStatus,
   type StreamLogsOptions,
 } from "./driver.js";
-import { readRegistry, withRegistryLock, withSharedLock } from "./registry.js";
+import { readRegistry, withLifecycleLock, withRegistryLock, withSharedLock } from "./registry.js";
 import { defaultIsPortFree, defaultPortHolder, type PortHolderReport } from "./port-probe.js";
 import { sharedStackHash, stackHash } from "./hash.js";
 import {
@@ -175,8 +175,18 @@ export type WithRegistryLock = (
   mutate: (snapshot: RegistrySnapshot) => RegistrySnapshot | Promise<RegistrySnapshot>,
 ) => Promise<RegistrySnapshot>;
 
-/** Type of the async lifecycle lock the caller passes for testability. */
+/** Type of the async shared lifecycle lock the caller passes for testability. */
 export type WithSharedLock = <T>(anchor: string, fn: () => Promise<T>) => Promise<T>;
+
+/**
+ * Type of the per-instance lifecycle lock (issue #91) the caller passes for
+ * testability — `withLifecycleLock` in src/registry.ts keyed by instance id.
+ */
+export type WithLifecycleLock = <T>(
+  anchor: string,
+  instanceId: string,
+  fn: () => Promise<T>,
+) => Promise<T>;
 
 /** One row of `details.collisions[]` in the `STALE_PORT_BLOCK` error envelope. */
 interface PortCollision {
@@ -313,6 +323,23 @@ export interface CommandDeps {
    * lockfile at <anchor>/devtrees/shared.lock. Injected so tests can stub it.
    */
   readonly withSharedLock?: WithSharedLock;
+  /**
+   * Per-worktree lifecycle lock held across `runUp`'s liveness-check →
+   * config-write → spawn → socket-wait window (issue #91), so two concurrent
+   * `up`s in the same worktree cannot double-spawn. Default: real lockfile at
+   * `<anchor>/devtrees/<worktreeId>.lock`. Injected so tests can observe or
+   * replace the hold window.
+   */
+  readonly withLifecycleLock?: WithLifecycleLock;
+  /**
+   * Poll until the worktree instance's control socket is observable on disk
+   * after `driver.up` (issue #91). Runs INSIDE the lifecycle lock: `driver.up`
+   * is fire-and-forget, so releasing the lock before the socket exists would
+   * let a concurrent up's liveness gate miss the spawn and double-start.
+   * Default: real `waitForSocket` poll. Injected so unit tests with a stub
+   * spawner that never binds a socket don't pay the poll timeout.
+   */
+  readonly waitForSocketFile?: (socketPath: string) => Promise<void>;
   /**
    * Wait for shared services to be healthy before bringing the worktree
    * instance up — orchestration-layer stand-in for the dropped cross-tier
@@ -582,6 +609,8 @@ function resolveUpSeams(deps: CommandDeps) {
     readStack: deps.readStack ?? loadStack,
     lock: deps.withRegistryLock ?? defaultWithRegistryLock,
     sharedLock: deps.withSharedLock ?? defaultWithSharedLock,
+    lifecycleLock: deps.withLifecycleLock ?? defaultWithLifecycleLock,
+    waitForSocketFile: deps.waitForSocketFile ?? waitForSocket,
     isPortFree: deps.isPortFree ?? defaultIsPortFree,
     portHolder: deps.portHolder ?? defaultPortHolder,
     warn: deps.warn ?? defaultWarn,
@@ -688,117 +717,148 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
   const driver = createDriver(deps.driver);
   const inst = { configPath: paths.configPath, socketPath: paths.socketPath };
 
-  // Liveness, not file existence (issue #80): probe the control socket for an
-  // actual listener. A SIGKILLed instance leaves its socket file behind in
-  // anchor state; trusting it would take the already-running branch against a
-  // dead instance AND skip the #58 pre-flight below. A stale file is unlinked
-  // here so this up falls through to the fresh-start path.
-  const ownInstanceLive = await socketIsLive(paths.socketPath, seams.probe);
+  // Per-worktree lifecycle lock (issue #91): the liveness-check →
+  // config-write → spawn → socket-wait window runs as ONE critical section.
+  // Without it, two concurrent `up`s in the same worktree (human + agent)
+  // both pass the liveness gate and both spawn process-compose against the
+  // same socket and port block — the loser's exit-time cleanup then unlinks
+  // the winner's socket. Under the lock, the loser blocks until the winner's
+  // socket is observable and takes the normal idempotency path below. The
+  // long health/attach phases run AFTER release, so the lock never outlives
+  // the spawn window on the happy path; a holder stuck inside it surfaces to
+  // contenders as LOCK_CONTENTION once the wait budget lapses.
+  const outcome = await seams.lifecycleLock(anchor.anchor, anchor.worktreeId, async () => {
+    // Liveness, not file existence (issue #80): probe the control socket for an
+    // actual listener. A SIGKILLed instance leaves its socket file behind in
+    // anchor state; trusting it would take the already-running branch against a
+    // dead instance AND skip the #58 pre-flight below. A stale file is unlinked
+    // here so this up falls through to the fresh-start path.
+    const ownInstanceLive = await socketIsLive(paths.socketPath, seams.probe);
 
-  // Pre-flight stale-port-block check (issue #58). Self-gates on the
-  // own-instance-live flag so the idempotent re-up path skips the probe
-  // (those listeners ARE our own); on the first-up path, any listener on a
-  // declared named port is by definition foreign and we abort with
-  // STALE_PORT_BLOCK so the agent sees a discoverable failure instead of a
-  // confusing "Completed" service status downstream of EADDRINUSE.
-  await assertBlockPortsFree({
-    stack,
-    worktreeId: anchor.worktreeId,
-    blockBase,
-    portFor,
-    portHolder,
-    ownInstanceLive,
-  });
-
-  // Lazy-start the shared instance if any shared services are declared. Runs
-  // BEFORE the idempotency dispatch (issue #56): the shared tier's lifecycle
-  // is independent of this worktree's, so a prior `down --shared` can leave
-  // shared dead while this worktree's socket is still present. The start is
-  // gated by `withSharedLock` and an idempotent socket-presence check so two
-  // simultaneous `up`s never double-start it (acceptance).
-  //
-  // The call also resolves the authoritative shared name→port map (issue
-  // #83): when the instance is already running, the map *it* persisted at
-  // start wins over this worktree's positional recomputation, so branch
-  // divergence (reordered services) cannot skew the injected numbers — and
-  // semantic divergence fails with SHARED_DRIFT before anything is derived
-  // or spawned for this worktree.
-  let sharedStarted = false;
-  let effectiveSharedPortFor = sharedPortFor;
-  if (sharedNeeded) {
-    const ensured = await ensureSharedStarted(
-      anchor.anchor,
+    // Pre-flight stale-port-block check (issue #58). Self-gates on the
+    // own-instance-live flag so the idempotent re-up path skips the probe
+    // (those listeners ARE our own); on the first-up path, any listener on a
+    // declared named port is by definition foreign and we abort with
+    // STALE_PORT_BLOCK so the agent sees a discoverable failure instead of a
+    // confusing "Completed" service status downstream of EADDRINUSE.
+    await assertBlockPortsFree({
       stack,
-      anchor.worktreeId,
-      sharedPortFor,
-      sharedLock,
-      { driver, probe: seams.probe, socketTimeoutMs: deps.sharedSocketTimeoutMs },
-    );
-    sharedStarted = ensured.started;
-    if (ensured.ports !== undefined) {
-      const ports = ensured.ports;
-      effectiveSharedPortFor = (name) => ports[name];
-    }
-  }
-
-  const derived = deriveWorktreeConfig(stack, {
-    worktreeId: anchor.worktreeId,
-    worktreeRoot: anchor.worktreeRoot,
-    portFor,
-    sharedPortFor: effectiveSharedPortFor,
-  });
-
-  // Surface every cross-tier `depends_on` edge devtrees just dropped. Silent
-  // dropping would make the orchestration-layer wiring a mystery (ADR-0003
-  // "Consequences").
-  for (const edge of derived.droppedEdges) {
-    warn(formatDroppedEdgeWarning(edge));
-  }
-
-  // Idempotency branch (issue #31): if this worktree's control socket is held
-  // by a live listener (probed above, #80 — file existence alone is not
-  // enough), the instance is up. Compare the current resolved-stack hash to
-  // the one stored from the previous successful `up`:
-  //   - match  -> noop, re-emit the envelope (no driver.up, no registry write)
-  //   - drift  -> attempt hot-reload via the driver; map failure to CONFIG_DRIFT.
-  if (ownInstanceLive) {
-    return await reconcileRunning({
-      stack,
-      anchor,
-      paths,
+      worktreeId: anchor.worktreeId,
       blockBase,
       portFor,
-      derived,
-      inst,
-      driver,
-      readHash,
-      writeHash,
-      sharedStarted,
-      deps,
+      portHolder,
+      ownInstanceLive,
     });
-  }
 
-  mkdirSync(paths.runDir, { recursive: true });
-  writeFileSync(paths.configPath, stringifyYaml(derived.config), "utf8");
+    // Lazy-start the shared instance if any shared services are declared. Runs
+    // BEFORE the idempotency dispatch (issue #56): the shared tier's lifecycle
+    // is independent of this worktree's, so a prior `down --shared` can leave
+    // shared dead while this worktree's socket is still present. The start is
+    // gated by `withSharedLock` and an idempotent socket-presence check so two
+    // simultaneous `up`s never double-start it (acceptance). Lock ordering is
+    // acyclic — worktree lifecycle lock, then shared — and no holder of the
+    // shared lock ever acquires a worktree's, so the nesting cannot deadlock.
+    //
+    // The call also resolves the authoritative shared name→port map (issue
+    // #83): when the instance is already running, the map *it* persisted at
+    // start wins over this worktree's positional recomputation, so branch
+    // divergence (reordered services) cannot skew the injected numbers — and
+    // semantic divergence fails with SHARED_DRIFT before anything is derived
+    // or spawned for this worktree.
+    let sharedStarted = false;
+    let effectiveSharedPortFor = sharedPortFor;
+    if (sharedNeeded) {
+      const ensured = await ensureSharedStarted(
+        anchor.anchor,
+        stack,
+        anchor.worktreeId,
+        sharedPortFor,
+        sharedLock,
+        { driver, probe: seams.probe, socketTimeoutMs: deps.sharedSocketTimeoutMs },
+      );
+      sharedStarted = ensured.started;
+      if (ensured.ports !== undefined) {
+        const ports = ensured.ports;
+        effectiveSharedPortFor = (name) => ports[name];
+      }
+    }
 
-  // Shared-health wait: gate the worktree start on the shared services'
-  // readiness probes whenever this worktree drops a cross-tier `depends_on`
-  // edge — orchestration-layer stand-in for the edge process-compose can't
-  // express across instances (ADR-0003). Skipped when there are no such edges
-  // (a stack with shared services nobody isolated depends on doesn't need it).
-  if (derived.droppedEdges.length > 0) {
-    const sharedPaths = sharedInstancePaths(anchor.anchor);
-    const sharedNames = stack.services.filter((s) => s.tier === "shared").map((s) => s.name);
-    warn(formatHealthWaitNotice(sharedNames));
-    const wait = deps.waitForSharedHealth ?? createWaitForSharedHealth(driver);
-    await wait({
-      anchor: anchor.anchor,
-      socketPath: sharedPaths.socketPath,
-      sharedServiceNames: sharedNames,
+    const derived = deriveWorktreeConfig(stack, {
+      worktreeId: anchor.worktreeId,
+      worktreeRoot: anchor.worktreeRoot,
+      portFor,
+      sharedPortFor: effectiveSharedPortFor,
     });
-  }
 
-  await driver.up(inst);
+    // Surface every cross-tier `depends_on` edge devtrees just dropped. Silent
+    // dropping would make the orchestration-layer wiring a mystery (ADR-0003
+    // "Consequences").
+    for (const edge of derived.droppedEdges) {
+      warn(formatDroppedEdgeWarning(edge));
+    }
+
+    // Idempotency branch (issue #31): if this worktree's control socket is held
+    // by a live listener (probed above, #80 — file existence alone is not
+    // enough), the instance is up. Compare the current resolved-stack hash to
+    // the one stored from the previous successful `up`:
+    //   - match  -> noop, re-emit the envelope (no driver.up, no registry write)
+    //   - drift  -> attempt hot-reload via the driver; map failure to CONFIG_DRIFT.
+    if (ownInstanceLive) {
+      const result = await reconcileRunning({
+        stack,
+        anchor,
+        paths,
+        blockBase,
+        portFor,
+        derived,
+        inst,
+        driver,
+        readHash,
+        writeHash,
+        sharedStarted,
+        deps,
+      });
+      return { kind: "reconciled", result } as const;
+    }
+
+    mkdirSync(paths.runDir, { recursive: true });
+    writeFileSync(paths.configPath, stringifyYaml(derived.config), "utf8");
+
+    // Shared-health wait: gate the worktree start on the shared services'
+    // readiness probes whenever this worktree drops a cross-tier `depends_on`
+    // edge — orchestration-layer stand-in for the edge process-compose can't
+    // express across instances (ADR-0003). Skipped when there are no such edges
+    // (a stack with shared services nobody isolated depends on doesn't need it).
+    if (derived.droppedEdges.length > 0) {
+      const sharedPaths = sharedInstancePaths(anchor.anchor);
+      const sharedNames = stack.services.filter((s) => s.tier === "shared").map((s) => s.name);
+      warn(formatHealthWaitNotice(sharedNames));
+      const wait = deps.waitForSharedHealth ?? createWaitForSharedHealth(driver);
+      await wait({
+        anchor: anchor.anchor,
+        socketPath: sharedPaths.socketPath,
+        sharedServiceNames: sharedNames,
+      });
+    }
+
+    await driver.up(inst);
+
+    // `driver.up` is fire-and-forget: spawn returns before the child binds the
+    // UDS. Hold the lifecycle lock until the socket is observable so the next
+    // contender's liveness gate sees this start as complete instead of racing
+    // a second spawn against it (same reasoning as `ensureSharedStarted`).
+    await seams.waitForSocketFile(paths.socketPath);
+
+    // Record the resolved-stack hash BEFORE releasing the lock: a loser that
+    // reconciles the moment we release must see this config as current — a
+    // missing hash would route it down the drift path and hot-reload a config
+    // the instance was just started from (issue #31 bookkeeping, #91 timing).
+    writeHash(anchor.anchor, anchor.worktreeId, stackHash(stack));
+
+    return { kind: "started", env: derived.env, sharedStarted } as const;
+  });
+
+  if (outcome.kind === "reconciled") return outcome.result;
 
   await waitForWorktreeHealth(stack, paths.socketPath, deps, driver);
 
@@ -809,17 +869,13 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
   // applies, issue #29).
   const services = await collectIsolatedServices(stack, paths.socketPath, portFor, deps, driver);
 
-  // First-up bookkeeping: remember the resolved-stack hash so a subsequent
-  // `up` can branch on noop vs. drift (issue #31).
-  writeHash(anchor.anchor, anchor.worktreeId, stackHash(stack));
-
   if (shouldAttachAfterUp(deps)) await driver.attach(inst);
 
   return {
     worktreeId: anchor.worktreeId,
     socketPath: paths.socketPath,
-    env: derived.env,
-    sharedStarted,
+    env: outcome.env,
+    sharedStarted: outcome.sharedStarted,
     blockBase,
     services,
   };
@@ -1776,6 +1832,20 @@ const defaultWithRegistryLock: WithRegistryLock = (anchor, mutate) =>
   withRegistryLock(anchor, mutate);
 
 const defaultWithSharedLock: WithSharedLock = (anchor, fn) => withSharedLock(anchor, fn);
+
+/**
+ * Wait budget for the per-worktree lifecycle lock (issue #91). The holder's
+ * window covers a process spawn plus a ≤3s socket-observable wait (and, with
+ * shared services, possibly the shared instance's own spawn and health wait),
+ * so the registry lock's default ~1s budget would mislabel an ordinary
+ * concurrent `up` as contention. ~10s comfortably covers the spawn window
+ * while still bounding the wait on a genuinely stuck holder — beyond it the
+ * caller sees LOCK_CONTENTION ("retry later"), never a half-dead socket.
+ */
+const UP_LIFECYCLE_LOCK_OPTIONS = { retries: 100, retryDelayMs: 100 } as const;
+
+const defaultWithLifecycleLock: WithLifecycleLock = (anchor, instanceId, fn) =>
+  withLifecycleLock(anchor, instanceId, fn, UP_LIFECYCLE_LOCK_OPTIONS);
 
 function defaultWarn(message: string): void {
   process.stderr.write(`${message}\n`);

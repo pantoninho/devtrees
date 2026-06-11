@@ -94,7 +94,7 @@ describe("stored hashes (per-worktree, anchor-local)", () => {
       // The lock error class is internal (issue #84) — match on the message,
       // the same contract `classifyError` keys off via `.code`.
       expect(() => writeStoredHash(anchor, "login", "x", { retries: 0 })).toThrow(
-        /holding the allocation registry lock/,
+        /holding the lock at/,
       );
     } finally {
       rmSync(anchor, { recursive: true, force: true });
