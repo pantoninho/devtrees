@@ -14,7 +14,14 @@
  * `port_base` per repo, not coordinated through this module.
  */
 
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import type { RegistrySnapshot } from "./allocator.js";
 
@@ -23,7 +30,8 @@ export class RegistryLockedError extends Error {
   constructor(lockPath: string) {
     super(
       `another devtrees process is holding the allocation registry lock at ${lockPath}. ` +
-        `If no devtrees command is running, the lock is stale — remove it and retry.`,
+        `Locks held by dead processes are reclaimed automatically, so the holder is ` +
+        `still alive — wait for it to finish (or, if it is stuck, kill it) and retry.`,
     );
     this.name = "RegistryLockedError";
   }
@@ -57,13 +65,26 @@ function sharedLockFile(anchor: string): string {
   return join(devtreesDir(anchor), "shared.lock");
 }
 
-/** Read the persisted snapshot for this anchor; empty object if none exists yet. */
+/**
+ * Read the persisted snapshot for this anchor; empty object if none exists yet.
+ *
+ * Parse-tolerant: a corrupt or non-object file (e.g. left behind by a crash
+ * that predates the atomic-rename writes) degrades to the empty snapshot
+ * instead of throwing on every subsequent command. The next locked write
+ * replaces the corrupt file with valid JSON, so the store self-heals.
+ */
 export function readRegistry(anchor: string): RegistrySnapshot {
   const file = registryFile(anchor);
   if (!existsSync(file)) return {};
   const text = readFileSync(file, "utf8");
   if (text.trim() === "") return {};
-  return JSON.parse(text) as RegistrySnapshot;
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return parsed as RegistrySnapshot;
+  } catch {
+    return {};
+  }
 }
 
 /** Outcome of one `wx`-create attempt. */
@@ -83,16 +104,56 @@ function tryWxCreate(path: string): AttemptResult {
   }
 }
 
+/** True when `pid` names a live process (EPERM counts as alive — it exists). */
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+/**
+ * Steal `path` if its recorded holder pid is dead (e.g. the holder was
+ * SIGKILLed before its `finally` release ran). Returns true when the lock was
+ * removed (or vanished concurrently) and a re-acquire attempt is worthwhile.
+ * Unparseable content is never stolen — we cannot prove the holder is gone.
+ *
+ * Racy by design: between reading the pid and unlinking, the dead holder's
+ * lock could be released-and-reacquired by a live process, in which case we
+ * would steal a live lock. The window is a few syscalls wide and only opens
+ * after a real crash left a stale lock behind; the alternative (bricking
+ * every subsequent `up` until a human deletes the file) is strictly worse.
+ */
+function stealIfStale(path: string): boolean {
+  let content: string;
+  try {
+    content = readFileSync(path, "utf8");
+  } catch (err) {
+    // Lock vanished between the failed create and this read — retry at once.
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return true;
+    throw err;
+  }
+  const pid = Number.parseInt(content.trim(), 10);
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (isPidAlive(pid)) return false;
+  releaseLockAt(path); // tolerates a concurrent stealer winning the unlink
+  return true;
+}
+
 /**
  * Acquire a lockfile by `wx`-creating it; throws RegistryLockedError on timeout.
  * Uses `setTimeout` between retries so other tasks (including the current
- * holder's `finally` release) can run.
+ * holder's `finally` release) can run. On contention, a lock whose recorded
+ * holder pid is dead is stolen immediately instead of being waited out.
  */
 async function acquireLockAtAsync(path: string, options: LockOptions): Promise<void> {
   const retries = options.retries ?? DEFAULT_RETRIES;
   const delay = options.retryDelayMs ?? DEFAULT_DELAY_MS;
   for (let attempt = 0; attempt <= retries; attempt++) {
     if (tryWxCreate(path) === "acquired") return;
+    if (stealIfStale(path) && tryWxCreate(path) === "acquired") return;
     if (attempt === retries) throw new RegistryLockedError(path);
     await new Promise<void>((resolve) => setTimeout(resolve, delay));
   }
@@ -111,8 +172,23 @@ function releaseLock(anchor: string): void {
   releaseLockAt(lockFile(anchor));
 }
 
+/**
+ * Persist the snapshot via temp-file + atomic rename. `env` and instance
+ * discovery read the registry lock-free, so an in-place truncate-write would
+ * expose a window where a reader sees an empty or half-written file — and a
+ * crash inside that window would leave permanently corrupt JSON. `rename(2)`
+ * within the same directory is atomic on POSIX: readers see either the old
+ * complete file or the new complete file, never anything in between.
+ */
 function writeSnapshot(anchor: string, snapshot: RegistrySnapshot): void {
-  writeFileSync(registryFile(anchor), `${JSON.stringify(snapshot, null, 2)}\n`, "utf8");
+  writeAtomic(registryFile(anchor), `${JSON.stringify(snapshot, null, 2)}\n`);
+}
+
+/** Write `content` to `file` atomically (same-directory temp file + rename). */
+export function writeAtomic(file: string, content: string): void {
+  const tmp = `${file}.${process.pid}.tmp`;
+  writeFileSync(tmp, content, "utf8");
+  renameSync(tmp, file);
 }
 
 /**
@@ -143,6 +219,45 @@ export async function withRegistryLock(
     return after;
   } finally {
     releaseLock(anchor);
+  }
+}
+
+/** Block the calling thread for `ms` without spinning (no event loop needed). */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Synchronous counterpart of the lock acquire, for callers whose critical
+ * section never awaits (the hashes store's read-modify-write). Safe to block
+ * the event loop here: a sync-only critical section can never be mid-hold in
+ * this process while we wait (single thread), so the only possible holder is
+ * another process, which releases independently. Same stale-steal behavior as
+ * the async path.
+ */
+function acquireLockSync(path: string, options: LockOptions): void {
+  const retries = options.retries ?? DEFAULT_RETRIES;
+  const delay = options.retryDelayMs ?? DEFAULT_DELAY_MS;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    if (tryWxCreate(path) === "acquired") return;
+    if (stealIfStale(path) && tryWxCreate(path) === "acquired") return;
+    if (attempt === retries) throw new RegistryLockedError(path);
+    sleepSync(delay);
+  }
+}
+
+/**
+ * Run a synchronous critical section under `path` as a lockfile. The callback
+ * MUST NOT await — see `acquireLockSync`. Exported for the hashes store, whose
+ * whole-file read-modify-write otherwise races concurrent `up`s in different
+ * worktrees (issue #85).
+ */
+export function withFileLockSync<T>(path: string, fn: () => T, options: LockOptions = {}): T {
+  acquireLockSync(path, options);
+  try {
+    return fn();
+  } finally {
+    releaseLockAt(path);
   }
 }
 
