@@ -34,6 +34,27 @@ describe("port allocator", () => {
     expect(block.base).toBe(natural + 32);
   });
 
+  it("skips a candidate that overlaps an off-grid registered block (range intersection)", async () => {
+    // A block registered under a previous port_base/block_size override can sit
+    // off the current grid. Exact-base matching would miss it; range
+    // intersection must skip every candidate whose span crosses it.
+    const natural = (await allocateBlock("login", {}, OPTS, () => true)).base;
+    // Off-grid: overlaps both the natural candidate [natural, natural+32) and
+    // the next one [natural+32, natural+64).
+    const snapshot = { other: natural + 10 };
+    const block = await allocateBlock("login", snapshot, OPTS, () => true);
+    expect(block.base).toBe(natural + 64);
+  });
+
+  it("skips a candidate whose span an off-grid registered block starts inside of", async () => {
+    const natural = (await allocateBlock("login", {}, OPTS, () => true)).base;
+    // Registered block starts just below the natural candidate; its span
+    // [natural-1, natural+31) reaches into [natural, natural+32).
+    const snapshot = { other: natural - 1 };
+    const block = await allocateBlock("login", snapshot, OPTS, () => true);
+    expect(block.base).toBe(natural + 32);
+  });
+
   it("probes past an in-use port reported by the injected probe", async () => {
     const natural = (await allocateBlock("login", {}, OPTS, () => true)).base;
     const isFree = (port: number) => port < natural || port >= natural + 32;

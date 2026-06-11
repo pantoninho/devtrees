@@ -66,7 +66,14 @@ async function blockIsAvailable(
   taken: ReadonlySet<number>,
   isFree: PortFreeProbe,
 ): Promise<boolean> {
-  if (taken.has(base)) return false;
+  // Range intersection, not exact base match: a block registered under a
+  // previous port_base/block_size override can sit off the current grid, so
+  // any candidate whose span [base, base+blockSize) crosses a registered
+  // block's span must be skipped. Registered blocks record only their base;
+  // the current blockSize is the best available estimate of their span.
+  for (const takenBase of taken) {
+    if (base < takenBase + blockSize && takenBase < base + blockSize) return false;
+  }
   for (let port = base; port < base + blockSize; port++) {
     if (!(await isFree(port))) return false;
   }
