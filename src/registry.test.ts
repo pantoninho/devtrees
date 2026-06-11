@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readRegistry, withRegistryLock, withSharedLock } from "./registry.js";
+import { readRegistry, withLifecycleLock, withRegistryLock, withSharedLock } from "./registry.js";
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
@@ -91,7 +91,7 @@ describe("registry store — lock + persistence", () => {
     writeFileSync(join(anchor, "devtrees", "registry.lock"), `${process.pid}\n`, { flag: "wx" });
 
     await expect(withRegistryLock(anchor, (s) => s, { retries: 0 })).rejects.toThrow(
-      /holding the allocation registry lock/,
+      /holding the lock at/,
     );
   });
 
@@ -111,7 +111,7 @@ describe("registry store — lock + persistence", () => {
       },
       (e: unknown) => e as Error & { code?: string },
     );
-    expect(err.name).toBe("RegistryLockedError");
+    expect(err.name).toBe("LockContentionError");
     expect(err.code).toBe("LOCK_CONTENTION");
   });
 
@@ -144,7 +144,7 @@ describe("registry store — lock + persistence", () => {
     writeFileSync(join(anchor, "devtrees", "registry.lock"), "not-a-pid\n", { flag: "wx" });
 
     await expect(withRegistryLock(anchor, (s) => s, { retries: 0 })).rejects.toThrow(
-      /holding the allocation registry lock/,
+      /holding the lock at/,
     );
   });
 
@@ -189,7 +189,7 @@ describe("withSharedLock — async lifecycle lock", () => {
     mkdirSync(join(anchor, "devtrees"), { recursive: true });
     writeFileSync(join(anchor, "devtrees", "shared.lock"), `${process.pid}\n`, { flag: "wx" });
     await expect(withSharedLock(anchor, async () => {}, { retries: 0 })).rejects.toThrow(
-      /holding the allocation registry lock/,
+      /holding the lock at/,
     );
   });
 
@@ -241,5 +241,94 @@ describe("withSharedLock — async lifecycle lock", () => {
 
     await Promise.all([first, second]);
     expect(order).toEqual(["first:enter", "first:exit", "second:enter"]);
+  });
+});
+
+describe("withLifecycleLock — per-instance lifecycle lock (issue #91)", () => {
+  it("runs the callback under <anchor>/devtrees/<instanceId>.lock and releases on success", async () => {
+    const anchor = newAnchor();
+    const lockPath = join(anchor, "devtrees", "login-3f9c2a1b.lock");
+    await withLifecycleLock(anchor, "login-3f9c2a1b", async () => {
+      // While inside, the file exists — proving the lock is held.
+      expect(existsSync(lockPath)).toBe(true);
+    });
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it("does not contend across distinct instance ids — locks are per-instance", async () => {
+    const anchor = newAnchor();
+    // Hold `login`'s lock while acquiring `billing`'s with zero retries: a
+    // single shared lockfile would reject here; per-instance files must not.
+    let ran = false;
+    await withLifecycleLock(anchor, "login-3f9c2a1b", async () => {
+      await withLifecycleLock(
+        anchor,
+        "billing-9a1b3f9c",
+        async () => {
+          ran = true;
+        },
+        { retries: 0 },
+      );
+    });
+    expect(ran).toBe(true);
+  });
+
+  it("tags the contended same-instance error with code LOCK_CONTENTION", async () => {
+    const anchor = newAnchor();
+    mkdirSync(join(anchor, "devtrees"), { recursive: true });
+    writeFileSync(join(anchor, "devtrees", "login-3f9c2a1b.lock"), `${process.pid}\n`, {
+      flag: "wx",
+    });
+    const err = await withLifecycleLock(anchor, "login-3f9c2a1b", async () => {}, {
+      retries: 0,
+    }).then(
+      () => {
+        throw new Error("expected withLifecycleLock to reject");
+      },
+      (e: unknown) => e as Error & { code?: string },
+    );
+    expect(err.code).toBe("LOCK_CONTENTION");
+  });
+
+  it("steals a lifecycle lock whose recorded holder pid is dead", async () => {
+    const anchor = newAnchor();
+    mkdirSync(join(anchor, "devtrees"), { recursive: true });
+    writeFileSync(join(anchor, "devtrees", "login-3f9c2a1b.lock"), `${deadPid()}\n`, {
+      flag: "wx",
+    });
+
+    let ran = false;
+    await withLifecycleLock(
+      anchor,
+      "login-3f9c2a1b",
+      async () => {
+        ran = true;
+      },
+      { retries: 0 },
+    );
+    expect(ran).toBe(true);
+    expect(existsSync(join(anchor, "devtrees", "login-3f9c2a1b.lock"))).toBe(false);
+  });
+
+  it("releases the lock even when the async callback throws", async () => {
+    const anchor = newAnchor();
+    await expect(
+      withLifecycleLock(anchor, "login-3f9c2a1b", async () => {
+        throw new Error("boom");
+      }),
+    ).rejects.toThrow("boom");
+    // A subsequent acquire must succeed — no leak.
+    await withLifecycleLock(anchor, "login-3f9c2a1b", async () => {}, { retries: 0 });
+  });
+
+  it("withSharedLock is the same mechanism under the reserved `shared` id", async () => {
+    const anchor = newAnchor();
+    // Holding the shared instance's lifecycle lock must block withSharedLock —
+    // they are one lock, not two (issue #91 generalized shared into per-instance).
+    await withLifecycleLock(anchor, "shared", async () => {
+      await expect(withSharedLock(anchor, async () => {}, { retries: 0 })).rejects.toThrow(
+        /holding the lock at/,
+      );
+    });
   });
 });
