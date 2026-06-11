@@ -3713,14 +3713,9 @@ describe("runUp — per-worktree lifecycle lock (issue #91)", () => {
     services: [isolated("web", "node server.js", ["WEB_PORT"])],
   };
 
-  it("holds the worktree's lock across spawn and socket-wait, releasing only after both", async () => {
-    const events: string[] = [];
-    const track: StubSpawn = { invocations: [], touchSocket: true };
-    const base = stubDeps({ stack: oneIsolated, track });
-    const inner = base.driver?.spawner;
-    if (inner === undefined) throw new Error("expected stub spawner");
-
-    const spyLock: WithLifecycleLock = async (_anchor, instanceId, fn) => {
+  /** A pass-through lock that records its acquire/release into `events`. */
+  function makeSpyLock(events: string[]): WithLifecycleLock {
+    return async (_anchor, instanceId, fn) => {
       events.push(`acquire:${instanceId}`);
       try {
         return await fn();
@@ -3728,9 +3723,18 @@ describe("runUp — per-worktree lifecycle lock (issue #91)", () => {
         events.push(`release:${instanceId}`);
       }
     };
+  }
+
+  it("holds the worktree's lock across spawn and socket-wait, releasing only after both", async () => {
+    const events: string[] = [];
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const base = stubDeps({ stack: oneIsolated, track });
+    const inner = base.driver?.spawner;
+    if (inner === undefined) throw new Error("expected stub spawner");
+
     const deps: CommandDeps = {
       ...base,
-      withLifecycleLock: spyLock,
+      withLifecycleLock: makeSpyLock(events),
       waitForSocketFile: async () => {
         events.push("socket-wait");
       },
@@ -3771,17 +3775,9 @@ describe("runUp — per-worktree lifecycle lock (issue #91)", () => {
     writeFileSync(socketPath, "");
 
     const currentHashStore: Record<string, string> = {};
-    const spyLock: WithLifecycleLock = async (_anchor, instanceId, fn) => {
-      events.push(`acquire:${instanceId}`);
-      try {
-        return await fn();
-      } finally {
-        events.push(`release:${instanceId}`);
-      }
-    };
     const deps: CommandDeps = {
       ...base,
-      withLifecycleLock: spyLock,
+      withLifecycleLock: makeSpyLock(events),
       readStoredHash: (_a, id) => currentHashStore[id],
       writeStoredHash: (_a, id, h) => {
         events.push("hash-write");
@@ -3868,11 +3864,6 @@ describe("runUp — per-worktree lifecycle lock (issue #91)", () => {
       withLifecycleLock: (anchor, id, fn) => withLifecycleLock(anchor, id, fn, { retries: 0 }),
     };
 
-    const err = await runUp(deps).then(
-      () => undefined,
-      (e: unknown) => e as Error & { code?: string },
-    );
-    if (err === undefined) throw new Error("expected runUp to reject");
-    expect(err.code).toBe("LOCK_CONTENTION");
+    await expect(runUp(deps)).rejects.toMatchObject({ code: "LOCK_CONTENTION" });
   });
 });

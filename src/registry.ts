@@ -168,6 +168,16 @@ function stealIfStale(path: string): boolean {
 }
 
 /**
+ * One full acquire attempt: a `wx`-create, then — on contention — a steal of
+ * a dead holder's lock followed by an immediate re-create. Shared by the
+ * async and sync acquire loops so the attempt semantics cannot drift apart.
+ */
+function tryAcquireOnce(path: string): boolean {
+  if (tryWxCreate(path) === "acquired") return true;
+  return stealIfStale(path) && tryWxCreate(path) === "acquired";
+}
+
+/**
  * Acquire a lockfile by `wx`-creating it; throws LockContentionError on timeout.
  * Uses `setTimeout` between retries so other tasks (including the current
  * holder's `finally` release) can run. On contention, a lock whose recorded
@@ -177,8 +187,7 @@ async function acquireLockAtAsync(path: string, options: LockOptions): Promise<v
   const retries = options.retries ?? DEFAULT_RETRIES;
   const delay = options.retryDelayMs ?? DEFAULT_DELAY_MS;
   for (let attempt = 0; attempt <= retries; attempt++) {
-    if (tryWxCreate(path) === "acquired") return;
-    if (stealIfStale(path) && tryWxCreate(path) === "acquired") return;
+    if (tryAcquireOnce(path)) return;
     if (attempt === retries) throw new LockContentionError(path);
     await new Promise<void>((resolve) => setTimeout(resolve, delay));
   }
@@ -264,8 +273,7 @@ function acquireLockSync(path: string, options: LockOptions): void {
   const retries = options.retries ?? DEFAULT_RETRIES;
   const delay = options.retryDelayMs ?? DEFAULT_DELAY_MS;
   for (let attempt = 0; attempt <= retries; attempt++) {
-    if (tryWxCreate(path) === "acquired") return;
-    if (stealIfStale(path) && tryWxCreate(path) === "acquired") return;
+    if (tryAcquireOnce(path)) return;
     if (attempt === retries) throw new LockContentionError(path);
     sleepSync(delay);
   }

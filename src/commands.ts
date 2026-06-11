@@ -609,14 +609,26 @@ function resolveUpSeams(deps: CommandDeps) {
     readStack: deps.readStack ?? loadStack,
     lock: deps.withRegistryLock ?? defaultWithRegistryLock,
     sharedLock: deps.withSharedLock ?? defaultWithSharedLock,
-    lifecycleLock: deps.withLifecycleLock ?? defaultWithLifecycleLock,
-    waitForSocketFile: deps.waitForSocketFile ?? waitForSocket,
     isPortFree: deps.isPortFree ?? defaultIsPortFree,
     portHolder: deps.portHolder ?? defaultPortHolder,
     warn: deps.warn ?? defaultWarn,
     readHash: deps.readStoredHash ?? defaultReadStoredHash,
     writeHash: deps.writeStoredHash ?? defaultWriteStoredHash,
     probe: resolveProbe(deps),
+    ...resolveLifecycleSeams(deps),
+  } as const;
+}
+
+/**
+ * Resolve the #91 lifecycle-lock seams — split from `resolveUpSeams`'s body
+ * for the same reason `resolveProbe` is: each resolver stays a flat
+ * default-bundle whose per-`??` cyclomatic count never creeps toward the
+ * audit gate's complexity threshold.
+ */
+function resolveLifecycleSeams(deps: CommandDeps) {
+  return {
+    lifecycleLock: deps.withLifecycleLock ?? defaultWithLifecycleLock,
+    waitForSocketFile: deps.waitForSocketFile ?? waitForSocket,
   } as const;
 }
 

@@ -23,6 +23,12 @@ function deadPid(): number {
   return child.pid;
 }
 
+/** Pre-create `<anchor>/devtrees/<name>` as if a foreign holder owned that lock. */
+function plantLockFile(anchor: string, name: string, content: string): void {
+  mkdirSync(join(anchor, "devtrees"), { recursive: true });
+  writeFileSync(join(anchor, "devtrees", name), content, { flag: "wx" });
+}
+
 describe("registry store — lock + persistence", () => {
   it("reads an empty snapshot when no registry has ever been written", () => {
     const anchor = newAnchor();
@@ -87,8 +93,7 @@ describe("registry store — lock + persistence", () => {
   it("refuses to acquire the lock if another holder is already there", async () => {
     const anchor = newAnchor();
     // Simulate another process holding the lock.
-    mkdirSync(join(anchor, "devtrees"), { recursive: true });
-    writeFileSync(join(anchor, "devtrees", "registry.lock"), `${process.pid}\n`, { flag: "wx" });
+    plantLockFile(anchor, "registry.lock", `${process.pid}\n`);
 
     await expect(withRegistryLock(anchor, (s) => s, { retries: 0 })).rejects.toThrow(
       /holding the lock at/,
@@ -102,8 +107,7 @@ describe("registry store — lock + persistence", () => {
     // apart from a real failure. The code is the agent-facing contract, so
     // that's what we assert on (direct property access, not toMatchObject).
     const anchor = newAnchor();
-    mkdirSync(join(anchor, "devtrees"), { recursive: true });
-    writeFileSync(join(anchor, "devtrees", "registry.lock"), `${process.pid}\n`, { flag: "wx" });
+    plantLockFile(anchor, "registry.lock", `${process.pid}\n`);
 
     const err = await withRegistryLock(anchor, (s) => s, { retries: 0 }).then(
       () => {
@@ -127,9 +131,8 @@ describe("registry store — lock + persistence", () => {
 
   it("steals a registry lock whose recorded holder pid is dead", async () => {
     const anchor = newAnchor();
-    mkdirSync(join(anchor, "devtrees"), { recursive: true });
     // Simulate a SIGKILLed holder: the lock file survives but its pid is gone.
-    writeFileSync(join(anchor, "devtrees", "registry.lock"), `${deadPid()}\n`, { flag: "wx" });
+    plantLockFile(anchor, "registry.lock", `${deadPid()}\n`);
 
     // Even with zero retries the stale lock must be stolen, not waited out.
     await withRegistryLock(anchor, (s) => ({ ...s, login: 20512 }), { retries: 0 });
@@ -140,8 +143,7 @@ describe("registry store — lock + persistence", () => {
 
   it("does not steal a lock whose content is not a parseable pid", async () => {
     const anchor = newAnchor();
-    mkdirSync(join(anchor, "devtrees"), { recursive: true });
-    writeFileSync(join(anchor, "devtrees", "registry.lock"), "not-a-pid\n", { flag: "wx" });
+    plantLockFile(anchor, "registry.lock", "not-a-pid\n");
 
     await expect(withRegistryLock(anchor, (s) => s, { retries: 0 })).rejects.toThrow(
       /holding the lock at/,
@@ -186,8 +188,7 @@ describe("withSharedLock — async lifecycle lock", () => {
 
   it("refuses to acquire if another holder is there (retries exhausted)", async () => {
     const anchor = newAnchor();
-    mkdirSync(join(anchor, "devtrees"), { recursive: true });
-    writeFileSync(join(anchor, "devtrees", "shared.lock"), `${process.pid}\n`, { flag: "wx" });
+    plantLockFile(anchor, "shared.lock", `${process.pid}\n`);
     await expect(withSharedLock(anchor, async () => {}, { retries: 0 })).rejects.toThrow(
       /holding the lock at/,
     );
@@ -195,8 +196,7 @@ describe("withSharedLock — async lifecycle lock", () => {
 
   it("steals a shared lock whose recorded holder pid is dead", async () => {
     const anchor = newAnchor();
-    mkdirSync(join(anchor, "devtrees"), { recursive: true });
-    writeFileSync(join(anchor, "devtrees", "shared.lock"), `${deadPid()}\n`, { flag: "wx" });
+    plantLockFile(anchor, "shared.lock", `${deadPid()}\n`);
 
     let ran = false;
     await withSharedLock(
@@ -212,15 +212,10 @@ describe("withSharedLock — async lifecycle lock", () => {
 
   it("tags the contended shared-lock error with code LOCK_CONTENTION (issue #84)", async () => {
     const anchor = newAnchor();
-    mkdirSync(join(anchor, "devtrees"), { recursive: true });
-    writeFileSync(join(anchor, "devtrees", "shared.lock"), `${process.pid}\n`, { flag: "wx" });
-    const err = await withSharedLock(anchor, async () => {}, { retries: 0 }).then(
-      () => {
-        throw new Error("expected withSharedLock to reject");
-      },
-      (e: unknown) => e as Error & { code?: string },
-    );
-    expect(err.code).toBe("LOCK_CONTENTION");
+    plantLockFile(anchor, "shared.lock", `${process.pid}\n`);
+    await expect(withSharedLock(anchor, async () => {}, { retries: 0 })).rejects.toMatchObject({
+      code: "LOCK_CONTENTION",
+    });
   });
 
   it("serialises overlapping callers — the second runs only after the first releases", async () => {
@@ -275,52 +270,16 @@ describe("withLifecycleLock — per-instance lifecycle lock (issue #91)", () => 
 
   it("tags the contended same-instance error with code LOCK_CONTENTION", async () => {
     const anchor = newAnchor();
-    mkdirSync(join(anchor, "devtrees"), { recursive: true });
-    writeFileSync(join(anchor, "devtrees", "login-3f9c2a1b.lock"), `${process.pid}\n`, {
-      flag: "wx",
-    });
-    const err = await withLifecycleLock(anchor, "login-3f9c2a1b", async () => {}, {
-      retries: 0,
-    }).then(
-      () => {
-        throw new Error("expected withLifecycleLock to reject");
-      },
-      (e: unknown) => e as Error & { code?: string },
-    );
-    expect(err.code).toBe("LOCK_CONTENTION");
-  });
-
-  it("steals a lifecycle lock whose recorded holder pid is dead", async () => {
-    const anchor = newAnchor();
-    mkdirSync(join(anchor, "devtrees"), { recursive: true });
-    writeFileSync(join(anchor, "devtrees", "login-3f9c2a1b.lock"), `${deadPid()}\n`, {
-      flag: "wx",
-    });
-
-    let ran = false;
-    await withLifecycleLock(
-      anchor,
-      "login-3f9c2a1b",
-      async () => {
-        ran = true;
-      },
-      { retries: 0 },
-    );
-    expect(ran).toBe(true);
-    expect(existsSync(join(anchor, "devtrees", "login-3f9c2a1b.lock"))).toBe(false);
-  });
-
-  it("releases the lock even when the async callback throws", async () => {
-    const anchor = newAnchor();
+    plantLockFile(anchor, "login-3f9c2a1b.lock", `${process.pid}\n`);
     await expect(
-      withLifecycleLock(anchor, "login-3f9c2a1b", async () => {
-        throw new Error("boom");
-      }),
-    ).rejects.toThrow("boom");
-    // A subsequent acquire must succeed — no leak.
-    await withLifecycleLock(anchor, "login-3f9c2a1b", async () => {}, { retries: 0 });
+      withLifecycleLock(anchor, "login-3f9c2a1b", async () => {}, { retries: 0 }),
+    ).rejects.toMatchObject({ code: "LOCK_CONTENTION" });
   });
 
+  // Dead-pid stealing and release-on-throw are NOT re-tested here: they are
+  // properties of the one acquire/release mechanism, pinned by the
+  // withSharedLock suite above — and the same-mechanism test below proves the
+  // shared lock IS this lock, so that coverage transfers.
   it("withSharedLock is the same mechanism under the reserved `shared` id", async () => {
     const anchor = newAnchor();
     // Holding the shared instance's lifecycle lock must block withSharedLock —
