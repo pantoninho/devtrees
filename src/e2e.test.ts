@@ -607,12 +607,12 @@ describe("e2e — devtrees ls discovers worktree instances + the shared instance
     // No readiness_probe on `web`: readiness is never observed, so health
     // stays `unknown` (the real binary reports `is_ready: "-"`; #108).
     expect(login?.services?.[0]?.health).toBe("unknown");
-    // Web sees its own WEB_PORT plus the shared DB_PORT (cross-tier
-    // connection-info injection). The worktree-id env var lives alongside
-    // these but is filtered out — only `KEY=NUMBER` entries qualify as ports.
+    // Web's row carries only the port web *declares* (#110). The shared
+    // DB_PORT is still in web's process environment (cross-tier
+    // connection-info injection) but must not leak into the service row —
+    // `up --json` and `ls --json` agree on per-service semantics.
     expect(login?.services?.[0]?.ports).toEqual({
       WEB_PORT: Number(up.env.WEB_PORT),
-      DB_PORT: Number(up.env.DB_PORT),
     });
 
     expect(shared?.services?.map((s) => s.name)).toEqual(["pgstub"]);

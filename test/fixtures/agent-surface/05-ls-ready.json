@@ -1,0 +1,46 @@
+{
+  "schema_version": "1",
+  "ls": {
+    "instances": [
+      {
+        "id": "shared",
+        "kind": "shared",
+        "status": "running",
+        "ports": {
+          "DB_PORT": 0
+        },
+        "services": [
+          {
+            "name": "db",
+            "status": "Running",
+            "health": "unknown",
+            "ports": {
+              "DB_PORT": 0
+            }
+          }
+        ],
+        "block_base": 0
+      },
+      {
+        "id": "<WT>",
+        "kind": "worktree",
+        "status": "running",
+        "ports": {
+          "DB_PORT": 0,
+          "WEB_PORT": 0
+        },
+        "services": [
+          {
+            "name": "web",
+            "status": "Running",
+            "health": "ready",
+            "ports": {
+              "WEB_PORT": 0
+            }
+          }
+        ],
+        "block_base": 0
+      }
+    ]
+  }
+}

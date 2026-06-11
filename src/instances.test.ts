@@ -45,20 +45,37 @@ function writeRegistry(anchor: string, snapshot: Record<string, number>): void {
   );
 }
 
-/** Write a derived config exposing one named-port env entry per process. */
+/**
+ * Write a derived config the way the real deriver shapes it: every process's
+ * `environment:` carries the flat injection of ALL the instance's named ports
+ * (connection info, issue #110), while the `x-devtrees.ports_by_service`
+ * metadata records only the ports each process *declares*. Pass
+ * `{ metadata: false }` to model a legacy config written before the metadata
+ * existed.
+ */
 function writeDerivedConfig(
   anchor: string,
   id: string,
   processes: Record<string, { ports: ReadonlyArray<[string, number]> }>,
+  opts: { metadata?: boolean } = {},
 ): void {
+  const allPorts = Object.values(processes).flatMap((p) => p.ports);
   const lines = ["processes:"];
-  for (const [name, proc] of Object.entries(processes)) {
+  for (const name of Object.keys(processes)) {
     lines.push(`  ${name}:`);
     lines.push("    command: noop");
     lines.push(`    working_dir: /tmp`);
-    if (proc.ports.length > 0) {
+    if (allPorts.length > 0) {
       lines.push("    environment:");
-      for (const [k, v] of proc.ports) lines.push(`      - ${k}=${v}`);
+      for (const [k, v] of allPorts) lines.push(`      - ${k}=${v}`);
+    }
+  }
+  if (opts.metadata !== false) {
+    lines.push("x-devtrees:");
+    lines.push("  ports_by_service:");
+    for (const [name, proc] of Object.entries(processes)) {
+      lines.push(`    ${name}:${proc.ports.length === 0 ? " {}" : ""}`);
+      for (const [k, v] of proc.ports) lines.push(`      ${k}: ${v}`);
     }
   }
   writeFileSync(join(anchor, "devtrees", `${id}.yaml`), `${lines.join("\n")}\n`, "utf8");
@@ -251,6 +268,59 @@ describe("discoverInstances", () => {
     expect(billing?.services).toEqual([
       { name: "web", status: "Running", health: "ready", ports: { WEB_PORT: 21000 } },
     ]);
+  });
+
+  it("scopes services[].ports to the service's declared ports — `{}` for a portless service (#110)", async () => {
+    // Every process's environment carries the whole instance port map (flat
+    // connection-info injection), so a service's ports must come from the
+    // `x-devtrees.ports_by_service` metadata, not from reading env back.
+    const anchor = tmpAnchor();
+    writeRegistry(anchor, { login: 20000 });
+    writeDerivedConfig(anchor, "login", {
+      web: { ports: [["WEB_PORT", 20000]] },
+      worker: { ports: [] },
+    });
+    await bindSocketServer(anchor, "login");
+
+    const getServiceStatuses = async (): Promise<ServiceStatus[]> => [
+      { name: "web", status: "Running", health: "ready" },
+      { name: "worker", status: "Running", health: "unknown" },
+    ];
+
+    const [instance] = await discoverInstances(anchor, { getServiceStatuses });
+    expect(instance?.services).toEqual([
+      { name: "web", status: "Running", health: "ready", ports: { WEB_PORT: 20000 } },
+      { name: "worker", status: "Running", health: "unknown", ports: {} },
+    ]);
+    // The instance-level projection still flattens the whole map.
+    expect(instance?.ports).toEqual({ WEB_PORT: 20000 });
+  });
+
+  it("falls back to `{}` per service for a legacy derived config without x-devtrees metadata", async () => {
+    // An instance started by an older devtrees has no ports_by_service record.
+    // Claiming the full instance map per service would be wrong (the #110 bug);
+    // the honest answer is "unknown" — empty ports, instance-level map intact.
+    const anchor = tmpAnchor();
+    writeRegistry(anchor, { login: 20000 });
+    writeDerivedConfig(
+      anchor,
+      "login",
+      { web: { ports: [["WEB_PORT", 20000]] } },
+      {
+        metadata: false,
+      },
+    );
+    await bindSocketServer(anchor, "login");
+
+    const getServiceStatuses = async (): Promise<ServiceStatus[]> => [
+      { name: "web", status: "Running", health: "ready" },
+    ];
+
+    const [instance] = await discoverInstances(anchor, { getServiceStatuses });
+    expect(instance?.services).toEqual([
+      { name: "web", status: "Running", health: "ready", ports: {} },
+    ]);
+    expect(instance?.ports).toEqual({ WEB_PORT: 20000 });
   });
 
   it("skips getServiceStatuses for stale instances — services[] is empty for an orphaned socket", async () => {

@@ -387,12 +387,17 @@ interface UpDoc {
     readonly block_base: number;
     readonly env: Record<string, string>;
     readonly shared_started: boolean;
+    readonly services: ReadonlyArray<{
+      readonly name: string;
+      readonly ports: Readonly<Record<string, number>>;
+    }>;
   };
 }
 
 interface LsServiceRow {
   readonly name: string;
   readonly health: string;
+  readonly ports: Readonly<Record<string, number>>;
 }
 
 interface LsDoc {
@@ -504,7 +509,7 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
     expect((second.doc as UpDoc).up.shared_started).toBe(true);
   }, 120_000);
 
-  it("scenario 5: readiness_probe converges and ls --json reports health:ready (#50)", async () => {
+  it("scenario 5: readiness_probe converges and ls --json reports health:ready (#50); envelope matches golden, ports agree with up (#110)", async () => {
     const { wt } = setupScenario("dt-rpc5-", { withProbe: true });
     const r = up(wt);
     expect(r.code, `up failed: stderr=${r.stderr}`).toBe(0);
@@ -513,6 +518,23 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
     // multiple seconds to converge in the real binary).
     const web = await pollWorktreeService(wt, wtId(wt), "web", 30_000);
     expect(web?.health).toBe("ready");
+
+    // #110: the whole ls envelope is golden — each services[] row carries
+    // only the ports that service declares (db has DB_PORT, web has
+    // WEB_PORT), never the full cross-tier injection map.
+    const ls = devtrees(wt, ["ls", "--json"]);
+    expect(ls.code).toBe(0);
+    expect(normaliseEnvelope(ls.doc, wtId(wt))).toEqual(readFixture("05-ls-ready.json"));
+
+    // #110 agreement: for the same running instance, ls reports the exact
+    // per-service ports up reported (unnormalised — real port numbers).
+    const upServices = (r.doc as UpDoc).up.services;
+    expect(upServices.length).toBeGreaterThan(0);
+    const lsWorktree = (ls.doc as LsDoc).ls.instances.find((i) => i.id === wtId(wt));
+    for (const svc of upServices) {
+      const row = lsWorktree?.services.find((s) => s.name === svc.name);
+      expect(row?.ports, `ls ports for service ${svc.name}`).toEqual(svc.ports);
+    }
   }, 90_000);
 
   it("scenario 6a: down --json (worktree) envelope is operation-output-only (#48)", async () => {
