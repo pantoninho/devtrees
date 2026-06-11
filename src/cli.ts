@@ -245,6 +245,7 @@ class UpCommand extends DevtreesCommand {
       "STALE_PORT_BLOCK",
       "CONFIG_DRIFT",
       "SHARED_DRIFT",
+      "SHARED_START_FAILED",
       "CONFIG_INVALID",
       "LOCK_CONTENTION",
       "HEALTH_TIMEOUT",

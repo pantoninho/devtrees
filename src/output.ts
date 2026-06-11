@@ -32,6 +32,7 @@ export const ERROR_CODES = [
   "HEALTH_TIMEOUT",
   "CONFIG_DRIFT",
   "SHARED_DRIFT",
+  "SHARED_START_FAILED",
   "STALE_PORT_BLOCK",
   "LOCK_CONTENTION",
   "CONFIG_INVALID",
@@ -60,6 +61,7 @@ export const ERROR_CODE_DESCRIPTIONS: Readonly<Record<ErrorCode, string>> = {
   CONFIG_DRIFT: "Running config differs from devtrees.yaml and hot-reload failed.",
   SHARED_DRIFT:
     "This worktree's shared services diverge from the running shared instance; bring shared down and up again.",
+  SHARED_START_FAILED: "The lazy-started shared instance died before binding its control socket.",
   STALE_PORT_BLOCK:
     "Foreign listeners hold ports in this worktree's allocated block (likely orphans).",
   LOCK_CONTENTION: "Another devtrees process holds the allocation registry lock.",

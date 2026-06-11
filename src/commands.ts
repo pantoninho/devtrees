@@ -106,6 +106,28 @@ class SharedDriftError extends Error {
 }
 
 /**
+ * Thrown when the lazy-started shared instance dies before binding its
+ * control socket (issue #92): `driver.up` is fire-and-forget, so an instantly
+ * crashing process-compose (bad config, missing binary deps, port conflict at
+ * bind time) is only observable as the socket never appearing. The socket
+ * wait used to return silently on deadline, letting `up` report
+ * `shared_started: true` for an instance that was already dead; now the
+ * deadline surfaces as the `SHARED_START_FAILED` envelope (ADR-0005).
+ */
+class SharedStartFailedError extends Error {
+  readonly code = "SHARED_START_FAILED" as const;
+  readonly details: {
+    readonly socket_path: string;
+    readonly timeout_ms: number;
+  };
+  constructor(message: string, details: { socket_path: string; timeout_ms: number }) {
+    super(message);
+    this.name = "SharedStartFailedError";
+    this.details = details;
+  }
+}
+
+/**
  * Compare this worktree's shared subset against the persisted identity of
  * the running shared instance; throw `SharedDriftError` on mismatch. The
  * hash is order-insensitive (`sharedStackHash`), so pure reordering in
@@ -308,6 +330,14 @@ export interface CommandDeps {
   readonly waitForHealth?: WaitForHealth;
   /** Health-wait window for the worktree instance. Default: 120s. */
   readonly waitTimeoutMs?: number;
+  /**
+   * How long the shared lazy-start waits for the spawned instance to bind its
+   * control socket before failing with `SHARED_START_FAILED` (issue #92).
+   * Default: 3s — generous for a healthy process-compose, short enough that
+   * an instantly-dying one fails fast. Injected so tests don't sit out the
+   * full window.
+   */
+  readonly sharedSocketTimeoutMs?: number;
   /**
    * Read the per-service runtime state for the worktree instance after health
    * is reached, so `runUp` can publish `services[]` in the issue-#30 state
@@ -701,7 +731,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
       anchor.worktreeId,
       sharedPortFor,
       sharedLock,
-      { driver, probe: seams.probe },
+      { driver, probe: seams.probe, socketTimeoutMs: deps.sharedSocketTimeoutMs },
     );
     sharedStarted = ensured.started;
     if (ensured.ports !== undefined) {
@@ -994,6 +1024,8 @@ async function ensureSharedStarted(
   deps: {
     driver: ReturnType<typeof createDriver>;
     probe: (socketPath: string) => Promise<InstanceStatus>;
+    /** Socket-bind wait window for the lazy start (issue #92). Default: 3s. */
+    socketTimeoutMs?: number;
   },
 ): Promise<EnsuredShared> {
   return await sharedLock(anchor, async () => {
@@ -1020,8 +1052,11 @@ async function ensureSharedStarted(
     // UDS. Hold the shared lock until the socket is observable on disk so a
     // concurrent `up` from another worktree sees the lazy-start as complete and
     // doesn't race a second stub against ours (the loser's exit-time cleanup
-    // would unlink the winner's socket).
-    await waitForSocket(paths.socketPath);
+    // would unlink the winner's socket). Throws `SHARED_START_FAILED` on
+    // deadline (issue #92): a socket that never appears means the instance
+    // died before binding, and reporting `shared_started: true` for a corpse
+    // would leave the agent debugging healthy-looking output.
+    await waitForSocket(paths.socketPath, deps.socketTimeoutMs);
 
     // Make the running instance the source of truth: persist what it was
     // started with so every subsequent `up`/`env` — on any branch — injects
@@ -1032,13 +1067,25 @@ async function ensureSharedStarted(
   });
 }
 
-/** Poll until `socketPath` exists or the deadline lapses. */
+/**
+ * Poll until `socketPath` exists, or throw `SharedStartFailedError` when the
+ * deadline lapses (issue #92). Silently returning here used to let `up`
+ * report a shared instance that died before binding as `shared_started:
+ * true` — the failure must surface as an error envelope instead.
+ */
 async function waitForSocket(socketPath: string, timeoutMs = 3000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (existsSync(socketPath)) return;
     await new Promise((r) => setTimeout(r, 10));
   }
+  throw new SharedStartFailedError(
+    `devtrees up: the shared instance was spawned but did not bind its control socket ` +
+      `within ${timeoutMs}ms — it most likely crashed on startup. ` +
+      `Check the shared services' commands (e.g. run \`process-compose -f <shared config>\` by hand) ` +
+      `and retry \`devtrees up\`.`,
+    { socket_path: socketPath, timeout_ms: timeoutMs },
+  );
 }
 
 // A real port a service binds shows up in its command as `--port 3000` / `:3000` /

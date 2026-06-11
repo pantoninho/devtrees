@@ -543,6 +543,61 @@ describe("runUp — shared tier lazy start", () => {
   });
 });
 
+/**
+ * Issue #92 — a shared instance that dies before binding its control socket
+ * must surface as a failure envelope from `up`, not `shared_started: true`.
+ * The socket-wait used to return silently on deadline, so a process that
+ * crashed instantly after spawn looked like a successful lazy-start.
+ */
+describe("runUp — shared instance dies before binding its socket (#92)", () => {
+  const mixedStack: ResolvedStack = {
+    services: [
+      isolated("web", "node server.js", ["WEB_PORT"]),
+      shared("postgres", "postgres", ["DB_PORT"]),
+    ],
+  };
+
+  it("throws SHARED_START_FAILED when the shared socket never appears", async () => {
+    // touchSocket: false — the spawn returns but no socket is ever bound,
+    // exactly what an instantly-dying shared instance looks like from here.
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const deps: CommandDeps = {
+      ...stubDeps({ stack: mixedStack, track }),
+      sharedSocketTimeoutMs: 50,
+    };
+    const err = await runUp(deps).then(
+      () => undefined,
+      (e: unknown) => e as Error & { code?: string },
+    );
+    if (err === undefined) throw new Error("expected runUp to reject");
+    expect(err.code).toBe("SHARED_START_FAILED");
+    expect(err.message).toMatch(/shared/i);
+    // The worktree instance was never spawned — only the doomed shared up.
+    const worktreeSpawn = track.invocations.find((i) => !i.socketPath.endsWith("/shared.sock"));
+    expect(worktreeSpawn).toBeUndefined();
+  });
+
+  it("does not persist shared state when the start failed", async () => {
+    // The persisted name→port map is the running instance's identity (#83);
+    // a failed start must not record one, or the next `up` would inject
+    // numbers nothing ever bound.
+    const { sharedAnchor, wtRoot, registryRef } = multiWorktreeFixture("dt-sockfail-");
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const deps: CommandDeps = {
+      ...stubDeps({
+        stack: mixedStack,
+        anchorOverride: sharedAnchor,
+        worktreeRootOverride: wtRoot,
+        registryRef,
+        track,
+      }),
+      sharedSocketTimeoutMs: 50,
+    };
+    await expect(runUp(deps)).rejects.toThrow(/shared/i);
+    expect(readSharedState(sharedAnchor)).toBeUndefined();
+  });
+});
+
 describe("runUp — cross-tier wiring (ADR-0003)", () => {
   /** isolated `web` depends on shared `postgres` — the canonical cross-tier edge. */
   const crossTierStack: ResolvedStack = {
