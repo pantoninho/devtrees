@@ -248,6 +248,81 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
     expect(result.stderr).toMatch(/process-compose/);
   });
 
+  /**
+   * Agent-onboarding hint on `up` (issue #119). The injected `initHint` thunk
+   * carries the gating decision; the command only forwards its line — to
+   * STDERR, never the stdout envelope, and exactly once.
+   */
+  describe("up init-hint (#119)", () => {
+    const okUp = () => ({
+      worktreeId: "login",
+      socketPath: "/x.sock",
+      env: { WEB_PORT: "20512" },
+    });
+
+    it("writes the hint to stderr when the thunk returns a line", async () => {
+      const initHint = vi.fn().mockReturnValue("devtrees: run `devtrees init --agents`");
+      const result = await execute(["up"], {
+        up: vi.fn().mockResolvedValue(okUp()),
+        down: vi.fn(),
+        initHint,
+      });
+      expect(result.code).toBe(0);
+      expect(initHint).toHaveBeenCalledOnce();
+      expect(result.stderr).toBe("devtrees: run `devtrees init --agents`\n");
+    });
+
+    it("leaves the --json stdout envelope byte-for-byte unaffected by the hint", async () => {
+      const hinted = await execute(["up", "--json"], {
+        up: vi.fn().mockResolvedValue(okUp()),
+        down: vi.fn(),
+        initHint: () => "devtrees: run `devtrees init --agents`",
+      });
+      const silent = await execute(["up", "--json"], {
+        up: vi.fn().mockResolvedValue(okUp()),
+        down: vi.fn(),
+        initHint: () => undefined,
+      });
+      // Same stdout document whether or not the hint fired — the hint lives on
+      // stderr only. JSON.parse round-trips cleanly in both cases.
+      expect(hinted.stdout).toBe(silent.stdout);
+      expect(() => JSON.parse(hinted.stdout)).not.toThrow();
+      expect(hinted.stderr).toContain("devtrees init --agents");
+      expect(silent.stderr).toBe("");
+    });
+
+    it("stays silent when the thunk returns undefined (gated off)", async () => {
+      const result = await execute(["up"], {
+        up: vi.fn().mockResolvedValue(okUp()),
+        down: vi.fn(),
+        initHint: () => undefined,
+      });
+      expect(result.code).toBe(0);
+      expect(result.stderr).toBe("");
+    });
+
+    it("does not hint when no thunk is wired", async () => {
+      const result = await execute(["up"], {
+        up: vi.fn().mockResolvedValue(okUp()),
+        down: vi.fn(),
+      });
+      expect(result.code).toBe(0);
+      expect(result.stderr).toBe("");
+    });
+
+    it("does not emit the hint when up fails (only on a successful up)", async () => {
+      const initHint = vi.fn().mockReturnValue("devtrees: run `devtrees init --agents`");
+      const result = await execute(["up"], {
+        up: vi.fn().mockRejectedValue(new Error("boom")),
+        down: vi.fn(),
+        initHint,
+      });
+      expect(result.code).toBe(1);
+      expect(initHint).not.toHaveBeenCalled();
+      expect(result.stderr).not.toContain("init --agents");
+    });
+  });
+
   it("delegates non-effectful commands to the pure run()", async () => {
     const result = await execute(["--version"], { up: vi.fn(), down: vi.fn() });
     expect(result.stdout.trim()).toMatch(/^\d+\.\d+\.\d+$/);

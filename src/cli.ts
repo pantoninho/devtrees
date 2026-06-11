@@ -20,6 +20,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { Writable } from "node:stream";
 import { Cli, Command, Option, Builtins, type BaseContext } from "clipanion";
 import type { LogEvent } from "./driver.js";
+import { maybeInitHint } from "./init-hint.js";
 import {
   classifyError,
   ERROR_CODE_DESCRIPTIONS,
@@ -138,6 +139,16 @@ export interface ExecuteDeps {
     path: string;
     action: "created" | "updated";
   }>;
+  /**
+   * The agent-onboarding hint `up` surfaces on stderr (issue #119): a one-line,
+   * non-fatal pointer at `devtrees init --agents`, returned only when the
+   * gating predicate fires (agent context + no agent-doc references devtrees)
+   * and `undefined` otherwise. Injected as a thunk so the gating decision is
+   * made by the caller — the entrypoint with real cwd + TTY detection, tests
+   * with a stub — and `UpCommand` only has to write the line it's handed.
+   * Optional so dispatch paths that don't wire it simply never hint.
+   */
+  initHint?: () => string | undefined;
 }
 
 /** Parsed `devtrees logs` options threaded into `deps.logs`. */
@@ -304,8 +315,23 @@ class UpCommand extends DevtreesCommand {
       );
       if (out.stdout) this.context.stdout.write(out.stdout);
       if (out.stderr) this.context.stderr.write(out.stderr);
+      this.emitInitHint();
       return 0;
     });
+  }
+
+  /**
+   * Agent-onboarding hint (issue #119): emitted on `up` only, at most once, to
+   * STDERR — never the `--json` stdout envelope (the stdout document is already
+   * written by the time we get here and stays byte-for-byte unaffected). The
+   * gating decision (agent context + no agent-doc referencing devtrees) lives
+   * in the injected `initHint` thunk; this only forwards the line it hands
+   * back, so a hint never changes the exit code or blocks. Extracted from
+   * `execute` so the dispatch body stays a flat sequence.
+   */
+  private emitInitHint(): void {
+    const hint = this.context.deps.initHint?.();
+    if (hint) this.context.stderr.write(`${hint}\n`);
   }
 }
 
@@ -822,6 +848,22 @@ export function isEntrypoint(metaUrl: string, argv1: string | undefined): boolea
   }
 }
 
+/**
+ * Is a human at a terminal watching this `devtrees` invocation? Both stdout AND
+ * stderr must be TTYs (the same signal `runUp`'s attach auto-detect uses,
+ * ADR-0005): if either is redirected, the caller asked for headless behaviour.
+ * Mirrored here — rather than reused from `commands.ts` — because the #119 hint
+ * is an entrypoint concern, decided once at the argv → call-site bridge.
+ *
+ * `DEVTREES_ASSUME_TTY=1` forces the TTY branch so a test harness spawning the
+ * built CLI as a subprocess (whose stdio pipes are never TTYs) can still
+ * exercise the human-context path where the hint stays silent.
+ */
+function entrypointIsTTY(): boolean {
+  if (process.env.DEVTREES_ASSUME_TTY === "1") return true;
+  return Boolean(process.stdout.isTTY && process.stderr.isTTY);
+}
+
 if (isEntrypoint(import.meta.url, process.argv[1])) {
   const { runUp, runDown, runEnv, runGenerate, runLs, runAttach, runPrune, runLogs, runInit } =
     await import("./commands.js");
@@ -850,6 +892,13 @@ if (isEntrypoint(import.meta.url, process.argv[1])) {
         },
       ),
     init: () => runInit(),
+    // Issue #119: the agent-onboarding hint `up` may surface on stderr. The
+    // gate is "agent context" (neither stdout nor stderr a TTY — the same
+    // signal `up` uses to skip the TUI) plus "no agent-doc references
+    // devtrees", evaluated against the real cwd at emit time.
+    // `DEVTREES_ASSUME_TTY` forces the TTY branch so a subprocess (whose pipes
+    // are never TTYs) can exercise the human-context silence path.
+    initHint: () => maybeInitHint({ cwd: process.cwd(), isTTY: entrypointIsTTY() }),
   };
   const result = await dispatchCli(process.argv.slice(2), deps);
   if (result.stdout) process.stdout.write(result.stdout);
