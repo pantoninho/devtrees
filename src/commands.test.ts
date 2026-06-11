@@ -26,6 +26,7 @@ import { Readable } from "node:stream";
 import type { SpawnOptions } from "node:child_process";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import {
+  filterLogEventsSince,
   findUnmanagedPortBinds,
   runAttach,
   runDown,
@@ -39,7 +40,7 @@ import {
 import { deriveWorktreeId } from "./anchor.js";
 import { deriveSharedConfig, deriveWorktreeConfig } from "./deriver.js";
 import type { RegistrySnapshot } from "./allocator.js";
-import type { SpawnedProcess } from "./driver.js";
+import type { LogEvent, SpawnedProcess } from "./driver.js";
 import { SHARED_REGISTRY_KEY, instancePaths, sharedInstancePaths } from "./paths.js";
 import { sharedStackHash } from "./hash.js";
 import { readSharedState } from "./shared-state.js";
@@ -2488,6 +2489,110 @@ describe("runLogs — stream service logs without locking", () => {
     const result = await runLogs(deps, { service: "web" });
     await collectLogs(result.events);
     expect(lockCalls).toBe(0);
+  });
+});
+
+/**
+ * `--since` — issue #88: client-side filtering on `LogEvent.ts`.
+ *
+ * The driver stamps each event when the line is read, so the cutoff
+ * comparison itself is pinned on the pure generator with fabricated
+ * timestamps; `runLogs` tests pin the wiring (fresh events survive a wide
+ * window) and the validation contract (a malformed window rejects before any
+ * subprocess is spawned).
+ */
+describe("filterLogEventsSince — drop events older than the cutoff (#88)", () => {
+  function event(ts: string, line: string): LogEvent {
+    return { ts, service: "web", stream: "stdout", line };
+  }
+
+  async function* fromArray(events: ReadonlyArray<LogEvent>): AsyncIterable<LogEvent> {
+    for (const ev of events) yield ev;
+  }
+
+  async function lines(it: AsyncIterable<LogEvent>): Promise<string[]> {
+    const out: string[] = [];
+    for await (const ev of it) out.push(ev.line);
+    return out;
+  }
+
+  it("drops events with ts strictly older than the cutoff and keeps the rest", async () => {
+    const cutoff = Date.parse("2026-06-11T12:00:00.000Z");
+    const events = [
+      event("2026-06-11T11:59:59.999Z", "old"),
+      event("2026-06-11T12:00:00.000Z", "at-cutoff"),
+      event("2026-06-11T12:00:01.000Z", "fresh"),
+    ];
+    await expect(lines(filterLogEventsSince(fromArray(events), cutoff))).resolves.toEqual([
+      "at-cutoff",
+      "fresh",
+    ]);
+  });
+
+  it("keeps events whose ts does not parse (never silently swallow lines)", async () => {
+    const cutoff = Date.parse("2026-06-11T12:00:00.000Z");
+    const events = [event("not-a-timestamp", "weird"), event("2026-06-11T12:00:01.000Z", "ok")];
+    await expect(lines(filterLogEventsSince(fromArray(events), cutoff))).resolves.toEqual([
+      "weird",
+      "ok",
+    ]);
+  });
+
+  it("preserves event order and passes everything through when all are fresh", async () => {
+    const cutoff = Date.parse("2026-06-11T12:00:00.000Z");
+    const events = [event("2026-06-11T12:00:01.000Z", "a"), event("2026-06-11T12:00:02.000Z", "b")];
+    await expect(lines(filterLogEventsSince(fromArray(events), cutoff))).resolves.toEqual([
+      "a",
+      "b",
+    ]);
+  });
+});
+
+describe("runLogs — --since window (#88)", () => {
+  it("streams fresh events unchanged when the window is wide (sinceMs wiring)", async () => {
+    const tmp = tmpAnchor();
+    const worktreeId = "login";
+    const stem = idFor(tmp.worktreeRoot, worktreeId);
+    touchSocket(tmp.anchor, stem);
+    writeDerivedConfig(tmp.anchor, stem, ["web"]);
+
+    const invocations: LogsInvocation[] = [];
+    const deps = logsDeps({
+      anchor: tmp.anchor,
+      worktreeRoot: tmp.worktreeRoot,
+      worktreeId,
+      invocations,
+      linesPerService: { web: ["hello", "world"] },
+    });
+
+    // Events are stamped at read time (now), so a 1h window keeps them all.
+    const result = await runLogs(deps, { service: "web", sinceMs: 3_600_000 });
+    const events = await collectLogs(result.events);
+    expect(events).toEqual([
+      { service: "web", line: "hello" },
+      { service: "web", line: "world" },
+    ]);
+  });
+
+  it("rejects a non-finite or negative sinceMs before spawning anything", async () => {
+    const tmp = tmpAnchor();
+    const worktreeId = "login";
+    const stem = idFor(tmp.worktreeRoot, worktreeId);
+    touchSocket(tmp.anchor, stem);
+    writeDerivedConfig(tmp.anchor, stem, ["web"]);
+
+    for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, -5_000]) {
+      const invocations: LogsInvocation[] = [];
+      const deps = logsDeps({
+        anchor: tmp.anchor,
+        worktreeRoot: tmp.worktreeRoot,
+        worktreeId,
+        invocations,
+        linesPerService: { web: ["a"] },
+      });
+      await expect(runLogs(deps, { service: "web", sinceMs: bad })).rejects.toThrow(/since/);
+      expect(invocations).toHaveLength(0);
+    }
   });
 });
 
