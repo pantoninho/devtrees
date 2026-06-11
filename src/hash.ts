@@ -13,6 +13,25 @@
 import { createHash } from "node:crypto";
 import type { ResolvedService, ResolvedStack } from "./stack.js";
 
+/**
+ * Recursively sort object keys so the JSON form of an opaque passthrough
+ * block is independent of authoring/insertion order — semantically identical
+ * blocks must not register as drift (#86). Arrays keep their order (it is
+ * meaningful, e.g. an exec command's argv); scalars pass through.
+ */
+function canonicalValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalValue);
+  if (value !== null && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return Object.fromEntries(
+      Object.keys(record)
+        .sort()
+        .map((key) => [key, canonicalValue(record[key])]),
+    );
+  }
+  return value;
+}
+
 function canonicalService(s: ResolvedService): unknown {
   return {
     name: s.name,
@@ -21,6 +40,11 @@ function canonicalService(s: ResolvedService): unknown {
     ports: [...s.ports],
     dependsOn: [...s.dependsOn],
     environment: [...s.environment],
+    // Opaque passthrough blocks flow into the derived config, so an edit to
+    // any of them must register as drift (#86). Absent blocks hash as null.
+    readinessProbe: canonicalValue(s.readinessProbe ?? null),
+    livenessProbe: canonicalValue(s.livenessProbe ?? null),
+    availability: canonicalValue(s.availability ?? null),
   };
 }
 

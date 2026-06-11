@@ -52,6 +52,80 @@ describe("stackHash", () => {
     const h = stackHash({ services: [svc("web", "node x.js")] });
     expect(h).toMatch(/^[0-9a-f]{64}$/);
   });
+
+  describe("passthrough blocks (#86)", () => {
+    it("changes when a readiness_probe is edited", () => {
+      const a: ResolvedStack = {
+        services: [
+          { ...svc("web", "node x.js"), readinessProbe: { http_get: { path: "/health" } } },
+        ],
+      };
+      const b: ResolvedStack = {
+        services: [
+          { ...svc("web", "node x.js"), readinessProbe: { http_get: { path: "/ready" } } },
+        ],
+      };
+      expect(stackHash(a)).not.toBe(stackHash(b));
+    });
+
+    it("changes when a readiness_probe is added", () => {
+      const a: ResolvedStack = { services: [svc("web", "node x.js")] };
+      const b: ResolvedStack = {
+        services: [
+          { ...svc("web", "node x.js"), readinessProbe: { http_get: { path: "/health" } } },
+        ],
+      };
+      expect(stackHash(a)).not.toBe(stackHash(b));
+    });
+
+    it("changes when a liveness_probe is edited", () => {
+      const a: ResolvedStack = {
+        services: [{ ...svc("web", "node x.js"), livenessProbe: { exec: { command: "ok" } } }],
+      };
+      const b: ResolvedStack = {
+        services: [{ ...svc("web", "node x.js"), livenessProbe: { exec: { command: "nope" } } }],
+      };
+      expect(stackHash(a)).not.toBe(stackHash(b));
+    });
+
+    it("is insensitive to key ordering inside a block — unchanged configs must not drift", () => {
+      const a: ResolvedStack = {
+        services: [
+          {
+            ...svc("web", "node x.js"),
+            readinessProbe: {
+              http_get: { path: "/health", port: 8080 },
+              period_seconds: 5,
+              failure_threshold: 3,
+            },
+          },
+        ],
+      };
+      const b: ResolvedStack = {
+        services: [
+          {
+            ...svc("web", "node x.js"),
+            readinessProbe: {
+              failure_threshold: 3,
+              period_seconds: 5,
+              http_get: { port: 8080, path: "/health" },
+            },
+          },
+        ],
+      };
+      expect(stackHash(a)).toBe(stackHash(b));
+    });
+
+    it("changes when availability is edited", () => {
+      const a: ResolvedStack = {
+        services: [{ ...svc("web", "node x.js"), availability: { restart: "on_failure" } }],
+      };
+      const b: ResolvedStack = {
+        services: [{ ...svc("web", "node x.js"), availability: { restart: "always" } }],
+      };
+      expect(stackHash(a)).not.toBe(stackHash(b));
+    });
+  });
 });
 
 describe("sharedStackHash (#83)", () => {
@@ -103,5 +177,25 @@ describe("sharedStackHash (#83)", () => {
 
   it("is hex-encoded SHA-256 (64 chars)", () => {
     expect(sharedStackHash({ services: [pg] })).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("changes when a shared service's readiness_probe is edited (#86)", () => {
+    const a: ResolvedStack = {
+      services: [{ ...pg, readinessProbe: { exec: { command: "pg_isready" } } }],
+    };
+    const b: ResolvedStack = {
+      services: [{ ...pg, readinessProbe: { exec: { command: "pg_isready -q" } } }],
+    };
+    expect(sharedStackHash(a)).not.toBe(sharedStackHash(b));
+  });
+
+  it("ignores probe edits on isolated services (#86)", () => {
+    const a: ResolvedStack = {
+      services: [pg, { ...web, livenessProbe: { exec: { command: "ok" } } }],
+    };
+    const b: ResolvedStack = {
+      services: [pg, { ...web, livenessProbe: { exec: { command: "nope" } } }],
+    };
+    expect(sharedStackHash(a)).toBe(sharedStackHash(b));
   });
 });
