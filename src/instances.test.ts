@@ -302,9 +302,14 @@ describe("discoverInstances", () => {
     // the honest answer is "unknown" — empty ports, instance-level map intact.
     const anchor = tmpAnchor();
     writeRegistry(anchor, { login: 20000 });
-    writeDerivedConfig(anchor, "login", { web: { ports: [["WEB_PORT", 20000]] } }, {
-      metadata: false,
-    });
+    writeDerivedConfig(
+      anchor,
+      "login",
+      { web: { ports: [["WEB_PORT", 20000]] } },
+      {
+        metadata: false,
+      },
+    );
     await bindSocketServer(anchor, "login");
 
     const getServiceStatuses = async (): Promise<ServiceStatus[]> => [
