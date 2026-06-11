@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "vite-plus/test";
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,6 +14,13 @@ function newAnchor(): string {
   const dir = mkdtempSync(join(tmpdir(), "dt-reg-"));
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
   return dir;
+}
+
+/** Pid of a process that is guaranteed to be dead (spawned and already reaped). */
+function deadPid(): number {
+  const child = spawnSync(process.execPath, ["-e", ""]);
+  if (child.pid === undefined) throw new Error("could not spawn throwaway process");
+  return child.pid;
 }
 
 describe("registry store — lock + persistence", () => {
@@ -97,6 +105,29 @@ describe("registry store — lock + persistence", () => {
     expect(readRegistry(anchor)).toEqual({ login: 20512, billing: 20544 });
   });
 
+  it("steals a registry lock whose recorded holder pid is dead", async () => {
+    const anchor = newAnchor();
+    mkdirSync(join(anchor, "devtrees"), { recursive: true });
+    // Simulate a SIGKILLed holder: the lock file survives but its pid is gone.
+    writeFileSync(join(anchor, "devtrees", "registry.lock"), `${deadPid()}\n`, { flag: "wx" });
+
+    // Even with zero retries the stale lock must be stolen, not waited out.
+    await withRegistryLock(anchor, (s) => ({ ...s, login: 20512 }), { retries: 0 });
+    expect(readRegistry(anchor)).toEqual({ login: 20512 });
+    // The steal must not leak the lock either.
+    expect(existsSync(join(anchor, "devtrees", "registry.lock"))).toBe(false);
+  });
+
+  it("does not steal a lock whose content is not a parseable pid", async () => {
+    const anchor = newAnchor();
+    mkdirSync(join(anchor, "devtrees"), { recursive: true });
+    writeFileSync(join(anchor, "devtrees", "registry.lock"), "not-a-pid\n", { flag: "wx" });
+
+    await expect(withRegistryLock(anchor, (s) => s, { retries: 0 })).rejects.toThrow(
+      RegistryLockedError,
+    );
+  });
+
   it("releases the lock even when the callback throws", async () => {
     const anchor = newAnchor();
     await expect(
@@ -140,6 +171,23 @@ describe("withSharedLock — async lifecycle lock", () => {
     await expect(withSharedLock(anchor, async () => {}, { retries: 0 })).rejects.toThrow(
       RegistryLockedError,
     );
+  });
+
+  it("steals a shared lock whose recorded holder pid is dead", async () => {
+    const anchor = newAnchor();
+    mkdirSync(join(anchor, "devtrees"), { recursive: true });
+    writeFileSync(join(anchor, "devtrees", "shared.lock"), `${deadPid()}\n`, { flag: "wx" });
+
+    let ran = false;
+    await withSharedLock(
+      anchor,
+      async () => {
+        ran = true;
+      },
+      { retries: 0 },
+    );
+    expect(ran).toBe(true);
+    expect(existsSync(join(anchor, "devtrees", "shared.lock"))).toBe(false);
   });
 
   it("serialises overlapping callers — the second runs only after the first releases", async () => {

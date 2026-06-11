@@ -30,7 +30,8 @@ export class RegistryLockedError extends Error {
   constructor(lockPath: string) {
     super(
       `another devtrees process is holding the allocation registry lock at ${lockPath}. ` +
-        `If no devtrees command is running, the lock is stale — remove it and retry.`,
+        `Locks held by dead processes are reclaimed automatically, so the holder is ` +
+        `still alive — wait for it to finish (or, if it is stuck, kill it) and retry.`,
     );
     this.name = "RegistryLockedError";
   }
@@ -103,16 +104,56 @@ function tryWxCreate(path: string): AttemptResult {
   }
 }
 
+/** True when `pid` names a live process (EPERM counts as alive — it exists). */
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+/**
+ * Steal `path` if its recorded holder pid is dead (e.g. the holder was
+ * SIGKILLed before its `finally` release ran). Returns true when the lock was
+ * removed (or vanished concurrently) and a re-acquire attempt is worthwhile.
+ * Unparseable content is never stolen — we cannot prove the holder is gone.
+ *
+ * Racy by design: between reading the pid and unlinking, the dead holder's
+ * lock could be released-and-reacquired by a live process, in which case we
+ * would steal a live lock. The window is a few syscalls wide and only opens
+ * after a real crash left a stale lock behind; the alternative (bricking
+ * every subsequent `up` until a human deletes the file) is strictly worse.
+ */
+function stealIfStale(path: string): boolean {
+  let content: string;
+  try {
+    content = readFileSync(path, "utf8");
+  } catch (err) {
+    // Lock vanished between the failed create and this read — retry at once.
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return true;
+    throw err;
+  }
+  const pid = Number.parseInt(content.trim(), 10);
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (isPidAlive(pid)) return false;
+  releaseLockAt(path); // tolerates a concurrent stealer winning the unlink
+  return true;
+}
+
 /**
  * Acquire a lockfile by `wx`-creating it; throws RegistryLockedError on timeout.
  * Uses `setTimeout` between retries so other tasks (including the current
- * holder's `finally` release) can run.
+ * holder's `finally` release) can run. On contention, a lock whose recorded
+ * holder pid is dead is stolen immediately instead of being waited out.
  */
 async function acquireLockAtAsync(path: string, options: LockOptions): Promise<void> {
   const retries = options.retries ?? DEFAULT_RETRIES;
   const delay = options.retryDelayMs ?? DEFAULT_DELAY_MS;
   for (let attempt = 0; attempt <= retries; attempt++) {
     if (tryWxCreate(path) === "acquired") return;
+    if (stealIfStale(path) && tryWxCreate(path) === "acquired") return;
     if (attempt === retries) throw new RegistryLockedError(path);
     await new Promise<void>((resolve) => setTimeout(resolve, delay));
   }
