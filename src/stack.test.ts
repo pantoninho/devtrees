@@ -532,3 +532,60 @@ services:
     expect(() => parseStack(yaml)).not.toThrow();
   });
 });
+
+/**
+ * Issue #84: CONFIG_INVALID must be reachable. Every config-rejection path —
+ * cross-tier validation AND raw YAML parse failures — throws an error tagged
+ * `code: "CONFIG_INVALID"`, so `classifyError` (src/output.ts) maps it into
+ * the documented `--json` envelope instead of `UNKNOWN`.
+ */
+describe("stack model — CONFIG_INVALID error code (issue #84)", () => {
+  function codeOf(fn: () => unknown): unknown {
+    try {
+      fn();
+    } catch (err) {
+      return (err as { code?: unknown }).code;
+    }
+    throw new Error("expected the callback to throw");
+  }
+
+  it("tags the cross-tier validation error with code CONFIG_INVALID", () => {
+    const yaml = `
+services:
+  postgres:
+    tier: shared
+    command: "postgres"
+    depends_on: [web]
+  web:
+    tier: isolated
+    command: "node server.js"
+`;
+    expect(codeOf(() => parseStack(yaml))).toBe("CONFIG_INVALID");
+  });
+
+  it("tags a YAML parse failure with code CONFIG_INVALID and a message naming the parse error", () => {
+    // Flow-sequence left unclosed — the yaml package raises YAMLParseError.
+    const malformed = "services: [unclosed";
+    expect(codeOf(() => parseStack(malformed))).toBe("CONFIG_INVALID");
+    try {
+      parseStack(malformed);
+    } catch (err) {
+      // The wrapped message must keep the underlying parser diagnostic so the
+      // human/agent can locate the syntax error.
+      expect((err as Error).message).toMatch(/devtrees\.yaml/i);
+      expect((err as Error).message.length).toBeGreaterThan("CONFIG_INVALID".length);
+    }
+  });
+
+  it("tags a parse failure in the extends base file with code CONFIG_INVALID", () => {
+    const yaml = "services: {}";
+    const badBase = "processes: [unclosed";
+    expect(codeOf(() => parseStack(yaml, { baseYaml: badBase }))).toBe("CONFIG_INVALID");
+  });
+
+  it("loadStack: a malformed devtrees.yaml on disk throws code CONFIG_INVALID", () => {
+    const dir = makeDir();
+    writeFileSync(join(dir, "devtrees.yaml"), "services:\n  web: [::bad\n");
+    expect(codeOf(() => loadStack(dir))).toBe("CONFIG_INVALID");
+  });
+});
