@@ -2,7 +2,6 @@ import { describe, expect, it } from "vite-plus/test";
 import { EventEmitter } from "node:events";
 import { Readable } from "node:stream";
 import {
-  HealthTimeoutError,
   createWaitForHealth,
   createWaitForSharedHealth,
   type ServiceStatusSource,
@@ -76,8 +75,11 @@ describe("health — createWaitForHealth (worktree instance gate)", () => {
       () => undefined,
       (e: unknown) => e,
     );
-    expect(err).toBeInstanceOf(HealthTimeoutError);
-    expect((err as HealthTimeoutError).code).toBe("HEALTH_TIMEOUT");
+    // The CLI's classifyError reads `code` by duck-typing (ADR-0005); assert
+    // the same surface instead of the module-private class identity.
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).name).toBe("HealthTimeoutError");
+    expect((err as Error & { code?: string }).code).toBe("HEALTH_TIMEOUT");
   });
 
   it("a zero-service wait returns immediately without touching the instance", async () => {
@@ -93,7 +95,7 @@ describe("health — createWaitForHealth (worktree instance gate)", () => {
     const wait = createWaitForHealth(source, { pollMs: 1 });
     await expect(
       wait({ socketPath: "/run/x.sock", serviceNames: ["web", "ghost"], timeoutMs: 10 }),
-    ).rejects.toBeInstanceOf(HealthTimeoutError);
+    ).rejects.toMatchObject({ code: "HEALTH_TIMEOUT" });
   });
 });
 

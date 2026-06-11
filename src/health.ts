@@ -52,10 +52,12 @@ export type WaitForHealth = (args: {
 
 /**
  * Throw on health-wait timeout; carries the `HEALTH_TIMEOUT` error code so the
- * CLI's error classifier routes it to the documented `--json` envelope without
- * pattern-matching on the message.
+ * CLI's error classifier (`classifyError` in output.ts) routes it to the
+ * documented `--json` envelope without pattern-matching on the message. The
+ * classifier reads `code` by duck-typing, so the class stays module-private —
+ * callers branch on `err.code`/`err.name`, never on the class identity.
  */
-export class HealthTimeoutError extends Error {
+class HealthTimeoutError extends Error {
   readonly code = "HEALTH_TIMEOUT" as const;
   constructor(message: string) {
     super(message);
