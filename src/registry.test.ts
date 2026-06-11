@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { RegistryLockedError, readRegistry, withRegistryLock, withSharedLock } from "./registry.js";
+import { readRegistry, withRegistryLock, withSharedLock } from "./registry.js";
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
@@ -91,7 +91,7 @@ describe("registry store — lock + persistence", () => {
     writeFileSync(join(anchor, "devtrees", "registry.lock"), `${process.pid}\n`, { flag: "wx" });
 
     await expect(withRegistryLock(anchor, (s) => s, { retries: 0 })).rejects.toThrow(
-      RegistryLockedError,
+      /holding the allocation registry lock/,
     );
   });
 
@@ -99,14 +99,21 @@ describe("registry store — lock + persistence", () => {
     // The CLI's classifyError (src/output.ts) maps a `.code`-tagged error
     // into the documented --json envelope; without the tag a contended lock
     // would classify as UNKNOWN and an agent couldn't tell "retry later"
-    // apart from a real failure.
+    // apart from a real failure. The error class itself is internal (like
+    // the other tagged errors) — the code IS the contract, so that's what
+    // we assert on.
     const anchor = newAnchor();
     mkdirSync(join(anchor, "devtrees"), { recursive: true });
     writeFileSync(join(anchor, "devtrees", "registry.lock"), `${process.pid}\n`, { flag: "wx" });
 
-    await expect(withRegistryLock(anchor, (s) => s, { retries: 0 })).rejects.toMatchObject({
-      code: "LOCK_CONTENTION",
-    });
+    const err = await withRegistryLock(anchor, (s) => s, { retries: 0 }).then(
+      () => {
+        throw new Error("expected withRegistryLock to reject");
+      },
+      (e: unknown) => e as Error & { code?: string },
+    );
+    expect(err.name).toBe("RegistryLockedError");
+    expect(err.code).toBe("LOCK_CONTENTION");
   });
 
   it("serializes concurrent withRegistryLock calls so neither loses an update (lock holds)", async () => {
@@ -183,7 +190,7 @@ describe("withSharedLock — async lifecycle lock", () => {
     mkdirSync(join(anchor, "devtrees"), { recursive: true });
     writeFileSync(join(anchor, "devtrees", "shared.lock"), `${process.pid}\n`, { flag: "wx" });
     await expect(withSharedLock(anchor, async () => {}, { retries: 0 })).rejects.toThrow(
-      RegistryLockedError,
+      /holding the allocation registry lock/,
     );
   });
 

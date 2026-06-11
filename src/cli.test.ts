@@ -1,10 +1,10 @@
-import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { execute, isEntrypoint, run } from "./cli.js";
-import { RegistryLockedError } from "./registry.js";
+import { withRegistryLock } from "./registry.js";
 import { parseStack } from "./stack.js";
 
 async function* fromArray<T>(items: ReadonlyArray<T>): AsyncIterable<T> {
@@ -918,9 +918,9 @@ describe("devtrees CLI — up non-interactive (#28)", () => {
 /**
  * Issue #84: CONFIG_INVALID and LOCK_CONTENTION must be reachable envelopes.
  * Both tests throw the REAL error objects the core raises (the actual
- * `parseStack` rejection and a real `RegistryLockedError`) — not fabricated
- * `{code}` stand-ins — so they pin the whole chain: throw site tag →
- * `classifyError` → `--json` envelope.
+ * `parseStack` rejection and an actually-contended `withRegistryLock`) — not
+ * fabricated `{code}` stand-ins — so they pin the whole chain: throw site
+ * tag → `classifyError` → `--json` envelope.
  */
 describe("devtrees CLI — CONFIG_INVALID / LOCK_CONTENTION envelopes (#84)", () => {
   /** Capture the real error `parseStack` raises for a malformed devtrees.yaml. */
@@ -931,6 +931,21 @@ describe("devtrees CLI — CONFIG_INVALID / LOCK_CONTENTION envelopes (#84)", ()
       return err as Error;
     }
     throw new Error("expected parseStack to reject the fixture");
+  }
+
+  /** Capture the real error a contended registry lock raises. */
+  async function realRegistryLockedError(): Promise<Error> {
+    const anchor = mkdtempSync(join(tmpdir(), "dt-cli-lock-"));
+    try {
+      mkdirSync(join(anchor, "devtrees"), { recursive: true });
+      writeFileSync(join(anchor, "devtrees", "registry.lock"), `${process.pid}\n`, { flag: "wx" });
+      await withRegistryLock(anchor, (s) => s, { retries: 0 });
+    } catch (err) {
+      return err as Error;
+    } finally {
+      rmSync(anchor, { recursive: true, force: true });
+    }
+    throw new Error("expected withRegistryLock to reject");
   }
 
   it("`up --json` with a malformed devtrees.yaml (parse error) → code:CONFIG_INVALID", async () => {
@@ -963,8 +978,7 @@ describe("devtrees CLI — CONFIG_INVALID / LOCK_CONTENTION envelopes (#84)", ()
   });
 
   it("`up --json` with a contended registry lock → code:LOCK_CONTENTION", async () => {
-    const err = new RegistryLockedError("/anchor/devtrees/registry.lock");
-    const up = vi.fn().mockRejectedValue(err);
+    const up = vi.fn().mockRejectedValue(await realRegistryLockedError());
     const result = await execute(["up", "--json"], { up, down: vi.fn() });
     expect(result.code).not.toBe(0);
     const parsed = JSON.parse(result.stdout) as { error: { code: string; message: string } };
