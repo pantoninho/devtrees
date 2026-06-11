@@ -28,7 +28,16 @@
  */
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vite-plus/test";
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { deriveWorktreeId } from "./anchor.js";
@@ -418,5 +427,62 @@ describe("built CLI e2e — argv→commands wiring over the stub process-compose
       expect(doc.error?.code, label).toBe("INVALID_ARGS");
       expect(doc.error?.message, label).toContain(c.needle);
     }
+  }, 30_000);
+
+  it("init --agents creates AGENTS.md, then re-runs idempotently through dist/cli.mjs (#118)", () => {
+    const dir = mkdtempSync(join(SHORT_TMP, "dt-bc5-"));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    // The spawned CLI resolves `process.cwd()`, which is the realpath — on
+    // macOS `/tmp` is a symlink to `/private/tmp`, so the envelope's `path`
+    // reflects the resolved location, not the raw mkdtemp path.
+    const realDir = realpathSync(dir);
+
+    // First run: neither file exists → AGENTS.md is created.
+    const created = devtrees(dir, ["init", "--agents", "--json"]);
+    expect(created.code, `init failed: ${created.stderr}`).toBe(0);
+    expect(created.doc).toEqual({
+      schema_version: "1",
+      init: { target: "AGENTS.md", path: join(realDir, "AGENTS.md"), action: "created" },
+    });
+    const firstBody = readFileSync(join(dir, "AGENTS.md"), "utf8");
+    expect(firstBody).toContain("<!-- devtrees:start -->");
+    expect(firstBody).toContain("<!-- devtrees:end -->");
+    expect(firstBody).toContain("## Running the stack with devtrees");
+    expect(existsSync(join(dir, "CLAUDE.md"))).toBe(false);
+
+    // Second run: AGENTS.md now exists → updated in place, never duplicated.
+    const updated = devtrees(dir, ["init", "--agents", "--json"]);
+    expect(updated.code, `re-init failed: ${updated.stderr}`).toBe(0);
+    expect((updated.doc as { init: { action: string } }).init.action).toBe("updated");
+    const secondBody = readFileSync(join(dir, "AGENTS.md"), "utf8");
+    expect(secondBody).toBe(firstBody);
+    expect(secondBody.split("<!-- devtrees:start -->").length - 1).toBe(1);
+  }, 30_000);
+
+  it("init --agents updates an existing CLAUDE.md when AGENTS.md is absent (#118)", () => {
+    const dir = mkdtempSync(join(SHORT_TMP, "dt-bc6-"));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    writeFileSync(join(dir, "CLAUDE.md"), "# House rules\n");
+
+    const r = devtrees(dir, ["init", "--agents", "--json"]);
+    expect(r.code, `init failed: ${r.stderr}`).toBe(0);
+    expect((r.doc as { init: { target: string; action: string } }).init).toMatchObject({
+      target: "CLAUDE.md",
+      action: "updated",
+    });
+    const body = readFileSync(join(dir, "CLAUDE.md"), "utf8");
+    expect(body.startsWith("# House rules\n")).toBe(true);
+    expect(body).toContain("## Running the stack with devtrees");
+    expect(existsSync(join(dir, "AGENTS.md"))).toBe(false);
+  }, 30_000);
+
+  it("init without --agents fails with the INVALID_ARGS envelope (#118)", () => {
+    const dir = mkdtempSync(join(SHORT_TMP, "dt-bc7-"));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    const r = devtrees(dir, ["init", "--json"]);
+    expect(r.code).toBe(1);
+    expect((r.doc as ErrorDoc).error?.code).toBe("INVALID_ARGS");
+    // No file was written on the failure path.
+    expect(existsSync(join(dir, "AGENTS.md"))).toBe(false);
   }, 30_000);
 });

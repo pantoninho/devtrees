@@ -699,7 +699,10 @@ void _typeCheck;
 
 describe("output formatter — formatInit (issue #118)", () => {
   it("human: names the file and action for a created file", () => {
-    const result = formatInit({ target: "AGENTS.md", path: "/p/AGENTS.md", action: "created" }, "human");
+    const result = formatInit(
+      { target: "AGENTS.md", path: "/p/AGENTS.md", action: "created" },
+      "human",
+    );
     expect(result.stdout).toBe(
       "devtrees init: created AGENTS.md with the agent onboarding block.\n",
     );
@@ -707,14 +710,20 @@ describe("output formatter — formatInit (issue #118)", () => {
   });
 
   it("human: distinguishes an updated file", () => {
-    const result = formatInit({ target: "CLAUDE.md", path: "/p/CLAUDE.md", action: "updated" }, "human");
+    const result = formatInit(
+      { target: "CLAUDE.md", path: "/p/CLAUDE.md", action: "updated" },
+      "human",
+    );
     expect(result.stdout).toBe(
       "devtrees init: updated CLAUDE.md with the agent onboarding block.\n",
     );
   });
 
   it("json: emits {schema_version, init:{target, path, action}}", () => {
-    const result = formatInit({ target: "AGENTS.md", path: "/p/AGENTS.md", action: "created" }, "json");
+    const result = formatInit(
+      { target: "AGENTS.md", path: "/p/AGENTS.md", action: "created" },
+      "json",
+    );
     expect(JSON.parse(result.stdout)).toEqual({
       schema_version: SCHEMA_VERSION,
       init: { target: "AGENTS.md", path: "/p/AGENTS.md", action: "created" },
