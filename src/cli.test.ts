@@ -644,7 +644,7 @@ describe("devtrees CLI — logs (#33)", () => {
       logs,
     });
     expect(logs).toHaveBeenCalledWith(
-      expect.objectContaining({ service: "web", follow: true, tail: 25, since: "5m" }),
+      expect.objectContaining({ service: "web", follow: true, tail: 25, sinceMs: 300_000 }),
     );
 
     const logsAll = vi.fn().mockResolvedValue({ services: ["web"], events: fromArray([]) });
@@ -795,6 +795,64 @@ describe("devtrees CLI — logs (#33)", () => {
       const result = await execute(["logs", "web", bad], { up: vi.fn(), down: vi.fn(), logs });
       expect(result.code).toBe(1);
       expect(result.stderr).toMatch(/--tail/);
+      expect(logs).not.toHaveBeenCalled();
+    }
+  });
+
+  it("coerces --since durations to milliseconds across all units (#88)", async () => {
+    const cases: ReadonlyArray<[string, number]> = [
+      ["500ms", 500],
+      ["30s", 30_000],
+      ["5m", 300_000],
+      ["1h", 3_600_000],
+      ["2d", 172_800_000],
+      ["1.5h", 5_400_000],
+    ];
+    for (const [raw, ms] of cases) {
+      const logs = vi.fn().mockResolvedValue({ services: ["web"], events: fromArray([]) });
+      const result = await execute(["logs", "web", `--since=${raw}`], {
+        up: vi.fn(),
+        down: vi.fn(),
+        logs,
+      });
+      expect(result.code).toBe(0);
+      expect(logs).toHaveBeenCalledWith(expect.objectContaining({ sinceMs: ms }));
+    }
+  });
+
+  it("rejects `--since=banana` with a validation error in human mode (exit 1, deps.logs untouched) (#88)", async () => {
+    const logs = vi.fn();
+    const result = await execute(["logs", "web", "--since=banana"], {
+      up: vi.fn(),
+      down: vi.fn(),
+      logs,
+    });
+    expect(result.code).toBe(1);
+    expect(result.stderr).toMatch(/--since/);
+    expect(result.stderr).toMatch(/banana/);
+    expect(logs).not.toHaveBeenCalled();
+  });
+
+  it("rejects `--since=banana` with an INVALID_ARGS envelope in JSON mode (#88)", async () => {
+    const logs = vi.fn();
+    const result = await execute(["logs", "web", "--since=banana", "--json"], {
+      up: vi.fn(),
+      down: vi.fn(),
+      logs,
+    });
+    expect(result.code).toBe(1);
+    const parsed = JSON.parse(result.stdout) as { error: { code: string; message: string } };
+    expect(parsed.error.code).toBe("INVALID_ARGS");
+    expect(parsed.error.message).toMatch(/--since/);
+    expect(logs).not.toHaveBeenCalled();
+  });
+
+  it("rejects unitless, unit-only, negative, and spaced --since values (#88)", async () => {
+    for (const bad of ["--since=5", "--since=m", "--since=-5m", "--since=5 m", "--since=5x"]) {
+      const logs = vi.fn();
+      const result = await execute(["logs", "web", bad], { up: vi.fn(), down: vi.fn(), logs });
+      expect(result.code).toBe(1);
+      expect(result.stderr).toMatch(/--since/);
       expect(logs).not.toHaveBeenCalled();
     }
   });

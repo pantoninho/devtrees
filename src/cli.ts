@@ -135,7 +135,8 @@ export interface LogsCliOptions {
   readonly shared: boolean;
   readonly follow: boolean;
   readonly tail?: number;
-  readonly since?: string;
+  /** `--since` window, already coerced from a duration string (e.g. `5m`) to ms. */
+  readonly sinceMs?: number;
 }
 
 // --- error-code footers for per-command --help -----------------------------
@@ -431,6 +432,7 @@ class LogsCommand extends DevtreesCommand {
       ["Tail one service", "devtrees logs web"],
       ["Tail every service, interleaved", "devtrees logs --all"],
       ["Stream as NDJSON", "devtrees logs web --json"],
+      ["Follow, keeping only the last 5 minutes of events", "devtrees logs web -f --since 5m"],
     ],
   });
 
@@ -446,7 +448,9 @@ class LogsCommand extends DevtreesCommand {
     description: "Print the last N lines before following.",
   });
   since = Option.String("--since", {
-    description: "Start from a duration ago (e.g. `5m`, `1h`).",
+    description:
+      "Only show events newer than a duration ago (e.g. `30s`, `5m`, `1h`; units: ms, s, m, h, d). " +
+      "Filters client-side on event timestamps, so it is most useful with --follow.",
   });
 
   override async execute(): Promise<number> {
@@ -458,7 +462,7 @@ class LogsCommand extends DevtreesCommand {
         shared: this.shared,
         follow: this.follow,
         ...(this.tail !== undefined ? { tail: parseTailCount(this.tail) } : {}),
-        ...(this.since !== undefined ? { since: this.since } : {}),
+        ...(this.since !== undefined ? { sinceMs: parseSinceDurationMs(this.since) } : {}),
       };
       if (!opts.all && opts.service === undefined) {
         // Thrown (not hand-written to stderr) so `dispatch` routes it through
@@ -503,6 +507,37 @@ function parseTailCount(raw: string): number {
     throw invalidArgsError(`--tail expects a non-negative integer of lines, got '${raw}'.`);
   }
   return n;
+}
+
+/**
+ * Unit multipliers for `--since` durations. Spelled-out map (not regex
+ * arithmetic) so the accepted vocabulary is greppable next to the parser.
+ */
+const SINCE_UNIT_MS: Record<string, number> = {
+  ms: 1,
+  s: 1_000,
+  m: 60_000,
+  h: 3_600_000,
+  d: 86_400_000,
+};
+
+/**
+ * Coerce a `--since` argument value (`<number><unit>`, e.g. `30s`, `5m`,
+ * `1.5h`) into milliseconds, or throw the documented `INVALID_ARGS` error.
+ * The unit is mandatory — a bare number is ambiguous — and the value must be
+ * non-negative with no whitespace, mirroring the strictness of `parseTailCount`
+ * above (#88).
+ */
+function parseSinceDurationMs(raw: string): number {
+  const match = /^(\d+(?:\.\d+)?)(ms|s|m|h|d)$/.exec(raw);
+  const unitMs = match === null ? undefined : SINCE_UNIT_MS[match[2] ?? ""];
+  if (match === null || unitMs === undefined) {
+    throw invalidArgsError(
+      `--since expects a duration like '30s', '5m', or '1h' ` +
+        `(a number followed by ms, s, m, h, or d), got '${raw}'.`,
+    );
+  }
+  return Math.round(Number(match[1]) * unitMs);
 }
 
 /**
@@ -737,7 +772,7 @@ if (isEntrypoint(import.meta.url, process.argv[1])) {
           shared: opts.shared,
           follow: opts.follow,
           tail: opts.tail,
-          since: opts.since,
+          sinceMs: opts.sinceMs,
         },
       ),
   };

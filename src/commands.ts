@@ -1508,7 +1508,8 @@ export async function runEnv(deps: CommandDeps = {}): Promise<EnvResult> {
  * Options governing a `devtrees logs` call. The single-service form passes
  * `service`; `--all` (interleave every service in the instance) sets `all`.
  * `--shared` flips socket selection from the worktree instance to the shared
- * one. `follow`, `tail`, and `since` thread straight through to the driver.
+ * one. `follow` and `tail` thread straight through to the driver; `sinceMs`
+ * is applied as a client-side filter on the merged event stream (issue #88).
  */
 export interface LogsOptions {
   /** Name of one service to stream. Mutually exclusive with `all`. */
@@ -1522,12 +1523,14 @@ export interface LogsOptions {
   /** Start from the last N lines. */
   readonly tail?: number;
   /**
-   * Start from the given duration ago (e.g. "5m"). Currently accepted but not
-   * passed through to process-compose — its `process logs` CLI does not yet
-   * expose a `--since` flag, so the option is recorded for forward compatibility
-   * and surfaced in the driver's `LogEvent` ts (the agent can filter client-side).
+   * Only emit events from the last `sinceMs` milliseconds. process-compose's
+   * `process logs` CLI exposes no `--since` flag, so this is a client-side
+   * filter on the driver's `LogEvent.ts` (stamped when each line is read):
+   * the cutoff is computed once when `runLogs` is called and older events are
+   * dropped. Most useful with `follow`, where the stream spans real time.
+   * Must be a finite, non-negative number of milliseconds.
    */
-  readonly since?: string;
+  readonly sinceMs?: number;
 }
 
 export interface LogsResult {
@@ -1556,6 +1559,13 @@ export async function runLogs(
   deps: CommandDeps = {},
   options: LogsOptions = {},
 ): Promise<LogsResult> {
+  if (options.sinceMs !== undefined && (!Number.isFinite(options.sinceMs) || options.sinceMs < 0)) {
+    throw new Error(
+      `devtrees logs: sinceMs must be a finite, non-negative number of milliseconds, ` +
+        `got ${String(options.sinceMs)}.`,
+    );
+  }
+
   const { anchor } = resolve(deps);
   const paths = options.shared
     ? sharedInstancePaths(anchor.anchor)
@@ -1593,7 +1603,29 @@ export async function runLogs(
     return driver.streamLogs(paths.socketPath, driverOpts);
   });
 
-  return { services, events: mergeAsyncIterables(streams) };
+  const merged = mergeAsyncIterables(streams);
+  const events =
+    options.sinceMs !== undefined
+      ? filterLogEventsSince(merged, Date.now() - options.sinceMs)
+      : merged;
+
+  return { services, events };
+}
+
+/**
+ * Drop log events whose `ts` is strictly older than `cutoffMs` (epoch ms).
+ * Client-side stand-in for a `--since` flag process-compose does not offer
+ * (issue #88). Events whose `ts` fails to parse are kept — a malformed
+ * timestamp must never silently swallow a log line.
+ */
+export async function* filterLogEventsSince(
+  events: AsyncIterable<LogEvent>,
+  cutoffMs: number,
+): AsyncIterable<LogEvent> {
+  for await (const event of events) {
+    const ts = Date.parse(event.ts);
+    if (Number.isNaN(ts) || ts >= cutoffMs) yield event;
+  }
 }
 
 /**
