@@ -239,12 +239,15 @@ describe("built CLI e2e — argv→commands wiring over the stub process-compose
     // down --json: documented operation-output-only envelope; socket reaped.
     const down = devtrees(wt, ["down", "--json"]);
     expect(down.code, `down failed: ${down.stderr}`).toBe(0);
-    expect(down.doc).toEqual({ schema_version: "1", down: { worktreeId: id } });
+    expect(down.doc).toEqual({ schema_version: "1", down: { worktreeId: id, stopped: true } });
     expect(existsSync(sock)).toBe(false);
 
     const downShared = devtrees(wt, ["down", "--shared", "--json"]);
     expect(downShared.code, `down --shared failed: ${downShared.stderr}`).toBe(0);
-    expect(downShared.doc).toEqual({ schema_version: "1", down: { shared: true } });
+    expect(downShared.doc).toEqual({
+      schema_version: "1",
+      down: { shared: true, stopped: true },
+    });
   }, 60_000);
 
   it("--wait-timeout reaches the health gate: never-ready stub times out at 1s, not 120s", () => {
