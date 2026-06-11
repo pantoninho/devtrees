@@ -99,7 +99,9 @@ describe("registry store — integration", () => {
     });
     await new Promise<void>((resolve, reject) => {
       seed.on("error", reject);
-      seed.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`seed exited ${code}`))));
+      seed.on("exit", (code) =>
+        code === 0 ? resolve() : reject(new Error(`seed exited ${code}`)),
+      );
     });
 
     // Writer child rewrites the whole snapshot ITERATIONS times while we read

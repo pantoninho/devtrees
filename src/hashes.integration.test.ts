@@ -60,7 +60,12 @@ for (let i = 0; i < batch; i++) {
 }
 `;
 
-function runWorker(workerPath: string, anchor: string, prefix: string, batch: number): Promise<void> {
+function runWorker(
+  workerPath: string,
+  anchor: string,
+  prefix: string,
+  batch: number,
+): Promise<void> {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [workerPath, anchor, prefix, String(batch)], {
       stdio: "inherit",
