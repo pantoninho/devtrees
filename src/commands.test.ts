@@ -543,6 +543,61 @@ describe("runUp — shared tier lazy start", () => {
   });
 });
 
+/**
+ * Issue #92 — a shared instance that dies before binding its control socket
+ * must surface as a failure envelope from `up`, not `shared_started: true`.
+ * The socket-wait used to return silently on deadline, so a process that
+ * crashed instantly after spawn looked like a successful lazy-start.
+ */
+describe("runUp — shared instance dies before binding its socket (#92)", () => {
+  const mixedStack: ResolvedStack = {
+    services: [
+      isolated("web", "node server.js", ["WEB_PORT"]),
+      shared("postgres", "postgres", ["DB_PORT"]),
+    ],
+  };
+
+  it("throws SHARED_START_FAILED when the shared socket never appears", async () => {
+    // touchSocket: false — the spawn returns but no socket is ever bound,
+    // exactly what an instantly-dying shared instance looks like from here.
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const deps: CommandDeps = {
+      ...stubDeps({ stack: mixedStack, track }),
+      sharedSocketTimeoutMs: 50,
+    };
+    const err = await runUp(deps).then(
+      () => undefined,
+      (e: unknown) => e as Error & { code?: string },
+    );
+    if (err === undefined) throw new Error("expected runUp to reject");
+    expect(err.code).toBe("SHARED_START_FAILED");
+    expect(err.message).toMatch(/shared/i);
+    // The worktree instance was never spawned — only the doomed shared up.
+    const worktreeSpawn = track.invocations.find((i) => !i.socketPath.endsWith("/shared.sock"));
+    expect(worktreeSpawn).toBeUndefined();
+  });
+
+  it("does not persist shared state when the start failed", async () => {
+    // The persisted name→port map is the running instance's identity (#83);
+    // a failed start must not record one, or the next `up` would inject
+    // numbers nothing ever bound.
+    const { sharedAnchor, wtRoot, registryRef } = multiWorktreeFixture("dt-sockfail-");
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const deps: CommandDeps = {
+      ...stubDeps({
+        stack: mixedStack,
+        anchorOverride: sharedAnchor,
+        worktreeRootOverride: wtRoot,
+        registryRef,
+        track,
+      }),
+      sharedSocketTimeoutMs: 50,
+    };
+    await expect(runUp(deps)).rejects.toThrow(/shared/i);
+    expect(readSharedState(sharedAnchor)).toBeUndefined();
+  });
+});
+
 describe("runUp — cross-tier wiring (ADR-0003)", () => {
   /** isolated `web` depends on shared `postgres` — the canonical cross-tier edge. */
   const crossTierStack: ResolvedStack = {
@@ -1352,6 +1407,104 @@ describe("runDown — operation-output result (#48)", () => {
     };
     await runDown(observed);
     expect(downCalls).toHaveLength(1);
+  });
+});
+
+/**
+ * Issue #92 — worktree `down` with nothing running is an idempotent no-op,
+ * matching the `--shared` branch: no unconditional driver call (which used to
+ * surface "process-compose down exited with code N" as UNKNOWN), exit 0, and
+ * a `stopped: false` field in the result so the CLI can render the notice.
+ */
+describe("runDown — idempotent no-op when nothing is running (#92)", () => {
+  const mixedStack: ResolvedStack = {
+    services: [
+      isolated("web", "node server.js", ["WEB_PORT"]),
+      shared("postgres", "postgres", ["DB_PORT"]),
+    ],
+  };
+
+  /** Wrap deps with a spawner that records `down` invocations. */
+  function recordingDownDeps(deps: CommandDeps): {
+    deps: CommandDeps;
+    downCalls: ReadonlyArray<string>[];
+  } {
+    const downCalls: ReadonlyArray<string>[] = [];
+    return {
+      downCalls,
+      deps: {
+        ...deps,
+        driver: {
+          exists: () => Promise.resolve(true),
+          spawner: (_b, args, _o): SpawnedProcess => {
+            if (args[0] === "down") downCalls.push(args);
+            return spawnedOk();
+          },
+        },
+      },
+    };
+  }
+
+  it("worktree down with no instance running skips the driver and returns stopped: false", async () => {
+    // No prior `up` — the worktree's control socket does not exist.
+    const { deps, downCalls } = recordingDownDeps(stubDeps({ stack: mixedStack }));
+    const result = await runDown(deps);
+    expect(downCalls).toHaveLength(0);
+    expect(result.shared).toBe(false);
+    expect(result.stopped).toBe(false);
+  });
+
+  it("worktree down against a live instance calls the driver and returns stopped: true", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const baseDeps = stubDeps({ stack: mixedStack, track });
+    await runUp(baseDeps);
+    const { deps, downCalls } = recordingDownDeps(baseDeps);
+    const result = await runDown(deps);
+    expect(downCalls).toHaveLength(1);
+    expect(result.stopped).toBe(true);
+    expect(result.worktreeId).toBe(baseDeps.expectedWorktreeId);
+  });
+
+  it("worktree down against a stale socket file (dead listener) is a no-op that unlinks the orphan", async () => {
+    // Mimic a SIGKILLed instance: the socket *file* survives in anchor state
+    // but no listener answers (#80). `down` must not shell out against the
+    // dead UDS — that's the raw "exited with code N" UNKNOWN the issue fixes.
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const baseDeps = stubDeps({
+      stack: mixedStack,
+      track,
+      probeSocket: async () => "stale" as const,
+    });
+    await runUp({ ...baseDeps, probeSocket: async () => "running" as const });
+    const worktreeSpawn = track.invocations.find((i) => !i.socketPath.endsWith("/shared.sock"));
+    if (worktreeSpawn === undefined) throw new Error("expected a worktree spawn");
+    expect(existsSync(worktreeSpawn.socketPath)).toBe(true);
+
+    const { deps, downCalls } = recordingDownDeps(baseDeps);
+    const result = await runDown(deps);
+    expect(downCalls).toHaveLength(0);
+    expect(result.stopped).toBe(false);
+    // The probe gate unlinked the orphaned socket file on the way through.
+    expect(existsSync(worktreeSpawn.socketPath)).toBe(false);
+  });
+
+  it("shared down reports stopped: true when it actually tore the instance down", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const baseDeps = stubDeps({ stack: mixedStack, track });
+    await runUp(baseDeps);
+    const { deps, downCalls } = recordingDownDeps(baseDeps);
+    const result = await runDown(deps, { shared: true });
+    expect(downCalls).toHaveLength(1);
+    expect(result.shared).toBe(true);
+    expect(result.stopped).toBe(true);
+  });
+
+  it("shared down no-op reports stopped: false", async () => {
+    const { deps, downCalls } = recordingDownDeps(stubDeps({ stack: mixedStack }));
+    const result = await runDown(deps, { shared: true });
+    expect(downCalls).toHaveLength(0);
+    expect(result.shared).toBe(true);
+    expect(result.stopped).toBe(false);
   });
 });
 
@@ -2843,6 +2996,83 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     expect(Object.values(hashes.raw)[0]?.[baseDeps.expectedWorktreeId]).toBe(storedAfterFirst);
   });
 
+  it("on failed reload, the on-disk derived config is restored to match the running instance (#92)", async () => {
+    // The drift path used to write the new config before attempting the
+    // reload; on failure the on-disk config no longer matched the running
+    // instance, so `ls` (which reads ports from the derived config) reported
+    // ports that were never bound.
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const hashes = hashStore();
+
+    const baseDeps = stubDeps({ stack: stackA, track });
+    const innerSpawner = baseDeps.driver?.spawner;
+    if (innerSpawner === undefined) throw new Error("expected stub spawner");
+
+    // Reload always exits 1 → reloadConfig reports failure.
+    const spawner = (binary: string, args: ReadonlyArray<string>, options: SpawnOptions) => {
+      if (args[0] === "project" && args[1] === "update") {
+        const emitter = new EventEmitter();
+        queueMicrotask(() => emitter.emit("exit", 1));
+        return emitter as unknown as SpawnedProcess;
+      }
+      return innerSpawner(binary, args, options);
+    };
+    const firstDeps: CommandDeps = {
+      ...baseDeps,
+      driver: { ...baseDeps.driver, spawner },
+      readStoredHash: hashes.read,
+      writeStoredHash: hashes.write,
+    };
+
+    await runUp(firstDeps);
+    const worktreeSpawn = track.invocations.find((i) => !i.socketPath.endsWith("/shared.sock"));
+    if (worktreeSpawn === undefined) throw new Error("expected a worktree spawn");
+    const configBefore = readFileSync(worktreeSpawn.configPath, "utf8");
+
+    const secondDeps: CommandDeps = { ...firstDeps, readStack: () => stackB };
+    await expect(runUp(secondDeps)).rejects.toThrow(/drift/i);
+
+    // The on-disk derived config still describes what the instance is
+    // actually running (stackA), byte-for-byte.
+    expect(readFileSync(worktreeSpawn.configPath, "utf8")).toBe(configBefore);
+    const parsed = parseYaml(readFileSync(worktreeSpawn.configPath, "utf8")) as {
+      processes: Record<string, { command: string }>;
+    };
+    expect(parsed.processes.web?.command).toBe("node a.js");
+  });
+
+  it("on successful reload, the new derived config is on disk (#92)", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const hashes = hashStore();
+
+    const baseDeps = stubDeps({ stack: stackA, track });
+    const innerSpawner = baseDeps.driver?.spawner;
+    if (innerSpawner === undefined) throw new Error("expected stub spawner");
+
+    const spawner = (binary: string, args: ReadonlyArray<string>, options: SpawnOptions) => {
+      if (args[0] === "project" && args[1] === "update") return spawnedOk();
+      return innerSpawner(binary, args, options);
+    };
+    const firstDeps: CommandDeps = {
+      ...baseDeps,
+      driver: { ...baseDeps.driver, spawner },
+      readStoredHash: hashes.read,
+      writeStoredHash: hashes.write,
+    };
+
+    await runUp(firstDeps);
+    const worktreeSpawn = track.invocations.find((i) => !i.socketPath.endsWith("/shared.sock"));
+    if (worktreeSpawn === undefined) throw new Error("expected a worktree spawn");
+
+    const secondDeps: CommandDeps = { ...firstDeps, readStack: () => stackB };
+    await runUp(secondDeps);
+
+    const parsed = parseYaml(readFileSync(worktreeSpawn.configPath, "utf8")) as {
+      processes: Record<string, { command: string }>;
+    };
+    expect(parsed.processes.web?.command).toBe("node b.js");
+  });
+
   it("noop path does NOT call driver.reloadConfig (no process-compose churn when the config matches)", async () => {
     const track: StubSpawn = { invocations: [], touchSocket: true };
     const hashes = hashStore();
@@ -3232,7 +3462,7 @@ describe("runDown — crash recovery: stale shared socket (#80)", () => {
     const result = await runDown(deps, { shared: true });
 
     // Idempotent no-op result, no `process-compose down` against the dead UDS.
-    expect(result).toEqual({ shared: true });
+    expect(result).toEqual({ shared: true, stopped: false });
     expect(downSpawns).toHaveLength(0);
     // The orphaned socket file was unlinked, so the next up lazy-starts fresh.
     expect(existsSync(sharedPaths.socketPath)).toBe(false);
@@ -3261,7 +3491,7 @@ describe("runDown — crash recovery: stale shared socket (#80)", () => {
 
     const result = await runDown(deps, { shared: true });
 
-    expect(result).toEqual({ shared: true });
+    expect(result).toEqual({ shared: true, stopped: true });
     expect(downSpawns).toHaveLength(1);
   });
 });

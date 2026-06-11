@@ -118,6 +118,7 @@ describe("devtrees CLI", () => {
         "STALE_PORT_BLOCK",
         "CONFIG_DRIFT",
         "SHARED_DRIFT",
+        "SHARED_START_FAILED",
         "CONFIG_INVALID",
         "LOCK_CONTENTION",
         "HEALTH_TIMEOUT",
@@ -146,6 +147,7 @@ describe("devtrees CLI", () => {
     "HEALTH_TIMEOUT",
     "CONFIG_DRIFT",
     "SHARED_DRIFT",
+    "SHARED_START_FAILED",
     "STALE_PORT_BLOCK",
     "LOCK_CONTENTION",
     "CONFIG_INVALID",
@@ -1066,7 +1068,7 @@ describe("devtrees CLI — down/prune --json envelopes (#48)", () => {
       down: Record<string, unknown>;
     };
     expect(parsed.schema_version).toBeDefined();
-    expect(parsed.down).toEqual({ worktreeId: "login" });
+    expect(parsed.down).toEqual({ worktreeId: "login", stopped: true });
     expect(parsed.down).not.toHaveProperty("shared");
     expect(parsed.down).not.toHaveProperty("env");
     expect(parsed.down).not.toHaveProperty("services");
@@ -1080,11 +1082,27 @@ describe("devtrees CLI — down/prune --json envelopes (#48)", () => {
     const parsed = JSON.parse(result.stdout) as {
       down: Record<string, unknown>;
     };
-    expect(parsed.down).toEqual({ shared: true });
+    expect(parsed.down).toEqual({ shared: true, stopped: true });
     expect(parsed.down).not.toHaveProperty("worktreeId");
     expect(parsed.down).not.toHaveProperty("env");
     expect(parsed.down).not.toHaveProperty("services");
     expect(parsed.down).not.toHaveProperty("block_base");
+  });
+
+  it("`down --json` no-op (nothing running) exits 0 with stopped: false (#92)", async () => {
+    const down = vi.fn().mockResolvedValue({ worktreeId: "login", stopped: false });
+    const result = await execute(["down", "--json"], { up: vi.fn(), down });
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+    const parsed = JSON.parse(result.stdout) as { down: Record<string, unknown> };
+    expect(parsed.down).toEqual({ worktreeId: "login", stopped: false });
+  });
+
+  it("`down` no-op (nothing running) exits 0 with the idempotent human notice (#92)", async () => {
+    const down = vi.fn().mockResolvedValue({ worktreeId: "login", stopped: false });
+    const result = await execute(["down"], { up: vi.fn(), down });
+    expect(result.code).toBe(0);
+    expect(result.stdout).toBe("devtrees down: no worktree instance running; nothing to do.\n");
   });
 
   it("`down` without --json is byte-for-byte unchanged from today's text", async () => {

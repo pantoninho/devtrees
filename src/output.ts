@@ -32,6 +32,7 @@ export const ERROR_CODES = [
   "HEALTH_TIMEOUT",
   "CONFIG_DRIFT",
   "SHARED_DRIFT",
+  "SHARED_START_FAILED",
   "STALE_PORT_BLOCK",
   "LOCK_CONTENTION",
   "CONFIG_INVALID",
@@ -60,6 +61,7 @@ export const ERROR_CODE_DESCRIPTIONS: Readonly<Record<ErrorCode, string>> = {
   CONFIG_DRIFT: "Running config differs from devtrees.yaml and hot-reload failed.",
   SHARED_DRIFT:
     "This worktree's shared services diverge from the running shared instance; bring shared down and up again.",
+  SHARED_START_FAILED: "The lazy-started shared instance died before binding its control socket.",
   STALE_PORT_BLOCK:
     "Foreign listeners hold ports in this worktree's allocated block (likely orphans).",
   LOCK_CONTENTION: "Another devtrees process holds the allocation registry lock.",
@@ -314,32 +316,41 @@ export function formatUp(payload: UpPayload, mode: FormatMode): OutputResult {
  * `down`; the action envelope does not pre-bake either snapshot.
  */
 export type DownPayload =
-  | { readonly shared: true; readonly worktreeId?: undefined }
-  | { readonly shared?: false; readonly worktreeId: string };
+  | { readonly shared: true; readonly worktreeId?: undefined; readonly stopped?: boolean }
+  | { readonly shared?: false; readonly worktreeId: string; readonly stopped?: boolean };
 
 /**
  * Render `devtrees down` output.
  *
- *   - `human`: today's one-liner — `worktree instance stopped` or `shared
- *     instance stopped`. Unchanged by the issue-#48 envelope trim.
+ *   - `human`: one-liner — `worktree instance stopped` / `shared instance
+ *     stopped`, or — when `stopped: false` (issue #92, idempotent no-op) —
+ *     the "nothing to do" notice. Exit stays 0 either way; the no-op is not
+ *     an error (it matches the `--shared` branch's long-standing semantics).
  *   - `json`: an operation-output-only envelope (issue #48) — `{schema_version,
- *     down:{shared:true}}` for a shared teardown or `{schema_version,
- *     down:{worktreeId:"<id>"}}` for a worktree teardown. No env / services /
- *     block_base — that pre-teardown state belongs to `ls --json`, called
- *     before or after the action.
+ *     down:{shared:true, stopped}}` for a shared teardown or `{schema_version,
+ *     down:{worktreeId:"<id>", stopped}}` for a worktree teardown. `stopped`
+ *     (issue #92) is `false` when nothing was running and the call no-opped;
+ *     it defaults to `true` for older callers that don't thread it. No env /
+ *     services / block_base — that pre-teardown state belongs to `ls --json`,
+ *     called before or after the action.
  */
 export function formatDown(payload: DownPayload, mode: FormatMode): OutputResult {
   const shared = payload.shared === true;
+  const stopped = payload.stopped ?? true;
   if (mode === "json") {
     const down: Record<string, unknown> = shared
-      ? { shared: true }
-      : { worktreeId: payload.worktreeId };
+      ? { shared: true, stopped }
+      : { worktreeId: payload.worktreeId, stopped };
     const doc = { schema_version: SCHEMA_VERSION, down };
     return { stdout: `${JSON.stringify(doc)}\n`, stderr: "" };
   }
   const text = shared
-    ? "devtrees down: shared instance stopped.\n"
-    : "devtrees down: worktree instance stopped.\n";
+    ? stopped
+      ? "devtrees down: shared instance stopped.\n"
+      : "devtrees down: shared instance not running; nothing to do.\n"
+    : stopped
+      ? "devtrees down: worktree instance stopped.\n"
+      : "devtrees down: no worktree instance running; nothing to do.\n";
   return { stdout: text, stderr: "" };
 }
 

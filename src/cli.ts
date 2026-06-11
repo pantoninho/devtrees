@@ -109,7 +109,9 @@ export interface ExecuteDeps {
     blockBase?: number;
     services?: ReadonlyArray<LsServiceRow>;
   }>;
-  down: (options: { shared: boolean }) => Promise<{ worktreeId?: string } | void>;
+  down: (options: {
+    shared: boolean;
+  }) => Promise<{ worktreeId?: string; stopped?: boolean } | void>;
   generate?: () => Promise<{
     worktreeId: string;
     worktreeRoot: string;
@@ -243,6 +245,7 @@ class UpCommand extends DevtreesCommand {
       "STALE_PORT_BLOCK",
       "CONFIG_DRIFT",
       "SHARED_DRIFT",
+      "SHARED_START_FAILED",
       "CONFIG_INVALID",
       "LOCK_CONTENTION",
       "HEALTH_TIMEOUT",
@@ -313,9 +316,13 @@ class DownCommand extends DevtreesCommand {
       const result = (await this.context.deps.down({ shared: this.shared })) ?? {};
       // Issue #48: the action envelope carries exactly one of `shared: true`
       // or `worktreeId: "<id>"`. Empty string preserves the discriminated-
-      // union shape when the runner couldn't supply an id.
+      // union shape when the runner couldn't supply an id. `stopped` (#92)
+      // defaults to true so runner stubs that don't thread it keep today's
+      // "instance stopped" output; `runDown` reports `false` on the
+      // idempotent no-op and the formatter renders the notice.
+      const stopped = result.stopped ?? true;
       const out = formatDown(
-        this.shared ? { shared: true } : { worktreeId: result.worktreeId ?? "" },
+        this.shared ? { shared: true, stopped } : { worktreeId: result.worktreeId ?? "", stopped },
         this.mode,
       );
       if (out.stdout) this.context.stdout.write(out.stdout);

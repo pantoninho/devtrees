@@ -478,7 +478,10 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
 
     const downShared = devtrees(wt, ["down", "--shared", "--json"]);
     expect(downShared.code).toBe(0);
-    expect(downShared.doc).toEqual({ schema_version: "1", down: { shared: true } });
+    expect(downShared.doc).toEqual({
+      schema_version: "1",
+      down: { shared: true, stopped: true },
+    });
 
     const second = up(wt);
     expect(second.code).toBe(0);
@@ -532,6 +535,18 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
     const down = devtrees(wt, ["down", "--shared", "--json"]);
     expect(down.code).toBe(0);
     expect(down.doc).toEqual(readFixture("06-down-shared.json"));
+  }, 90_000);
+
+  it("scenario 6c: down --json with nothing running is an idempotent no-op (#92)", async () => {
+    // No `up` here — `down` on a clean repo used to surface the raw
+    // "process-compose down exited with code N" as UNKNOWN with exit 1.
+    const { wt } = setupScenario("dt-rpc6c-", { noDefaultCleanups: true });
+    const down = devtrees(wt, ["down", "--json"]);
+    expect(down.code).toBe(0);
+    expect(normaliseEnvelope(down.doc, wtId(wt))).toEqual({
+      schema_version: "1",
+      down: { worktreeId: "<WT>", stopped: false },
+    });
   }, 90_000);
 
   it("scenario 7: prune --json with no orphans returns an empty list", async () => {

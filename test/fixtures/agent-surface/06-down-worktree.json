@@ -1,6 +1,7 @@
 {
   "schema_version": "1",
   "down": {
-    "worktreeId": "<WT>"
+    "worktreeId": "<WT>",
+    "stopped": true
   }
 }

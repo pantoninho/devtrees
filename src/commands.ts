@@ -106,6 +106,28 @@ class SharedDriftError extends Error {
 }
 
 /**
+ * Thrown when the lazy-started shared instance dies before binding its
+ * control socket (issue #92): `driver.up` is fire-and-forget, so an instantly
+ * crashing process-compose (bad config, missing binary deps, port conflict at
+ * bind time) is only observable as the socket never appearing. The socket
+ * wait used to return silently on deadline, letting `up` report
+ * `shared_started: true` for an instance that was already dead; now the
+ * deadline surfaces as the `SHARED_START_FAILED` envelope (ADR-0005).
+ */
+class SharedStartFailedError extends Error {
+  readonly code = "SHARED_START_FAILED" as const;
+  readonly details: {
+    readonly socket_path: string;
+    readonly timeout_ms: number;
+  };
+  constructor(message: string, details: { socket_path: string; timeout_ms: number }) {
+    super(message);
+    this.name = "SharedStartFailedError";
+    this.details = details;
+  }
+}
+
+/**
  * Compare this worktree's shared subset against the persisted identity of
  * the running shared instance; throw `SharedDriftError` on mismatch. The
  * hash is order-insensitive (`sharedStackHash`), so pure reordering in
@@ -308,6 +330,14 @@ export interface CommandDeps {
   readonly waitForHealth?: WaitForHealth;
   /** Health-wait window for the worktree instance. Default: 120s. */
   readonly waitTimeoutMs?: number;
+  /**
+   * How long the shared lazy-start waits for the spawned instance to bind its
+   * control socket before failing with `SHARED_START_FAILED` (issue #92).
+   * Default: 3s — generous for a healthy process-compose, short enough that
+   * an instantly-dying one fails fast. Injected so tests don't sit out the
+   * full window.
+   */
+  readonly sharedSocketTimeoutMs?: number;
   /**
    * Read the per-service runtime state for the worktree instance after health
    * is reached, so `runUp` can publish `services[]` in the issue-#30 state
@@ -599,8 +629,9 @@ async function socketIsLive(
  *  - **Already up, drifted config** (socket present, stored hash differs):
  *    write the new derived config, call `driver.reloadConfig`. On success,
  *    update the stored hash and return the new envelope; on failure
- *    (`not_supported` or otherwise), throw `ConfigDriftError` (code
- *    `CONFIG_DRIFT`) and leave the instance running unchanged.
+ *    (`not_supported` or otherwise), restore the previous on-disk config
+ *    (issue #92) and throw `ConfigDriftError` (code `CONFIG_DRIFT`), leaving
+ *    the instance running unchanged.
  *
  * Pre-flight stale-port-block check (issue #58): when the worktree's
  * control socket is absent (first up — not the idempotent re-up path),
@@ -701,7 +732,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
       anchor.worktreeId,
       sharedPortFor,
       sharedLock,
-      { driver, probe: seams.probe },
+      { driver, probe: seams.probe, socketTimeoutMs: deps.sharedSocketTimeoutMs },
     );
     sharedStarted = ensured.started;
     if (ensured.ports !== undefined) {
@@ -994,6 +1025,8 @@ async function ensureSharedStarted(
   deps: {
     driver: ReturnType<typeof createDriver>;
     probe: (socketPath: string) => Promise<InstanceStatus>;
+    /** Socket-bind wait window for the lazy start (issue #92). Default: 3s. */
+    socketTimeoutMs?: number;
   },
 ): Promise<EnsuredShared> {
   return await sharedLock(anchor, async () => {
@@ -1020,8 +1053,11 @@ async function ensureSharedStarted(
     // UDS. Hold the shared lock until the socket is observable on disk so a
     // concurrent `up` from another worktree sees the lazy-start as complete and
     // doesn't race a second stub against ours (the loser's exit-time cleanup
-    // would unlink the winner's socket).
-    await waitForSocket(paths.socketPath);
+    // would unlink the winner's socket). Throws `SHARED_START_FAILED` on
+    // deadline (issue #92): a socket that never appears means the instance
+    // died before binding, and reporting `shared_started: true` for a corpse
+    // would leave the agent debugging healthy-looking output.
+    await waitForSocket(paths.socketPath, deps.socketTimeoutMs);
 
     // Make the running instance the source of truth: persist what it was
     // started with so every subsequent `up`/`env` — on any branch — injects
@@ -1032,13 +1068,25 @@ async function ensureSharedStarted(
   });
 }
 
-/** Poll until `socketPath` exists or the deadline lapses. */
+/**
+ * Poll until `socketPath` exists, or throw `SharedStartFailedError` when the
+ * deadline lapses (issue #92). Silently returning here used to let `up`
+ * report a shared instance that died before binding as `shared_started:
+ * true` — the failure must surface as an error envelope instead.
+ */
 async function waitForSocket(socketPath: string, timeoutMs = 3000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (existsSync(socketPath)) return;
     await new Promise((r) => setTimeout(r, 10));
   }
+  throw new SharedStartFailedError(
+    `devtrees up: the shared instance was spawned but did not bind its control socket ` +
+      `within ${timeoutMs}ms — it most likely crashed on startup. ` +
+      `Check the shared services' commands (e.g. run \`process-compose -f <shared config>\` by hand) ` +
+      `and retry \`devtrees up\`.`,
+    { socket_path: socketPath, timeout_ms: timeoutMs },
+  );
 }
 
 // A real port a service binds shows up in its command as `--port 3000` / `:3000` /
@@ -1112,8 +1160,8 @@ export function findUnmanagedPortBinds(
  * dropped it.
  */
 export type DownResult =
-  | { readonly shared: true; readonly worktreeId?: undefined }
-  | { readonly shared: false; readonly worktreeId: string };
+  | { readonly shared: true; readonly worktreeId?: undefined; readonly stopped: boolean }
+  | { readonly shared: false; readonly worktreeId: string; readonly stopped: boolean };
 
 /**
  * Stop this worktree's instance (default) or — with `{ shared: true }` — the
@@ -1149,17 +1197,19 @@ export async function runDown(
     const probe = resolveProbe(deps);
     const paths = sharedInstancePaths(anchor.anchor);
 
-    await sharedLock(anchor.anchor, async () => {
+    const stopped = await sharedLock(anchor.anchor, async () => {
       // Probe, don't trust the file (#80): after a SIGKILL the socket file
       // survives with no listener behind it, and `process-compose down`
       // against the dead UDS fails. A live instance is signalled through the
       // driver; a stale socket is unlinked by the probe gate itself, so
       // either way the call converges to "shared is down" — idempotently.
-      if (await socketIsLive(paths.socketPath, probe)) {
+      const live = await socketIsLive(paths.socketPath, probe);
+      if (live) {
         await driver.down({ configPath: paths.configPath, socketPath: paths.socketPath });
       }
       // Best-effort cleanup of the derived config — a future `up` re-derives it.
       rmSync(paths.configPath, { force: true });
+      return live;
     });
 
     // Keep the `__shared__` registry entry across the teardown (issue #51).
@@ -1169,13 +1219,22 @@ export async function runDown(
     // from socket presence (instances.ts), not the registry, so dropping the
     // entry was tidy theatre at the cost of port stability.
 
-    return { shared: true };
+    return { shared: true, stopped };
   }
 
+  // Worktree branch mirrors the shared branch's idempotency (issue #92): a
+  // `down` with nothing running used to shell out unconditionally and surface
+  // a raw "process-compose down exited with code N" as UNKNOWN. Probe first
+  // (#80 — a stale socket file is unlinked by the gate itself) and skip the
+  // driver when no live instance answers; the caller renders the no-op notice
+  // from `stopped: false` and still exits 0.
   const paths = instancePaths(anchor.anchor, anchor.worktreeId);
-  await driver.down({ configPath: paths.configPath, socketPath: paths.socketPath });
+  const live = await socketIsLive(paths.socketPath, resolveProbe(deps));
+  if (live) {
+    await driver.down({ configPath: paths.configPath, socketPath: paths.socketPath });
+  }
 
-  return { shared: false, worktreeId: anchor.worktreeId };
+  return { shared: false, worktreeId: anchor.worktreeId, stopped: live };
 }
 
 /** Inputs unique to `runLs` — same anchor resolution as the other commands. */
@@ -1633,8 +1692,10 @@ function readDerivedServices(configPath: string): string[] {
  *    a fresh `up` would (issue-#30 contract).
  *  - **Drift** -> write the new derived config and call `driver.reloadConfig`.
  *    On success, persist the new hash and return the new envelope; on any
- *    failure, throw `ConfigDriftError` so the CLI emits the `CONFIG_DRIFT`
- *    envelope and the instance keeps running (ADR-0005).
+ *    failure, restore the previous on-disk config (issue #92 — the file must
+ *    keep matching the still-running instance, `ls` reads ports from it) and
+ *    throw `ConfigDriftError` so the CLI emits the `CONFIG_DRIFT` envelope
+ *    and the instance keeps running (ADR-0005).
  */
 async function reconcileRunning(args: {
   readonly stack: ResolvedStack;
@@ -1664,10 +1725,21 @@ async function reconcileRunning(args: {
   const currentHash = stackHash(stack);
   const storedHash = args.readHash(anchor.anchor, anchor.worktreeId);
   if (storedHash !== currentHash) {
+    // The on-disk derived config must always describe the *running* instance
+    // (issue #92) — `ls` reads its ports from this file. `driver.reloadConfig`
+    // re-reads the config from disk, so the new one has to be written before
+    // the attempt; snapshot the old bytes first and restore them on failure
+    // so a failed reload never leaves the file describing config the instance
+    // is not running.
     mkdirSync(paths.runDir, { recursive: true });
+    const previousConfig = existsSync(paths.configPath)
+      ? readFileSync(paths.configPath, "utf8")
+      : undefined;
     writeFileSync(paths.configPath, stringifyYaml(derived.config), "utf8");
     const reload = await driver.reloadConfig(inst);
     if (!reload.ok) {
+      if (previousConfig === undefined) rmSync(paths.configPath, { force: true });
+      else writeFileSync(paths.configPath, previousConfig, "utf8");
       throw new ConfigDriftError(
         `devtrees up: config drift detected for '${anchor.worktreeId}' and the running ` +
           `process-compose could not hot-reload the new config` +
