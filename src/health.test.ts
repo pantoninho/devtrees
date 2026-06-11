@@ -99,10 +99,7 @@ describe("health — createWaitForHealth (worktree instance gate)", () => {
 
 describe("health — createWaitForSharedHealth (cross-tier gate)", () => {
   it("resolves once every shared service is healthy", async () => {
-    const source = sourceFromQueue([
-      [row("db", "Pending")],
-      [row("db", "Running")],
-    ]);
+    const source = sourceFromQueue([[row("db", "Pending")], [row("db", "Running")]]);
     const wait = createWaitForSharedHealth(source, { pollMs: 1 });
     await expect(
       wait({ anchor: "/a", socketPath: "/run/shared.sock", sharedServiceNames: ["db"] }),

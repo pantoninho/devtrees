@@ -88,10 +88,10 @@ function stubDriverDeps(worktree: string): {
     cwd: worktree,
     driver: { binary: process.execPath, prefixArgs: [STUB] },
     attach: false,
-    // The stub doesn't implement `process-compose process list`, so the real
-    // poll loop would hang. The wait-for-healthy contract itself is unit-
-    // tested in commands.test.ts (#28); e2e here only proves the up/down
-    // wiring against the stub binary.
+    // Skip the real poll loop for up/down-focused e2e tests — the
+    // wait-for-healthy contract is unit-tested in health.test.ts, and the
+    // default driver-backed wait is exercised against the stub in the #87
+    // e2e below.
     waitForHealth: () => Promise.resolve(),
     // The issue-#30 `up --json` envelope publishes per-service rows via the
     // driver's `getServiceStatuses` (same hook `ls --json` uses, issue #29).
@@ -186,6 +186,38 @@ describe("e2e smoke — up then down a single isolated service", () => {
     expect(existsSync(join(absCommon, "devtrees", `${up.worktreeId}.yaml`))).toBe(true);
 
     // Acceptance: down stops the worktree instance cleanly.
+    await runDown(deps as never);
+    expect(await waitForGone(port)).toBe(true);
+  }, 20000);
+});
+
+describe("e2e — default health wait goes through the injected driver (#87)", () => {
+  it("up with a custom driver binary passes the DEFAULT health wait", async () => {
+    const repo = makeRepo("dt-hw-", ["login"]);
+    cleanups.push(() => rmSync(repo.root, { recursive: true, force: true }));
+    const worktree = repo.worktrees.login;
+    if (worktree === undefined) throw new Error("expected login worktree");
+    writeStackConfig(worktree);
+
+    // Deliberately NO waitForHealth injection: the default poller must reach
+    // the instance through the driver's binary/prefixArgs (the stub), not
+    // whatever `process-compose` happens to be on PATH. Before #87 the
+    // default shelled out to the hardcoded name and spun to HEALTH_TIMEOUT
+    // against a perfectly healthy stack.
+    const deps = {
+      cwd: worktree,
+      driver: { binary: process.execPath, prefixArgs: [STUB] },
+      attach: false,
+      waitTimeoutMs: 8000,
+    };
+
+    const up = await runUp(deps as never);
+    cleanups.push(() => runDown(deps as never));
+
+    expect(up.worktreeId).toMatch(/^login-[0-9a-f]{8}$/);
+    const port = Number(up.env.WEB_PORT);
+    expect(await waitForHttp(port)).toBe(true);
+
     await runDown(deps as never);
     expect(await waitForGone(port)).toBe(true);
   }, 20000);
