@@ -44,12 +44,16 @@ const STUB = join(REPO_ROOT, "test", "stub-process-compose.mjs");
 const SHORT_TMP = process.platform === "darwin" ? "/tmp" : (process.env.RUNNER_TEMP ?? "/tmp");
 
 /**
- * Env var the PATH shim understands: when set to `1`, `process list` reports
- * an empty service set, so health waits can never converge. This is how the
- * `--wait-timeout` scenario distinguishes "the flag reached the poller"
- * (HEALTH_TIMEOUT after ~1s) from "the flag was dropped" (120s default).
+ * Env vars the stub `process-compose` understands (see
+ * `test/stub-process-compose.mjs`): `DEVTREES_STUB_NEVER_READY=1` pins every
+ * probed service to `Running` + `is_ready: "Not Ready"` — the
+ * Running-but-not-ready state issue #108's regression class lives in —
+ * and `DEVTREES_STUB_READY_AFTER_MS=<n>` flips probed services to Ready only
+ * once the instance is `n` ms old. Unprobed services always report
+ * `is_ready: "-"` (health `unknown`), like the real binary.
  */
 const NEVER_READY = "DEVTREES_STUB_NEVER_READY";
+const READY_AFTER_MS = "DEVTREES_STUB_READY_AFTER_MS";
 
 let shimDir = "";
 
@@ -64,10 +68,6 @@ beforeAll(() => {
     [
       "#!/bin/sh",
       `# devtrees test shim: the built CLI resolves \`process-compose\` from PATH.`,
-      `if [ "\${${NEVER_READY}:-}" = "1" ] && [ "$1" = "process" ] && [ "$2" = "list" ]; then`,
-      "  printf '[]'",
-      "  exit 0",
-      "fi",
       `exec "${process.execPath}" "${STUB}" "$@"`,
       "",
     ].join("\n"),
@@ -126,11 +126,18 @@ function devtrees(
 
 /**
  * Fresh tmp git repo with one `login` worktree carrying a two-tier stack
- * (shared `db` + isolated `web`, both long-running noops). Registers rm +
- * `down`/`down --shared` cleanups, and returns the derived worktree id and
- * control-socket path so scenarios can assert against runtime state on disk.
+ * (shared `db` + isolated `web`, both long-running noops). `web` declares a
+ * readiness probe by default — the agent-surface dogfooding shape issue #108
+ * regressed on — so health gating is exercised end-to-end; pass
+ * `webProbe: false` for a probe-free stack. Registers rm + `down`/`down
+ * --shared` cleanups, and returns the derived worktree id and control-socket
+ * path so scenarios can assert against runtime state on disk.
  */
-function setupScenario(prefix: string): { wt: string; id: string; sock: string } {
+function setupScenario(
+  prefix: string,
+  opts: { webProbe?: boolean } = {},
+): { wt: string; id: string; sock: string } {
+  const webProbe = opts.webProbe ?? true;
   const root = mkdtempSync(join(SHORT_TMP, prefix));
   const seed = join(root, "main");
   mkdirSync(seed, { recursive: true });
@@ -156,6 +163,14 @@ function setupScenario(prefix: string): { wt: string; id: string; sock: string }
       "    tier: isolated",
       '    command: "sleep 300"',
       "    ports: [WEB_PORT]",
+      ...(webProbe
+        ? [
+            "    readiness_probe:",
+            "      exec:",
+            '        command: "echo ok"',
+            "      period_seconds: 1",
+          ]
+        : []),
       "",
     ].join("\n"),
   );
@@ -176,6 +191,11 @@ interface UpDoc {
     readonly env: Record<string, string>;
     readonly shared_started: boolean;
     readonly block_base: number;
+    readonly services: Array<{
+      readonly name: string;
+      readonly status: string;
+      readonly health: string;
+    }>;
   };
 }
 
@@ -219,6 +239,11 @@ describe("built CLI e2e — argv→commands wiring over the stub process-compose
     expect(dbPort).toBeGreaterThan(0);
     // The instance is really up: its control socket exists on disk.
     expect(existsSync(sock)).toBe(true);
+    // #108 acceptance: the success envelope reports health:ready for the
+    // probed service — readiness was consulted, not just process state.
+    const webRow = upDoc.up.services.find((s) => s.name === "web");
+    expect(webRow?.status).toBe("Running");
+    expect(webRow?.health).toBe("ready");
 
     // ls --json sees the instance, with per-service health from the stub.
     const ls = devtrees(wt, ["ls", "--json"]);
@@ -254,9 +279,11 @@ describe("built CLI e2e — argv→commands wiring over the stub process-compose
     });
   }, 60_000);
 
-  it("--wait-timeout reaches the health gate: never-ready stub times out at 1s, not 120s", () => {
-    const { wt } = setupScenario("dt-bc2-");
+  it("--wait-timeout reaches the health gate: never-ready probed service times out at 1s, not 120s", () => {
+    const { wt, sock } = setupScenario("dt-bc2-");
 
+    // #108: the stub's probed `web` stays Running with is_ready "Not Ready" —
+    // the exact state the old status-only gate sailed straight through.
     const started = Date.now();
     const r = devtrees(wt, ["up", "--json", "--wait-timeout", "1"], {
       env: { [NEVER_READY]: "1" },
@@ -272,6 +299,45 @@ describe("built CLI e2e — argv→commands wiring over the stub process-compose
     // both assertions below would fail.
     expect(doc.error?.message).toContain("after 1000ms");
     expect(elapsed).toBeLessThan(30_000);
+    // ADR-0005 / #108 acceptance: the timeout leaves the instance running so
+    // the agent can inspect it — its control socket is still on disk.
+    expect(existsSync(sock)).toBe(true);
+  }, 90_000);
+
+  it("a probed service gates up until its probe passes (ready arrives late)", () => {
+    // #108 acceptance: fresh `up` must not exit before the probed service
+    // reports ready. The stub flips is_ready to "Ready" only once the
+    // instance is 1.5s old, so a gate that consulted readiness takes ≥1.5s
+    // while the regressed status-only gate returned on the first poll.
+    const { wt } = setupScenario("dt-bc5-");
+
+    const started = Date.now();
+    const r = devtrees(wt, ["up", "--json", "--wait-timeout", "30"], {
+      env: { [READY_AFTER_MS]: "1500" },
+      timeoutMs: 60_000,
+    });
+    const elapsed = Date.now() - started;
+
+    expect(r.code, `up failed: stderr=${r.stderr} stdout=${r.stdout}`).toBe(0);
+    expect(elapsed).toBeGreaterThanOrEqual(1400);
+    const webRow = (r.doc as UpDoc).up.services.find((s) => s.name === "web");
+    expect(webRow?.health).toBe("ready");
+  }, 90_000);
+
+  it("services without probes do not block up: health stays unknown, exit 0", () => {
+    // #108 acceptance: NEVER_READY only pins *probed* services; a probe-free
+    // stack keeps the Running/Completed semantics and must come up fine.
+    const { wt } = setupScenario("dt-bc6-", { webProbe: false });
+
+    const r = devtrees(wt, ["up", "--json", "--wait-timeout", "30"], {
+      env: { [NEVER_READY]: "1" },
+      timeoutMs: 60_000,
+    });
+
+    expect(r.code, `up failed: stderr=${r.stderr} stdout=${r.stdout}`).toBe(0);
+    const webRow = (r.doc as UpDoc).up.services.find((s) => s.name === "web");
+    expect(webRow?.status).toBe("Running");
+    expect(webRow?.health).toBe("unknown");
   }, 90_000);
 
   it("logs --tail N reaches the driver argv (stub trims to the last N lines)", () => {

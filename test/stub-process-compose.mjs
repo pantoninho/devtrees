@@ -29,7 +29,7 @@
  *     to exit, so callers observe a fully reaped state.
  */
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { dirname } from "node:path";
 import { parse as parseYaml } from "yaml";
@@ -189,19 +189,37 @@ if (cmd === "up") {
     // `process list -U -u <socket> -o json` — devtrees driver reads each
     // running instance's per-service runtime state from here. The stub
     // recovers the service set from the derived config the matching `up` call
-    // wrote to disk, alongside the pids file (under <socket>.config). Each
-    // service reports a stable Running/Ready pair so tests can assert against
-    // a deterministic snapshot.
+    // wrote to disk, alongside the pids file (under <socket>.config).
+    //
+    // Readiness mirrors the real binary's reporting (issue #108): a service's
+    // `status` stays "Running" regardless of probes; the probe verdict lives
+    // in the separate `is_ready` field. Services WITHOUT a `readiness_probe`
+    // report `is_ready: "-"` (the driver normalises that to health
+    // `unknown`). Services WITH one report "Ready", except:
+    //
+    //   DEVTREES_STUB_NEVER_READY=1     probed services stay "Not Ready"
+    //                                   forever — the Running-but-not-ready
+    //                                   state the #108 regression class
+    //                                   slipped through.
+    //   DEVTREES_STUB_READY_AFTER_MS=n  probed services report "Not Ready"
+    //                                   until the instance is n ms old (aged
+    //                                   off the `<socket>.config` mtime), then
+    //                                   "Ready" — a converging probe.
     const cfgPath = `${socketPath}.config`;
     if (!existsSync(cfgPath)) {
       process.stderr.write(`stub-process-compose: no instance at ${socketPath}\n`);
       process.exit(1);
     }
     const config = parseYaml(readFileSync(cfgPath, "utf8"));
-    const procs = Object.keys(config.processes ?? {}).map((name) => ({
+    const readyAfterMs = Number(process.env.DEVTREES_STUB_READY_AFTER_MS ?? "0");
+    const instanceAgeMs = Date.now() - statSync(cfgPath).mtimeMs;
+    const probedReady =
+      process.env.DEVTREES_STUB_NEVER_READY !== "1" &&
+      (!Number.isFinite(readyAfterMs) || instanceAgeMs >= readyAfterMs);
+    const procs = Object.entries(config.processes ?? {}).map(([name, proc]) => ({
       name,
       status: "Running",
-      is_ready: "Ready",
+      is_ready: proc?.readiness_probe === undefined ? "-" : probedReady ? "Ready" : "Not Ready",
     }));
     process.stdout.write(JSON.stringify(procs));
     process.exit(0);
