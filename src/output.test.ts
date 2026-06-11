@@ -118,6 +118,27 @@ describe("output formatter — formatError", () => {
     expect(result.stdout).toBe("");
     expect(result.stderr).toContain("process-compose not found on PATH");
   });
+
+  // #111: the formatter is the single seam that owns the `devtrees:` prefix.
+  // A message must never reach `formatError` already carrying one, otherwise
+  // stderr renders the doubled `devtrees: devtrees:` observed on SHARED_DRIFT.
+  it("in human mode, prefixes stderr with `devtrees:` exactly once", () => {
+    const result = formatError(
+      { code: "SHARED_DRIFT", message: "this worktree's shared services diverge" },
+      "human",
+    );
+    expect(result.stderr.match(/devtrees:/g)).toHaveLength(1);
+    expect(result.stderr).toBe("devtrees: this worktree's shared services diverge\n");
+  });
+
+  it("in JSON mode, prefixes the stderr diagnostic with `devtrees:` exactly once", () => {
+    const result = formatError(
+      { code: "SHARED_DRIFT", message: "this worktree's shared services diverge" },
+      "json",
+    );
+    expect(result.stderr.match(/devtrees:/g)).toHaveLength(1);
+    expect(result.stderr).toBe("devtrees: this worktree's shared services diverge\n");
+  });
 });
 
 describe("output formatter — formatLs", () => {

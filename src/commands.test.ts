@@ -3739,6 +3739,10 @@ describe("runUp / runEnv — shared port map persistence & drift (#83)", () => {
     expect(err.code).toBe("SHARED_DRIFT");
     // The remediation is explicit: bring shared down and up again.
     expect(err.message).toMatch(/down --shared/);
+    // #111: the message must not embed its own `devtrees:` prefix — the
+    // output formatter is the single seam that owns it, so an embedded one
+    // renders the doubled `devtrees: devtrees:` on stderr.
+    expect(err.message).not.toMatch(/devtrees:/);
   });
 
   it("drift does not spawn the divergent worktree's instance (no partial up)", async () => {
