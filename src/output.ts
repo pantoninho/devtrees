@@ -29,6 +29,7 @@ export const SCHEMA_VERSION = "1";
 export const ERROR_CODES = [
   "PROCESS_COMPOSE_NOT_FOUND",
   "INSTANCE_NOT_FOUND",
+  "SERVICE_NOT_FOUND",
   "HEALTH_TIMEOUT",
   "CONFIG_DRIFT",
   "SHARED_DRIFT",
@@ -56,6 +57,8 @@ export type ErrorCode = (typeof ERROR_CODES)[number];
 export const ERROR_CODE_DESCRIPTIONS: Readonly<Record<ErrorCode, string>> = {
   PROCESS_COMPOSE_NOT_FOUND: "The `process-compose` binary is not on PATH.",
   INSTANCE_NOT_FOUND: "No worktree (or shared) instance is running for this anchor.",
+  SERVICE_NOT_FOUND:
+    "The named service does not exist in the target instance; `details.valid_services` lists the known ones.",
   HEALTH_TIMEOUT:
     "Stack started but services did not report healthy before the wait window expired.",
   CONFIG_DRIFT: "Running config differs from devtrees.yaml and hot-reload failed.",

@@ -1688,11 +1688,15 @@ export async function runLogs(
     );
   }
 
-  const services = options.all
-    ? readDerivedServices(paths.configPath)
-    : options.service !== undefined
-      ? [options.service]
-      : [];
+  const known = readDerivedServices(paths.configPath);
+  if (!options.all && options.service !== undefined && !known.includes(options.service)) {
+    // Fail fast before spawning: `process-compose process logs <unknown>`
+    // blocks forever instead of erroring, which would hang an agent until its
+    // own timeout (#109). The derived config on disk is authoritative for the
+    // running instance, so an absent name there is a user error, not a race.
+    throw serviceNotFoundError(options.service, known, options.shared === true);
+  }
+  const services = options.all ? known : options.service !== undefined ? [options.service] : [];
   if (services.length === 0) {
     throw new Error("devtrees logs: specify a service (e.g. `devtrees logs web`) or pass `--all`.");
   }
@@ -1733,9 +1737,36 @@ export async function* filterLogEventsSince(
 }
 
 /**
+ * Build the documented `SERVICE_NOT_FOUND` error (#109): tagged with the
+ * stable code so `classifyError` routes it into the JSON envelope, and
+ * carrying `{service, valid_services}` details so an agent can correct the
+ * name without a second round-trip. Mirrors the `invalidArgsError` /
+ * `StalePortBlockError` tagging convention.
+ */
+function serviceNotFoundError(
+  service: string,
+  validServices: ReadonlyArray<string>,
+  shared: boolean,
+): Error {
+  const where = shared ? "the shared instance" : "this worktree's instance";
+  const valid =
+    validServices.length > 0
+      ? `Valid services: ${validServices.join(", ")}.`
+      : "Its derived config lists no services.";
+  const err = new Error(`unknown service '${service}' in ${where}. ${valid}`) as Error & {
+    code?: string;
+    details?: Readonly<Record<string, unknown>>;
+  };
+  err.code = "SERVICE_NOT_FOUND";
+  err.details = { service, valid_services: [...validServices] };
+  return err;
+}
+
+/**
  * Read the derived process-compose config from disk and return its service
  * names in source order. Used by `--all` to know which services to spawn a
- * `process logs` subprocess for. The config is the same file `devtrees up`
+ * `process logs` subprocess for, and by the single-service path to validate
+ * the name before streaming (#109). The config is the same file `devtrees up`
  * writes, so the list is authoritative for the running instance.
  */
 function readDerivedServices(configPath: string): string[] {

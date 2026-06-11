@@ -194,7 +194,11 @@ interface LsDoc {
 }
 
 interface ErrorDoc {
-  readonly error?: { readonly code?: string; readonly message?: string };
+  readonly error?: {
+    readonly code?: string;
+    readonly message?: string;
+    readonly details?: { readonly service?: string; readonly valid_services?: string[] };
+  };
 }
 
 describe("built CLI e2e — argv→commands wiring over the stub process-compose (#93)", () => {
@@ -291,6 +295,42 @@ describe("built CLI e2e — argv→commands wiring over the stub process-compose
     const human = devtrees(wt, ["logs", "web", "--tail", "2"]);
     expect(human.code, `logs failed: ${human.stderr}`).toBe(0);
     expect(human.stdout).toBe("four\nfive\n");
+  }, 60_000);
+
+  it("logs with an unknown service fails fast with SERVICE_NOT_FOUND — no hang (#109)", () => {
+    const { wt } = setupScenario("dt-bc5-");
+
+    const up = devtrees(wt, ["up", "--json", "--wait-timeout", "30"]);
+    expect(up.code, `up failed: ${up.stderr}`).toBe(0);
+
+    // --json: one error envelope on stdout, naming the unknown service and
+    // listing the valid ones, exiting non-zero promptly (the real
+    // process-compose would block forever on an unknown name).
+    const started = Date.now();
+    const json = devtrees(wt, ["logs", "nosuchservice", "--json"], { timeoutMs: 15_000 });
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(json.code, `expected SERVICE_NOT_FOUND failure, got: ${json.stdout}`).toBe(1);
+    const doc = json.doc as ErrorDoc;
+    expect(doc.error?.code).toBe("SERVICE_NOT_FOUND");
+    expect(doc.error?.message).toContain("nosuchservice");
+    expect(doc.error?.details?.service).toBe("nosuchservice");
+    expect(doc.error?.details?.valid_services).toContain("web");
+
+    // Human mode: diagnostic on stderr, nothing on stdout, non-zero exit.
+    const human = devtrees(wt, ["logs", "nosuchservice"], { timeoutMs: 15_000 });
+    expect(human.code).toBe(1);
+    expect(human.stdout).toBe("");
+    expect(human.stderr).toMatch(/devtrees: unknown service 'nosuchservice'/);
+
+    // --shared validates against the shared instance's own service set.
+    const shared = devtrees(wt, ["logs", "nosuchservice", "--shared", "--json"], {
+      timeoutMs: 15_000,
+    });
+    expect(shared.code).toBe(1);
+    const sharedDoc = shared.doc as ErrorDoc;
+    expect(sharedDoc.error?.code).toBe("SERVICE_NOT_FOUND");
+    expect(sharedDoc.error?.details?.valid_services).toContain("db");
+    expect(sharedDoc.error?.details?.valid_services).not.toContain("web");
   }, 60_000);
 
   it("invalid flag values come back as the documented INVALID_ARGS envelope", () => {
