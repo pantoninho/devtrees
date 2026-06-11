@@ -138,12 +138,14 @@ describe("devtrees CLI", () => {
     // `env` loads devtrees.yaml (CONFIG_INVALID) and reports shared-tier
     // divergence (SHARED_DRIFT, #83) but is lock-free (pure registry read).
     ["env", ["SHARED_DRIFT", "CONFIG_INVALID", "UNKNOWN"]],
-    ["logs", ["INSTANCE_NOT_FOUND", "INVALID_ARGS", "UNKNOWN"]],
+    // `logs` validates the service name against the derived config (#109).
+    ["logs", ["INSTANCE_NOT_FOUND", "SERVICE_NOT_FOUND", "INVALID_ARGS", "UNKNOWN"]],
   ];
 
   const ALL_KNOWN_CODES = [
     "PROCESS_COMPOSE_NOT_FOUND",
     "INSTANCE_NOT_FOUND",
+    "SERVICE_NOT_FOUND",
     "HEALTH_TIMEOUT",
     "CONFIG_DRIFT",
     "SHARED_DRIFT",
@@ -889,6 +891,46 @@ describe("devtrees CLI — logs (#33)", () => {
     const parsed = JSON.parse(result.stdout) as { error: { code: string } };
     expect(parsed.error.code).toBe("INSTANCE_NOT_FOUND");
     expect(result.stderr).toMatch(/no worktree instance is running/);
+  });
+
+  it("`logs --json` unknown-service failure → SERVICE_NOT_FOUND envelope with details (#109)", async () => {
+    const err = new Error("unknown service 'nosuchservice' in this worktree's instance.") as Error & {
+      code?: string;
+      details?: Record<string, unknown>;
+    };
+    err.code = "SERVICE_NOT_FOUND";
+    err.details = { service: "nosuchservice", valid_services: ["web", "worker"] };
+    const logs = vi.fn().mockRejectedValue(err);
+    const result = await execute(["logs", "nosuchservice", "--json"], {
+      up: vi.fn(),
+      down: vi.fn(),
+      logs,
+    });
+    expect(result.code).toBe(1);
+    const parsed = JSON.parse(result.stdout) as {
+      schema_version: string;
+      error: { code: string; message: string; details?: Record<string, unknown> };
+    };
+    expect(parsed.schema_version).toBe("1");
+    expect(parsed.error.code).toBe("SERVICE_NOT_FOUND");
+    expect(parsed.error.message).toContain("nosuchservice");
+    expect(parsed.error.details).toEqual({
+      service: "nosuchservice",
+      valid_services: ["web", "worker"],
+    });
+  });
+
+  it("`logs` unknown-service failure in human mode → diagnostic on stderr, empty stdout (#109)", async () => {
+    const err = new Error(
+      "unknown service 'nosuchservice' in this worktree's instance. Valid services: web.",
+    ) as Error & { code?: string };
+    err.code = "SERVICE_NOT_FOUND";
+    const logs = vi.fn().mockRejectedValue(err);
+    const result = await execute(["logs", "nosuchservice"], { up: vi.fn(), down: vi.fn(), logs });
+    expect(result.code).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toMatch(/devtrees: unknown service 'nosuchservice'/);
+    expect(result.stderr).toMatch(/web/);
   });
 });
 
