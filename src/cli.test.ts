@@ -27,7 +27,7 @@ describe("devtrees CLI", () => {
     expect(result.code).toBe(0);
     expect(result.stdout).toContain("devtrees");
     // clipanion lists every registered command in `$ devtrees <cmd>` form.
-    for (const cmd of ["up", "down", "ls", "attach", "generate", "prune", "env", "logs"]) {
+    for (const cmd of ["up", "down", "ls", "attach", "generate", "prune", "env", "logs", "init"]) {
       expect(result.stdout).toContain(`devtrees ${cmd}`);
     }
   });
@@ -76,7 +76,7 @@ describe("devtrees CLI", () => {
    * body — verified by passing `--help` with no deps wired: a help path
    * that fell through to the command body would throw.
    */
-  for (const cmd of ["up", "down", "ls", "attach", "generate", "prune", "env", "logs"]) {
+  for (const cmd of ["up", "down", "ls", "attach", "generate", "prune", "env", "logs", "init"]) {
     it(`\`devtrees ${cmd} --help\` exits 0, prints non-empty help, skips the body`, async () => {
       // No deps wired — the command body would throw "up: no deps provided"
       // if it were invoked. The fact this test passes proves help is a
@@ -140,6 +140,9 @@ describe("devtrees CLI", () => {
     ["env", ["SHARED_DRIFT", "CONFIG_INVALID", "UNKNOWN"]],
     // `logs` validates the service name against the derived config (#109).
     ["logs", ["INSTANCE_NOT_FOUND", "SERVICE_NOT_FOUND", "INVALID_ARGS", "UNKNOWN"]],
+    // `init --agents` validates the required --agents flag (INVALID_ARGS) and
+    // can hit a filesystem write error (UNKNOWN). No anchor/lock/spawn.
+    ["init", ["INVALID_ARGS", "UNKNOWN"]],
   ];
 
   const ALL_KNOWN_CODES = [
@@ -283,6 +286,53 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
     const result = await execute(["generate"], { up: vi.fn(), down: vi.fn(), generate });
     expect(result.code).toBe(1);
     expect(result.stderr).toMatch(/devtrees\.yaml not found/);
+  });
+
+  it("routes `init --agents` to the init command and names the written file", async () => {
+    const init = vi
+      .fn()
+      .mockResolvedValue({ target: "AGENTS.md", path: "/repo/AGENTS.md", action: "created" });
+    const result = await execute(["init", "--agents"], { up: vi.fn(), down: vi.fn(), init });
+    expect(init).toHaveBeenCalledOnce();
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("AGENTS.md");
+    expect(result.stdout).toMatch(/created/);
+  });
+
+  it("`init --agents --json` emits the created-vs-updated envelope", async () => {
+    const init = vi
+      .fn()
+      .mockResolvedValue({ target: "CLAUDE.md", path: "/repo/CLAUDE.md", action: "updated" });
+    const result = await execute(["init", "--agents", "--json"], {
+      up: vi.fn(),
+      down: vi.fn(),
+      init,
+    });
+    expect(result.code).toBe(0);
+    const parsed = JSON.parse(result.stdout) as {
+      init: { target: string; path: string; action: string };
+    };
+    expect(parsed.init).toEqual({
+      target: "CLAUDE.md",
+      path: "/repo/CLAUDE.md",
+      action: "updated",
+    });
+  });
+
+  it("`init` without `--agents` fails with the INVALID_ARGS envelope", async () => {
+    const init = vi.fn();
+    const result = await execute(["init", "--json"], { up: vi.fn(), down: vi.fn(), init });
+    expect(init).not.toHaveBeenCalled();
+    expect(result.code).toBe(1);
+    const parsed = JSON.parse(result.stdout) as { error: { code: string } };
+    expect(parsed.error.code).toBe("INVALID_ARGS");
+  });
+
+  it("turns an init filesystem failure into a clear, non-zero error", async () => {
+    const init = vi.fn().mockRejectedValue(new Error("EACCES: permission denied"));
+    const result = await execute(["init", "--agents"], { up: vi.fn(), down: vi.fn(), init });
+    expect(result.code).toBe(1);
+    expect(result.stderr).toMatch(/EACCES/);
   });
 
   it("routes `ls` to the ls command and formats the table", async () => {

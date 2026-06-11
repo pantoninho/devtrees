@@ -126,8 +126,12 @@ agent can drive the stack non-interactively.
 The block is agent-agnostic — it's plain instructions about the devtrees CLI,
 valid as `AGENTS.md` / `CLAUDE.md` content for any coding agent.
 
-> A `devtrees init --agents` command that generates this block for you is a
-> possible follow-up; it does not exist yet, so copy the block manually.
+> Rather than copy this by hand, run `devtrees init --agents` in your project: it
+> writes the exact block below into your `AGENTS.md` (or `CLAUDE.md` if that's
+> your convention, creating `AGENTS.md` otherwise), fenced by
+> `<!-- devtrees:start -->` / `<!-- devtrees:end -->` markers so re-running
+> replaces it in place. The block is generated from the same in-repo source this
+> README quotes, so the two can't drift.
 
 ````markdown
 ## Running the stack with devtrees

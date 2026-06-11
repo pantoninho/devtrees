@@ -382,6 +382,43 @@ export function formatGenerate(payload: GeneratePayload, mode: FormatMode): Outp
   return { stdout: lines.join("\n"), stderr: "" };
 }
 
+// --- init -------------------------------------------------------------------
+
+/**
+ * `devtrees init --agents` payload (issue #118). Names the file the onboarding
+ * block landed in and whether this run created that file or updated an existing
+ * one — the created-vs-updated signal an agent (or human) reads to know whether
+ * the file is new. `path` is the absolute location; `target` the bare filename.
+ */
+export interface InitPayload {
+  readonly target: string;
+  readonly path: string;
+  readonly action: "created" | "updated";
+}
+
+/**
+ * Render `devtrees init --agents` output.
+ *
+ *   - `human`: a one-liner naming the file and the action, e.g.
+ *     `devtrees init: created AGENTS.md with the agent onboarding block.`
+ *   - `json`: `{schema_version, init: {target, path, action}}` — one top-level
+ *     key named after the command, matching every other JSON-emitting command.
+ */
+export function formatInit(payload: InitPayload, mode: FormatMode): OutputResult {
+  if (mode === "json") {
+    const doc = {
+      schema_version: SCHEMA_VERSION,
+      init: { target: payload.target, path: payload.path, action: payload.action },
+    };
+    return { stdout: `${JSON.stringify(doc)}\n`, stderr: "" };
+  }
+  const verb = payload.action === "created" ? "created" : "updated";
+  return {
+    stdout: `devtrees init: ${verb} ${payload.target} with the agent onboarding block.\n`,
+    stderr: "",
+  };
+}
+
 // --- env --------------------------------------------------------------------
 
 /**
