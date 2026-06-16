@@ -27,7 +27,7 @@ describe("devtrees CLI", () => {
     expect(result.code).toBe(0);
     expect(result.stdout).toContain("devtrees");
     // clipanion lists every registered command in `$ devtrees <cmd>` form.
-    for (const cmd of ["up", "down", "ls", "attach", "generate", "prune", "env", "logs", "init"]) {
+    for (const cmd of ["up", "down", "ls", "attach", "prune", "env", "logs", "init"]) {
       expect(result.stdout).toContain(`devtrees ${cmd}`);
     }
   });
@@ -76,7 +76,7 @@ describe("devtrees CLI", () => {
    * body — verified by passing `--help` with no deps wired: a help path
    * that fell through to the command body would throw.
    */
-  for (const cmd of ["up", "down", "ls", "attach", "generate", "prune", "env", "logs", "init"]) {
+  for (const cmd of ["up", "down", "ls", "attach", "prune", "env", "logs", "init"]) {
     it(`\`devtrees ${cmd} --help\` exits 0, prints non-empty help, skips the body`, async () => {
       // No deps wired — the command body would throw "up: no deps provided"
       // if it were invoked. The fact this test passes proves help is a
@@ -131,8 +131,6 @@ describe("devtrees CLI", () => {
     ["down", ["PROCESS_COMPOSE_NOT_FOUND", "LOCK_CONTENTION", "UNKNOWN"]],
     ["ls", ["UNKNOWN"]],
     ["attach", ["INSTANCE_NOT_FOUND", "PROCESS_COMPOSE_NOT_FOUND", "UNKNOWN"]],
-    // `generate` loads devtrees.yaml and allocates under the registry lock.
-    ["generate", ["CONFIG_INVALID", "LOCK_CONTENTION", "UNKNOWN"]],
     // `prune` drops orphan registry entries under the registry lock.
     ["prune", ["LOCK_CONTENTION", "UNKNOWN"]],
     // `env` loads devtrees.yaml (CONFIG_INVALID) and reports shared-tier
@@ -326,41 +324,6 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
   it("delegates non-effectful commands to the pure run()", async () => {
     const result = await execute(["--version"], { up: vi.fn(), down: vi.fn() });
     expect(result.stdout.trim()).toMatch(/^\d+\.\d+\.\d+$/);
-  });
-
-  it("routes `generate` to the generate command and reports the written paths", async () => {
-    const generate = vi.fn().mockResolvedValue({
-      worktreeId: "login",
-      worktreeRoot: "/r/wt/login",
-      worktreePath: "/r/.git/devtrees/login.yaml",
-      env: { WEB_PORT: "20512" },
-    });
-    const result = await execute(["generate"], { up: vi.fn(), down: vi.fn(), generate });
-    expect(generate).toHaveBeenCalledOnce();
-    expect(result.code).toBe(0);
-    expect(result.stdout).toContain("/r/.git/devtrees/login.yaml");
-  });
-
-  it("`generate` also prints the shared config path when one was written", async () => {
-    const generate = vi.fn().mockResolvedValue({
-      worktreeId: "login",
-      worktreeRoot: "/r/wt/login",
-      worktreePath: "/r/.git/devtrees/login.yaml",
-      sharedPath: "/r/.git/devtrees/shared.yaml",
-      env: { WEB_PORT: "20512", DB_PORT: "20000" },
-      sharedEnv: { DB_PORT: "20000" },
-    });
-    const result = await execute(["generate"], { up: vi.fn(), down: vi.fn(), generate });
-    expect(result.code).toBe(0);
-    expect(result.stdout).toContain("/r/.git/devtrees/login.yaml");
-    expect(result.stdout).toContain("/r/.git/devtrees/shared.yaml");
-  });
-
-  it("turns a generate failure into a clear, non-zero error", async () => {
-    const generate = vi.fn().mockRejectedValue(new Error("devtrees.yaml not found"));
-    const result = await execute(["generate"], { up: vi.fn(), down: vi.fn(), generate });
-    expect(result.code).toBe(1);
-    expect(result.stderr).toMatch(/devtrees\.yaml not found/);
   });
 
   it("routes `init --agents` to the init command and names the written file", async () => {

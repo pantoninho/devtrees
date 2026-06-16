@@ -28,7 +28,6 @@ import {
   formatDown,
   formatEnv,
   formatError,
-  formatGenerate,
   formatInit,
   formatLogLine,
   formatLs,
@@ -70,7 +69,6 @@ export const COMMANDS: ReadonlyArray<{ name: string; summary: string }> = [
     name: "attach",
     summary: "Attach a TUI to this worktree's instance (--shared for the shared one)",
   },
-  { name: "generate", summary: "Write the derived process-compose config to disk" },
   {
     name: "prune",
     summary: "Reconcile against `git worktree list` and clean up orphaned instances",
@@ -135,14 +133,6 @@ export interface ExecuteDeps {
   down: (options: {
     shared: boolean;
   }) => Promise<{ worktreeId?: string; stopped?: boolean } | void>;
-  generate?: () => Promise<{
-    worktreeId: string;
-    worktreeRoot: string;
-    worktreePath: string;
-    sharedPath?: string;
-    env: Record<string, string>;
-    sharedEnv?: Record<string, string>;
-  }>;
   ls?: () => Promise<{ anchor: string; instances: ReadonlyArray<LsInstanceRow> }>;
   attach?: (options: { shared: boolean }) => Promise<void>;
   prune?: () => Promise<{ anchor: string; pruned: ReadonlyArray<PrunedRow> }>;
@@ -281,8 +271,8 @@ class UpCommand extends DevtreesCommand {
     description: "Bring up this worktree's stack with collision-free ports.",
     // `--dry-run` runs only the derivation pipeline (load devtrees.yaml →
     // CONFIG_INVALID; allocate ports under the registry lock → LOCK_CONTENTION)
-    // and stops before any side effect, so it can only emit that subset of the
-    // codes below — the same set `generate` emits today (#124).
+    // and stops before any side effect, so it can only emit the allocation
+    // subset of the codes below (#124).
     details: errorCodeFooter([
       "STALE_PORT_BLOCK",
       "CONFIG_DRIFT",
@@ -321,7 +311,7 @@ class UpCommand extends DevtreesCommand {
       "no process-compose spawn, no config file written, no socket, no instance registered, " +
       "no health wait. With `--json`, emits the `up_dry_run` envelope so an agent reads the " +
       "allocated ports and the full process-compose document off stdout. (Port allocation may " +
-      "briefly take the registry lock to pick a non-colliding block, as `generate` does.)",
+      "briefly take the registry lock to pick a non-colliding block.)",
   });
 
   override async execute(): Promise<number> {
@@ -417,30 +407,6 @@ class DownCommand extends DevtreesCommand {
       const stopped = result.stopped ?? true;
       const out = formatDown(
         this.shared ? { shared: true, stopped } : { worktreeId: result.worktreeId ?? "", stopped },
-        this.mode,
-      );
-      if (out.stdout) this.context.stdout.write(out.stdout);
-      if (out.stderr) this.context.stderr.write(out.stderr);
-      return 0;
-    });
-  }
-}
-
-class GenerateCommand extends DevtreesCommand {
-  static override paths = [["generate"]];
-  static override usage = Command.Usage({
-    description: "Write the derived process-compose config to disk without starting anything.",
-    // Loads devtrees.yaml (CONFIG_INVALID) and allocates ports under the
-    // registry lock (LOCK_CONTENTION) — see `runGenerate` in src/commands.ts.
-    details: errorCodeFooter(["CONFIG_INVALID", "LOCK_CONTENTION", "UNKNOWN"]),
-  });
-
-  override async execute(): Promise<number> {
-    return this.dispatch(async () => {
-      if (!this.context.deps.generate) return 0;
-      const result = await this.context.deps.generate();
-      const out = formatGenerate(
-        { worktreePath: result.worktreePath, sharedPath: result.sharedPath },
         this.mode,
       );
       if (out.stdout) this.context.stdout.write(out.stdout);
@@ -732,7 +698,6 @@ function buildCli(): Cli<DevtreesContext> {
   cli.register(Builtins.VersionCommand);
   cli.register(UpCommand);
   cli.register(DownCommand);
-  cli.register(GenerateCommand);
   cli.register(LsCommand);
   cli.register(AttachCommand);
   cli.register(PruneCommand);
@@ -923,18 +888,8 @@ function entrypointIsTTY(): boolean {
 }
 
 if (isEntrypoint(import.meta.url, process.argv[1])) {
-  const {
-    runUp,
-    runUpDryRun,
-    runDown,
-    runEnv,
-    runGenerate,
-    runLs,
-    runAttach,
-    runPrune,
-    runLogs,
-    runInit,
-  } = await import("./commands.js");
+  const { runUp, runUpDryRun, runDown, runEnv, runLs, runAttach, runPrune, runLogs, runInit } =
+    await import("./commands.js");
   const deps: ExecuteDeps = {
     up: (options) =>
       runUp({
@@ -943,7 +898,6 @@ if (isEntrypoint(import.meta.url, process.argv[1])) {
       }),
     upDryRun: () => runUpDryRun(),
     down: ({ shared }) => runDown({}, { shared }),
-    generate: () => runGenerate(),
     ls: () => runLs(),
     attach: ({ shared }) => runAttach({}, { shared }),
     prune: () => runPrune(),

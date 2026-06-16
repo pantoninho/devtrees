@@ -258,7 +258,7 @@ export function formatPrune(pruned: ReadonlyArray<PrunedRow>, mode: FormatMode):
   return { stdout: formatPruneHuman(pruned), stderr: "" };
 }
 
-// --- up / down / generate (human path only for now) -------------------------
+// --- up / down (human path only for now) ------------------------------------
 
 export interface UpPayload {
   readonly worktreeId: string;
@@ -361,30 +361,6 @@ export function formatDown(payload: DownPayload, mode: FormatMode): OutputResult
   return { stdout: text, stderr: "" };
 }
 
-export interface GeneratePayload {
-  readonly worktreePath: string;
-  readonly sharedPath?: string;
-}
-
-export function formatGenerate(payload: GeneratePayload, mode: FormatMode): OutputResult {
-  if (mode === "json") {
-    const doc = {
-      schema_version: SCHEMA_VERSION,
-      generate: {
-        worktree_path: payload.worktreePath,
-        ...(payload.sharedPath ? { shared_path: payload.sharedPath } : {}),
-      },
-    };
-    return { stdout: `${JSON.stringify(doc)}\n`, stderr: "" };
-  }
-  const lines = [
-    `devtrees generate: wrote ${payload.worktreePath}`,
-    ...(payload.sharedPath ? [`devtrees generate: wrote ${payload.sharedPath}`] : []),
-    "",
-  ];
-  return { stdout: lines.join("\n"), stderr: "" };
-}
-
 // --- up --dry-run -----------------------------------------------------------
 
 /**
@@ -393,8 +369,8 @@ export function formatGenerate(payload: GeneratePayload, mode: FormatMode): Outp
  * worktree ports + injected shared ports), and — when the stack declares shared
  * services — the derived shared config + its env. A sibling reads the allocated
  * `WEB_PORT` (and shared `DB_PORT`) straight off `env`, and the full
- * process-compose document off `config`, without touching the filesystem (#125
- * migrates `generate`'s inspection use onto this).
+ * process-compose document off `config`, without touching the filesystem — the
+ * preview-the-derived-config use case, served with no disk write (#125).
  */
 export interface UpDryRunPayload {
   readonly worktreeId: string;
@@ -414,8 +390,8 @@ export interface UpDryRunPayload {
  *     agent-readable preview of what `up` would run. `shared_*` keys are
  *     omitted when the stack has no shared services. Stderr stays untouched.
  *   - `human`: the derived YAML document(s) — the worktree config, then the
- *     shared config (separated by a `---` document marker) when present. This
- *     is what `generate` used to write to disk; here it goes to stdout so a
+ *     shared config (separated by a `---` document marker) when present. The
+ *     same derived config `up` writes to disk; here it goes to stdout so a
  *     developer can eyeball it or pipe it into `process-compose -f -`.
  */
 export function formatUpDryRun(payload: UpDryRunPayload, mode: FormatMode): OutputResult {

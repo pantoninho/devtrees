@@ -609,16 +609,17 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
     const { wt, root } = setupScenario("dt-rpc9-", { noDefaultCleanups: true });
 
     // First, allocate without spawning so we know which ports are in the
-    // block. `generate` writes the derived config with the allocated ports.
-    expect(devtrees(wt, ["generate", "--json"]).code).toBe(0);
-
-    // Read back the derived config to find the WEB_PORT this worktree owns.
-    const commonDir = execGit(wt, ["rev-parse", "--git-common-dir"]);
-    const absCommon = commonDir.startsWith("/") ? commonDir : join(wt, commonDir);
-    const derivedYaml = readFileSync(join(absCommon, "devtrees", `${wtId(wt)}.yaml`), "utf8");
-    const portMatch = derivedYaml.match(/WEB_PORT=(\d+)/);
-    if (!portMatch) throw new Error(`could not find WEB_PORT in derived config: ${derivedYaml}`);
-    const port = Number(portMatch[1]);
+    // block. `up --dry-run` runs the full derivation pipeline and prints the
+    // allocated env to stdout with no side effects (#124) — read the WEB_PORT
+    // this worktree owns off the dry-run JSON envelope (#125).
+    const dryRun = devtrees(wt, ["up", "--dry-run", "--json"]);
+    expect(dryRun.code, `up --dry-run failed: ${dryRun.stderr}`).toBe(0);
+    const dryDoc = dryRun.doc as { up_dry_run?: { env?: { WEB_PORT?: string } } } | undefined;
+    const webPort = dryDoc?.up_dry_run?.env?.WEB_PORT;
+    if (!webPort) {
+      throw new Error(`could not find WEB_PORT in dry-run envelope: ${dryRun.stdout}`);
+    }
+    const port = Number(webPort);
     void root;
 
     // Bind that port externally so the up-time port-probe sees a stale holder.

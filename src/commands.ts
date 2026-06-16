@@ -457,23 +457,6 @@ export interface UpResult {
   readonly services: ReadonlyArray<Service>;
 }
 
-export interface GenerateResult {
-  readonly worktreeId: string;
-  readonly worktreeRoot: string;
-  /** Path of the written worktree-isolated config. */
-  readonly worktreePath: string;
-  /** Path of the written shared config — present iff the stack has shared services. */
-  readonly sharedPath?: string;
-  /**
-   * Env injection the worktree instance would receive — this worktree's own
-   * named ports + the shared services' named ports + the worktree id. Same
-   * shape `runUp` returns; lets callers re-derive identically.
-   */
-  readonly env: Record<string, string>;
-  /** Env injection for the shared instance — present iff a shared file was written. */
-  readonly sharedEnv?: Record<string, string>;
-}
-
 /**
  * Result of `runUpDryRun` (#124): the full derivation pipeline's output —
  * the worktree-isolated config (and, when the stack declares shared services,
@@ -481,14 +464,14 @@ export interface GenerateResult {
  * *no* side effects. Nothing is written to disk, no `process-compose` is
  * spawned, no socket is created, no instance is registered, no health wait
  * runs. Port allocation may still briefly take the registry lock to pick a
- * non-colliding block (as `runGenerate` does today); that is the only
- * registry touch and it neither starts nor registers an instance.
+ * non-colliding block; that is the only registry touch and it neither starts
+ * nor registers an instance.
  *
  * The envelope is the agent-readable preview of what `devtrees up` would run:
  * a sibling can read the allocated `WEB_PORT`/`DB_PORT` off `env` and the full
  * process-compose document off `config` without touching the filesystem
- * (PRD #26 / ADR-0005). It supersedes `generate`'s only legitimate use —
- * materializing the derived config for inspection (#125).
+ * (PRD #26 / ADR-0005). This is the "preview the derived config" use case,
+ * served with no disk write (#125).
  */
 export interface DryRunResult {
   readonly worktreeId: string;
@@ -498,7 +481,7 @@ export interface DryRunResult {
   /**
    * Flat env injection the worktree instance would receive: this worktree's
    * own named ports + the shared services' named ports + the worktree id.
-   * Same shape `runUp`/`runGenerate` return; a sibling reads the allocated
+   * Same shape `runUp` returns; a sibling reads the allocated
    * `WEB_PORT` (and shared `DB_PORT`) off here.
    */
   readonly env: Record<string, string>;
@@ -586,7 +569,7 @@ interface AllocatedPortMaps {
  * Allocate this worktree's port block — and, if the stack declares shared
  * services, the shared block — under one read-modify-write of the registry
  * lock, then build the named-port → number resolvers from the resulting
- * offsets. Both `runUp` and `runGenerate` need the same allocation pass; the
+ * offsets. Both `runUp` and `runUpDryRun` need the same allocation pass; the
  * only thing they do differently is what they do with the resolved ports
  * afterwards.
  */
@@ -983,71 +966,6 @@ async function collectIsolatedServices(
 }
 
 /**
- * Emit the derived process-compose config(s) to disk without starting anything.
- * Allocates port blocks the same way `runUp` does — so the emitted files reflect
- * the very ports `up` would use — but does not spawn `process-compose` and does
- * not lazy-start the shared instance. Useful for debugging or for running with
- * raw `process-compose -f <derived>.yaml` (acceptance, #10).
- *
- * The worktree-isolated subset is always written. The shared subset is written
- * only when the stack declares shared services.
- */
-export async function runGenerate(deps: CommandDeps = {}): Promise<GenerateResult> {
-  const { anchor } = resolve(deps);
-  const readStack = deps.readStack ?? loadStack;
-  const lock = deps.withRegistryLock ?? defaultWithRegistryLock;
-  const isPortFree = deps.isPortFree ?? defaultIsPortFree;
-
-  const stack = readStack(anchor.worktreeRoot);
-  const options = resolveAllocatorOptions(stack, deps.allocator ?? DEFAULT_ALLOCATOR);
-  const sharedNeeded = hasTier(stack, "shared");
-
-  const { portFor, sharedPortFor } = await allocateAndBuildPortMaps({
-    anchor: anchor.anchor,
-    worktreeId: anchor.worktreeId,
-    stack,
-    options,
-    lock,
-    isPortFree,
-  });
-
-  const derivedWt = deriveWorktreeConfig(stack, {
-    worktreeId: anchor.worktreeId,
-    worktreeRoot: anchor.worktreeRoot,
-    portFor,
-    sharedPortFor,
-  });
-
-  const paths = instancePaths(anchor.anchor, anchor.worktreeId);
-  mkdirSync(paths.runDir, { recursive: true });
-  writeFileSync(paths.configPath, stringifyYaml(derivedWt.config), "utf8");
-
-  if (sharedNeeded) {
-    const derivedShared = deriveSharedConfig(stack, {
-      workingDir: anchor.anchor,
-      portFor: sharedPortFor,
-    });
-    const sharedPaths = sharedInstancePaths(anchor.anchor);
-    writeFileSync(sharedPaths.configPath, stringifyYaml(derivedShared.config), "utf8");
-    return {
-      worktreeId: anchor.worktreeId,
-      worktreeRoot: anchor.worktreeRoot,
-      worktreePath: paths.configPath,
-      sharedPath: sharedPaths.configPath,
-      env: derivedWt.env,
-      sharedEnv: derivedShared.env,
-    };
-  }
-
-  return {
-    worktreeId: anchor.worktreeId,
-    worktreeRoot: anchor.worktreeRoot,
-    worktreePath: paths.configPath,
-    env: derivedWt.env,
-  };
-}
-
-/**
  * Run the full derivation pipeline a real `up` would run — load the stack,
  * allocate this worktree's collision-free port block (and the repo-wide shared
  * block when the stack has shared services), derive the worktree-isolated
@@ -1062,22 +980,21 @@ export async function runGenerate(deps: CommandDeps = {}): Promise<GenerateResul
  *    worktree config nor the shared config touch disk.
  *  - No instance registered: the registry's allocation entry IS read-modify-
  *    written (allocation needs a non-colliding block), but no *instance* is
- *    recorded — same as `generate` today. The stored-stack hash is not
- *    written, the per-worktree lifecycle lock is never taken, and the shared
- *    instance is never lazy-started.
+ *    recorded. The stored-stack hash is not written, the per-worktree
+ *    lifecycle lock is never taken, and the shared instance is never
+ *    lazy-started.
  *
  * The one registry touch — `allocateAndBuildPortMaps`'s lock-guarded
  * read-modify-write — is acceptable for a dry run because it neither starts
  * nor registers an instance; it only reserves (or looks up) a block so the
  * previewed ports match what a real `up` would use. If allocation can't get
  * the lock, the caller surfaces `LOCK_CONTENTION` through the standard error
- * envelope, exactly as `generate` does. A real `up` racing this dry run could
- * still pick a different block, so the preview reflects a possible (not
- * guaranteed) allocation.
+ * envelope. A real `up` racing this dry run could still pick a different
+ * block, so the preview reflects a possible (not guaranteed) allocation.
  *
- * Unlike `runGenerate`, nothing is materialized to disk: the derived
- * config(s) are returned in-memory for the caller to print to stdout (#125
- * migrates `generate`'s inspection use onto this).
+ * Nothing is materialized to disk: the derived config(s) are returned
+ * in-memory for the caller to print to stdout — the "preview the derived
+ * config" use case, served with no disk write (#125).
  */
 export async function runUpDryRun(deps: CommandDeps = {}): Promise<DryRunResult> {
   const { anchor } = resolve(deps);
@@ -1649,8 +1566,8 @@ export interface EnvResult {
   readonly worktreeId: string;
   /**
    * The injected-value map the worktree instance would receive — same shape
-   * `runUp` and `runGenerate` produce. Computed without spawning, locking, or
-   * persisting (issue #32 "Pure read").
+   * `runUp` produces. Computed without spawning, locking, or persisting
+   * (issue #32 "Pure read").
    */
   readonly env: Record<string, string>;
 }
