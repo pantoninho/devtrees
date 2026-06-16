@@ -20,6 +20,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { Writable } from "node:stream";
 import { Cli, Command, Option, Builtins, type BaseContext } from "clipanion";
 import type { LogEvent } from "./driver.js";
+import type { DerivedConfig } from "./deriver.js";
 import { maybeInitHint } from "./init-hint.js";
 import {
   classifyError,
@@ -33,6 +34,7 @@ import {
   formatLs,
   formatPrune,
   formatUp,
+  formatUpDryRun,
   type ErrorCode,
   type FormatMode,
   type LsInstanceRow,
@@ -114,6 +116,21 @@ export interface ExecuteDeps {
     sharedStarted?: boolean;
     blockBase?: number;
     services?: ReadonlyArray<LsServiceRow>;
+  }>;
+  /**
+   * Dry-run derivation (#124): runs the full pipeline `up` would run and
+   * returns the derived config(s) + the resolved env, with no side effects.
+   * Optional so dispatch paths that don't wire it fall through to a no-op
+   * `return 0` (same convention as the other optional commands). The env
+   * carries the allocated worktree ports (and injected shared ports) a sibling
+   * reads off the `--json` envelope (#125).
+   */
+  upDryRun?: () => Promise<{
+    worktreeId: string;
+    env: Record<string, string>;
+    config: DerivedConfig;
+    sharedEnv?: Record<string, string>;
+    sharedConfig?: DerivedConfig;
   }>;
   down: (options: {
     shared: boolean;
@@ -262,6 +279,10 @@ class UpCommand extends DevtreesCommand {
   static override paths = [["up"]];
   static override usage = Command.Usage({
     description: "Bring up this worktree's stack with collision-free ports.",
+    // `--dry-run` runs only the derivation pipeline (load devtrees.yaml →
+    // CONFIG_INVALID; allocate ports under the registry lock → LOCK_CONTENTION)
+    // and stops before any side effect, so it can only emit that subset of the
+    // codes below — the same set `generate` emits today (#124).
     details: errorCodeFooter([
       "STALE_PORT_BLOCK",
       "CONFIG_DRIFT",
@@ -278,6 +299,7 @@ class UpCommand extends DevtreesCommand {
       ["Bring up the stack", "devtrees up"],
       ["Bring up + emit JSON envelope", "devtrees up --json"],
       ["Bring up with a 30s health-wait window", "devtrees up --wait-timeout 30"],
+      ["Preview the derived config(s) + env without side effects", "devtrees up --dry-run --json"],
     ],
   });
 
@@ -293,9 +315,18 @@ class UpCommand extends DevtreesCommand {
   waitTimeout = Option.String("--wait-timeout", {
     description: "Health-wait timeout in seconds. Default 120.",
   });
+  dryRun = Option.Boolean("--dry-run", false, {
+    description:
+      "Derive and print the config(s) + allocated env to stdout WITHOUT side effects: " +
+      "no process-compose spawn, no config file written, no socket, no instance registered, " +
+      "no health wait. With `--json`, emits the `up_dry_run` envelope so an agent reads the " +
+      "allocated ports and the full process-compose document off stdout. (Port allocation may " +
+      "briefly take the registry lock to pick a non-colliding block, as `generate` does.)",
+  });
 
   override async execute(): Promise<number> {
     return this.dispatch(async () => {
+      if (this.dryRun) return this.executeDryRun();
       const options: UpOptions = {
         ...(this.attach !== undefined ? { attach: this.attach } : {}),
         ...(this.waitTimeout !== undefined
@@ -332,6 +363,33 @@ class UpCommand extends DevtreesCommand {
   private emitInitHint(): void {
     const hint = this.context.deps.initHint?.();
     if (hint) this.context.stderr.write(`${hint}\n`);
+  }
+
+  /**
+   * `up --dry-run` (#124): run the derivation pipeline through the injected
+   * `upDryRun` and print the result via `formatUpDryRun` — the derived
+   * config(s) + allocated env on stdout, no side effects. NOT the `up` path:
+   * no spawn, no socket, no registry instance, no health wait, and (crucially)
+   * no init-hint on stderr — the `--json` stdout stays a single byte-clean
+   * document. When `upDryRun` is unwired (a test stub omitting it), this
+   * no-ops to exit 0, matching the convention the other optional commands use.
+   */
+  private async executeDryRun(): Promise<number> {
+    if (!this.context.deps.upDryRun) return 0;
+    const result = await this.context.deps.upDryRun();
+    const out = formatUpDryRun(
+      {
+        worktreeId: result.worktreeId,
+        env: result.env,
+        config: result.config,
+        ...(result.sharedEnv !== undefined ? { sharedEnv: result.sharedEnv } : {}),
+        ...(result.sharedConfig !== undefined ? { sharedConfig: result.sharedConfig } : {}),
+      },
+      this.mode,
+    );
+    if (out.stdout) this.context.stdout.write(out.stdout);
+    if (out.stderr) this.context.stderr.write(out.stderr);
+    return 0;
   }
 }
 
@@ -865,14 +923,25 @@ function entrypointIsTTY(): boolean {
 }
 
 if (isEntrypoint(import.meta.url, process.argv[1])) {
-  const { runUp, runDown, runEnv, runGenerate, runLs, runAttach, runPrune, runLogs, runInit } =
-    await import("./commands.js");
+  const {
+    runUp,
+    runUpDryRun,
+    runDown,
+    runEnv,
+    runGenerate,
+    runLs,
+    runAttach,
+    runPrune,
+    runLogs,
+    runInit,
+  } = await import("./commands.js");
   const deps: ExecuteDeps = {
     up: (options) =>
       runUp({
         ...(options?.attach !== undefined ? { attach: options.attach } : {}),
         ...(options?.waitTimeoutMs !== undefined ? { waitTimeoutMs: options.waitTimeoutMs } : {}),
       }),
+    upDryRun: () => runUpDryRun(),
     down: ({ shared }) => runDown({}, { shared }),
     generate: () => runGenerate(),
     ls: () => runLs(),
