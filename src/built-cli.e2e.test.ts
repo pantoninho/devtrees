@@ -34,11 +34,12 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { deriveWorktreeId } from "./anchor.js";
 
@@ -208,6 +209,17 @@ interface UpDoc {
   };
 }
 
+interface DryRunDoc {
+  readonly schema_version: string;
+  readonly up_dry_run: {
+    readonly worktree_id: string;
+    readonly env: Record<string, string>;
+    readonly config: { readonly processes: Record<string, unknown> };
+    readonly shared_env?: Record<string, string>;
+    readonly shared_config?: { readonly processes: Record<string, unknown> };
+  };
+}
+
 interface LsDoc {
   readonly ls: {
     readonly instances: Array<{
@@ -286,6 +298,62 @@ describe("built CLI e2e — argv→commands wiring over the stub process-compose
       schema_version: "1",
       down: { shared: true, stopped: true },
     });
+  }, 60_000);
+
+  it("up --dry-run --json previews the config(s) + env with NO side effects (#124)", () => {
+    const { wt, id, sock } = setupScenario("dt-bcdry-");
+    // <absCommon>/devtrees holds the per-instance configs, registry, and the
+    // `run/` socket dir. sock = <devtreesDir>/run/<id>.sock.
+    const devtreesDir = dirname(dirname(sock));
+    const wtConfig = join(devtreesDir, `${id}.yaml`);
+    const sharedConfig = join(devtreesDir, "shared.yaml");
+
+    const dry = devtrees(wt, ["up", "--dry-run", "--json"]);
+    expect(dry.code, `dry-run failed: stderr=${dry.stderr} stdout=${dry.stdout}`).toBe(0);
+
+    // Stdout is one byte-clean JSON document; no log/hint bleed.
+    expect(dry.stdout.startsWith("{")).toBe(true);
+    const doc = dry.doc as DryRunDoc;
+    expect(doc.schema_version).toBe("1");
+    expect(doc.up_dry_run.worktree_id).toBe(id);
+    // A sibling reads the allocated ports straight off the envelope (#125).
+    const webPort = Number(doc.up_dry_run.env.WEB_PORT);
+    const dbPort = Number(doc.up_dry_run.env.DB_PORT);
+    expect(webPort).toBeGreaterThan(0);
+    expect(dbPort).toBeGreaterThan(0);
+    expect(doc.up_dry_run.env.DEVTREES_WORKTREE_ID).toBe(id);
+    // The derived configs are present in-envelope.
+    expect(doc.up_dry_run.config.processes.web).toBeDefined();
+    expect(doc.up_dry_run.shared_config?.processes.db).toBeDefined();
+    // The injected shared port matches between worktree env and shared env.
+    expect(doc.up_dry_run.shared_env?.DB_PORT).toBe(doc.up_dry_run.env.DB_PORT);
+
+    // NO side effects: no config files were written, and no control socket
+    // was created. (Allocation may have written the registry to reserve the
+    // block — that is the documented, acceptable touch; the derived configs
+    // and the instance socket are what `dry-run` must not produce.)
+    expect(existsSync(wtConfig), "no worktree config written").toBe(false);
+    expect(existsSync(sharedConfig), "no shared config written").toBe(false);
+    expect(existsSync(sock), "no control socket created").toBe(false);
+    // If devtrees/ exists at all (the allocation registry), it has no
+    // per-instance run sockets in it.
+    if (existsSync(join(devtreesDir, "run"))) {
+      expect(readdirSync(join(devtreesDir, "run"))).toEqual([]);
+    }
+
+    // ls still shows nothing — the dry run registered no instance.
+    const ls = devtrees(wt, ["ls", "--json"]);
+    expect(ls.code, `ls failed: ${ls.stderr}`).toBe(0);
+    const instances = (ls.doc as LsDoc).ls.instances;
+    expect(instances.find((i) => i.id === id)).toBeUndefined();
+
+    // Human mode prints the derived YAML to stdout (not a JSON envelope).
+    const human = devtrees(wt, ["up", "--dry-run"]);
+    expect(human.code, `dry-run human failed: ${human.stderr}`).toBe(0);
+    expect(human.stdout).toContain("processes:");
+    expect(human.stdout.startsWith("{")).toBe(false);
+    // Still no side effects after the human run.
+    expect(existsSync(sock)).toBe(false);
   }, 60_000);
 
   it("--wait-timeout reaches the health gate: never-ready probed service times out at 1s, not 120s", () => {
