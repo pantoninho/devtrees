@@ -1144,6 +1144,83 @@ describe("devtrees CLI — up non-interactive (#28)", () => {
   });
 });
 
+describe("devtrees CLI — up --dry-run (#124)", () => {
+  const dryResult = {
+    worktreeId: "login",
+    worktreeRoot: "/wt/login",
+    anchor: "/wt/login/.git",
+    env: { DEVTREES_WORKTREE_ID: "login", WEB_PORT: "20512", DB_PORT: "30000" },
+    config: {
+      processes: { web: { command: "node x", working_dir: "/wt", environment: [] } },
+      "x-devtrees": { ports_by_service: { web: { WEB_PORT: 20512 } } },
+    },
+    sharedEnv: { DB_PORT: "30000" },
+    sharedConfig: {
+      processes: { db: { command: "postgres", working_dir: "/anchor", environment: [] } },
+      "x-devtrees": { ports_by_service: { db: { DB_PORT: 30000 } } },
+    },
+  };
+
+  it("dispatches to upDryRun (NOT up) and never spawns the real up path", async () => {
+    const up = vi.fn();
+    const upDryRun = vi.fn().mockResolvedValue(dryResult);
+    const result = await execute(["up", "--dry-run"], { up, down: vi.fn(), upDryRun });
+    expect(result.code).toBe(0);
+    expect(upDryRun).toHaveBeenCalledTimes(1);
+    expect(up).not.toHaveBeenCalled();
+  });
+
+  it("--json emits the up_dry_run envelope on byte-clean stdout — a sibling reads the allocated ports", async () => {
+    const upDryRun = vi.fn().mockResolvedValue(dryResult);
+    const result = await execute(["up", "--dry-run", "--json"], {
+      up: vi.fn(),
+      down: vi.fn(),
+      upDryRun,
+    });
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+    const parsed = JSON.parse(result.stdout) as {
+      schema_version: string;
+      up_dry_run: { worktree_id: string; env: Record<string, string>; config: unknown };
+    };
+    expect(parsed.schema_version).toBe("1");
+    expect(parsed.up_dry_run.worktree_id).toBe("login");
+    expect(parsed.up_dry_run.env.WEB_PORT).toBe("20512");
+    expect(parsed.up_dry_run.env.DB_PORT).toBe("30000");
+    expect(parsed.up_dry_run.config).toEqual(dryResult.config);
+  });
+
+  it("without --json prints the derived YAML to stdout (human preview)", async () => {
+    const upDryRun = vi.fn().mockResolvedValue(dryResult);
+    const result = await execute(["up", "--dry-run"], { up: vi.fn(), down: vi.fn(), upDryRun });
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("node x");
+    expect(result.stdout.startsWith("{")).toBe(false);
+  });
+
+  it("routes a dry-run CONFIG_INVALID through the standard error envelope under --json", async () => {
+    const err = Object.assign(new Error("devtrees.yaml is malformed"), {
+      code: "CONFIG_INVALID" as const,
+    });
+    const upDryRun = vi.fn().mockRejectedValue(err);
+    const result = await execute(["up", "--dry-run", "--json"], {
+      up: vi.fn(),
+      down: vi.fn(),
+      upDryRun,
+    });
+    expect(result.code).toBe(1);
+    const parsed = JSON.parse(result.stdout) as { error: { code: string } };
+    expect(parsed.error.code).toBe("CONFIG_INVALID");
+  });
+
+  it("`devtrees up --help` lists --dry-run and the CONFIG_INVALID / LOCK_CONTENTION error codes", async () => {
+    const help = (await run(["up", "--help"])).stdout;
+    expect(help).toMatch(/--dry-run/);
+    expect(help).toMatch(/CONFIG_INVALID/);
+    expect(help).toMatch(/LOCK_CONTENTION/);
+  });
+});
+
 /**
  * Issue #84: CONFIG_INVALID and LOCK_CONTENTION must be reachable envelopes.
  * Both tests throw the REAL error objects the core raises (the actual

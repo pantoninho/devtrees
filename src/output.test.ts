@@ -20,12 +20,15 @@ import {
   formatLs,
   formatPrune,
   formatUp,
+  formatUpDryRun,
   type ErrorCode,
   type LsInstanceRow,
   type LsServiceRow,
   type PrunedRow,
+  type UpDryRunPayload,
   type UpPayload,
 } from "./output.js";
+import { parse as parseYaml } from "yaml";
 
 describe("output formatter — constants", () => {
   it("declares a schema_version string", () => {
@@ -469,6 +472,98 @@ describe("output formatter — formatUp", () => {
     const result = formatUp(payload, "json");
     expect(result.stdout.endsWith("\n")).toBe(true);
     expect(result.stdout.endsWith("\n\n")).toBe(false);
+  });
+});
+
+/**
+ * `formatUpDryRun` — `devtrees up --dry-run` envelope (#124). The agent-facing
+ * preview of what `up` would run: the derived config(s) and the resolved env
+ * (allocated worktree ports + injected shared ports), with no side effects.
+ * A sibling reads the allocated `WEB_PORT`/`DB_PORT` off `up_dry_run.env`.
+ */
+describe("output formatter — formatUpDryRun (#124)", () => {
+  const config = {
+    processes: { web: { command: "node server.js", working_dir: "/wt", environment: [] } },
+    "x-devtrees": { ports_by_service: { web: { WEB_PORT: 20512 } } },
+  };
+  const sharedConfig = {
+    processes: { db: { command: "postgres", working_dir: "/anchor", environment: [] } },
+    "x-devtrees": { ports_by_service: { db: { DB_PORT: 30000 } } },
+  };
+  const payload: UpDryRunPayload = {
+    worktreeId: "login",
+    env: { DEVTREES_WORKTREE_ID: "login", WEB_PORT: "20512", DB_PORT: "30000" },
+    config,
+    sharedEnv: { DB_PORT: "30000" },
+    sharedConfig,
+  };
+
+  it("in JSON mode, emits schema_version + worktree_id + env + config + shared_config", () => {
+    const result = formatUpDryRun(payload, "json");
+    expect(result.stderr).toBe("");
+    const parsed = JSON.parse(result.stdout) as {
+      schema_version: string;
+      up_dry_run: {
+        worktree_id: string;
+        env: Record<string, string>;
+        config: unknown;
+        shared_env?: Record<string, string>;
+        shared_config?: unknown;
+      };
+    };
+    expect(parsed.schema_version).toBe(SCHEMA_VERSION);
+    expect(parsed.up_dry_run.worktree_id).toBe("login");
+    // A sibling reads the allocated ports straight off env (#125).
+    expect(parsed.up_dry_run.env).toEqual({
+      DEVTREES_WORKTREE_ID: "login",
+      WEB_PORT: "20512",
+      DB_PORT: "30000",
+    });
+    expect(parsed.up_dry_run.config).toEqual(config);
+    expect(parsed.up_dry_run.shared_env).toEqual({ DB_PORT: "30000" });
+    expect(parsed.up_dry_run.shared_config).toEqual(sharedConfig);
+  });
+
+  it("in JSON mode, omits shared_config/shared_env when the stack has no shared services", () => {
+    const result = formatUpDryRun(
+      { worktreeId: "login", env: { WEB_PORT: "20512" }, config },
+      "json",
+    );
+    const parsed = JSON.parse(result.stdout) as {
+      up_dry_run: Record<string, unknown>;
+    };
+    expect("shared_config" in parsed.up_dry_run).toBe(false);
+    expect("shared_env" in parsed.up_dry_run).toBe(false);
+  });
+
+  it("JSON output is one byte-clean document with a single trailing newline", () => {
+    const result = formatUpDryRun(payload, "json");
+    expect(result.stdout.startsWith("{")).toBe(true);
+    expect(result.stdout.endsWith("\n")).toBe(true);
+    expect(result.stdout.endsWith("\n\n")).toBe(false);
+    // Exactly one JSON document on stdout, nothing else.
+    expect(() => JSON.parse(result.stdout)).not.toThrow();
+  });
+
+  it("in human mode, prints the derived YAML (worktree, then shared), nothing on stderr", () => {
+    const result = formatUpDryRun(payload, "human");
+    expect(result.stderr).toBe("");
+    // The worktree config round-trips through YAML.
+    expect(result.stdout).toContain("node server.js");
+    expect(result.stdout).toContain("postgres");
+    // The emitted document parses back into the derived configs.
+    const docs = result.stdout.split(/^---$/m).map((d) => parseYaml(d));
+    expect(docs).toContainEqual(config);
+    expect(docs).toContainEqual(sharedConfig);
+  });
+
+  it("in human mode with no shared services, prints only the worktree config", () => {
+    const result = formatUpDryRun(
+      { worktreeId: "login", env: { WEB_PORT: "20512" }, config },
+      "human",
+    );
+    expect(result.stdout).toContain("node server.js");
+    expect(result.stdout).not.toContain("postgres");
   });
 });
 

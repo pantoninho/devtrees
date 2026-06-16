@@ -18,6 +18,9 @@
  * Stable contract: present on every `--json` payload. Field additions are
  * non-breaking; renames and removals bump this. New error codes are additive.
  */
+import { stringify as stringifyYaml } from "yaml";
+import type { DerivedConfig } from "./deriver.js";
+
 export const SCHEMA_VERSION = "1";
 
 /**
@@ -380,6 +383,60 @@ export function formatGenerate(payload: GeneratePayload, mode: FormatMode): Outp
     "",
   ];
   return { stdout: lines.join("\n"), stderr: "" };
+}
+
+// --- up --dry-run -----------------------------------------------------------
+
+/**
+ * `devtrees up --dry-run` payload (#124). The derivation pipeline's output with
+ * no side effects: the derived worktree config + the resolved env (allocated
+ * worktree ports + injected shared ports), and — when the stack declares shared
+ * services — the derived shared config + its env. A sibling reads the allocated
+ * `WEB_PORT` (and shared `DB_PORT`) straight off `env`, and the full
+ * process-compose document off `config`, without touching the filesystem (#125
+ * migrates `generate`'s inspection use onto this).
+ */
+export interface UpDryRunPayload {
+  readonly worktreeId: string;
+  readonly env: Readonly<Record<string, string>>;
+  readonly config: DerivedConfig;
+  /** Present iff the stack declares shared services. */
+  readonly sharedEnv?: Readonly<Record<string, string>>;
+  /** Present iff the stack declares shared services. */
+  readonly sharedConfig?: DerivedConfig;
+}
+
+/**
+ * Render `devtrees up --dry-run` output.
+ *
+ *   - `json`: `{schema_version, up_dry_run: {worktree_id, env, config,
+ *     shared_env?, shared_config?}}` — one byte-clean document on stdout, the
+ *     agent-readable preview of what `up` would run. `shared_*` keys are
+ *     omitted when the stack has no shared services. Stderr stays untouched.
+ *   - `human`: the derived YAML document(s) — the worktree config, then the
+ *     shared config (separated by a `---` document marker) when present. This
+ *     is what `generate` used to write to disk; here it goes to stdout so a
+ *     developer can eyeball it or pipe it into `process-compose -f -`.
+ */
+export function formatUpDryRun(payload: UpDryRunPayload, mode: FormatMode): OutputResult {
+  if (mode === "json") {
+    const dry: Record<string, unknown> = {
+      worktree_id: payload.worktreeId,
+      env: payload.env,
+      config: payload.config,
+    };
+    if (payload.sharedConfig !== undefined) {
+      dry.shared_env = payload.sharedEnv ?? {};
+      dry.shared_config = payload.sharedConfig;
+    }
+    const doc = { schema_version: SCHEMA_VERSION, up_dry_run: dry };
+    return { stdout: `${JSON.stringify(doc)}\n`, stderr: "" };
+  }
+  const worktreeYaml = stringifyYaml(payload.config);
+  const sharedYaml =
+    payload.sharedConfig !== undefined ? stringifyYaml(payload.sharedConfig) : undefined;
+  const body = sharedYaml === undefined ? worktreeYaml : `${worktreeYaml}---\n${sharedYaml}`;
+  return { stdout: body, stderr: "" };
 }
 
 // --- init -------------------------------------------------------------------

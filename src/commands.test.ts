@@ -34,6 +34,7 @@ import {
   runGenerate,
   runLogs,
   runUp,
+  runUpDryRun,
   type CommandDeps,
   type WithLifecycleLock,
   type WithSharedLock,
@@ -1773,6 +1774,133 @@ describe("runGenerate — emit derived configs to disk", () => {
     expect(raw).not.toMatch(/readiness_probe/);
     expect(raw).not.toMatch(/liveness_probe/);
     expect(raw).not.toMatch(/availability/);
+  });
+});
+
+describe("runUpDryRun — derive the config(s) with no side effects (#124)", () => {
+  it("returns the worktree config + env matching the deriver, without writing files or spawning", async () => {
+    const stack: ResolvedStack = {
+      services: [isolated("web", "node server.js", ["WEB_PORT", "METRICS_PORT"])],
+    };
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const deps = stubDeps({ stack, track });
+
+    const result = await runUpDryRun(deps);
+
+    expect(result.worktreeId).toBe(deps.expectedWorktreeId);
+    // The env carries the allocated worktree ports a sibling reads (#125).
+    expect(Number(result.env.WEB_PORT)).toBeGreaterThanOrEqual(20000);
+    expect(Number(result.env.METRICS_PORT)).toBe(Number(result.env.WEB_PORT) + 1);
+    expect(result.env.DEVTREES_WORKTREE_ID).toBe(deps.expectedWorktreeId);
+
+    // The derived config is byte-identical to deriveWorktreeConfig for the same allocation.
+    const expected = deriveWorktreeConfig(stack, {
+      worktreeId: deps.expectedWorktreeId,
+      worktreeRoot: result.worktreeRoot,
+      portFor: (name) => (result.env[name] !== undefined ? Number(result.env[name]) : undefined),
+    });
+    expect(result.config).toEqual(expected.config);
+
+    // No spawn, no config file on disk.
+    expect(track.invocations).toEqual([]);
+    const paths = instancePaths(
+      result.worktreeRoot.replace(/\/wt\/login$/, "/.git"),
+      deps.expectedWorktreeId,
+    );
+    expect(existsSync(paths.configPath)).toBe(false);
+  });
+
+  it("derives both the worktree and shared config(s) + injects shared ports into env", async () => {
+    const stack: ResolvedStack = {
+      services: [
+        isolated("web", "node server.js", ["WEB_PORT"]),
+        shared("postgres", "postgres -D ./pgdata", ["DB_PORT"]),
+      ],
+    };
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const result = await runUpDryRun(stubDeps({ stack, track }));
+
+    expect(result.sharedConfig).toBeDefined();
+    expect(result.sharedEnv).toBeDefined();
+    // The shared port is injected into the worktree env as connection info.
+    expect(result.env.DB_PORT).toBeDefined();
+    expect(result.env.DB_PORT).toBe(result.sharedEnv?.DB_PORT);
+
+    const expectedShared = deriveSharedConfig(stack, {
+      workingDir: result.anchor,
+      portFor: (name) =>
+        result.sharedEnv?.[name] !== undefined ? Number(result.sharedEnv[name]) : undefined,
+    });
+    expect(result.sharedConfig).toEqual(expectedShared.config);
+
+    // Dry run never lazy-starts the shared instance.
+    expect(track.invocations).toEqual([]);
+  });
+
+  it("omits the shared config when the stack declares no shared services", async () => {
+    const stack: ResolvedStack = {
+      services: [isolated("web", "node x.js", ["WEB_PORT"])],
+    };
+    const result = await runUpDryRun(stubDeps({ stack }));
+    expect(result.sharedConfig).toBeUndefined();
+    expect(result.sharedEnv).toBeUndefined();
+  });
+
+  it("does not register an instance, write a hash, take the lifecycle lock, or wait for health", async () => {
+    const stack: ResolvedStack = {
+      services: [
+        isolated("web", "node server.js", ["WEB_PORT"]),
+        shared("postgres", "postgres", ["DB_PORT"]),
+      ],
+    };
+    let lifecycleLockTaken = false;
+    let sharedLockTaken = false;
+    let hashWritten = false;
+    let healthWaited = false;
+    const deps: CommandDeps = {
+      ...stubDeps({ stack }),
+      withLifecycleLock: async (_a, _i, fn) => {
+        lifecycleLockTaken = true;
+        return fn();
+      },
+      withSharedLock: async (_a, fn) => {
+        sharedLockTaken = true;
+        return fn();
+      },
+      writeStoredHash: () => {
+        hashWritten = true;
+      },
+      waitForHealth: async () => {
+        healthWaited = true;
+      },
+      waitForSharedHealth: async () => {
+        healthWaited = true;
+      },
+    };
+    await runUpDryRun(deps);
+    expect(lifecycleLockTaken).toBe(false);
+    expect(sharedLockTaken).toBe(false);
+    expect(hashWritten).toBe(false);
+    expect(healthWaited).toBe(false);
+  });
+
+  it("allocation may take the registry lock briefly to pick a non-colliding block (documented)", async () => {
+    // Port allocation is the ONE registry-lock touch dry-run is allowed (it
+    // does not start or register an instance) — mirrors `generate` today.
+    const stack: ResolvedStack = {
+      services: [isolated("web", "node x.js", ["WEB_PORT"])],
+    };
+    let registryLockTaken = false;
+    const base = stubDeps({ stack });
+    const deps: CommandDeps = {
+      ...base,
+      withRegistryLock: async (anchor, mutate) => {
+        registryLockTaken = true;
+        return base.withRegistryLock!(anchor, mutate);
+      },
+    };
+    await runUpDryRun(deps);
+    expect(registryLockTaken).toBe(true);
   });
 });
 

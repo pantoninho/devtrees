@@ -15,7 +15,12 @@ import {
   type RegistrySnapshot,
 } from "./allocator.js";
 import { resolveAnchor, type GitProbe } from "./anchor.js";
-import { deriveSharedConfig, deriveWorktreeConfig, type DroppedEdge } from "./deriver.js";
+import {
+  deriveSharedConfig,
+  deriveWorktreeConfig,
+  type DerivedConfig,
+  type DroppedEdge,
+} from "./deriver.js";
 import {
   discoverInstances,
   probeSocket as defaultProbeSocket,
@@ -467,6 +472,42 @@ export interface GenerateResult {
   readonly env: Record<string, string>;
   /** Env injection for the shared instance — present iff a shared file was written. */
   readonly sharedEnv?: Record<string, string>;
+}
+
+/**
+ * Result of `runUpDryRun` (#124): the full derivation pipeline's output —
+ * the worktree-isolated config (and, when the stack declares shared services,
+ * the shared config) plus the env injection a real `up` would apply — with
+ * *no* side effects. Nothing is written to disk, no `process-compose` is
+ * spawned, no socket is created, no instance is registered, no health wait
+ * runs. Port allocation may still briefly take the registry lock to pick a
+ * non-colliding block (as `runGenerate` does today); that is the only
+ * registry touch and it neither starts nor registers an instance.
+ *
+ * The envelope is the agent-readable preview of what `devtrees up` would run:
+ * a sibling can read the allocated `WEB_PORT`/`DB_PORT` off `env` and the full
+ * process-compose document off `config` without touching the filesystem
+ * (PRD #26 / ADR-0005). It supersedes `generate`'s only legitimate use —
+ * materializing the derived config for inspection (#125).
+ */
+export interface DryRunResult {
+  readonly worktreeId: string;
+  readonly worktreeRoot: string;
+  /** The anchor (git common dir) the shared config's processes run in. */
+  readonly anchor: string;
+  /**
+   * Flat env injection the worktree instance would receive: this worktree's
+   * own named ports + the shared services' named ports + the worktree id.
+   * Same shape `runUp`/`runGenerate` return; a sibling reads the allocated
+   * `WEB_PORT` (and shared `DB_PORT`) off here.
+   */
+  readonly env: Record<string, string>;
+  /** The derived worktree-isolated process-compose config. */
+  readonly config: DerivedConfig;
+  /** Env injection for the shared instance — present iff the stack has shared services. */
+  readonly sharedEnv?: Record<string, string>;
+  /** The derived shared process-compose config — present iff the stack has shared services. */
+  readonly sharedConfig?: DerivedConfig;
 }
 
 export interface DownOptions {
@@ -1004,6 +1045,81 @@ export async function runGenerate(deps: CommandDeps = {}): Promise<GenerateResul
     worktreePath: paths.configPath,
     env: derivedWt.env,
   };
+}
+
+/**
+ * Run the full derivation pipeline a real `up` would run — load the stack,
+ * allocate this worktree's collision-free port block (and the repo-wide shared
+ * block when the stack has shared services), derive the worktree-isolated
+ * config and env, and the shared config and env — then STOP before any side
+ * effect (#124). The result is the agent-readable preview of what `devtrees
+ * up` would run.
+ *
+ * No side effects, by design (the dry-run invariant, ADR-0005):
+ *
+ *  - No `process-compose` spawn, no control socket, no health/readiness wait.
+ *  - No config files written under `<anchor>/devtrees/` — neither the
+ *    worktree config nor the shared config touch disk.
+ *  - No instance registered: the registry's allocation entry IS read-modify-
+ *    written (allocation needs a non-colliding block), but no *instance* is
+ *    recorded — same as `generate` today. The stored-stack hash is not
+ *    written, the per-worktree lifecycle lock is never taken, and the shared
+ *    instance is never lazy-started.
+ *
+ * The one registry touch — `allocateAndBuildPortMaps`'s lock-guarded
+ * read-modify-write — is acceptable for a dry run because it neither starts
+ * nor registers an instance; it only reserves (or looks up) a block so the
+ * previewed ports match what a real `up` would use. If allocation can't get
+ * the lock, the caller surfaces `LOCK_CONTENTION` through the standard error
+ * envelope, exactly as `generate` does. A real `up` racing this dry run could
+ * still pick a different block, so the preview reflects a possible (not
+ * guaranteed) allocation.
+ *
+ * Unlike `runGenerate`, nothing is materialized to disk: the derived
+ * config(s) are returned in-memory for the caller to print to stdout (#125
+ * migrates `generate`'s inspection use onto this).
+ */
+export async function runUpDryRun(deps: CommandDeps = {}): Promise<DryRunResult> {
+  const { anchor } = resolve(deps);
+  const readStack = deps.readStack ?? loadStack;
+  const lock = deps.withRegistryLock ?? defaultWithRegistryLock;
+  const isPortFree = deps.isPortFree ?? defaultIsPortFree;
+
+  const stack = readStack(anchor.worktreeRoot);
+  const options = resolveAllocatorOptions(stack, deps.allocator ?? DEFAULT_ALLOCATOR);
+  const sharedNeeded = hasTier(stack, "shared");
+
+  const { portFor, sharedPortFor } = await allocateAndBuildPortMaps({
+    anchor: anchor.anchor,
+    worktreeId: anchor.worktreeId,
+    stack,
+    options,
+    lock,
+    isPortFree,
+  });
+
+  const derivedWt = deriveWorktreeConfig(stack, {
+    worktreeId: anchor.worktreeId,
+    worktreeRoot: anchor.worktreeRoot,
+    portFor,
+    sharedPortFor,
+  });
+
+  const base: DryRunResult = {
+    worktreeId: anchor.worktreeId,
+    worktreeRoot: anchor.worktreeRoot,
+    anchor: anchor.anchor,
+    env: derivedWt.env,
+    config: derivedWt.config,
+  };
+
+  if (!sharedNeeded) return base;
+
+  const derivedShared = deriveSharedConfig(stack, {
+    workingDir: anchor.anchor,
+    portFor: sharedPortFor,
+  });
+  return { ...base, sharedEnv: derivedShared.env, sharedConfig: derivedShared.config };
 }
 
 /**
