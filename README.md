@@ -39,7 +39,6 @@ Commands (from the exported `COMMANDS` manifest in [`src/cli.ts`](src/cli.ts)):
 | `devtrees down`     | Stop this worktree's stack (`--shared` tears down the shared instance)    |
 | `devtrees ls`       | List every instance across the repo with status and ports                 |
 | `devtrees attach`   | Attach a TUI to this worktree's instance (`--shared` for the shared one)  |
-| `devtrees generate` | Write the derived process-compose config to disk                          |
 | `devtrees prune`    | Reconcile against `git worktree list` and clean up orphaned instances     |
 | `devtrees env`      | Print this worktree's injected env (KEY=value, or `--json` for a map)     |
 | `devtrees logs`     | Stream a service's logs (`--follow`, `--tail=N`, `--since=DUR`, `--all`, `--shared`) |
