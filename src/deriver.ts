@@ -48,6 +48,13 @@ export interface DerivedProcess {
   readonly readiness_probe?: Readonly<Record<string, unknown>>;
   readonly liveness_probe?: Readonly<Record<string, unknown>>;
   readonly availability?: Readonly<Record<string, unknown>>;
+  /**
+   * process-compose `namespace` the process belongs to (issue #128), copied
+   * verbatim from the resolved stack. `up -n <ns>` starts only the selected
+   * namespaces; present only when the author declared one — a namespace-less
+   * service derives without the key (process-compose's implicit `default`).
+   */
+  readonly namespace?: string;
 }
 
 /**
@@ -281,6 +288,7 @@ function buildTierProcesses(input: {
     readinessProbe?: Readonly<Record<string, unknown>>;
     livenessProbe?: Readonly<Record<string, unknown>>;
     availability?: Readonly<Record<string, unknown>>;
+    namespace?: string;
   }>;
   workingDir: string;
   extraEnvLines: ReadonlyArray<string>;
@@ -303,6 +311,9 @@ function buildTierProcesses(input: {
         ...(service.readinessProbe !== undefined && { readiness_probe: service.readinessProbe }),
         ...(service.livenessProbe !== undefined && { liveness_probe: service.livenessProbe }),
         ...(service.availability !== undefined && { availability: service.availability }),
+        // process-compose `namespace` passthrough (#128) — re-emitted verbatim,
+        // only when authored, so namespace-less services derive without the key.
+        ...(service.namespace !== undefined && { namespace: service.namespace }),
       },
       partition.kept,
     );

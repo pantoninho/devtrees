@@ -28,9 +28,18 @@ export class MissingProcessComposeError extends Error {
   }
 }
 
-/** Start the instance's server detached, over its UDS, with the TUI disabled. */
-export function buildUpArgs(inst: InstanceRef): string[] {
-  return ["up", "-f", inst.configPath, "-U", "-u", inst.socketPath, "-t=false"];
+/**
+ * Start the instance's server detached, over its UDS, with the TUI disabled.
+ *
+ * `namespaces` is forwarded verbatim as process-compose's repeatable
+ * `-n/--namespace` flag (a `stringArray`) — one `-n <ns>` token per value
+ * (issue #128). Empty / omitted means no flag, which is process-compose's
+ * "run all namespaces" default (unchanged behaviour for existing stacks).
+ */
+export function buildUpArgs(inst: InstanceRef, namespaces: ReadonlyArray<string> = []): string[] {
+  const args = ["up", "-f", inst.configPath, "-U", "-u", inst.socketPath, "-t=false"];
+  for (const ns of namespaces) args.push("-n", ns);
+  return args;
 }
 
 /** Stop the running instance by talking to its UDS. */
@@ -236,10 +245,14 @@ export function createDriver(deps: DriverDeps = {}) {
   }
 
   return {
-    /** Start the worktree instance's server in the background. */
-    async up(inst: InstanceRef): Promise<void> {
+    /**
+     * Start the instance's server in the background. `namespaces` (issue #128)
+     * is forwarded verbatim as process-compose's repeatable `-n` flag; empty
+     * means all namespaces (the unchanged default).
+     */
+    async up(inst: InstanceRef, namespaces: ReadonlyArray<string> = []): Promise<void> {
       await ensureBinary({ binary, exists });
-      const child = spawner(binary, [...prefix, ...buildUpArgs(inst)], {
+      const child = spawner(binary, [...prefix, ...buildUpArgs(inst, namespaces)], {
         detached: true,
         stdio: "ignore",
       });

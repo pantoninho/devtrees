@@ -1105,6 +1105,116 @@ describe("runUp — wait-for-healthy (worktree instance, #28)", () => {
 });
 
 /**
+ * `runUp` — issue #128: namespace selection. `-n/--namespace` narrows what
+ * process-compose starts AND what the #108 health-wait expects, so `up -n
+ * default` neither spawns nor waits on a probed service in an excluded
+ * namespace.
+ */
+describe("runUp — namespace selection (#128)", () => {
+  /**
+   * A `default`-namespace web (no `namespace:` key → implicit default) plus a
+   * `local-backend` api whose readiness probe would HEALTH_TIMEOUT if it were
+   * left in the expected set after `-n default` excludes it.
+   */
+  const mixedNamespaces: ResolvedStack = {
+    services: [
+      isolated("web", "node web.js", ["WEB_PORT"]),
+      {
+        ...isolated("api", "node api.js", ["API_PORT"]),
+        namespace: "local-backend",
+        readinessProbe: { exec: {} },
+      },
+    ],
+  };
+
+  it("forwards each requested namespace verbatim to the worktree up-spawn", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const baseDeps = stubDeps({ stack: mixedNamespaces, track });
+    const inner = baseDeps.driver?.spawner;
+    if (inner === undefined) throw new Error("expected stub spawner");
+    let upArgs: ReadonlyArray<string> | undefined;
+    const deps: CommandDeps = {
+      ...baseDeps,
+      namespaces: ["default"],
+      driver: {
+        ...baseDeps.driver,
+        spawner: (binary, args, options) => {
+          if (args[0] === "up") upArgs = args;
+          return inner(binary, args, options);
+        },
+      },
+    };
+    await runUp(deps);
+    if (upArgs === undefined) throw new Error("expected an up-spawn");
+    expect(upArgs.join(" ")).toContain("-n default");
+    expect(upArgs.filter((a) => a === "-n")).toHaveLength(1);
+  });
+
+  it("narrows the health-wait's expected set to the selected namespaces", async () => {
+    // The crux of #128: `up -n default` must NOT wait on the excluded
+    // local-backend api (a probed service) — otherwise it HEALTH_TIMEOUTs on a
+    // service it never asked process-compose to start.
+    let observed: { serviceNames: string[]; probedServiceNames: string[] } | undefined;
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const deps: CommandDeps = {
+      ...stubDeps({ stack: mixedNamespaces, track }),
+      namespaces: ["default"],
+      waitForHealth: async ({ serviceNames, probedServiceNames }) => {
+        observed = {
+          serviceNames: [...serviceNames].sort(),
+          probedServiceNames: [...probedServiceNames].sort(),
+        };
+      },
+    };
+    await runUp(deps);
+    expect(observed).toEqual({ serviceNames: ["web"], probedServiceNames: [] });
+  });
+
+  it("still waits on probed services WITHIN the selected namespace (no #108 regression)", async () => {
+    // Selecting local-backend keeps the probed api in the expected set.
+    let observed: { serviceNames: string[]; probedServiceNames: string[] } | undefined;
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const deps: CommandDeps = {
+      ...stubDeps({ stack: mixedNamespaces, track }),
+      namespaces: ["local-backend"],
+      waitForHealth: async ({ serviceNames, probedServiceNames }) => {
+        observed = {
+          serviceNames: [...serviceNames].sort(),
+          probedServiceNames: [...probedServiceNames].sort(),
+        };
+      },
+    };
+    await runUp(deps);
+    expect(observed).toEqual({ serviceNames: ["api"], probedServiceNames: ["api"] });
+  });
+
+  it("with no namespaces requested, the full isolated set is expected (unchanged default)", async () => {
+    let observed: string[] | undefined;
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const baseDeps = stubDeps({ stack: mixedNamespaces, track });
+    const inner = baseDeps.driver?.spawner;
+    if (inner === undefined) throw new Error("expected stub spawner");
+    let upArgs: ReadonlyArray<string> | undefined;
+    const deps: CommandDeps = {
+      ...baseDeps,
+      waitForHealth: async ({ serviceNames }) => {
+        observed = [...serviceNames].sort();
+      },
+      driver: {
+        ...baseDeps.driver,
+        spawner: (binary, args, options) => {
+          if (args[0] === "up") upArgs = args;
+          return inner(binary, args, options);
+        },
+      },
+    };
+    await runUp(deps);
+    expect(observed).toEqual(["api", "web"]);
+    expect(upArgs?.includes("-n")).toBe(false);
+  });
+});
+
+/**
  * `runUp` — issue #30 state envelope: on success, the result must carry the
  * allocated port block plus the per-service runtime rows so the CLI can
  * publish `up --json` in one document without a follow-up `ls --json` /

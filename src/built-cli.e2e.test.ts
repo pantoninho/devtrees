@@ -148,21 +148,8 @@ function setupScenario(
   opts: { webProbe?: boolean } = {},
 ): { wt: string; id: string; sock: string } {
   const webProbe = opts.webProbe ?? true;
-  const root = mkdtempSync(join(SHORT_TMP, prefix));
-  const seed = join(root, "main");
-  mkdirSync(seed, { recursive: true });
-  const git = (cwd: string, ...args: string[]): string =>
-    execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
-  git(seed, "init", "-q");
-  git(seed, "config", "user.email", "t@t");
-  git(seed, "config", "user.name", "t");
-  writeFileSync(join(seed, "README.md"), "x");
-  git(seed, "add", ".");
-  git(seed, "commit", "-qm", "init");
-  const wt = join(root, "login");
-  git(seed, "worktree", "add", "-q", wt, "-b", "login");
-  writeFileSync(
-    join(wt, "devtrees.yaml"),
+  const scenario = setupRepoWithStack(
+    prefix,
     [
       "services:",
       "  db:",
@@ -184,8 +171,69 @@ function setupScenario(
       "",
     ].join("\n"),
   );
+  // This stack has a shared tier, so its teardown also stops the shared instance.
+  cleanups.push(() => devtrees(scenario.wt, ["down", "--shared"]));
+  return scenario;
+}
+
+/**
+ * Multi-namespace scenario (#128): a worktree with two isolated services in
+ * distinct namespaces — `web` in the implicit `default` namespace, and `api`
+ * (carrying a readiness probe) in `local-backend`. Selecting `-n default`
+ * must start only `web` and must NOT HEALTH_TIMEOUT on the probed `api`,
+ * which is excluded and never started. Returns the worktree id + socket path.
+ */
+function setupNamespaceScenario(prefix: string): { wt: string; id: string; sock: string } {
+  return setupRepoWithStack(
+    prefix,
+    [
+      "services:",
+      "  web:",
+      "    tier: isolated",
+      '    command: "sleep 300"',
+      "    ports: [WEB_PORT]",
+      "  api:",
+      "    tier: isolated",
+      "    namespace: local-backend",
+      '    command: "sleep 300"',
+      "    ports: [API_PORT]",
+      // A probe on the EXCLUDED service: if its namespace weren't filtered out
+      // of the health-wait's expected set, `up -n default` would HEALTH_TIMEOUT.
+      "    readiness_probe:",
+      "      exec:",
+      '        command: "echo ok"',
+      "      period_seconds: 1",
+      "",
+    ].join("\n"),
+  );
+}
+
+/**
+ * The shared scaffold both built-CLI scenarios sit on: a fresh tmp git repo
+ * with one `login` worktree carrying the given `devtrees.yaml` body. Registers
+ * the rm + worktree `down` cleanups (callers add `down --shared` when their
+ * stack has a shared tier) and returns the derived worktree id + control-socket
+ * path so scenarios can assert against on-disk runtime state.
+ */
+function setupRepoWithStack(
+  prefix: string,
+  devtreesYaml: string,
+): { wt: string; id: string; sock: string } {
+  const root = mkdtempSync(join(SHORT_TMP, prefix));
+  const seed = join(root, "main");
+  mkdirSync(seed, { recursive: true });
+  const git = (cwd: string, ...args: string[]): string =>
+    execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+  git(seed, "init", "-q");
+  git(seed, "config", "user.email", "t@t");
+  git(seed, "config", "user.name", "t");
+  writeFileSync(join(seed, "README.md"), "x");
+  git(seed, "add", ".");
+  git(seed, "commit", "-qm", "init");
+  const wt = join(root, "login");
+  git(seed, "worktree", "add", "-q", wt, "-b", "login");
+  writeFileSync(join(wt, "devtrees.yaml"), devtreesYaml);
   cleanups.push(() => rmSync(root, { recursive: true, force: true }));
-  cleanups.push(() => devtrees(wt, ["down", "--shared"]));
   cleanups.push(() => devtrees(wt, ["down"]));
 
   const id = deriveWorktreeId(git(wt, "rev-parse", "--show-toplevel"));
@@ -598,4 +646,42 @@ describe("built CLI e2e — argv→commands wiring over the stub process-compose
     // No file was written on the failure path.
     expect(existsSync(join(dir, "AGENTS.md"))).toBe(false);
   }, 30_000);
+
+  it("up -n default starts only the default-namespace subset and does not hang on an excluded probed service (#128)", () => {
+    const { wt, id, sock } = setupNamespaceScenario("dt-bcns-");
+
+    // `web` is in `default`; the probed `api` is in `local-backend`. A short
+    // wait-timeout proves we don't burn the full window: if the excluded
+    // probed service were still in the expected set this would HEALTH_TIMEOUT.
+    const up = devtrees(wt, ["up", "-n", "default", "--json", "--wait-timeout", "10"]);
+    expect(up.code, `up -n default failed: stderr=${up.stderr} stdout=${up.stdout}`).toBe(0);
+    const upDoc = up.doc as UpDoc;
+    expect(upDoc.up.worktree_id).toBe(id);
+    expect(existsSync(sock)).toBe(true);
+
+    // ls reflects the actually-running set: only `web` (default), not `api`.
+    const names = (devtrees(wt, ["ls", "--json"]).doc as LsDoc).ls.instances
+      .find((i) => i.id === id)
+      ?.services.map((s) => s.name)
+      .sort();
+    expect(names).toEqual(["web"]);
+  }, 60_000);
+
+  it("up -n local-backend starts only that namespace and still gates on its probed service (#128)", () => {
+    const { wt, id } = setupNamespaceScenario("dt-bcns2-");
+
+    const up = devtrees(wt, ["up", "-n", "local-backend", "--json", "--wait-timeout", "30"]);
+    expect(up.code, `up -n local-backend failed: stderr=${up.stderr} stdout=${up.stdout}`).toBe(0);
+    const services = (up.doc as UpDoc).up.services;
+    // Only `api` runs, and the readiness probe was consulted (health:ready) —
+    // no #108 regression within the selected namespace.
+    expect(services.map((s) => s.name).sort()).toEqual(["api"]);
+    expect(services.find((s) => s.name === "api")?.health).toBe("ready");
+
+    const names = (devtrees(wt, ["ls", "--json"]).doc as LsDoc).ls.instances
+      .find((i) => i.id === id)
+      ?.services.map((s) => s.name)
+      .sort();
+    expect(names).toEqual(["api"]);
+  }, 60_000);
 });

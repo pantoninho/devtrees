@@ -42,6 +42,29 @@ function flag(name, short) {
   return undefined;
 }
 
+/** Collect every value of a repeatable flag (e.g. `-n a -n b`) into an array. */
+function flagAll(name, short) {
+  const argv = process.argv.slice(3);
+  const out = [];
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === name || argv[i] === short) {
+      const v = argv[i + 1];
+      if (v !== undefined) out.push(v);
+    }
+  }
+  return out;
+}
+
+/**
+ * process-compose's namespace model (issue #128): a process with no
+ * `namespace` is in the implicit `default` namespace. `-n` selects a subset;
+ * an empty selection means all namespaces.
+ */
+function selectedByNamespace(proc, namespaces) {
+  if (namespaces.length === 0) return true;
+  return namespaces.includes(proc?.namespace ?? "default");
+}
+
 function killChild(pid) {
   // detached children are process-group leaders; -pid kills the group.
   try {
@@ -69,6 +92,10 @@ const socketPath = flag("--unix-socket", "-u");
 if (cmd === "up") {
   const configPath = flag("-f", "-f");
   const config = parseYaml(readFileSync(configPath, "utf8"));
+  // Namespace selection (#128): `-n/--namespace` is repeatable; an empty
+  // selection starts every namespace (process-compose's default). Only the
+  // selected subset is spawned, and `process list` reports only that subset.
+  const namespaces = flagAll("--namespace", "-n");
   const pids = [];
 
   // Synchronous reaper: kills every recorded child. Safe to call from
@@ -90,6 +117,11 @@ if (cmd === "up") {
     }
     try {
       rmSync(`${socketPath}.config`, { force: true });
+    } catch {
+      // ignore
+    }
+    try {
+      rmSync(`${socketPath}.namespaces`, { force: true });
     } catch {
       // ignore
     }
@@ -123,6 +155,7 @@ if (cmd === "up") {
   const server = createServer();
   server.listen(socketPath, () => {
     for (const proc of Object.values(config.processes ?? {})) {
+      if (!selectedByNamespace(proc, namespaces)) continue;
       const env = { ...process.env };
       for (const entry of proc.environment ?? []) {
         const eq = entry.indexOf("=");
@@ -141,6 +174,10 @@ if (cmd === "up") {
     // Remember the derived config alongside the socket so `process list` can
     // recover the service set without re-resolving the original path.
     writeFileSync(`${socketPath}.config`, readFileSync(configPath, "utf8"));
+    // Persist the namespace selection (#128) so `process list` reports only the
+    // subset this `up` actually started — the real binary lists running
+    // processes, not the whole config.
+    writeFileSync(`${socketPath}.namespaces`, JSON.stringify(namespaces));
     writeFileSync(`${socketPath}.parent-pid`, String(process.pid));
     server.unref();
   });
@@ -211,16 +248,26 @@ if (cmd === "up") {
       process.exit(1);
     }
     const config = parseYaml(readFileSync(cfgPath, "utf8"));
+    // Only the namespaces the matching `up` started are "running" (#128); the
+    // real binary lists running processes, not the whole config.
+    let namespaces = [];
+    try {
+      namespaces = JSON.parse(readFileSync(`${socketPath}.namespaces`, "utf8"));
+    } catch {
+      namespaces = [];
+    }
     const readyAfterMs = Number(process.env.DEVTREES_STUB_READY_AFTER_MS ?? "0");
     const instanceAgeMs = Date.now() - statSync(cfgPath).mtimeMs;
     const probedReady =
       process.env.DEVTREES_STUB_NEVER_READY !== "1" &&
       (!Number.isFinite(readyAfterMs) || instanceAgeMs >= readyAfterMs);
-    const procs = Object.entries(config.processes ?? {}).map(([name, proc]) => ({
-      name,
-      status: "Running",
-      is_ready: proc?.readiness_probe === undefined ? "-" : probedReady ? "Ready" : "Not Ready",
-    }));
+    const procs = Object.entries(config.processes ?? {})
+      .filter(([, proc]) => selectedByNamespace(proc, namespaces))
+      .map(([name, proc]) => ({
+        name,
+        status: "Running",
+        is_ready: proc?.readiness_probe === undefined ? "-" : probedReady ? "Ready" : "Not Ready",
+      }));
     process.stdout.write(JSON.stringify(procs));
     process.exit(0);
   }
@@ -301,6 +348,7 @@ if (cmd === "up") {
   }
   rmSync(`${socketPath}.parent-pid`, { force: true });
   rmSync(`${socketPath}.config`, { force: true });
+  rmSync(`${socketPath}.namespaces`, { force: true });
   rmSync(socketPath, { force: true });
   process.exit(0);
 } else {
