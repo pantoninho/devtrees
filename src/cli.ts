@@ -333,16 +333,7 @@ class UpCommand extends DevtreesCommand {
   override async execute(): Promise<number> {
     return this.dispatch(async () => {
       if (this.dryRun) return this.executeDryRun();
-      const options: UpOptions = {
-        ...(this.attach !== undefined ? { attach: this.attach } : {}),
-        ...(this.waitTimeout !== undefined
-          ? { waitTimeoutMs: parseWaitTimeoutSecondsToMs(this.waitTimeout) }
-          : {}),
-        ...(this.namespaces !== undefined && this.namespaces.length > 0
-          ? { namespaces: this.namespaces }
-          : {}),
-      };
-      const result = await this.context.deps.up(options);
+      const result = await this.context.deps.up(this.buildUpOptions());
       const out = formatUp(
         {
           worktreeId: result.worktreeId,
@@ -358,6 +349,24 @@ class UpCommand extends DevtreesCommand {
       this.emitInitHint();
       return 0;
     });
+  }
+
+  /**
+   * Collect the parsed `up` flags into `UpOptions`, omitting each absent one so
+   * `runUp`'s own defaults apply (TTY-based attach, 120s wait, all namespaces).
+   * Extracted from `execute` so the dispatch body stays a flat sequence and its
+   * cyclomatic complexity doesn't grow per optional flag.
+   */
+  private buildUpOptions(): UpOptions {
+    return {
+      ...(this.attach !== undefined ? { attach: this.attach } : {}),
+      ...(this.waitTimeout !== undefined
+        ? { waitTimeoutMs: parseWaitTimeoutSecondsToMs(this.waitTimeout) }
+        : {}),
+      ...(this.namespaces !== undefined && this.namespaces.length > 0
+        ? { namespaces: this.namespaces }
+        : {}),
+    };
   }
 
   /**

@@ -148,21 +148,8 @@ function setupScenario(
   opts: { webProbe?: boolean } = {},
 ): { wt: string; id: string; sock: string } {
   const webProbe = opts.webProbe ?? true;
-  const root = mkdtempSync(join(SHORT_TMP, prefix));
-  const seed = join(root, "main");
-  mkdirSync(seed, { recursive: true });
-  const git = (cwd: string, ...args: string[]): string =>
-    execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
-  git(seed, "init", "-q");
-  git(seed, "config", "user.email", "t@t");
-  git(seed, "config", "user.name", "t");
-  writeFileSync(join(seed, "README.md"), "x");
-  git(seed, "add", ".");
-  git(seed, "commit", "-qm", "init");
-  const wt = join(root, "login");
-  git(seed, "worktree", "add", "-q", wt, "-b", "login");
-  writeFileSync(
-    join(wt, "devtrees.yaml"),
+  const scenario = setupRepoWithStack(
+    prefix,
     [
       "services:",
       "  db:",
@@ -184,14 +171,9 @@ function setupScenario(
       "",
     ].join("\n"),
   );
-  cleanups.push(() => rmSync(root, { recursive: true, force: true }));
-  cleanups.push(() => devtrees(wt, ["down", "--shared"]));
-  cleanups.push(() => devtrees(wt, ["down"]));
-
-  const id = deriveWorktreeId(git(wt, "rev-parse", "--show-toplevel"));
-  const common = git(wt, "rev-parse", "--git-common-dir");
-  const absCommon = common.startsWith("/") ? common : join(wt, common);
-  return { wt, id, sock: join(absCommon, "devtrees", "run", `${id}.sock`) };
+  // This stack has a shared tier, so its teardown also stops the shared instance.
+  cleanups.push(() => devtrees(scenario.wt, ["down", "--shared"]));
+  return scenario;
 }
 
 /**
@@ -202,21 +184,8 @@ function setupScenario(
  * which is excluded and never started. Returns the worktree id + socket path.
  */
 function setupNamespaceScenario(prefix: string): { wt: string; id: string; sock: string } {
-  const root = mkdtempSync(join(SHORT_TMP, prefix));
-  const seed = join(root, "main");
-  mkdirSync(seed, { recursive: true });
-  const git = (cwd: string, ...args: string[]): string =>
-    execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
-  git(seed, "init", "-q");
-  git(seed, "config", "user.email", "t@t");
-  git(seed, "config", "user.name", "t");
-  writeFileSync(join(seed, "README.md"), "x");
-  git(seed, "add", ".");
-  git(seed, "commit", "-qm", "init");
-  const wt = join(root, "login");
-  git(seed, "worktree", "add", "-q", wt, "-b", "login");
-  writeFileSync(
-    join(wt, "devtrees.yaml"),
+  return setupRepoWithStack(
+    prefix,
     [
       "services:",
       "  web:",
@@ -237,6 +206,33 @@ function setupNamespaceScenario(prefix: string): { wt: string; id: string; sock:
       "",
     ].join("\n"),
   );
+}
+
+/**
+ * The shared scaffold both built-CLI scenarios sit on: a fresh tmp git repo
+ * with one `login` worktree carrying the given `devtrees.yaml` body. Registers
+ * the rm + worktree `down` cleanups (callers add `down --shared` when their
+ * stack has a shared tier) and returns the derived worktree id + control-socket
+ * path so scenarios can assert against on-disk runtime state.
+ */
+function setupRepoWithStack(
+  prefix: string,
+  devtreesYaml: string,
+): { wt: string; id: string; sock: string } {
+  const root = mkdtempSync(join(SHORT_TMP, prefix));
+  const seed = join(root, "main");
+  mkdirSync(seed, { recursive: true });
+  const git = (cwd: string, ...args: string[]): string =>
+    execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+  git(seed, "init", "-q");
+  git(seed, "config", "user.email", "t@t");
+  git(seed, "config", "user.name", "t");
+  writeFileSync(join(seed, "README.md"), "x");
+  git(seed, "add", ".");
+  git(seed, "commit", "-qm", "init");
+  const wt = join(root, "login");
+  git(seed, "worktree", "add", "-q", wt, "-b", "login");
+  writeFileSync(join(wt, "devtrees.yaml"), devtreesYaml);
   cleanups.push(() => rmSync(root, { recursive: true, force: true }));
   cleanups.push(() => devtrees(wt, ["down"]));
 
