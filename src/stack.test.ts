@@ -616,6 +616,83 @@ services:
 });
 
 /**
+ * Issue #130: namespace selection (`up -n`) is a launch-time filter on this
+ * worktree's isolated instance; it cannot reach the shared singleton (a
+ * repo-wide instance whose lifecycle is independent of any one worktree's
+ * `up`, ADR-0001). A `namespace` on a shared service is therefore inert for
+ * selection — the singleton runs it regardless — so it's rejected at
+ * resolution time to surface the footgun loudly instead of silently.
+ */
+describe("stack model — shared-tier namespace rejection (issue #130)", () => {
+  it("rejects a shared service that declares a namespace", () => {
+    const yaml = `
+services:
+  postgres:
+    tier: shared
+    command: "postgres"
+    namespace: local-backend
+`;
+    expect(() => parseStack(yaml)).toThrow(/namespace.*isolated/i);
+  });
+
+  it("rejects a shared service with an explicit namespace: default", () => {
+    // No inert-but-allowed form: the rule is "no namespace key on a shared
+    // service", with no special-casing for the implicit default namespace.
+    const yaml = `
+services:
+  postgres:
+    tier: shared
+    command: "postgres"
+    namespace: default
+`;
+    expect(() => parseStack(yaml)).toThrow(/namespace.*isolated/i);
+  });
+
+  it("names the offending service and points at the fix in the error", () => {
+    const yaml = `
+services:
+  cache:
+    tier: shared
+    command: "redis"
+    namespace: local-backend
+`;
+    try {
+      parseStack(yaml);
+      throw new Error("expected parseStack to throw");
+    } catch (err) {
+      const msg = (err as Error).message;
+      expect(msg).toContain("cache");
+      expect(msg).toMatch(/isolated/i);
+    }
+  });
+
+  it("allows an isolated service with a namespace (no #128 regression)", () => {
+    const yaml = `
+services:
+  api:
+    tier: isolated
+    command: "node api.js"
+    namespace: local-backend
+`;
+    expect(() => parseStack(yaml)).not.toThrow();
+    expect(parseStack(yaml).services[0]?.namespace).toBe("local-backend");
+  });
+
+  it("allows a shared service with no namespace", () => {
+    const yaml = `
+services:
+  postgres:
+    tier: shared
+    command: "postgres"
+`;
+    expect(() => parseStack(yaml)).not.toThrow();
+    const postgres = parseStack(yaml).services[0];
+    if (!postgres) throw new Error("expected postgres");
+    expect("namespace" in postgres).toBe(false);
+  });
+});
+
+/**
  * Issue #84: CONFIG_INVALID must be reachable. Every config-rejection path —
  * cross-tier validation AND raw YAML parse failures — throws an error tagged
  * `code: "CONFIG_INVALID"`, so `classifyError` (src/output.ts) maps it into
@@ -641,6 +718,17 @@ services:
   web:
     tier: isolated
     command: "node server.js"
+`;
+    expect(codeOf(() => parseStack(yaml))).toBe("CONFIG_INVALID");
+  });
+
+  it("tags the shared-namespace rejection (issue #130) with code CONFIG_INVALID", () => {
+    const yaml = `
+services:
+  postgres:
+    tier: shared
+    command: "postgres"
+    namespace: local-backend
 `;
     expect(codeOf(() => parseStack(yaml))).toBe("CONFIG_INVALID");
   });
