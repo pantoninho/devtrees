@@ -1062,6 +1062,22 @@ describe("devtrees CLI — up non-interactive (#28)", () => {
     expect(call.attach).toBeUndefined();
   });
 
+  it("passes attach=false to `up` under --json so the TUI never hijacks the agent output", async () => {
+    // Regression: `--json` is an agent invocation (ADR-0005), but the flag never
+    // reached the attach decision — a human running `devtrees up --json` in a
+    // terminal hit runUp's TTY auto-detect and the TUI took over the very output
+    // they asked to be machine-readable. `--json` now defaults attach to false.
+    const up = vi.fn().mockResolvedValue(baseUpResult);
+    await execute(["up", "--json"], { up, down: vi.fn() });
+    expect(up).toHaveBeenCalledWith(expect.objectContaining({ attach: false }));
+  });
+
+  it("lets an explicit --attach win over the --json no-attach default", async () => {
+    const up = vi.fn().mockResolvedValue(baseUpResult);
+    await execute(["up", "--json", "--attach"], { up, down: vi.fn() });
+    expect(up).toHaveBeenCalledWith(expect.objectContaining({ attach: true }));
+  });
+
   it("parses --wait-timeout=<seconds> into milliseconds for `up`", async () => {
     const up = vi.fn().mockResolvedValue(baseUpResult);
     await execute(["up", "--wait-timeout=30"], { up, down: vi.fn() });

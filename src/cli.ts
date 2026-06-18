@@ -356,10 +356,17 @@ class UpCommand extends DevtreesCommand {
    * `runUp`'s own defaults apply (TTY-based attach, 120s wait, all namespaces).
    * Extracted from `execute` so the dispatch body stays a flat sequence and its
    * cyclomatic complexity doesn't grow per optional flag.
+   *
+   * `--json` is an agent invocation, so it defaults to no-attach (ADR-0005 —
+   * agent invocations shouldn't be hijacked by the TUI). Without this, a human
+   * running `devtrees up --json` in a terminal hits runUp's TTY auto-detect and
+   * the TUI takes over the very output they asked to be machine-readable. An
+   * explicit `--attach`/`--no-attach` still wins over the `--json` default.
    */
   private buildUpOptions(): UpOptions {
+    const attach = this.attach ?? (this.json ? false : undefined);
     return {
-      ...(this.attach !== undefined ? { attach: this.attach } : {}),
+      ...(attach !== undefined ? { attach } : {}),
       ...(this.waitTimeout !== undefined
         ? { waitTimeoutMs: parseWaitTimeoutSecondsToMs(this.waitTimeout) }
         : {}),
