@@ -342,16 +342,29 @@ function parseYamlConfig(yamlText: string, sourceLabel: string): unknown {
 }
 
 /**
- * Cross-service validation pass over a resolved stack. Currently checks the
- * ADR-0003 rule: a `shared` service may not `depends_on` an `isolated` service
- * — that would mean depending on N per-worktree copies of one process and is
- * undefined. Rejected at load time so the developer hears about it before the
- * stack ever tries to start.
+ * Cross-service validation pass over a resolved stack. Checks two load-time
+ * rules, both rejected before the stack ever tries to start:
+ *
+ *  - ADR-0003: a `shared` service may not `depends_on` an `isolated` service
+ *    — that would mean depending on N per-worktree copies of one process and
+ *    is undefined.
+ *  - Issue #130: a `shared` service may not declare a `namespace`. Namespace
+ *    selection (`up -n`) is a launch-time filter on this worktree's isolated
+ *    instance; the shared singleton (ADR-0001) runs regardless of any one
+ *    worktree's `-n`, so a namespace on a shared service is inert for
+ *    selection. Reject it loudly instead of letting it pass through silently.
  */
 function validateStack(stack: ResolvedStack): void {
   const tierOf = new Map(stack.services.map((s) => [s.name, s.tier]));
   for (const service of stack.services) {
     if (service.tier !== "shared") continue;
+    if (service.namespace !== undefined) {
+      throw new StackConfigError(
+        `service '${service.name}': namespace selection (up -n) applies only to isolated services; ` +
+          `shared services are a repo-wide singleton and always run. ` +
+          `Remove the namespace from '${service.name}', or make it isolated.`,
+      );
+    }
     for (const dep of service.dependsOn) {
       if (tierOf.get(dep) === "isolated") {
         throw new StackConfigError(
