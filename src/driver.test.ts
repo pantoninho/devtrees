@@ -35,6 +35,19 @@ describe("process-compose driver — argv construction", () => {
     expect(args).toContain("-t=false");
   });
 
+  it("forwards no namespace flag when none is requested (default: all)", () => {
+    expect(buildUpArgs(inst)).not.toContain("-n");
+    expect(buildUpArgs(inst, [])).not.toContain("-n");
+  });
+
+  it("appends `-n <ns>` once per requested namespace, verbatim", () => {
+    const args = buildUpArgs(inst, ["default", "local-backend"]);
+    expect(args.join(" ")).toContain("-n default");
+    expect(args.join(" ")).toContain("-n local-backend");
+    // one `-n` token per value
+    expect(args.filter((a) => a === "-n")).toHaveLength(2);
+  });
+
   it("stops an instance by talking to its UDS", () => {
     const args = buildDownArgs(inst);
     expect(args).toContain("down");
