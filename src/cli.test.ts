@@ -101,6 +101,12 @@ describe("devtrees CLI", () => {
     expect(help).toMatch(/--wait-timeout/);
   });
 
+  it("`devtrees up --help` documents --namespace/-n with its repeatable semantics (#128)", async () => {
+    const help = (await run(["up", "--help"])).stdout;
+    expect(help).toMatch(/--namespace/);
+    expect(help).toMatch(/repeat/i);
+  });
+
   /**
    * Per-subcommand error-code footer (issue #64). Each subcommand's `--help`
    * lists the ADR-0005 error codes it can emit under `--json`, with a terse
@@ -1084,6 +1090,27 @@ describe("devtrees CLI — up non-interactive (#28)", () => {
     expect(result.code).not.toBe(0);
     expect(result.stderr).toMatch(/--wait-timeout/);
     expect(up).not.toHaveBeenCalled();
+  });
+
+  it("passes a single -n/--namespace value to `up` (#128)", async () => {
+    const up = vi.fn().mockResolvedValue(baseUpResult);
+    await execute(["up", "-n", "default"], { up, down: vi.fn() });
+    expect(up).toHaveBeenCalledWith(expect.objectContaining({ namespaces: ["default"] }));
+  });
+
+  it("collects repeated -n/--namespace flags into an array, in order (#128)", async () => {
+    const up = vi.fn().mockResolvedValue(baseUpResult);
+    await execute(["up", "-n", "default", "--namespace", "local-backend"], { up, down: vi.fn() });
+    expect(up).toHaveBeenCalledWith(
+      expect.objectContaining({ namespaces: ["default", "local-backend"] }),
+    );
+  });
+
+  it("omits namespaces from `up` options when no -n flag is given (#128)", async () => {
+    const up = vi.fn().mockResolvedValue(baseUpResult);
+    await execute(["up"], { up, down: vi.fn() });
+    const call = up.mock.calls[0]?.[0] ?? {};
+    expect(call.namespaces).toBeUndefined();
   });
 
   it("`up --json` HEALTH_TIMEOUT failure → error envelope with code:HEALTH_TIMEOUT", async () => {

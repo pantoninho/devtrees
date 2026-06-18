@@ -103,6 +103,12 @@ export interface UpOptions {
   readonly attach?: boolean;
   /** Health-wait window in ms (`--wait-timeout=<seconds>`). */
   readonly waitTimeoutMs?: number;
+  /**
+   * process-compose namespaces to start (`-n/--namespace`, issue #128),
+   * repeatable and forwarded verbatim. Omitted when no `-n` flag is given, so
+   * `runUp`'s default (all namespaces) applies.
+   */
+  readonly namespaces?: ReadonlyArray<string>;
 }
 
 /** The effectful commands, injected so dispatch stays unit-testable. */
@@ -305,6 +311,16 @@ class UpCommand extends DevtreesCommand {
   waitTimeout = Option.String("--wait-timeout", {
     description: "Health-wait timeout in seconds. Default 120.",
   });
+  // process-compose `-n/--namespace` (issue #128): a repeatable string-array
+  // selecting which namespace subset to start. Repeat the flag to pass more
+  // than one (`-n a -n b`); omitted starts every namespace (the default). The
+  // selection also narrows the health-wait's expected set so `up -n default`
+  // never waits on a probed service in an excluded namespace.
+  namespaces = Option.Array("--namespace,-n", {
+    description:
+      "Start only the given process-compose namespace(s). Repeatable (`-n a -n b`); " +
+      "omitted starts all namespaces (the default).",
+  });
   dryRun = Option.Boolean("--dry-run", false, {
     description:
       "Derive and print the config(s) + allocated env to stdout WITHOUT side effects: " +
@@ -321,6 +337,9 @@ class UpCommand extends DevtreesCommand {
         ...(this.attach !== undefined ? { attach: this.attach } : {}),
         ...(this.waitTimeout !== undefined
           ? { waitTimeoutMs: parseWaitTimeoutSecondsToMs(this.waitTimeout) }
+          : {}),
+        ...(this.namespaces !== undefined && this.namespaces.length > 0
+          ? { namespaces: this.namespaces }
           : {}),
       };
       const result = await this.context.deps.up(options);
@@ -895,6 +914,7 @@ if (isEntrypoint(import.meta.url, process.argv[1])) {
       runUp({
         ...(options?.attach !== undefined ? { attach: options.attach } : {}),
         ...(options?.waitTimeoutMs !== undefined ? { waitTimeoutMs: options.waitTimeoutMs } : {}),
+        ...(options?.namespaces !== undefined ? { namespaces: options.namespaces } : {}),
       }),
     upDryRun: () => runUpDryRun(),
     down: ({ shared }) => runDown({}, { shared }),
