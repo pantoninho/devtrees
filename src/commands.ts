@@ -428,6 +428,14 @@ export interface CommandDeps {
   readonly isTTY?: () => boolean;
   /** Sink for non-fatal warnings (e.g. unmanaged port detection). Default: stderr. */
   readonly warn?: (message: string) => void;
+  /**
+   * process-compose namespaces to start (issue #128) — the `-n/--namespace`
+   * selection. Forwarded verbatim to the worktree up-spawn AND used to narrow
+   * the worktree health-wait's expected set, so `up -n default` neither spawns
+   * nor waits on a probed service in an excluded namespace. Empty / omitted
+   * starts every namespace (process-compose's default — unchanged behaviour).
+   */
+  readonly namespaces?: ReadonlyArray<string>;
 }
 
 export interface UpResult {
@@ -881,7 +889,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
       });
     }
 
-    await driver.up(inst);
+    await driver.up(inst, deps.namespaces ?? []);
 
     // `driver.up` is fire-and-forget: spawn returns before the child binds the
     // UDS. Hold the lifecycle lock until the socket is observable so the next
@@ -2012,13 +2020,43 @@ async function waitForWorktreeHealth(
   driver: { getServiceStatuses(socketPath: string): Promise<ServiceStatus[]> },
 ): Promise<void> {
   const wait = deps.waitForHealth ?? createWaitForHealth(driver);
-  const isolated = stack.services.filter((s) => s.tier === "isolated");
+  // Narrow the expected set to the services process-compose actually started:
+  // the isolated tier, intersected with the selected namespaces (issue #128).
+  // Without the namespace narrowing, `up -n default` would wait on a probed
+  // service in an excluded namespace process-compose never started and
+  // HEALTH_TIMEOUT (the critical #108 interaction).
+  const isolated = stack.services.filter(
+    (s) => s.tier === "isolated" && namespaceSelected(s, deps.namespaces),
+  );
   await wait({
     socketPath,
     serviceNames: isolated.map((s) => s.name),
     probedServiceNames: probedNames(isolated),
     timeoutMs: deps.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS,
   });
+}
+
+/**
+ * Process-compose's `default` namespace — where a service with no explicit
+ * `namespace:` lands. `-n default` therefore selects exactly the unlabelled
+ * services (issue #128).
+ */
+const DEFAULT_NAMESPACE = "default";
+
+/**
+ * Is this service part of the selected namespace set (issue #128)? An empty /
+ * absent selection means "all namespaces" (process-compose's default), so
+ * everything is selected. Otherwise a service is selected iff its namespace —
+ * the implicit `default` when unlabelled — is among the requested values. This
+ * mirrors what process-compose's `-n` actually starts, so the health-wait
+ * expects exactly the running set.
+ */
+function namespaceSelected(
+  service: ResolvedService,
+  namespaces: ReadonlyArray<string> | undefined,
+): boolean {
+  if (namespaces === undefined || namespaces.length === 0) return true;
+  return namespaces.includes(service.namespace ?? DEFAULT_NAMESPACE);
 }
 
 /**
