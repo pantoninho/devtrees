@@ -404,6 +404,38 @@ describe("built CLI e2e — argv→commands wiring over the stub process-compose
     expect(existsSync(sock)).toBe(false);
   }, 60_000);
 
+  it("rejects a namespaced shared service as CONFIG_INVALID with no side effects (#130)", () => {
+    // A shared service can't be namespace-selected (ADR-0001 singleton), so a
+    // `namespace` on it is rejected at resolution time. Exercised through
+    // `up --dry-run --json` — a resolve-only path — so the envelope must carry
+    // CONFIG_INVALID (not UNKNOWN) and produce no config/socket side effects.
+    const { wt, id, sock } = setupRepoWithStack(
+      "dt-bcns-",
+      [
+        "services:",
+        "  db:",
+        "    tier: shared",
+        '    command: "sleep 300"',
+        "    namespace: local-backend",
+        "",
+      ].join("\n"),
+    );
+    const devtreesDir = dirname(dirname(sock));
+
+    const dry = devtrees(wt, ["up", "--dry-run", "--json"]);
+    expect(dry.code, `expected a non-zero exit; stdout=${dry.stdout}`).not.toBe(0);
+    const err = (dry.doc as ErrorDoc).error;
+    expect(err?.code).toBe("CONFIG_INVALID");
+    // Message names the offending service and points at the isolated-only rule.
+    expect(err?.message).toContain("db");
+    expect(err?.message).toMatch(/isolated/i);
+
+    // No side effects: no derived config and no control socket were written.
+    expect(existsSync(join(devtreesDir, `${id}.yaml`)), "no worktree config").toBe(false);
+    expect(existsSync(join(devtreesDir, "shared.yaml")), "no shared config").toBe(false);
+    expect(existsSync(sock), "no control socket").toBe(false);
+  }, 60_000);
+
   it("--wait-timeout reaches the health gate: never-ready probed service times out at 1s, not 120s", () => {
     const { wt, sock } = setupScenario("dt-bc2-");
 
