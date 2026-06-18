@@ -175,7 +175,9 @@ const PASSTHROUGH_FIELDS: ReadonlyArray<readonly [keyof ResolvedService, keyof R
 function resolvePassthrough(
   over: RawService,
   base: RawService,
-): Partial<Pick<ResolvedService, "readinessProbe" | "livenessProbe" | "availability" | "shutdown">> {
+): Partial<
+  Pick<ResolvedService, "readinessProbe" | "livenessProbe" | "availability" | "shutdown">
+> {
   const out: Record<string, Readonly<Record<string, unknown>>> = {};
   for (const [outKey, rawKey] of PASSTHROUGH_FIELDS) {
     const value = asOpaqueRecord(over[rawKey] ?? base[rawKey]);

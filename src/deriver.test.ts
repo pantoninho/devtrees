@@ -475,6 +475,129 @@ describe("config deriver — namespace passthrough (#128)", () => {
   });
 });
 
+describe("config deriver — shutdown / daemon-launch passthrough (#134)", () => {
+  function daemonStack(tier: "isolated" | "shared"): ResolvedStack {
+    return {
+      services: [
+        {
+          name: "data",
+          tier,
+          command: "supabase start",
+          ports: [],
+          dependsOn: [],
+          environment: [],
+          shutdown: { command: "supabase stop", timeout_seconds: 60, parent_only: false },
+          isDaemon: true,
+          launchTimeoutSeconds: 5,
+        },
+      ],
+    };
+  }
+
+  it("copies shutdown / is_daemon / launch_timeout_seconds verbatim onto an isolated process", () => {
+    const derived = deriveWorktreeConfig(daemonStack("isolated"), {
+      worktreeId: "login",
+      worktreeRoot: "/wt/login",
+      portFor: () => 20512,
+    });
+    const data = derived.config.processes.data;
+    if (!data) throw new Error("expected data");
+    expect(data.shutdown).toEqual({
+      command: "supabase stop",
+      timeout_seconds: 60,
+      parent_only: false,
+    });
+    expect(data.is_daemon).toBe(true);
+    expect(data.launch_timeout_seconds).toBe(5);
+  });
+
+  it("copies the same three keys onto a shared process", () => {
+    const out = deriveSharedConfig(daemonStack("shared"), {
+      workingDir: "/anchor",
+      portFor: () => 19000,
+    });
+    const data = out.config.processes.data;
+    if (!data) throw new Error("expected data");
+    expect(data.shutdown).toEqual({
+      command: "supabase stop",
+      timeout_seconds: 60,
+      parent_only: false,
+    });
+    expect(data.is_daemon).toBe(true);
+    expect(data.launch_timeout_seconds).toBe(5);
+  });
+
+  it("omits all three keys when the service didn't declare them (no undefined leak)", () => {
+    const plain: ResolvedStack = {
+      services: [
+        {
+          name: "web",
+          tier: "isolated",
+          command: "node server.js",
+          ports: [],
+          dependsOn: [],
+          environment: [],
+        },
+      ],
+    };
+    const derived = deriveWorktreeConfig(plain, {
+      worktreeId: "login",
+      worktreeRoot: "/wt/login",
+      portFor: () => 20512,
+    });
+    const web = derived.config.processes.web;
+    if (!web) throw new Error("expected web");
+    expect("shutdown" in web).toBe(false);
+    expect("is_daemon" in web).toBe(false);
+    expect("launch_timeout_seconds" in web).toBe(false);
+    const yaml = stringifyYaml(derived.config);
+    expect(yaml).not.toMatch(/shutdown/);
+    expect(yaml).not.toMatch(/is_daemon/);
+    expect(yaml).not.toMatch(/launch_timeout_seconds/);
+  });
+
+  it("preserves a declared is_daemon: false (false is not absence)", () => {
+    const stack: ResolvedStack = {
+      services: [
+        {
+          name: "data",
+          tier: "isolated",
+          command: "supabase start",
+          ports: [],
+          dependsOn: [],
+          environment: [],
+          isDaemon: false,
+          launchTimeoutSeconds: 0,
+        },
+      ],
+    };
+    const derived = deriveWorktreeConfig(stack, {
+      worktreeId: "login",
+      worktreeRoot: "/wt/login",
+      portFor: () => 20512,
+    });
+    const data = derived.config.processes.data;
+    if (!data) throw new Error("expected data");
+    expect("is_daemon" in data).toBe(true);
+    expect(data.is_daemon).toBe(false);
+    expect("launch_timeout_seconds" in data).toBe(true);
+    expect(data.launch_timeout_seconds).toBe(0);
+  });
+
+  it("serializes shutdown to YAML round-trip without normalization", () => {
+    const derived = deriveWorktreeConfig(daemonStack("isolated"), {
+      worktreeId: "login",
+      worktreeRoot: "/wt/login",
+      portFor: () => 20512,
+    });
+    const yaml = stringifyYaml(derived.config);
+    expect(yaml).toMatch(/shutdown:/);
+    expect(yaml).toMatch(/command: supabase stop/);
+    expect(yaml).toMatch(/is_daemon: true/);
+    expect(yaml).toMatch(/launch_timeout_seconds: 5/);
+  });
+});
+
 describe("config deriver — cross-tier depends_on handling (ADR-0003)", () => {
   function mixedDepsStack(): ResolvedStack {
     return {
