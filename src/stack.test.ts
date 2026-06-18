@@ -297,6 +297,45 @@ services:
     expect("readinessProbe" in web).toBe(false);
   });
 
+  it("carries an inline namespace through verbatim", () => {
+    const yaml = `
+services:
+  api:
+    command: "node api.js"
+    namespace: local-backend
+`;
+    const stack = parseStack(yaml);
+    expect(stack.services[0]?.namespace).toBe("local-backend");
+  });
+
+  it("omits namespace from ResolvedService when the author didn't declare one", () => {
+    const yaml = `
+services:
+  web:
+    command: "node server.js"
+`;
+    const stack = parseStack(yaml);
+    const web = stack.services[0];
+    if (!web) throw new Error("expected web");
+    expect("namespace" in web).toBe(false);
+  });
+
+  it("lets the overlay attach a namespace to a base-defined service", () => {
+    const devtrees = `
+extends: ./process-compose.yaml
+services:
+  api:
+    namespace: local-backend
+`;
+    const base = `
+processes:
+  api:
+    command: "node api.js"
+`;
+    const stack = parseStack(devtrees, { baseYaml: base });
+    expect(stack.services[0]?.namespace).toBe("local-backend");
+  });
+
   it("uses the base's readiness_probe when the overlay omits it", () => {
     const devtrees = `
 extends: ./process-compose.yaml

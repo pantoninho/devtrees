@@ -52,6 +52,14 @@ export interface ResolvedService {
   readonly livenessProbe?: Readonly<Record<string, unknown>>;
   /** process-compose `availability` block (restart policy etc.), opaque passthrough. */
   readonly availability?: Readonly<Record<string, unknown>>;
+  /**
+   * process-compose `namespace` the service belongs to, passed through verbatim
+   * (issue #128). Selects which subset of the stack `up -n <ns>` starts; absent
+   * when the author declared none, in which case process-compose places the
+   * service in its implicit `default` namespace. Unlike `tier`, this is a
+   * process-compose-native field — it is re-emitted into the derived config.
+   */
+  readonly namespace?: string;
 }
 
 /** Per-repo allocator overrides, partial — unspecified fields fall back to defaults. */
@@ -74,6 +82,7 @@ interface RawService {
   ports?: unknown;
   depends_on?: unknown;
   environment?: unknown;
+  namespace?: unknown;
   /**
    * Pure passthrough surface — devtrees never validates the inner shape of
    * these process-compose blocks. They're typed as `unknown` here so the
@@ -149,6 +158,23 @@ function resolvePassthrough(
     if (value !== undefined) out[outKey] = value;
   }
   return out;
+}
+
+/**
+ * Resolve the `namespace` passthrough for one service (#128). Overlay wins over
+ * base; the key is left off the returned record entirely when neither declares
+ * a non-empty string, so `"namespace" in svc` reflects authoring intent and a
+ * namespace-less service derives without a `namespace` key. Non-string scalars
+ * coerce through `asString`; an empty result is treated as "no namespace".
+ */
+function resolveNamespace(
+  over: RawService,
+  base: RawService,
+): Partial<Pick<ResolvedService, "namespace">> {
+  const raw = over.namespace ?? base.namespace;
+  if (raw === undefined || raw === null) return {};
+  const ns = asString(raw);
+  return ns === "" ? {} : { namespace: ns };
 }
 
 /**
@@ -241,6 +267,11 @@ export function parseStack(yamlText: string, options: ParseStackOptions = {}): R
       ports: asStringArray(over.ports ?? base.ports),
       dependsOn: asDependencyList(over.depends_on ?? base.depends_on),
       environment: asStringArray(over.environment ?? base.environment),
+      // process-compose `namespace` passthrough (#128). Overlay wins over base;
+      // only set when authored, so `"namespace" in svc` reflects intent and a
+      // namespace-less service is emitted without the key (lands in
+      // process-compose's implicit `default` namespace — no behaviour change).
+      ...resolveNamespace(over, base),
       // Opaque passthrough fields — only present when authored, so
       // `"readinessProbe" in svc` reflects intent (no `undefined` leak).
       ...resolvePassthrough(over, base),
