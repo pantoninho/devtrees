@@ -409,6 +409,72 @@ describe("config deriver — probe / availability passthrough", () => {
   });
 });
 
+describe("config deriver — namespace passthrough (#128)", () => {
+  it("copies a service's namespace verbatim onto the derived isolated process", () => {
+    const stack: ResolvedStack = {
+      services: [
+        {
+          name: "api",
+          tier: "isolated",
+          command: "node api.js",
+          ports: [],
+          dependsOn: [],
+          environment: [],
+          namespace: "local-backend",
+        },
+      ],
+    };
+    const derived = deriveWorktreeConfig(stack, {
+      worktreeId: "login",
+      worktreeRoot: "/wt/login",
+      portFor: () => 20512,
+    });
+    expect(derived.config.processes.api?.namespace).toBe("local-backend");
+  });
+
+  it("omits the namespace key when the service didn't declare one", () => {
+    const stack: ResolvedStack = {
+      services: [
+        {
+          name: "web",
+          tier: "isolated",
+          command: "node server.js",
+          ports: [],
+          dependsOn: [],
+          environment: [],
+        },
+      ],
+    };
+    const derived = deriveWorktreeConfig(stack, {
+      worktreeId: "login",
+      worktreeRoot: "/wt/login",
+      portFor: () => 20512,
+    });
+    const web = derived.config.processes.web;
+    if (!web) throw new Error("expected web");
+    expect("namespace" in web).toBe(false);
+    expect(stringifyYaml(derived.config)).not.toMatch(/namespace/);
+  });
+
+  it("copies namespace onto a shared derived process too", () => {
+    const stack: ResolvedStack = {
+      services: [
+        {
+          name: "postgres",
+          tier: "shared",
+          command: "postgres",
+          ports: ["DB_PORT"],
+          dependsOn: [],
+          environment: [],
+          namespace: "data",
+        },
+      ],
+    };
+    const out = deriveSharedConfig(stack, { workingDir: "/anchor", portFor: () => 19000 });
+    expect(out.config.processes.postgres?.namespace).toBe("data");
+  });
+});
+
 describe("config deriver — cross-tier depends_on handling (ADR-0003)", () => {
   function mixedDepsStack(): ResolvedStack {
     return {
