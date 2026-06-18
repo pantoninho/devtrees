@@ -194,6 +194,58 @@ function setupScenario(
   return { wt, id, sock: join(absCommon, "devtrees", "run", `${id}.sock`) };
 }
 
+/**
+ * Multi-namespace scenario (#128): a worktree with two isolated services in
+ * distinct namespaces — `web` in the implicit `default` namespace, and `api`
+ * (carrying a readiness probe) in `local-backend`. Selecting `-n default`
+ * must start only `web` and must NOT HEALTH_TIMEOUT on the probed `api`,
+ * which is excluded and never started. Returns the worktree id + socket path.
+ */
+function setupNamespaceScenario(prefix: string): { wt: string; id: string; sock: string } {
+  const root = mkdtempSync(join(SHORT_TMP, prefix));
+  const seed = join(root, "main");
+  mkdirSync(seed, { recursive: true });
+  const git = (cwd: string, ...args: string[]): string =>
+    execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+  git(seed, "init", "-q");
+  git(seed, "config", "user.email", "t@t");
+  git(seed, "config", "user.name", "t");
+  writeFileSync(join(seed, "README.md"), "x");
+  git(seed, "add", ".");
+  git(seed, "commit", "-qm", "init");
+  const wt = join(root, "login");
+  git(seed, "worktree", "add", "-q", wt, "-b", "login");
+  writeFileSync(
+    join(wt, "devtrees.yaml"),
+    [
+      "services:",
+      "  web:",
+      "    tier: isolated",
+      '    command: "sleep 300"',
+      "    ports: [WEB_PORT]",
+      "  api:",
+      "    tier: isolated",
+      "    namespace: local-backend",
+      '    command: "sleep 300"',
+      "    ports: [API_PORT]",
+      // A probe on the EXCLUDED service: if its namespace weren't filtered out
+      // of the health-wait's expected set, `up -n default` would HEALTH_TIMEOUT.
+      "    readiness_probe:",
+      "      exec:",
+      '        command: "echo ok"',
+      "      period_seconds: 1",
+      "",
+    ].join("\n"),
+  );
+  cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+  cleanups.push(() => devtrees(wt, ["down"]));
+
+  const id = deriveWorktreeId(git(wt, "rev-parse", "--show-toplevel"));
+  const common = git(wt, "rev-parse", "--git-common-dir");
+  const absCommon = common.startsWith("/") ? common : join(wt, common);
+  return { wt, id, sock: join(absCommon, "devtrees", "run", `${id}.sock`) };
+}
+
 interface UpDoc {
   readonly schema_version: string;
   readonly up: {
@@ -598,4 +650,42 @@ describe("built CLI e2e — argv→commands wiring over the stub process-compose
     // No file was written on the failure path.
     expect(existsSync(join(dir, "AGENTS.md"))).toBe(false);
   }, 30_000);
+
+  it("up -n default starts only the default-namespace subset and does not hang on an excluded probed service (#128)", () => {
+    const { wt, id, sock } = setupNamespaceScenario("dt-bcns-");
+
+    // `web` is in `default`; the probed `api` is in `local-backend`. A short
+    // wait-timeout proves we don't burn the full window: if the excluded
+    // probed service were still in the expected set this would HEALTH_TIMEOUT.
+    const up = devtrees(wt, ["up", "-n", "default", "--json", "--wait-timeout", "10"]);
+    expect(up.code, `up -n default failed: stderr=${up.stderr} stdout=${up.stdout}`).toBe(0);
+    const upDoc = up.doc as UpDoc;
+    expect(upDoc.up.worktree_id).toBe(id);
+    expect(existsSync(sock)).toBe(true);
+
+    // ls reflects the actually-running set: only `web` (default), not `api`.
+    const names = (devtrees(wt, ["ls", "--json"]).doc as LsDoc).ls.instances
+      .find((i) => i.id === id)
+      ?.services.map((s) => s.name)
+      .sort();
+    expect(names).toEqual(["web"]);
+  }, 60_000);
+
+  it("up -n local-backend starts only that namespace and still gates on its probed service (#128)", () => {
+    const { wt, id } = setupNamespaceScenario("dt-bcns2-");
+
+    const up = devtrees(wt, ["up", "-n", "local-backend", "--json", "--wait-timeout", "30"]);
+    expect(up.code, `up -n local-backend failed: stderr=${up.stderr} stdout=${up.stdout}`).toBe(0);
+    const services = (up.doc as UpDoc).up.services;
+    // Only `api` runs, and the readiness probe was consulted (health:ready) —
+    // no #108 regression within the selected namespace.
+    expect(services.map((s) => s.name).sort()).toEqual(["api"]);
+    expect(services.find((s) => s.name === "api")?.health).toBe("ready");
+
+    const names = (devtrees(wt, ["ls", "--json"]).doc as LsDoc).ls.instances
+      .find((i) => i.id === id)
+      ?.services.map((s) => s.name)
+      .sort();
+    expect(names).toEqual(["api"]);
+  }, 60_000);
 });
