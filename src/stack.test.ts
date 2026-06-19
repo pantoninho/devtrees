@@ -514,6 +514,182 @@ services:
   });
 });
 
+describe("stack model — shutdown / daemon-launch passthrough (#134)", () => {
+  it("carries an inline shutdown block through as an opaque record", () => {
+    // shutdown is an object → rides the same opaque-record passthrough as the
+    // probe blocks. devtrees never models its inner shape; process-compose owns it.
+    const yaml = `
+services:
+  data:
+    command: "supabase start"
+    shutdown:
+      command: "supabase stop"
+      timeout_seconds: 60
+      signal: 15
+      parent_only: false
+      future_field_devtrees_doesnt_know: 7
+`;
+    const stack = parseStack(yaml);
+    expect(stack.services[0]?.shutdown).toEqual({
+      command: "supabase stop",
+      timeout_seconds: 60,
+      signal: 15,
+      parent_only: false,
+      future_field_devtrees_doesnt_know: 7,
+    });
+  });
+
+  it("omits shutdown from ResolvedService when the author didn't declare one", () => {
+    const yaml = `
+services:
+  web:
+    command: "node server.js"
+`;
+    const stack = parseStack(yaml);
+    const web = stack.services[0];
+    if (!web) throw new Error("expected web");
+    expect("shutdown" in web).toBe(false);
+  });
+
+  it("uses the base's shutdown when the overlay omits it; overlay wins when both set", () => {
+    const devtrees = `
+extends: ./process-compose.yaml
+services:
+  api:
+    tier: isolated
+  web:
+    tier: isolated
+    shutdown:
+      command: "/overlay-down"
+`;
+    const base = `
+processes:
+  api:
+    command: "node api.js"
+    shutdown:
+      command: "/base-api-down"
+  web:
+    command: "node server.js"
+    shutdown:
+      command: "/base-web-down"
+`;
+    const stack = parseStack(devtrees, { baseYaml: base });
+    const byName = Object.fromEntries(stack.services.map((s) => [s.name, s]));
+    expect(byName.api?.shutdown).toEqual({ command: "/base-api-down" });
+    expect(byName.web?.shutdown).toEqual({ command: "/overlay-down" });
+  });
+
+  it("carries is_daemon (boolean scalar) through verbatim", () => {
+    const yaml = `
+services:
+  data:
+    command: "supabase start"
+    is_daemon: true
+`;
+    const stack = parseStack(yaml);
+    expect(stack.services[0]?.isDaemon).toBe(true);
+  });
+
+  it("carries is_daemon: false through verbatim (a declared false is not absence)", () => {
+    const yaml = `
+services:
+  data:
+    command: "supabase start"
+    is_daemon: false
+`;
+    const stack = parseStack(yaml);
+    const data = stack.services[0];
+    if (!data) throw new Error("expected data");
+    expect("isDaemon" in data).toBe(true);
+    expect(data.isDaemon).toBe(false);
+  });
+
+  it("omits is_daemon when the author didn't declare one", () => {
+    const yaml = `
+services:
+  web:
+    command: "node server.js"
+`;
+    const stack = parseStack(yaml);
+    const web = stack.services[0];
+    if (!web) throw new Error("expected web");
+    expect("isDaemon" in web).toBe(false);
+  });
+
+  it("rejects a non-boolean is_daemon as CONFIG_INVALID", () => {
+    const yaml = `
+services:
+  data:
+    command: "supabase start"
+    is_daemon: "yes"
+`;
+    expect(() => parseStack(yaml)).toThrow(/is_daemon/);
+  });
+
+  it("carries launch_timeout_seconds (number scalar) through verbatim", () => {
+    const yaml = `
+services:
+  data:
+    command: "supabase start"
+    launch_timeout_seconds: 5
+`;
+    const stack = parseStack(yaml);
+    expect(stack.services[0]?.launchTimeoutSeconds).toBe(5);
+  });
+
+  it("omits launch_timeout_seconds when the author didn't declare one", () => {
+    const yaml = `
+services:
+  web:
+    command: "node server.js"
+`;
+    const stack = parseStack(yaml);
+    const web = stack.services[0];
+    if (!web) throw new Error("expected web");
+    expect("launchTimeoutSeconds" in web).toBe(false);
+  });
+
+  it("rejects a non-number launch_timeout_seconds as CONFIG_INVALID", () => {
+    const yaml = `
+services:
+  data:
+    command: "supabase start"
+    launch_timeout_seconds: "soon"
+`;
+    expect(() => parseStack(yaml)).toThrow(/launch_timeout_seconds/);
+  });
+
+  it("uses the base's scalars when the overlay omits them; overlay wins when both set", () => {
+    const devtrees = `
+extends: ./process-compose.yaml
+services:
+  api:
+    tier: isolated
+  web:
+    tier: isolated
+    is_daemon: false
+    launch_timeout_seconds: 9
+`;
+    const base = `
+processes:
+  api:
+    command: "node api.js"
+    is_daemon: true
+    launch_timeout_seconds: 3
+  web:
+    command: "node server.js"
+    is_daemon: true
+    launch_timeout_seconds: 1
+`;
+    const stack = parseStack(devtrees, { baseYaml: base });
+    const byName = Object.fromEntries(stack.services.map((s) => [s.name, s]));
+    expect(byName.api?.isDaemon).toBe(true);
+    expect(byName.api?.launchTimeoutSeconds).toBe(3);
+    expect(byName.web?.isDaemon).toBe(false);
+    expect(byName.web?.launchTimeoutSeconds).toBe(9);
+  });
+});
+
 describe("stack model — depends_on parsing (process-compose map form)", () => {
   it("parses depends_on map form (name -> { condition }) into a name list", () => {
     // The canonical process-compose form is a map. Tier-aware deriving needs the

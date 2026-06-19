@@ -60,6 +60,26 @@ export interface ResolvedService {
    * process-compose-native field — it is re-emitted into the derived config.
    */
   readonly namespace?: string;
+  /**
+   * process-compose `shutdown` block (issue #134), opaque object passthrough.
+   * Holds the teardown hook (`command`, `timeout_seconds`, `signal`,
+   * `parent_only`) process-compose runs first on `down`; absent when unauthored.
+   * See `readinessProbe` — devtrees never models the inner shape.
+   */
+  readonly shutdown?: Readonly<Record<string, unknown>>;
+  /**
+   * process-compose `is_daemon` flag (issue #134), scalar passthrough. Marks a
+   * process whose `command` launches work into the background and returns, so
+   * process-compose treats the launch as the readiness boundary. Unlike the
+   * object passthroughs this is a boolean, copied verbatim; absent when
+   * unauthored, and a declared `false` is preserved (not treated as absence).
+   */
+  readonly isDaemon?: boolean;
+  /**
+   * process-compose `launch_timeout_seconds` (issue #134), scalar passthrough.
+   * Number copied verbatim; absent when unauthored. Companion to `isDaemon`.
+   */
+  readonly launchTimeoutSeconds?: number;
 }
 
 /** Per-repo allocator overrides, partial — unspecified fields fall back to defaults. */
@@ -92,6 +112,9 @@ interface RawService {
   readiness_probe?: unknown;
   liveness_probe?: unknown;
   availability?: unknown;
+  shutdown?: unknown;
+  is_daemon?: unknown;
+  launch_timeout_seconds?: unknown;
 }
 
 const DEFAULT_TIER: Tier = "isolated";
@@ -141,6 +164,7 @@ const PASSTHROUGH_FIELDS: ReadonlyArray<readonly [keyof ResolvedService, keyof R
   ["readinessProbe", "readiness_probe"],
   ["livenessProbe", "liveness_probe"],
   ["availability", "availability"],
+  ["shutdown", "shutdown"],
 ];
 
 /**
@@ -151,7 +175,9 @@ const PASSTHROUGH_FIELDS: ReadonlyArray<readonly [keyof ResolvedService, keyof R
 function resolvePassthrough(
   over: RawService,
   base: RawService,
-): Partial<Pick<ResolvedService, "readinessProbe" | "livenessProbe" | "availability">> {
+): Partial<
+  Pick<ResolvedService, "readinessProbe" | "livenessProbe" | "availability" | "shutdown">
+> {
   const out: Record<string, Readonly<Record<string, unknown>>> = {};
   for (const [outKey, rawKey] of PASSTHROUGH_FIELDS) {
     const value = asOpaqueRecord(over[rawKey] ?? base[rawKey]);
@@ -175,6 +201,63 @@ function resolveNamespace(
   if (raw === undefined || raw === null) return {};
   const ns = asString(raw);
   return ns === "" ? {} : { namespace: ns };
+}
+
+/**
+ * Scalar passthrough fields (#134). Unlike the object passthroughs, these are a
+ * boolean / number that process-compose reads as primitives, so they cannot go
+ * through `asOpaqueRecord` (which rejects scalars). Each entry pairs the
+ * resolved camelCase key with its snake_case YAML key and a type guard; a value
+ * that fails the guard is rejected loudly as `CONFIG_INVALID` rather than
+ * leaking a wrong-typed key into the derived config. Encoded once so
+ * `resolveScalarPassthrough` resolves them in a single loop.
+ */
+const SCALAR_PASSTHROUGH_FIELDS: ReadonlyArray<{
+  readonly outKey: "isDaemon" | "launchTimeoutSeconds";
+  readonly rawKey: "is_daemon" | "launch_timeout_seconds";
+  readonly check: (v: unknown) => boolean;
+  readonly typeLabel: string;
+}> = [
+  {
+    outKey: "isDaemon",
+    rawKey: "is_daemon",
+    check: (v) => typeof v === "boolean",
+    typeLabel: "a boolean",
+  },
+  {
+    outKey: "launchTimeoutSeconds",
+    rawKey: "launch_timeout_seconds",
+    check: (v) => typeof v === "number" && Number.isFinite(v),
+    typeLabel: "a number",
+  },
+];
+
+/**
+ * Resolve the scalar passthrough fields (`is_daemon`, `launch_timeout_seconds`)
+ * for one service. Overlay wins over base; a key absent from both is left off
+ * the returned record so `"isDaemon" in svc` reflects authoring intent (and a
+ * declared `false` / `0` is preserved, distinct from absence). A present value
+ * of the wrong type is rejected as `CONFIG_INVALID` — process-compose would
+ * otherwise silently misread it.
+ */
+function resolveScalarPassthrough(
+  over: RawService,
+  base: RawService,
+): Partial<Pick<ResolvedService, "isDaemon" | "launchTimeoutSeconds">> {
+  const out: { isDaemon?: boolean; launchTimeoutSeconds?: number } = {};
+  for (const { outKey, rawKey, check, typeLabel } of SCALAR_PASSTHROUGH_FIELDS) {
+    const raw = over[rawKey] ?? base[rawKey];
+    if (raw === undefined || raw === null) continue;
+    if (!check(raw)) {
+      throw new StackConfigError(
+        `${rawKey} must be ${typeLabel}, got ${typeof raw}. ` +
+          `It is passed through to process-compose verbatim; fix the value in devtrees.yaml.`,
+      );
+    }
+    if (outKey === "isDaemon") out.isDaemon = raw as boolean;
+    else out.launchTimeoutSeconds = raw as number;
+  }
+  return out;
 }
 
 /**
@@ -275,6 +358,9 @@ export function parseStack(yamlText: string, options: ParseStackOptions = {}): R
       // Opaque passthrough fields — only present when authored, so
       // `"readinessProbe" in svc` reflects intent (no `undefined` leak).
       ...resolvePassthrough(over, base),
+      // Scalar passthrough fields (#134: is_daemon, launch_timeout_seconds) —
+      // validated by type, copied verbatim, only present when authored.
+      ...resolveScalarPassthrough(over, base),
     };
   });
 

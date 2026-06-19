@@ -49,6 +49,24 @@ export interface DerivedProcess {
   readonly liveness_probe?: Readonly<Record<string, unknown>>;
   readonly availability?: Readonly<Record<string, unknown>>;
   /**
+   * process-compose `shutdown` block (issue #134) — the teardown hook that runs
+   * first on `down` (and `down --shared`) so a service can clean up out-of-band
+   * resources before SIGKILL. Opaque object passthrough; present only when the
+   * author declared it.
+   */
+  readonly shutdown?: Readonly<Record<string, unknown>>;
+  /**
+   * process-compose `is_daemon` flag (issue #134) — scalar passthrough for a
+   * process whose `command` launches work into the background and returns.
+   * Present only when authored; a declared `false` is preserved.
+   */
+  readonly is_daemon?: boolean;
+  /**
+   * process-compose `launch_timeout_seconds` (issue #134) — scalar passthrough,
+   * companion to `is_daemon`. Present only when authored.
+   */
+  readonly launch_timeout_seconds?: number;
+  /**
    * process-compose `namespace` the process belongs to (issue #128), copied
    * verbatim from the resolved stack. `up -n <ns>` starts only the selected
    * namespaces; present only when the author declared one — a namespace-less
@@ -289,6 +307,9 @@ function buildTierProcesses(input: {
     livenessProbe?: Readonly<Record<string, unknown>>;
     availability?: Readonly<Record<string, unknown>>;
     namespace?: string;
+    shutdown?: Readonly<Record<string, unknown>>;
+    isDaemon?: boolean;
+    launchTimeoutSeconds?: number;
   }>;
   workingDir: string;
   extraEnvLines: ReadonlyArray<string>;
@@ -314,6 +335,15 @@ function buildTierProcesses(input: {
         // process-compose `namespace` passthrough (#128) — re-emitted verbatim,
         // only when authored, so namespace-less services derive without the key.
         ...(service.namespace !== undefined && { namespace: service.namespace }),
+        // shutdown / daemon-launch passthrough (#134) — each emitted only when
+        // the author declared it, so plain services derive unchanged. `shutdown`
+        // is an opaque object; `is_daemon` / `launch_timeout_seconds` are
+        // scalars copied verbatim (a declared `false` / `0` rides through).
+        ...(service.shutdown !== undefined && { shutdown: service.shutdown }),
+        ...(service.isDaemon !== undefined && { is_daemon: service.isDaemon }),
+        ...(service.launchTimeoutSeconds !== undefined && {
+          launch_timeout_seconds: service.launchTimeoutSeconds,
+        }),
       },
       partition.kept,
     );

@@ -130,6 +130,34 @@ function writeMinimalStack(worktreeRoot: string, opts: { withProbe?: boolean } =
   writeFileSync(join(worktreeRoot, "devtrees.yaml"), yaml);
 }
 
+/**
+ * A stack whose **shared** service is a daemon-launch process (#134): its
+ * `command` writes a marker and returns, `is_daemon: true` tells
+ * process-compose the launch is the readiness boundary, and `shutdown.command`
+ * writes a second marker so the test can prove the teardown hook fired on
+ * `down --shared`. The marker paths are passed in so the caller can assert on
+ * them after teardown.
+ */
+function writeShutdownHookStack(
+  worktreeRoot: string,
+  markers: { readonly up: string; readonly down: string },
+): void {
+  const yaml = [
+    "services:",
+    "  daemon:",
+    "    tier: shared",
+    // Launches "work" (here just a marker) and returns immediately.
+    `    command: "touch ${markers.up}"`,
+    "    is_daemon: true",
+    "    launch_timeout_seconds: 30",
+    "    shutdown:",
+    `      command: "touch ${markers.down}"`,
+    "      timeout_seconds: 10",
+    "",
+  ].join("\n");
+  writeFileSync(join(worktreeRoot, "devtrees.yaml"), yaml);
+}
+
 interface CliResult {
   readonly code: number;
   readonly stdout: string;
@@ -660,6 +688,40 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
     const survivors = await waitForNoPids(root, 5000);
     expect(survivors).toEqual([]);
   }, 90_000);
+
+  it("scenario 11: a shared service's shutdown.command runs on down --shared (#134)", async () => {
+    // The strongest acceptance criterion for #134: prove against the real
+    // binary that a declared `shutdown.command` actually fires on a graceful
+    // `down`, so a daemon-launch service can clean up out-of-band resources
+    // before SIGKILL. We assert via two marker files the service touches.
+    const repo = buildSmokeRepo("dt-rpc11-", ["login"]);
+    currentCtx = { pidNeedle: repo.root, root: repo.root };
+    const wt = repo.worktrees.login!;
+    const upMarker = join(repo.root, "daemon-up.marker");
+    const downMarker = join(repo.root, "daemon-down.marker");
+    writeShutdownHookStack(wt, { up: upMarker, down: downMarker });
+    cleanupStack.push(() => devtrees(wt, ["down"]));
+
+    expect(up(wt).code, "up should start the shared daemon").toBe(0);
+    // The daemon-launch command ran (touched its marker) and the shutdown hook
+    // has NOT fired yet — the service is still up.
+    expect(existsSync(upMarker), "daemon launch command should have run").toBe(true);
+    expect(existsSync(downMarker), "shutdown hook must not fire before down").toBe(false);
+
+    const down = devtrees(wt, ["down", "--shared", "--json"]);
+    expect(down.code, `down --shared failed: ${down.stderr}`).toBe(0);
+
+    // #134: process-compose runs `shutdown.command` first on a graceful down,
+    // so the marker exists. Allow a brief settle for the hook + file write.
+    const deadline = Date.now() + 10_000;
+    while (!existsSync(downMarker) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(
+      existsSync(downMarker),
+      "shutdown.command should have run on down --shared, touching its marker",
+    ).toBe(true);
+  }, 120_000);
 });
 
 // Without the gate, log once so a developer running `vp test run` locally
