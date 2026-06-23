@@ -16,7 +16,8 @@
     "test:watch": "vp test watch",
     "lint": "vp lint",
     "check": "vp check",
-    "dev": "vp pack --watch"
+    "dev": "vp pack --watch",
+    "prepublishOnly": "npm run build && npm run check && npm run test"
   },
   "devDependencies": {
     "@types/node": "^22.19.19",
