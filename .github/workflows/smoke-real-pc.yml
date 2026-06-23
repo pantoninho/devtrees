@@ -29,6 +29,10 @@ on:
       - "src/allocator.ts"
       - "src/instances.ts"
       - "src/port-probe.ts"
+      # The deriver templates `log_location` through `logsDir` (paths.ts), and
+      # `commands.ts` creates the per-instance logs dir from it (#136) — a
+      # regression there only surfaces against the real binary.
+      - "src/paths.ts"
       - "src/real-pc.smoke.test.ts"
       - "test/fixtures/agent-surface/**"
       - "vite.config.ts"
