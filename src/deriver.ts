@@ -21,6 +21,8 @@
  * `portFor` lookups so the deriver stays decoupled from the allocator.
  */
 
+import { join } from "node:path";
+import { SHARED_INSTANCE_ID, logsDir } from "./paths.js";
 import type { ResolvedStack, Tier } from "./stack.js";
 
 /** Env-var name devtrees injects the stable worktree id under. */
@@ -73,6 +75,21 @@ export interface DerivedProcess {
    * service derives without the key (process-compose's implicit `default`).
    */
   readonly namespace?: string;
+  /**
+   * process-compose `log_location` (issue #136) — the **absolute** on-disk path
+   * process-compose writes this process's logs to, so external tooling can tail
+   * a component's log as a file. devtrees templates the author's relative
+   * `log_location` under the per-instance logs dir (`<anchor>/devtrees/logs/
+   * <instanceId>/`) so the same authored filename in two worktrees lands in
+   * different files. Present only when the author declared one.
+   */
+  readonly log_location?: string;
+  /**
+   * process-compose `log_configuration` (issue #136) — opaque object passthrough
+   * (rotation / format / flush), copied verbatim like `shutdown`; devtrees never
+   * templates anything inside it. Present only when authored.
+   */
+  readonly log_configuration?: Readonly<Record<string, unknown>>;
 }
 
 /**
@@ -119,6 +136,14 @@ export type PortResolver = (portName: string) => number | undefined;
 export interface DeriveContext {
   readonly worktreeId: string;
   readonly worktreeRoot: string;
+  /**
+   * Anchor (git common dir) — needed only to template a service's `log_location`
+   * under the per-instance logs dir (`<anchor>/devtrees/logs/<worktreeId>/`,
+   * issue #136). Optional: a stack with no `log_location` derives without it.
+   * The deriver throws if a service authors `log_location` but no anchor was
+   * provided — a programming error, since every production call site supplies it.
+   */
+  readonly anchor?: string;
   /** Resolve a declared isolated named port to its allocated number for this worktree. */
   readonly portFor: PortResolver;
   /**
@@ -217,6 +242,9 @@ export function deriveWorktreeConfig(stack: ResolvedStack, ctx: DeriveContext): 
     tier: "isolated",
     services: isolated,
     workingDir: ctx.worktreeRoot,
+    // Logs dir for this worktree instance — the authored `log_location` is
+    // templated under it (issue #136). Resolved only when the anchor is known.
+    logsBase: ctx.anchor !== undefined ? logsDir(ctx.anchor, ctx.worktreeId) : undefined,
     extraEnvLines: envLines(env),
   });
 
@@ -237,6 +265,14 @@ export interface SharedDeriveContext {
    * default — shared services have no working tree of their own (ADR-0001).
    */
   readonly workingDir: string;
+  /**
+   * Anchor (git common dir) — needed only to template a shared service's
+   * `log_location` under the shared instance's logs dir (`<anchor>/devtrees/
+   * logs/shared/`, issue #136). Optional: a stack with no `log_location`
+   * derives without it. The deriver throws if a service authors `log_location`
+   * but no anchor was provided.
+   */
+  readonly anchor?: string;
   /** Resolve a declared shared named port to its repo-wide allocated number. */
   readonly portFor: PortResolver;
 }
@@ -270,6 +306,9 @@ export function deriveSharedConfig(stack: ResolvedStack, ctx: SharedDeriveContex
     tier: "shared",
     services: shared,
     workingDir: ctx.workingDir,
+    // Shared-tier logs live under the fixed `shared` instance id so they never
+    // collide with any worktree's logs (issue #136).
+    logsBase: ctx.anchor !== undefined ? logsDir(ctx.anchor, SHARED_INSTANCE_ID) : undefined,
     extraEnvLines: envLines(env),
   });
 
@@ -310,8 +349,17 @@ function buildTierProcesses(input: {
     shutdown?: Readonly<Record<string, unknown>>;
     isDaemon?: boolean;
     launchTimeoutSeconds?: number;
+    logLocation?: string;
+    logConfiguration?: Readonly<Record<string, unknown>>;
   }>;
   workingDir: string;
+  /**
+   * Absolute per-instance logs dir (issue #136) under which an authored
+   * `log_location` is templated, or `undefined` when no anchor was supplied. A
+   * service that authors `log_location` without a logs base is a programming
+   * error — the deriver throws rather than emit an un-templated path.
+   */
+  logsBase?: string;
   extraEnvLines: ReadonlyArray<string>;
 }): { processes: Record<string, DerivedProcess>; droppedEdges: DroppedEdge[] } {
   const tierIndex = buildTierIndex(input.stack);
@@ -344,11 +392,44 @@ function buildTierProcesses(input: {
         ...(service.launchTimeoutSeconds !== undefined && {
           launch_timeout_seconds: service.launchTimeoutSeconds,
         }),
+        // log persistence passthrough (#136). `log_location` is templated under
+        // the per-instance logs dir to an absolute path so the same authored
+        // filename in two worktrees never collides; `log_configuration` is an
+        // opaque object copied verbatim. Each emitted only when authored, so a
+        // service that declares neither derives unchanged.
+        ...(service.logLocation !== undefined && {
+          log_location: resolveLogLocation(service.name, service.logLocation, input.logsBase),
+        }),
+        ...(service.logConfiguration !== undefined && {
+          log_configuration: service.logConfiguration,
+        }),
       },
       partition.kept,
     );
   }
   return { processes, droppedEdges };
+}
+
+/**
+ * Template a service's authored (relative, validated) `log_location` into the
+ * per-instance logs dir, returning the absolute path process-compose writes to
+ * (issue #136). `logsBase` is `undefined` only when no anchor reached the
+ * deriver; a service that authored a `log_location` in that case is a
+ * programming error (every production call site supplies the anchor), so we
+ * throw rather than emit an un-rooted path that would defeat collision-proofing.
+ */
+function resolveLogLocation(
+  serviceName: string,
+  logLocation: string,
+  logsBase: string | undefined,
+): string {
+  if (logsBase === undefined) {
+    throw new Error(
+      `cannot derive log_location for service '${serviceName}': no anchor was provided to the ` +
+        `deriver, so the per-instance logs dir is unknown. Pass \`anchor\` in the derive context.`,
+    );
+  }
+  return join(logsBase, logLocation);
 }
 
 /** Index `name → tier` over a resolved stack — keeps depends_on classification O(1). */
