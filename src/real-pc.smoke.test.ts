@@ -158,6 +158,30 @@ function writeShutdownHookStack(
   writeFileSync(join(worktreeRoot, "devtrees.yaml"), yaml);
 }
 
+/**
+ * A stack whose **isolated** `web` service declares a per-process `log_location`
+ * (issue #136) and emits a distinctive marker line on a tight loop, so the test
+ * can prove process-compose wrote the log to disk at the templated per-instance
+ * path and that an external process can tail it while the stack runs. The
+ * authored value is a plain relative filename — devtrees roots it under
+ * `<anchor>/devtrees/logs/<worktreeId>/`. High emit volume forces
+ * process-compose to flush its log buffer within the test window.
+ */
+function writeLogLocationStack(worktreeRoot: string, opts: { marker: string }): void {
+  const yaml = [
+    "services:",
+    "  web:",
+    "    tier: isolated",
+    // Emit the marker on a fast loop forever (the stack is `down`ed by cleanup).
+    // The volume forces process-compose's log buffer to flush to disk promptly.
+    `    command: "sh -c 'while true; do echo ${opts.marker}; done'"`,
+    "    ports: [WEB_PORT]",
+    "    log_location: web.log",
+    "",
+  ].join("\n");
+  writeFileSync(join(worktreeRoot, "devtrees.yaml"), yaml);
+}
+
 interface CliResult {
   readonly code: number;
   readonly stdout: string;
@@ -720,6 +744,48 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
     expect(
       existsSync(downMarker),
       "shutdown.command should have run on down --shared, touching its marker",
+    ).toBe(true);
+  }, 120_000);
+
+  it("scenario 12: a service's log_location is written to disk at the per-instance path and is tail-able (#136)", async () => {
+    // The strongest acceptance criterion for #136: prove against the real binary
+    // that a declared `log_location` causes process-compose to persist the
+    // process's logs to a file on disk at the templated per-instance path
+    // (<anchor>/devtrees/logs/<worktreeId>/web.log), and that an external
+    // process can tail that file while the stack runs.
+    const repo = buildSmokeRepo("dt-rpc12-", ["login"]);
+    currentCtx = { pidNeedle: repo.root, root: repo.root };
+    const wt = repo.worktrees.login!;
+    const marker = "DEVTREES_LOG_MARKER_12";
+    writeLogLocationStack(wt, { marker });
+    cleanupStack.push(() => devtrees(wt, ["down"]));
+
+    expect(up(wt).code, "up should start the worktree instance").toBe(0);
+
+    // Templated per-instance path: the authored `web.log` is rooted under the
+    // anchor's per-worktree logs dir, so the same filename in another worktree
+    // would land elsewhere (no cross-worktree collision).
+    const commonDir = execGit(wt, ["rev-parse", "--git-common-dir"]);
+    const absCommon = commonDir.startsWith("/") ? commonDir : join(wt, commonDir);
+    const logFile = join(absCommon, "devtrees", "logs", wtId(wt), "web.log");
+
+    // Tail-ability: poll the file (as an external reader would) until the
+    // marker shows up, proving process-compose wrote and flushed the log to
+    // disk while the stack is still running.
+    const deadline = Date.now() + 30_000;
+    let contents = "";
+    while (Date.now() < deadline) {
+      if (existsSync(logFile)) {
+        contents = readFileSync(logFile, "utf8");
+        if (contents.includes(marker)) break;
+      }
+      await new Promise((r) => setTimeout(r, 250));
+    }
+
+    expect(existsSync(logFile), `log file should exist at ${logFile}`).toBe(true);
+    expect(
+      contents.includes(marker),
+      `external tail of ${logFile} should observe the marker while the stack runs`,
     ).toBe(true);
   }, 120_000);
 });
