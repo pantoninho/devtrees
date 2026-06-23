@@ -652,9 +652,7 @@ describe("config deriver — log persistence passthrough (#136)", () => {
       anchor: "/repo/.git",
       portFor: () => 20512,
     });
-    expect(login.config.processes.api?.log_location).toBe(
-      "/repo/.git/devtrees/logs/login/api.log",
-    );
+    expect(login.config.processes.api?.log_location).toBe("/repo/.git/devtrees/logs/login/api.log");
     expect(billing.config.processes.api?.log_location).toBe(
       "/repo/.git/devtrees/logs/billing/api.log",
     );
