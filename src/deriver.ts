@@ -375,39 +375,72 @@ function buildTierProcesses(input: {
         // Author-declared env first, then devtrees injection (injection wins on
         // duplicate keys because process-compose takes the last occurrence).
         environment: [...service.environment, ...input.extraEnvLines],
-        // Opaque passthrough — only set when present, so the derived YAML
-        // doesn't sprout `readiness_probe: undefined` for plain services.
-        ...(service.readinessProbe !== undefined && { readiness_probe: service.readinessProbe }),
-        ...(service.livenessProbe !== undefined && { liveness_probe: service.livenessProbe }),
-        ...(service.availability !== undefined && { availability: service.availability }),
-        // process-compose `namespace` passthrough (#128) — re-emitted verbatim,
-        // only when authored, so namespace-less services derive without the key.
-        ...(service.namespace !== undefined && { namespace: service.namespace }),
-        // shutdown / daemon-launch passthrough (#134) — each emitted only when
-        // the author declared it, so plain services derive unchanged. `shutdown`
-        // is an opaque object; `is_daemon` / `launch_timeout_seconds` are
-        // scalars copied verbatim (a declared `false` / `0` rides through).
-        ...(service.shutdown !== undefined && { shutdown: service.shutdown }),
-        ...(service.isDaemon !== undefined && { is_daemon: service.isDaemon }),
-        ...(service.launchTimeoutSeconds !== undefined && {
-          launch_timeout_seconds: service.launchTimeoutSeconds,
-        }),
-        // log persistence passthrough (#136). `log_location` is templated under
-        // the per-instance logs dir to an absolute path so the same authored
-        // filename in two worktrees never collides; `log_configuration` is an
-        // opaque object copied verbatim. Each emitted only when authored, so a
-        // service that declares neither derives unchanged.
-        ...(service.logLocation !== undefined && {
-          log_location: resolveLogLocation(service.name, service.logLocation, input.logsBase),
-        }),
-        ...(service.logConfiguration !== undefined && {
-          log_configuration: service.logConfiguration,
-        }),
+        ...buildPassthroughFields(service, input.logsBase),
       },
       partition.kept,
     );
   }
   return { processes, droppedEdges };
+}
+
+/** The subset of a service the passthrough emitter reads. */
+type PassthroughSource = {
+  name: string;
+  readinessProbe?: Readonly<Record<string, unknown>>;
+  livenessProbe?: Readonly<Record<string, unknown>>;
+  availability?: Readonly<Record<string, unknown>>;
+  namespace?: string;
+  shutdown?: Readonly<Record<string, unknown>>;
+  isDaemon?: boolean;
+  launchTimeoutSeconds?: number;
+  logLocation?: string;
+  logConfiguration?: Readonly<Record<string, unknown>>;
+};
+
+/**
+ * The verbatim passthrough fields — copied from the resolved service straight to
+ * the derived process under their process-compose key, present only when the
+ * author declared them. Encoded once as `[resolvedKey, derivedKey]` pairs so the
+ * emitter resolves them in a single loop instead of one conditional branch per
+ * field (which is what tipped the function over the complexity gate). Covers the
+ * probes / availability, `namespace` (#128), `shutdown` + the daemon-launch
+ * scalars (#134), and `log_configuration` (#136). `log_location` is NOT here —
+ * it is the one field devtrees transforms (see `buildPassthroughFields`).
+ */
+const VERBATIM_PASSTHROUGH: ReadonlyArray<
+  readonly [keyof PassthroughSource, keyof DerivedProcess]
+> = [
+  ["readinessProbe", "readiness_probe"],
+  ["livenessProbe", "liveness_probe"],
+  ["availability", "availability"],
+  ["namespace", "namespace"],
+  ["shutdown", "shutdown"],
+  ["isDaemon", "is_daemon"],
+  ["launchTimeoutSeconds", "launch_timeout_seconds"],
+  ["logConfiguration", "log_configuration"],
+];
+
+/**
+ * Emit the process-compose passthrough fields for one service — each present
+ * only when the author declared it, so a plain service derives without sprouting
+ * `readiness_probe: undefined` (or any other absent key). The verbatim fields
+ * ride through unchanged via `VERBATIM_PASSTHROUGH`; only `log_location` (#136)
+ * is transformed — templated under the per-instance logs dir to an absolute path
+ * so the same authored filename in two worktrees never collides.
+ */
+function buildPassthroughFields(
+  service: PassthroughSource,
+  logsBase: string | undefined,
+): Partial<DerivedProcess> {
+  const out: Record<string, unknown> = {};
+  for (const [from, to] of VERBATIM_PASSTHROUGH) {
+    const value = service[from];
+    if (value !== undefined) out[to] = value;
+  }
+  if (service.logLocation !== undefined) {
+    out.log_location = resolveLogLocation(service.name, service.logLocation, logsBase);
+  }
+  return out;
 }
 
 /**
