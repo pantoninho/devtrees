@@ -690,6 +690,128 @@ processes:
   });
 });
 
+describe("stack model — log persistence passthrough (#136)", () => {
+  it("carries a relative log_location through as the raw authored string", () => {
+    // The raw authored value is preserved here — path templating (resolving it
+    // under the per-instance logs dir) happens in the deriver, not the parser.
+    const yaml = `
+services:
+  api:
+    command: "node api.js"
+    log_location: api.log
+`;
+    const stack = parseStack(yaml);
+    expect(stack.services[0]?.logLocation).toBe("api.log");
+  });
+
+  it("accepts a safe nested relative log_location (sub/api.log)", () => {
+    const yaml = `
+services:
+  api:
+    command: "node api.js"
+    log_location: sub/api.log
+`;
+    const stack = parseStack(yaml);
+    expect(stack.services[0]?.logLocation).toBe("sub/api.log");
+  });
+
+  it("omits logLocation from ResolvedService when the author didn't declare one", () => {
+    const yaml = `
+services:
+  web:
+    command: "node server.js"
+`;
+    const stack = parseStack(yaml);
+    const web = stack.services[0];
+    if (!web) throw new Error("expected web");
+    expect("logLocation" in web).toBe(false);
+  });
+
+  it("rejects an absolute log_location as CONFIG_INVALID", () => {
+    const yaml = `
+services:
+  api:
+    command: "node api.js"
+    log_location: /var/log/api.log
+`;
+    expect(() => parseStack(yaml)).toThrow(/log_location/);
+  });
+
+  it("rejects a log_location that escapes the logs dir (contains ..) as CONFIG_INVALID", () => {
+    const yaml = `
+services:
+  api:
+    command: "node api.js"
+    log_location: ../escape.log
+`;
+    expect(() => parseStack(yaml)).toThrow(/log_location/);
+  });
+
+  it("carries an inline log_configuration block through as an opaque record (no templating)", () => {
+    // log_configuration rides the same opaque-record passthrough as shutdown —
+    // devtrees never models its inner shape and never templates anything inside.
+    const yaml = `
+services:
+  api:
+    command: "node api.js"
+    log_location: api.log
+    log_configuration:
+      rotation:
+        max_size_mb: 10
+        max_backups: 3
+      disable_json: true
+      future_field_devtrees_doesnt_know: 7
+`;
+    const stack = parseStack(yaml);
+    expect(stack.services[0]?.logConfiguration).toEqual({
+      rotation: { max_size_mb: 10, max_backups: 3 },
+      disable_json: true,
+      future_field_devtrees_doesnt_know: 7,
+    });
+  });
+
+  it("omits logConfiguration when the author didn't declare one", () => {
+    const yaml = `
+services:
+  web:
+    command: "node server.js"
+    log_location: web.log
+`;
+    const stack = parseStack(yaml);
+    const web = stack.services[0];
+    if (!web) throw new Error("expected web");
+    expect("logConfiguration" in web).toBe(false);
+  });
+
+  it("uses the base's log fields when the overlay omits them; overlay wins when both set", () => {
+    const devtrees = `
+extends: ./process-compose.yaml
+services:
+  api:
+    tier: isolated
+  web:
+    tier: isolated
+    log_location: overlay-web.log
+`;
+    const base = `
+processes:
+  api:
+    command: "node api.js"
+    log_location: base-api.log
+    log_configuration:
+      disable_json: true
+  web:
+    command: "node server.js"
+    log_location: base-web.log
+`;
+    const stack = parseStack(devtrees, { baseYaml: base });
+    const byName = Object.fromEntries(stack.services.map((s) => [s.name, s]));
+    expect(byName.api?.logLocation).toBe("base-api.log");
+    expect(byName.api?.logConfiguration).toEqual({ disable_json: true });
+    expect(byName.web?.logLocation).toBe("overlay-web.log");
+  });
+});
+
 describe("stack model — depends_on parsing (process-compose map form)", () => {
   it("parses depends_on map form (name -> { condition }) into a name list", () => {
     // The canonical process-compose form is a map. Tier-aware deriving needs the
