@@ -598,6 +598,163 @@ describe("config deriver — shutdown / daemon-launch passthrough (#134)", () =>
   });
 });
 
+describe("config deriver — log persistence passthrough (#136)", () => {
+  function logStack(tier: "isolated" | "shared"): ResolvedStack {
+    return {
+      services: [
+        {
+          name: "api",
+          tier,
+          command: "node api.js",
+          ports: [],
+          dependsOn: [],
+          environment: [],
+          logLocation: "api.log",
+          logConfiguration: { rotation: { max_size_mb: 10 }, disable_json: true },
+        },
+      ],
+    };
+  }
+
+  it("templates an isolated log_location to the absolute per-worktree logs path", () => {
+    const derived = deriveWorktreeConfig(logStack("isolated"), {
+      worktreeId: "login",
+      worktreeRoot: "/wt/login",
+      anchor: "/repo/.git",
+      portFor: () => 20512,
+    });
+    const api = derived.config.processes.api;
+    if (!api) throw new Error("expected api");
+    expect(api.log_location).toBe("/repo/.git/devtrees/logs/login/api.log");
+  });
+
+  it("templates a shared log_location under the shared instance logs dir", () => {
+    const out = deriveSharedConfig(logStack("shared"), {
+      workingDir: "/repo/.git",
+      anchor: "/repo/.git",
+      portFor: () => 19000,
+    });
+    const api = out.config.processes.api;
+    if (!api) throw new Error("expected api");
+    expect(api.log_location).toBe("/repo/.git/devtrees/logs/shared/api.log");
+  });
+
+  it("lands the same authored log_location in different files across worktrees (no collision)", () => {
+    const login = deriveWorktreeConfig(logStack("isolated"), {
+      worktreeId: "login",
+      worktreeRoot: "/wt/login",
+      anchor: "/repo/.git",
+      portFor: () => 20512,
+    });
+    const billing = deriveWorktreeConfig(logStack("isolated"), {
+      worktreeId: "billing",
+      worktreeRoot: "/wt/billing",
+      anchor: "/repo/.git",
+      portFor: () => 20512,
+    });
+    expect(login.config.processes.api?.log_location).toBe("/repo/.git/devtrees/logs/login/api.log");
+    expect(billing.config.processes.api?.log_location).toBe(
+      "/repo/.git/devtrees/logs/billing/api.log",
+    );
+    expect(login.config.processes.api?.log_location).not.toBe(
+      billing.config.processes.api?.log_location,
+    );
+  });
+
+  it("resolves a nested relative log_location under the logs dir", () => {
+    const stack: ResolvedStack = {
+      services: [
+        {
+          name: "api",
+          tier: "isolated",
+          command: "node api.js",
+          ports: [],
+          dependsOn: [],
+          environment: [],
+          logLocation: "sub/api.log",
+        },
+      ],
+    };
+    const derived = deriveWorktreeConfig(stack, {
+      worktreeId: "login",
+      worktreeRoot: "/wt/login",
+      anchor: "/repo/.git",
+      portFor: () => 20512,
+    });
+    expect(derived.config.processes.api?.log_location).toBe(
+      "/repo/.git/devtrees/logs/login/sub/api.log",
+    );
+  });
+
+  it("copies log_configuration verbatim with no templating", () => {
+    const derived = deriveWorktreeConfig(logStack("isolated"), {
+      worktreeId: "login",
+      worktreeRoot: "/wt/login",
+      anchor: "/repo/.git",
+      portFor: () => 20512,
+    });
+    expect(derived.config.processes.api?.log_configuration).toEqual({
+      rotation: { max_size_mb: 10 },
+      disable_json: true,
+    });
+  });
+
+  it("omits log_location / log_configuration when the service declared neither (no undefined leak)", () => {
+    const plain: ResolvedStack = {
+      services: [
+        {
+          name: "web",
+          tier: "isolated",
+          command: "node server.js",
+          ports: [],
+          dependsOn: [],
+          environment: [],
+        },
+      ],
+    };
+    const derived = deriveWorktreeConfig(plain, {
+      worktreeId: "login",
+      worktreeRoot: "/wt/login",
+      anchor: "/repo/.git",
+      portFor: () => 20512,
+    });
+    const web = derived.config.processes.web;
+    if (!web) throw new Error("expected web");
+    expect("log_location" in web).toBe(false);
+    expect("log_configuration" in web).toBe(false);
+    const yaml = stringifyYaml(derived.config);
+    expect(yaml).not.toMatch(/log_location/);
+    expect(yaml).not.toMatch(/log_configuration/);
+    expect(yaml).not.toMatch(/logs/);
+  });
+
+  it("emits a log_configuration even when log_location is absent (object passthrough is independent)", () => {
+    const stack: ResolvedStack = {
+      services: [
+        {
+          name: "web",
+          tier: "isolated",
+          command: "node server.js",
+          ports: [],
+          dependsOn: [],
+          environment: [],
+          logConfiguration: { disable_json: true },
+        },
+      ],
+    };
+    const derived = deriveWorktreeConfig(stack, {
+      worktreeId: "login",
+      worktreeRoot: "/wt/login",
+      anchor: "/repo/.git",
+      portFor: () => 20512,
+    });
+    const web = derived.config.processes.web;
+    if (!web) throw new Error("expected web");
+    expect("log_location" in web).toBe(false);
+    expect(web.log_configuration).toEqual({ disable_json: true });
+  });
+});
+
 describe("config deriver — cross-tier depends_on handling (ADR-0003)", () => {
   function mixedDepsStack(): ResolvedStack {
     return {

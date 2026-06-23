@@ -3,6 +3,7 @@ import {
   SHARED_INSTANCE_ID,
   SHARED_REGISTRY_KEY,
   instancePaths,
+  logsDir,
   sharedInstancePaths,
   stateDir,
 } from "./paths.js";
@@ -31,5 +32,15 @@ describe("shared instance paths", () => {
     // never produce `__shared__` — the well-known key is unambiguous.
     expect(SHARED_REGISTRY_KEY).toBe("__shared__");
     expect(SHARED_INSTANCE_ID).toBe("shared");
+  });
+});
+
+describe("per-instance logs dir (#136)", () => {
+  it("roots a worktree instance's logs under <anchor>/devtrees/logs/<worktreeId>/", () => {
+    expect(logsDir("/repo/.git", "login")).toBe("/repo/.git/devtrees/logs/login");
+  });
+
+  it("uses the shared instance id for the shared tier, so it never collides with a worktree", () => {
+    expect(logsDir("/repo/.git", SHARED_INSTANCE_ID)).toBe("/repo/.git/devtrees/logs/shared");
   });
 });

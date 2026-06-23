@@ -55,6 +55,18 @@ export function instancePaths(anchor: string, worktreeId: string): InstancePaths
 }
 
 /**
+ * Per-instance on-disk logs dir — `<anchor>/devtrees/logs/<instanceId>/` (issue
+ * #136). devtrees templates an authored `log_location` under this dir and emits
+ * the resolved absolute path as process-compose `log_location`, so the same
+ * authored filename in two worktrees lands in different files (no cross-worktree
+ * collision). `instanceId` is the worktree id for isolated services and
+ * `SHARED_INSTANCE_ID` (`shared`) for the shared tier.
+ */
+export function logsDir(anchor: string, instanceId: string): string {
+  return join(stateDir(anchor), "logs", instanceId);
+}
+
+/**
  * Paths for the shared instance — fixed at `<anchor>/devtrees/shared.yaml`
  * and `<anchor>/devtrees/run/shared.sock`. There is only ever one shared
  * instance per repo, so its filenames are constant rather than keyed.

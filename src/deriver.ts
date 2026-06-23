@@ -21,6 +21,8 @@
  * `portFor` lookups so the deriver stays decoupled from the allocator.
  */
 
+import { join } from "node:path";
+import { SHARED_INSTANCE_ID, logsDir } from "./paths.js";
 import type { ResolvedStack, Tier } from "./stack.js";
 
 /** Env-var name devtrees injects the stable worktree id under. */
@@ -73,6 +75,21 @@ export interface DerivedProcess {
    * service derives without the key (process-compose's implicit `default`).
    */
   readonly namespace?: string;
+  /**
+   * process-compose `log_location` (issue #136) — the **absolute** on-disk path
+   * process-compose writes this process's logs to, so external tooling can tail
+   * a component's log as a file. devtrees templates the author's relative
+   * `log_location` under the per-instance logs dir (`<anchor>/devtrees/logs/
+   * <instanceId>/`) so the same authored filename in two worktrees lands in
+   * different files. Present only when the author declared one.
+   */
+  readonly log_location?: string;
+  /**
+   * process-compose `log_configuration` (issue #136) — opaque object passthrough
+   * (rotation / format / flush), copied verbatim like `shutdown`; devtrees never
+   * templates anything inside it. Present only when authored.
+   */
+  readonly log_configuration?: Readonly<Record<string, unknown>>;
 }
 
 /**
@@ -119,6 +136,14 @@ export type PortResolver = (portName: string) => number | undefined;
 export interface DeriveContext {
   readonly worktreeId: string;
   readonly worktreeRoot: string;
+  /**
+   * Anchor (git common dir) — needed only to template a service's `log_location`
+   * under the per-instance logs dir (`<anchor>/devtrees/logs/<worktreeId>/`,
+   * issue #136). Optional: a stack with no `log_location` derives without it.
+   * The deriver throws if a service authors `log_location` but no anchor was
+   * provided — a programming error, since every production call site supplies it.
+   */
+  readonly anchor?: string;
   /** Resolve a declared isolated named port to its allocated number for this worktree. */
   readonly portFor: PortResolver;
   /**
@@ -217,6 +242,9 @@ export function deriveWorktreeConfig(stack: ResolvedStack, ctx: DeriveContext): 
     tier: "isolated",
     services: isolated,
     workingDir: ctx.worktreeRoot,
+    // Logs dir for this worktree instance — the authored `log_location` is
+    // templated under it (issue #136). Resolved only when the anchor is known.
+    logsBase: ctx.anchor !== undefined ? logsDir(ctx.anchor, ctx.worktreeId) : undefined,
     extraEnvLines: envLines(env),
   });
 
@@ -237,6 +265,14 @@ export interface SharedDeriveContext {
    * default — shared services have no working tree of their own (ADR-0001).
    */
   readonly workingDir: string;
+  /**
+   * Anchor (git common dir) — needed only to template a shared service's
+   * `log_location` under the shared instance's logs dir (`<anchor>/devtrees/
+   * logs/shared/`, issue #136). Optional: a stack with no `log_location`
+   * derives without it. The deriver throws if a service authors `log_location`
+   * but no anchor was provided.
+   */
+  readonly anchor?: string;
   /** Resolve a declared shared named port to its repo-wide allocated number. */
   readonly portFor: PortResolver;
 }
@@ -270,6 +306,9 @@ export function deriveSharedConfig(stack: ResolvedStack, ctx: SharedDeriveContex
     tier: "shared",
     services: shared,
     workingDir: ctx.workingDir,
+    // Shared-tier logs live under the fixed `shared` instance id so they never
+    // collide with any worktree's logs (issue #136).
+    logsBase: ctx.anchor !== undefined ? logsDir(ctx.anchor, SHARED_INSTANCE_ID) : undefined,
     extraEnvLines: envLines(env),
   });
 
@@ -310,8 +349,17 @@ function buildTierProcesses(input: {
     shutdown?: Readonly<Record<string, unknown>>;
     isDaemon?: boolean;
     launchTimeoutSeconds?: number;
+    logLocation?: string;
+    logConfiguration?: Readonly<Record<string, unknown>>;
   }>;
   workingDir: string;
+  /**
+   * Absolute per-instance logs dir (issue #136) under which an authored
+   * `log_location` is templated, or `undefined` when no anchor was supplied. A
+   * service that authors `log_location` without a logs base is a programming
+   * error — the deriver throws rather than emit an un-templated path.
+   */
+  logsBase?: string;
   extraEnvLines: ReadonlyArray<string>;
 }): { processes: Record<string, DerivedProcess>; droppedEdges: DroppedEdge[] } {
   const tierIndex = buildTierIndex(input.stack);
@@ -327,28 +375,94 @@ function buildTierProcesses(input: {
         // Author-declared env first, then devtrees injection (injection wins on
         // duplicate keys because process-compose takes the last occurrence).
         environment: [...service.environment, ...input.extraEnvLines],
-        // Opaque passthrough — only set when present, so the derived YAML
-        // doesn't sprout `readiness_probe: undefined` for plain services.
-        ...(service.readinessProbe !== undefined && { readiness_probe: service.readinessProbe }),
-        ...(service.livenessProbe !== undefined && { liveness_probe: service.livenessProbe }),
-        ...(service.availability !== undefined && { availability: service.availability }),
-        // process-compose `namespace` passthrough (#128) — re-emitted verbatim,
-        // only when authored, so namespace-less services derive without the key.
-        ...(service.namespace !== undefined && { namespace: service.namespace }),
-        // shutdown / daemon-launch passthrough (#134) — each emitted only when
-        // the author declared it, so plain services derive unchanged. `shutdown`
-        // is an opaque object; `is_daemon` / `launch_timeout_seconds` are
-        // scalars copied verbatim (a declared `false` / `0` rides through).
-        ...(service.shutdown !== undefined && { shutdown: service.shutdown }),
-        ...(service.isDaemon !== undefined && { is_daemon: service.isDaemon }),
-        ...(service.launchTimeoutSeconds !== undefined && {
-          launch_timeout_seconds: service.launchTimeoutSeconds,
-        }),
+        ...buildPassthroughFields(service, input.logsBase),
       },
       partition.kept,
     );
   }
   return { processes, droppedEdges };
+}
+
+/** The subset of a service the passthrough emitter reads. */
+type PassthroughSource = {
+  name: string;
+  readinessProbe?: Readonly<Record<string, unknown>>;
+  livenessProbe?: Readonly<Record<string, unknown>>;
+  availability?: Readonly<Record<string, unknown>>;
+  namespace?: string;
+  shutdown?: Readonly<Record<string, unknown>>;
+  isDaemon?: boolean;
+  launchTimeoutSeconds?: number;
+  logLocation?: string;
+  logConfiguration?: Readonly<Record<string, unknown>>;
+};
+
+/**
+ * The verbatim passthrough fields — copied from the resolved service straight to
+ * the derived process under their process-compose key, present only when the
+ * author declared them. Encoded once as `[resolvedKey, derivedKey]` pairs so the
+ * emitter resolves them in a single loop instead of one conditional branch per
+ * field (which is what tipped the function over the complexity gate). Covers the
+ * probes / availability, `namespace` (#128), `shutdown` + the daemon-launch
+ * scalars (#134), and `log_configuration` (#136). `log_location` is NOT here —
+ * it is the one field devtrees transforms (see `buildPassthroughFields`).
+ */
+const VERBATIM_PASSTHROUGH: ReadonlyArray<
+  readonly [keyof PassthroughSource, keyof DerivedProcess]
+> = [
+  ["readinessProbe", "readiness_probe"],
+  ["livenessProbe", "liveness_probe"],
+  ["availability", "availability"],
+  ["namespace", "namespace"],
+  ["shutdown", "shutdown"],
+  ["isDaemon", "is_daemon"],
+  ["launchTimeoutSeconds", "launch_timeout_seconds"],
+  ["logConfiguration", "log_configuration"],
+];
+
+/**
+ * Emit the process-compose passthrough fields for one service — each present
+ * only when the author declared it, so a plain service derives without sprouting
+ * `readiness_probe: undefined` (or any other absent key). The verbatim fields
+ * ride through unchanged via `VERBATIM_PASSTHROUGH`; only `log_location` (#136)
+ * is transformed — templated under the per-instance logs dir to an absolute path
+ * so the same authored filename in two worktrees never collides.
+ */
+function buildPassthroughFields(
+  service: PassthroughSource,
+  logsBase: string | undefined,
+): Partial<DerivedProcess> {
+  const out: Record<string, unknown> = {};
+  for (const [from, to] of VERBATIM_PASSTHROUGH) {
+    const value = service[from];
+    if (value !== undefined) out[to] = value;
+  }
+  if (service.logLocation !== undefined) {
+    out.log_location = resolveLogLocation(service.name, service.logLocation, logsBase);
+  }
+  return out;
+}
+
+/**
+ * Template a service's authored (relative, validated) `log_location` into the
+ * per-instance logs dir, returning the absolute path process-compose writes to
+ * (issue #136). `logsBase` is `undefined` only when no anchor reached the
+ * deriver; a service that authored a `log_location` in that case is a
+ * programming error (every production call site supplies the anchor), so we
+ * throw rather than emit an un-rooted path that would defeat collision-proofing.
+ */
+function resolveLogLocation(
+  serviceName: string,
+  logLocation: string,
+  logsBase: string | undefined,
+): string {
+  if (logsBase === undefined) {
+    throw new Error(
+      `cannot derive log_location for service '${serviceName}': no anchor was provided to the ` +
+        `deriver, so the per-instance logs dir is unknown. Pass \`anchor\` in the derive context.`,
+    );
+  }
+  return join(logsBase, logLocation);
 }
 
 /** Index `name → tier` over a resolved stack — keeps depends_on classification O(1). */

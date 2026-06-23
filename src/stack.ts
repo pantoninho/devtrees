@@ -80,6 +80,22 @@ export interface ResolvedService {
    * Number copied verbatim; absent when unauthored. Companion to `isDaemon`.
    */
   readonly launchTimeoutSeconds?: number;
+  /**
+   * Authored `log_location` (issue #136) — the **raw**, author-relative log file
+   * path as written in `devtrees.yaml`. devtrees treats it as relative to the
+   * per-instance logs dir and templates the resolved absolute path into the
+   * derived process at derive time (the deriver knows the anchor + instance id);
+   * the parser only stores the raw value and validates it (no absolute paths, no
+   * `..` escapes — see `validateLogLocation`). Absent when unauthored.
+   */
+  readonly logLocation?: string;
+  /**
+   * process-compose `log_configuration` block (issue #136), opaque object
+   * passthrough — rotation / format / flush options copied verbatim like
+   * `shutdown`. devtrees never models or templates its inner shape; absent when
+   * unauthored.
+   */
+  readonly logConfiguration?: Readonly<Record<string, unknown>>;
 }
 
 /** Per-repo allocator overrides, partial — unspecified fields fall back to defaults. */
@@ -115,6 +131,8 @@ interface RawService {
   shutdown?: unknown;
   is_daemon?: unknown;
   launch_timeout_seconds?: unknown;
+  log_location?: unknown;
+  log_configuration?: unknown;
 }
 
 const DEFAULT_TIER: Tier = "isolated";
@@ -165,6 +183,10 @@ const PASSTHROUGH_FIELDS: ReadonlyArray<readonly [keyof ResolvedService, keyof R
   ["livenessProbe", "liveness_probe"],
   ["availability", "availability"],
   ["shutdown", "shutdown"],
+  // log_configuration (#136) is an opaque object copied verbatim — devtrees
+  // never templates anything inside it, so it rides the same object path as
+  // shutdown / the probes.
+  ["logConfiguration", "log_configuration"],
 ];
 
 /**
@@ -176,7 +198,10 @@ function resolvePassthrough(
   over: RawService,
   base: RawService,
 ): Partial<
-  Pick<ResolvedService, "readinessProbe" | "livenessProbe" | "availability" | "shutdown">
+  Pick<
+    ResolvedService,
+    "readinessProbe" | "livenessProbe" | "availability" | "shutdown" | "logConfiguration"
+  >
 > {
   const out: Record<string, Readonly<Record<string, unknown>>> = {};
   for (const [outKey, rawKey] of PASSTHROUGH_FIELDS) {
@@ -201,6 +226,50 @@ function resolveNamespace(
   if (raw === undefined || raw === null) return {};
   const ns = asString(raw);
   return ns === "" ? {} : { namespace: ns };
+}
+
+/**
+ * Resolve the `log_location` for one service (#136). Overlay wins over base; the
+ * key is left off the returned record when neither declares a non-empty value,
+ * so `"logLocation" in svc` reflects authoring intent and a service without a
+ * log file derives without the key. The stored value is the **raw** authored
+ * relative path — templating it under the per-instance logs dir is the deriver's
+ * job. An absolute path or one that escapes the logs dir (contains a `..`
+ * segment) is rejected as `CONFIG_INVALID`: devtrees roots every log file under
+ * `<anchor>/devtrees/logs/<instanceId>/` so parallel worktree stacks cannot
+ * collide, and an absolute / escaping path would defeat that by construction.
+ */
+function resolveLogLocation(
+  service: string,
+  over: RawService,
+  base: RawService,
+): Partial<Pick<ResolvedService, "logLocation">> {
+  const raw = over.log_location ?? base.log_location;
+  if (raw === undefined || raw === null) return {};
+  if (typeof raw !== "string") {
+    throw new StackConfigError(
+      `service '${service}': log_location must be a string, got ${typeof raw}. ` +
+        `It is a per-process log file path relative to the per-instance logs dir.`,
+    );
+  }
+  const value = raw.trim();
+  if (value === "") return {};
+  if (isAbsolute(value)) {
+    throw new StackConfigError(
+      `service '${service}': log_location '${value}' must be relative, not absolute. ` +
+        `devtrees roots every log file under the per-instance logs dir ` +
+        `(<anchor>/devtrees/logs/<instanceId>/) so parallel worktree stacks cannot collide; ` +
+        `use a plain filename like 'api.log' or a safe sub-path like 'sub/api.log'.`,
+    );
+  }
+  if (value.split(/[/\\]/).includes("..")) {
+    throw new StackConfigError(
+      `service '${service}': log_location '${value}' must not escape the logs dir (no '..' segments). ` +
+        `devtrees roots every log file under the per-instance logs dir so parallel worktree stacks ` +
+        `cannot collide; use a plain filename like 'api.log' or a safe sub-path like 'sub/api.log'.`,
+    );
+  }
+  return { logLocation: value };
 }
 
 /**
@@ -361,6 +430,10 @@ export function parseStack(yamlText: string, options: ParseStackOptions = {}): R
       // Scalar passthrough fields (#134: is_daemon, launch_timeout_seconds) —
       // validated by type, copied verbatim, only present when authored.
       ...resolveScalarPassthrough(over, base),
+      // log_location (#136) — raw author-relative path, validated against
+      // absolute / `..`-escaping values; templated into the per-instance logs
+      // dir at derive time. log_configuration rides resolvePassthrough above.
+      ...resolveLogLocation(name, over, base),
     };
   });
 

@@ -28,9 +28,15 @@ import {
   type InstanceStatus,
   type Service,
 } from "./instances.js";
-import { SHARED_REGISTRY_KEY, instancePaths, sharedInstancePaths } from "./paths.js";
+import {
+  SHARED_INSTANCE_ID,
+  SHARED_REGISTRY_KEY,
+  instancePaths,
+  logsDir,
+  sharedInstancePaths,
+} from "./paths.js";
 import { findOrphans, parseWorktreeIds } from "./prune.js";
-import { loadStack, type ResolvedService, type ResolvedStack } from "./stack.js";
+import { loadStack, type ResolvedService, type ResolvedStack, type Tier } from "./stack.js";
 import {
   createDriver,
   mergeAsyncIterables,
@@ -55,7 +61,7 @@ import {
 } from "./health.js";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { TARGET_CANDIDATES, fencedBlock, upsertBlock } from "./onboarding.js";
 
@@ -564,6 +570,24 @@ function hasTier(stack: ResolvedStack, tier: "isolated" | "shared"): boolean {
   return stack.services.some((s) => s.tier === tier);
 }
 
+/**
+ * Create the directories every authored `log_location` file needs (issue #136)
+ * so process-compose can open the file — it opens but does not `mkdir -p` the
+ * path itself. Created lazily: a stack where no service authored a
+ * `log_location` makes no dir at all, so a plain stack never sprouts an empty
+ * `devtrees/logs/<instanceId>/` (acceptance: "no empty logs dir surprise"). For
+ * a nested location (e.g. `sub/api.log`) the file's *parent* dir is created, so
+ * `<logsBase>/sub/` exists before launch. `logsBase` is the per-instance logs
+ * dir (`logsDir(anchor, instanceId)`); the authored values are already validated
+ * to be relative and non-escaping, so the join stays under it.
+ */
+function ensureLogsDir(stack: ResolvedStack, logsBase: string, tier: Tier): void {
+  for (const svc of stack.services) {
+    if (svc.tier !== tier || svc.logLocation === undefined) continue;
+    mkdirSync(dirname(join(logsBase, svc.logLocation)), { recursive: true });
+  }
+}
+
 interface AllocatedPortMaps {
   readonly blockBase: number;
   readonly sharedBase?: number;
@@ -832,6 +856,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     const derived = deriveWorktreeConfig(stack, {
       worktreeId: anchor.worktreeId,
       worktreeRoot: anchor.worktreeRoot,
+      anchor: anchor.anchor,
       portFor,
       sharedPortFor: effectiveSharedPortFor,
     });
@@ -868,6 +893,10 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     }
 
     mkdirSync(paths.runDir, { recursive: true });
+    // Create this worktree instance's logs dir so process-compose can open any
+    // `log_location` file the derived config points at (issue #136). Only the
+    // isolated services land in this instance, so scope dir creation to them.
+    ensureLogsDir(stack, logsDir(anchor.anchor, anchor.worktreeId), "isolated");
     writeFileSync(paths.configPath, stringifyYaml(derived.config), "utf8");
 
     // Shared-health wait: gate the worktree start on the shared services'
@@ -1026,6 +1055,7 @@ export async function runUpDryRun(deps: CommandDeps = {}): Promise<DryRunResult>
   const derivedWt = deriveWorktreeConfig(stack, {
     worktreeId: anchor.worktreeId,
     worktreeRoot: anchor.worktreeRoot,
+    anchor: anchor.anchor,
     portFor,
     sharedPortFor,
   });
@@ -1042,6 +1072,7 @@ export async function runUpDryRun(deps: CommandDeps = {}): Promise<DryRunResult>
 
   const derivedShared = deriveSharedConfig(stack, {
     workingDir: anchor.anchor,
+    anchor: anchor.anchor,
     portFor: sharedPortFor,
   });
   return { ...base, sharedEnv: derivedShared.env, sharedConfig: derivedShared.config };
@@ -1155,10 +1186,15 @@ async function ensureSharedStarted(
 
     const derived = deriveSharedConfig(stack, {
       workingDir: anchor,
+      anchor,
       portFor: sharedPortFor,
     });
 
     mkdirSync(paths.runDir, { recursive: true });
+    // Create the shared instance's logs dir so process-compose can open any
+    // `log_location` file the derived config points at (issue #136). Only the
+    // shared services land in this instance, so scope dir creation to them.
+    ensureLogsDir(stack, logsDir(anchor, SHARED_INSTANCE_ID), "shared");
     writeFileSync(paths.configPath, stringifyYaml(derived.config), "utf8");
 
     await deps.driver.up({ configPath: paths.configPath, socketPath: paths.socketPath });
@@ -1646,6 +1682,7 @@ export async function runEnv(deps: CommandDeps = {}): Promise<EnvResult> {
   const derived = deriveWorktreeConfig(stack, {
     worktreeId: anchor.worktreeId,
     worktreeRoot: anchor.worktreeRoot,
+    anchor: anchor.anchor,
     portFor,
     sharedPortFor: effectiveSharedPortFor,
   });
