@@ -4,7 +4,7 @@
   "description": "Run a project's process-compose stack across multiple git worktrees without collision.",
   "license": "MIT",
   "bin": {
-    "devtrees": "./dist/cli.mjs"
+    "devtrees": "dist/cli.mjs"
   },
   "files": [
     "dist"
