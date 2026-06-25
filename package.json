@@ -1,6 +1,6 @@
 {
   "name": "devtrees",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "Run a project's process-compose stack across multiple git worktrees without collision.",
   "license": "MIT",
   "bin": {
