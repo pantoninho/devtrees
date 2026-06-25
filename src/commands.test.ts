@@ -2362,6 +2362,65 @@ describe("runPrune — reconcile instances against git worktree list", () => {
     expect("alpha" in registryRef.snapshot).toBe(false);
     expect("beta" in registryRef.snapshot).toBe(false);
   });
+
+  it("reclaims a dead registry reservation with no socket (down-then-removed) and preserves __shared__ (issue #142)", async () => {
+    // The tidy workflow: `devtrees down` then `git worktree remove`. No socket
+    // survives, so socket discovery finds nothing — but the registry still
+    // holds the dead reservation and the derived *.yaml is orphaned on disk.
+    // Prune must reconcile the registry directly against the live worktree set.
+    const tmp = tmpAnchor();
+    mkdirSync(join(tmp.anchor, "devtrees"), { recursive: true });
+    const deadId = idFor(tmp.worktreeRoot, "feature");
+    const liveId = idFor(tmp.worktreeRoot, "main");
+    // The orphaned derived config carries the worktree path under working_dir.
+    const featurePath = join(tmp.worktreeRoot, "feature");
+    const deadConfig = instancePaths(tmp.anchor, deadId).configPath;
+    writeFileSync(deadConfig, stringifyYaml({ processes: { web: { working_dir: featurePath } } }));
+
+    const git = pruneGit({
+      anchor: tmp.anchor,
+      worktreeRoot: tmp.worktreeRoot,
+      worktreeId: "main",
+      porcelain: [`worktree ${join(tmp.worktreeRoot, "main")}`, "HEAD x", ""].join("\n"),
+    });
+
+    const registryRef = {
+      snapshot: {
+        [liveId]: 22048,
+        [deadId]: 42560,
+        [SHARED_REGISTRY_KEY]: 30000,
+      } as RegistrySnapshot,
+    };
+
+    const { runPrune } = await import("./commands.js");
+    const result = await runPrune({
+      cwd: join(tmp.worktreeRoot, "main"),
+      git,
+      // No socket survives: discovery finds nothing.
+      discover: async () => [],
+      readRegistry: () => registryRef.snapshot,
+      withRegistryLock: async (_anchor, mutate) => {
+        const after = await mutate(registryRef.snapshot);
+        registryRef.snapshot = after;
+        return after;
+      },
+    });
+
+    // Acceptance: the dead reservation is reported in pruned[] with its path.
+    expect(result.pruned.map((p) => p.id)).toEqual([deadId]);
+    expect(result.pruned[0]?.worktreePath).toBe(featurePath);
+    // Acceptance: the registry entry is gone.
+    expect(deadId in registryRef.snapshot).toBe(false);
+    // Acceptance: __shared__ is preserved.
+    expect(registryRef.snapshot[SHARED_REGISTRY_KEY]).toBe(30000);
+    // Acceptance: the live worktree's reservation is untouched.
+    expect(registryRef.snapshot[liveId]).toBe(22048);
+    // Acceptance: the orphaned derived config is removed.
+    expect(existsSync(deadConfig)).toBe(false);
+    // Acceptance: __shared__ and the live worktree's reservation are preserved.
+    expect(registryRef.snapshot[SHARED_REGISTRY_KEY]).toBe(30000);
+    expect(registryRef.snapshot[liveId]).toBe(22048);
+  });
 });
 
 /**

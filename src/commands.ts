@@ -35,7 +35,7 @@ import {
   logsDir,
   sharedInstancePaths,
 } from "./paths.js";
-import { findOrphans, parseWorktreeIds } from "./prune.js";
+import { findDeadReservations, findOrphans, parseWorktreeIds } from "./prune.js";
 import { loadStack, type ResolvedService, type ResolvedStack, type Tier } from "./stack.js";
 import {
   createDriver,
@@ -1485,6 +1485,15 @@ export interface PruneDeps {
    * under the anchor.
    */
   readonly withRegistryLock?: WithRegistryLock;
+  /**
+   * Read the allocation registry to reconcile its keys directly against the
+   * live worktree id set (issue #142). This is the socket-independent
+   * complement to socket-keyed discovery: a worktree taken `down` and then
+   * `git worktree remove`d leaves no socket, so its reservation is invisible
+   * to `discover` — but it still leaks a registry entry and an orphaned
+   * derived config. Default: real `readRegistry` under the anchor.
+   */
+  readonly readRegistry?: (anchor: string) => RegistrySnapshot;
 }
 
 /**
@@ -1544,12 +1553,38 @@ export async function runPrune(deps: PruneDeps = {}): Promise<PruneResult> {
   const anchor = resolveAnchor(cwd, git);
   const discover = deps.discover ?? discoverInstances;
   const lock = deps.withRegistryLock ?? defaultWithRegistryLock;
+  const readReg = deps.readRegistry ?? readRegistry;
   const driver = createDriver(deps.driver);
 
   const instances = await discover(anchor.anchor);
   const porcelain = git(["worktree", "list", "--porcelain"]);
   const liveIds = parseWorktreeIds(porcelain);
-  const orphans = findOrphans(instances, liveIds);
+  const socketOrphans = findOrphans(instances, liveIds);
+
+  // Socket-independent reconciliation (issue #142): a worktree taken `down`
+  // then `git worktree remove`d leaves no socket, so `discover` can't see it —
+  // but its registry reservation and derived config leak. `findDeadReservations`
+  // reconciles the registry keys directly against the live worktree set
+  // (skipping ids already found via socket so a double-keyed orphan is
+  // reported once). Each dead reservation becomes an identity-only synthetic
+  // orphan so it flows through the same cleanup + reporting path below.
+  const discoveredIds = new Set(socketOrphans.map((o) => o.id));
+  const deadReservations = findDeadReservations(
+    Object.keys(readReg(anchor.anchor)),
+    liveIds,
+    discoveredIds,
+  ).map<InstanceInfo>((id) => ({
+    id,
+    kind: "worktree",
+    // No live process backs a dead reservation — identity only.
+    status: "stale",
+    socketPath: instancePaths(anchor.anchor, id).socketPath,
+    ports: {},
+    blockBase: undefined,
+    services: [],
+  }));
+
+  const orphans = [...socketOrphans, ...deadReservations];
   if (orphans.length === 0) return { anchor: anchor.anchor, pruned: [] };
 
   // Capture identity-only metadata for each orphan *before* tearing down its

@@ -24,6 +24,7 @@
 
 import { deriveWorktreeId } from "./anchor.js";
 import type { InstanceInfo } from "./instances.js";
+import { SHARED_REGISTRY_KEY } from "./paths.js";
 
 /**
  * Filter the discovered instance list down to the orphans: worktree-kind
@@ -35,6 +36,34 @@ export function findOrphans(
   liveWorktreeIds: ReadonlySet<string>,
 ): InstanceInfo[] {
   return instances.filter((inst) => inst.kind === "worktree" && !liveWorktreeIds.has(inst.id));
+}
+
+/**
+ * Find the registry keys that name a dead reservation: a worktree that no
+ * longer exists, leaking its allocation-registry entry (and derived config)
+ * with no live control socket to be discovered (issue #142).
+ *
+ * This is the socket-independent complement to `findOrphans`: the registry is
+ * keyed by the same ids `parseWorktreeIds` produces, so any key that is not a
+ * live worktree id is a leak — *except* the reserved shared key, which is
+ * intentionally retained across teardown (#51) and is not a worktree. Ids in
+ * `alreadyDiscovered` (the socket-keyed orphans) are skipped so a double-keyed
+ * orphan is reclaimed and reported exactly once. Pure — no I/O, deterministic
+ * order (registry key order preserved).
+ */
+export function findDeadReservations(
+  registryKeys: Iterable<string>,
+  liveWorktreeIds: ReadonlySet<string>,
+  alreadyDiscovered: ReadonlySet<string>,
+): string[] {
+  const dead: string[] = [];
+  for (const id of registryKeys) {
+    if (id === SHARED_REGISTRY_KEY) continue;
+    if (liveWorktreeIds.has(id)) continue;
+    if (alreadyDiscovered.has(id)) continue;
+    dead.push(id);
+  }
+  return dead;
 }
 
 /**
