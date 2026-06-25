@@ -306,10 +306,13 @@ class UpCommand extends DevtreesCommand {
   // the positive variant in the options table.
   attach = Option.Boolean("--attach", {
     description:
-      "Force-attach the TUI; pass `--no-attach` to force-skip (default: only when stdout & stderr are TTYs).",
+      "Force-attach the TUI; pass `--no-attach` to force-skip (default: only when stdout & stderr are TTYs). " +
+      "When attached, the TUI shows services coming up live and `up` returns when you detach; when not, `up` waits silently for health first.",
   });
   waitTimeout = Option.String("--wait-timeout", {
-    description: "Health-wait timeout in seconds. Default 120.",
+    description:
+      "Health-wait timeout in seconds for the headless (`--no-attach` / `--json`) path. Default 120. " +
+      "Ignored when the TUI is attached — the live view, not a silent wait, signals readiness.",
   });
   // process-compose `-n/--namespace` (issue #128): a repeatable string-array
   // selecting which namespace subset to start. Repeat the flag to pass more

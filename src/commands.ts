@@ -937,6 +937,34 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
 
   if (outcome.kind === "reconciled") return outcome.result;
 
+  const result = {
+    worktreeId: anchor.worktreeId,
+    socketPath: paths.socketPath,
+    env: outcome.env,
+    sharedStarted: outcome.sharedStarted,
+    blockBase,
+  } as const;
+
+  if (shouldAttachAfterUp(deps)) {
+    // Attach path (#132): the server is already started detached, and
+    // `process-compose attach` renders each service transitioning starting ->
+    // ready live. Attach NOW — before any health-wait — so the human watches
+    // the stack come up instead of staring at a blank terminal for the whole
+    // (possibly 30-60s) wait. The live TUI IS the progress indicator AND the
+    // health signal: the human watching it decides when the stack is ready, so
+    // `up` returns when they detach. The silent health-wait + HEALTH_TIMEOUT
+    // gate only matters for the headless paths below, where nothing renders the
+    // state that already exists during the wait.
+    await driver.attach(inst);
+    // Snapshot the per-service rows after the human detaches so the post-TUI
+    // summary line reflects the state at detach time. Best-effort (issue #29).
+    const services = await collectIsolatedServices(stack, paths.socketPath, portFor, deps, driver);
+    return { ...result, services };
+  }
+
+  // Headless paths (`--json` / `--no-attach`): no TUI to render progress, so the
+  // silent health-wait is what turns "up returned" into "the stack is serving
+  // traffic" (PRD #26, ADR-0005), and HEALTH_TIMEOUT surfaces a stuck start.
   await waitForWorktreeHealth(stack, paths.socketPath, deps, driver);
 
   // After the health-wait, snapshot the per-service runtime rows so the
@@ -946,16 +974,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
   // applies, issue #29).
   const services = await collectIsolatedServices(stack, paths.socketPath, portFor, deps, driver);
 
-  if (shouldAttachAfterUp(deps)) await driver.attach(inst);
-
-  return {
-    worktreeId: anchor.worktreeId,
-    socketPath: paths.socketPath,
-    env: outcome.env,
-    sharedStarted: outcome.sharedStarted,
-    blockBase,
-    services,
-  };
+  return { ...result, services };
 }
 
 /**
