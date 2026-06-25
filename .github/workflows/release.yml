@@ -1,0 +1,88 @@
+name: Release
+
+# release-please maintains a standing release PR off `main` from the
+# conventional-commit subjects since the last release. Merging that PR creates
+# the vX.Y.Z tag + GitHub release, which flips `release_created` and unlocks the
+# publish job. Both stages live in this single workflow (ADR-0006).
+on:
+  push:
+    branches: [main]
+
+# Default GITHUB_TOKEN only — no PAT (ADR-0006). The release-please step needs
+# contents + PRs write to push the tag/release and maintain the release PR.
+permissions:
+  contents: write
+  pull-requests: write
+
+# Never run two releases for the same branch concurrently; let an in-flight
+# release finish rather than cancelling it.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Stage 1 — release-please. Reads release-please-config.json and
+  # .release-please-manifest.json, maintains the release PR, and on merge cuts
+  # the tag + GitHub release. Authored by the default GITHUB_TOKEN, so the
+  # release PR itself runs no CI by design (ADR-0006).
+  # ---------------------------------------------------------------------------
+  release-please:
+    name: release-please
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - name: Run release-please
+        id: release
+        uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  # ---------------------------------------------------------------------------
+  # Stage 2 — publish to npm via OIDC trusted publishing (ADR-0006). Runs only
+  # when stage 1 cut a release. `id-token: write` lets npm mint a short-lived
+  # token it trusts (the trusted publisher is registered once on npmjs.com) and
+  # attest provenance automatically — there is NO NPM_TOKEN anywhere. npm is
+  # upgraded to >= 11.5.1 because OIDC trusted publishing requires it and the
+  # pinned Node ships an older npm. The `prepublishOnly` guard (build + check +
+  # test) is the last line of defence before the actual publish.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: publish to npm (OIDC)
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Checkout the released tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - name: Set up Node (npm registry)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Upgrade npm to an OIDC-capable version (>= 11.5.1)
+        run: npm install -g npm@latest
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      # No NPM_TOKEN / NODE_AUTH_TOKEN in env: with `id-token: write` and an
+      # OIDC-capable npm, the publish authenticates via trusted publishing and
+      # attaches provenance automatically. `prepublishOnly` re-runs
+      # build + check + test as the pre-publish safety net.
+      - name: Publish to npm with provenance
+        run: npm publish --provenance --access public
