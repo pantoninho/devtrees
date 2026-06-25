@@ -1,0 +1,47 @@
+name: PR Title
+
+# PRs are squash-merged, so the PR title becomes the squash subject on `main`,
+# which release-please parses directly (ADR-0006). This required check rejects
+# any PR title that is not a valid conventional-commit subject, so a release is
+# never silently missed or misclassified.
+on:
+  pull_request:
+    types: [opened, edited, synchronize]
+
+# Only needs to read the PR; the action surfaces its verdict via the check
+# status, not by writing back.
+permissions:
+  pull-requests: read
+
+concurrency:
+  group: pr-title-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate PR title (conventional commit)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate
+        uses: amannn/action-semantic-pull-request@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # Allowed types mirror what release-please recognizes so the squash
+          # subject is always parseable into the changelog/version bump.
+          types: |
+            feat
+            fix
+            chore
+            docs
+            refactor
+            test
+            build
+            ci
+            perf
+            style
+            revert
+          # Allow an optional scope but do not require one (e.g. `feat(up): ...`
+          # and `feat: ...` are both valid). `feat!: ...` breaking markers pass
+          # because the type is still `feat`.
+          requireScope: false
