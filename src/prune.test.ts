@@ -14,9 +14,9 @@
 
 import { describe, expect, it } from "vite-plus/test";
 import { deriveWorktreeId } from "./anchor.js";
-import { findOrphans, parseWorktreeIds } from "./prune.js";
+import { findDeadReservations, findOrphans, parseWorktreeIds } from "./prune.js";
 import type { InstanceInfo } from "./instances.js";
-import { SHARED_INSTANCE_ID } from "./paths.js";
+import { SHARED_INSTANCE_ID, SHARED_REGISTRY_KEY } from "./paths.js";
 
 /** Compact builder for a discovered instance — keeps the test bodies declarative. */
 function instance(
@@ -83,6 +83,42 @@ describe("findOrphans", () => {
     const inst = instance(id);
     expect(findOrphans([inst], new Set([id]))).toEqual([]);
     expect(findOrphans([inst], new Set())).toEqual([inst]);
+  });
+});
+
+describe("findDeadReservations", () => {
+  // The socket-independent complement to findOrphans (issue #142): registry
+  // keys for worktrees that are gone but left no socket to be discovered.
+  const none = new Set<string>();
+
+  it("flags a registry key whose worktree is no longer live", () => {
+    expect(findDeadReservations(["login", "billing"], new Set(["login"]), none)).toEqual([
+      "billing",
+    ]);
+  });
+
+  it("returns nothing when every registry key is a live worktree", () => {
+    expect(findDeadReservations(["login", "billing"], new Set(["login", "billing"]), none)).toEqual(
+      [],
+    );
+  });
+
+  it("never flags the reserved shared key, even when it has no live worktree", () => {
+    // __shared__ is intentionally retained across teardown (#51) and is not a
+    // worktree, so it must survive prune regardless of liveness.
+    expect(findDeadReservations([SHARED_REGISTRY_KEY, "login"], new Set(["login"]), none)).toEqual(
+      [],
+    );
+    expect(findDeadReservations([SHARED_REGISTRY_KEY], none, none)).toEqual([]);
+  });
+
+  it("skips ids already discovered via socket so a double-keyed orphan is reported once", () => {
+    // An orphan removed while still running is both socket-discovered AND a
+    // dead registry key; the registry pass must not re-report it.
+    const discovered = new Set(["removed"]);
+    expect(findDeadReservations(["removed", "stale-only"], none, discovered)).toEqual([
+      "stale-only",
+    ]);
   });
 });
 
