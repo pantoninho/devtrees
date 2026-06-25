@@ -919,10 +919,12 @@ describe("runUp — wait-for-healthy (worktree instance, #28)", () => {
     expect(observed).toBe(120_000);
   });
 
-  it("on health timeout: throws HEALTH_TIMEOUT and does NOT attach the TUI", async () => {
-    // ADR-0005: timeout exits non-zero, leaves the stack running, agent can
-    // then call `devtrees logs <service>` to inspect. So the worktree's
-    // `process-compose down` must NOT be invoked from this path.
+  it("on health timeout (headless): throws HEALTH_TIMEOUT and does NOT attach the TUI", async () => {
+    // The silent health-wait — and so HEALTH_TIMEOUT — only runs on the headless
+    // (`--no-attach` / `--json`) path; the attach path lets the human watch the
+    // TUI instead of waiting (#132). ADR-0005: timeout exits non-zero, leaves the
+    // stack running, agent can then call `devtrees logs <service>` to inspect, so
+    // the worktree's `process-compose down` must NOT be invoked from this path.
     const track: StubSpawn = { invocations: [], touchSocket: false };
     const baseDeps = stubDeps({ stack: twoIsolated, track });
     const inner = baseDeps.driver?.spawner;
@@ -932,7 +934,7 @@ describe("runUp — wait-for-healthy (worktree instance, #28)", () => {
     const sawDown = { called: false };
     const deps: CommandDeps = {
       ...baseDeps,
-      attach: true, // force attach so we can prove the timeout skipped it
+      attach: false, // headless: the path the silent health-wait gates
       waitForHealth: async () => {
         const err = new Error(
           "timed out waiting for services to be healthy [web, worker] after 120000ms",
@@ -1078,29 +1080,36 @@ describe("runUp — wait-for-healthy (worktree instance, #28)", () => {
     expect(attached).toBe(false);
   });
 
-  it("attaches after a successful wait when deps.attach is true", async () => {
+  it("attach mode (#132): attaches the live TUI and skips the silent health-wait", async () => {
+    // Option 1: the server is already started detached and `process-compose
+    // attach` renders services going starting -> ready, so in attach mode we
+    // attach the TUI immediately — the human watching it is the progress AND the
+    // health signal. The silent `waitForHealth` gate (and HEALTH_TIMEOUT) is for
+    // the headless paths only, so it must NOT run here.
     const track: StubSpawn = { invocations: [], touchSocket: false };
     const baseDeps = stubDeps({ stack: twoIsolated, track });
     const inner = baseDeps.driver?.spawner;
     if (inner === undefined) throw new Error("expected stub spawner");
 
-    const order: string[] = [];
+    let waited = false;
+    let attached = false;
     const deps: CommandDeps = {
       ...baseDeps,
       attach: true,
       waitForHealth: async () => {
-        order.push("wait");
+        waited = true;
       },
       driver: {
         ...baseDeps.driver,
         spawner: (binary, args, options) => {
-          if (args[0] === "attach") order.push("attach");
+          if (args[0] === "attach") attached = true;
           return inner(binary, args, options);
         },
       },
     };
     await runUp(deps);
-    expect(order).toEqual(["wait", "attach"]);
+    expect(attached).toBe(true);
+    expect(waited).toBe(false);
   });
 });
 
