@@ -36,6 +36,7 @@ import {
   sharedInstancePaths,
 } from "./paths.js";
 import { findDeadReservations, findOrphans, parseWorktreeIds } from "./prune.js";
+import { reapShutdownHooks, type ReapDeps, type ReapOutcome } from "./reaper.js";
 import { loadStack, type ResolvedService, type ResolvedStack, type Tier } from "./stack.js";
 import {
   createDriver,
@@ -1494,6 +1495,38 @@ export interface PruneDeps {
    * derived config. Default: real `readRegistry` under the anchor.
    */
   readonly readRegistry?: (anchor: string) => RegistrySnapshot;
+  /**
+   * Run an orphan's derived `shutdown.command`(s) directly — socket-free, from
+   * a cwd that exists (the anchor) — to reap its out-of-band resources (issue
+   * #148). The graceful `process-compose down` cannot fire the hook once `git
+   * worktree remove` has deleted the worktree's `working_dir`, so devtrees runs
+   * it itself. Default: the real `reapShutdownHooks`. Injected so tests can
+   * observe the reap surface without spawning a shell.
+   */
+  readonly reap?: Reaper;
+  /** Sink for non-fatal warnings (e.g. a failed reap). Default: stderr. */
+  readonly warn?: (message: string) => void;
+}
+
+/** Type of the orphan-reap collaborator `runPrune`/`runDown` inject (issue #148). */
+export type Reaper = (config: DerivedConfig, deps: ReapDeps) => Promise<ReapOutcome>;
+
+/**
+ * A reap that failed for at least one of an orphan's shutdown hooks (issue
+ * #148). Surfaced so `prune`/`down` report that out-of-band resources may
+ * survive rather than claiming a clean teardown (acceptance #5). The reap is
+ * the author's `shutdown.command`; devtrees only knows its exit status.
+ */
+export interface ReapWarning {
+  readonly orphanId: string;
+  /** Absolute path the orphan was anchored at, for the operator's context. */
+  readonly worktreePath: string;
+  readonly failures: ReadonlyArray<{
+    readonly process: string;
+    readonly command: string;
+    readonly reason: "launch" | "exit" | "timeout";
+    readonly message?: string;
+  }>;
 }
 
 /**
@@ -1523,6 +1556,13 @@ export interface PruneResult {
   readonly anchor: string;
   /** The orphans that were stopped + cleaned. Source order from discovery. */
   readonly pruned: ReadonlyArray<PrunedOrphan>;
+  /**
+   * Orphans whose `shutdown.command` reap failed (issue #148) — out-of-band
+   * resources may have survived. Empty on a clean sweep. The orphan is still
+   * listed in `pruned` (on-disk state is reclaimed regardless), but this list
+   * tells an agent/operator the reap itself did not cleanly complete.
+   */
+  readonly warnings: ReadonlyArray<ReapWarning>;
 }
 
 /**
@@ -1555,6 +1595,8 @@ export async function runPrune(deps: PruneDeps = {}): Promise<PruneResult> {
   const lock = deps.withRegistryLock ?? defaultWithRegistryLock;
   const readReg = deps.readRegistry ?? readRegistry;
   const driver = createDriver(deps.driver);
+  const reap = deps.reap ?? reapShutdownHooks;
+  const warn = deps.warn ?? defaultWarn;
 
   const instances = await discover(anchor.anchor);
   const porcelain = git(["worktree", "list", "--porcelain"]);
@@ -1585,7 +1627,7 @@ export async function runPrune(deps: PruneDeps = {}): Promise<PruneResult> {
   }));
 
   const orphans = [...socketOrphans, ...deadReservations];
-  if (orphans.length === 0) return { anchor: anchor.anchor, pruned: [] };
+  if (orphans.length === 0) return { anchor: anchor.anchor, pruned: [], warnings: [] };
 
   // Capture identity-only metadata for each orphan *before* tearing down its
   // derived config — `worktreePath` is recovered from the on-disk YAML and
@@ -1597,9 +1639,34 @@ export async function runPrune(deps: PruneDeps = {}): Promise<PruneResult> {
     worktreePath: readWorktreePath(instancePaths(anchor.anchor, orphan.id).configPath),
   }));
 
+  const warnings: ReapWarning[] = [];
   for (const orphan of orphans) {
     const paths = instancePaths(anchor.anchor, orphan.id);
+
+    // Reap the orphan's out-of-band resources by running each derived
+    // `shutdown.command` ourselves (issue #148). This is socket-free and runs
+    // from the anchor — a directory that still exists — instead of relying on
+    // `process-compose down`'s graceful path, which cannot launch the hook
+    // once `git worktree remove` deleted the `working_dir`. We do this for
+    // BOTH a live and a stale supervisor: the leak happens regardless of
+    // supervisor liveness (acceptance #1/#2). Read the config BEFORE deletion;
+    // the author's hook removes the `.project` record, so a surviving record
+    // would prove it never ran (acceptance #3).
+    const config = readDerivedConfig(paths.configPath);
+    if (config !== undefined) {
+      const outcome = await reap(config, { cwd: anchor.anchor });
+      if (outcome.failures.length > 0) {
+        const worktreePath = readWorktreePath(paths.configPath);
+        warnings.push({ orphanId: orphan.id, worktreePath, failures: outcome.failures });
+        warn(formatReapWarning(orphan.id, worktreePath, outcome));
+      }
+    }
+
     if (orphan.status === "running") {
+      // Stop the supervisor too — a graceful `down` over its still-live socket.
+      // The direct hook run above IS the reap; this just reclaims the running
+      // process-compose. Best-effort: a failed/half-dead down must not abort
+      // the sweep, and the on-disk state is cleared below regardless.
       try {
         await driver.down({
           configPath: paths.configPath,
@@ -1633,7 +1700,45 @@ export async function runPrune(deps: PruneDeps = {}): Promise<PruneResult> {
     return changed ? next : snapshot;
   });
 
-  return { anchor: anchor.anchor, pruned: reported };
+  return { anchor: anchor.anchor, pruned: reported, warnings };
+}
+
+/**
+ * Read and parse an orphan's full derived process-compose config from disk
+ * (issue #148). Returns `undefined` when the file is missing or unparsable —
+ * an orphan with no on-disk config has no `shutdown.command` to run, so the
+ * reaper has nothing to do. Best-effort, like `readWorktreePath`: a malformed
+ * config must not abort the sweep.
+ */
+function readDerivedConfig(configPath: string): DerivedConfig | undefined {
+  if (!existsSync(configPath)) return undefined;
+  try {
+    const doc = parseYaml(readFileSync(configPath, "utf8")) as DerivedConfig | null;
+    if (doc === null || typeof doc !== "object" || typeof doc.processes !== "object") {
+      return undefined;
+    }
+    return doc;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Human-readable warning for a failed orphan reap (issue #148, acceptance #5).
+ * Names the orphan and that its out-of-band resources may survive, plus the
+ * failing hook(s) — devtrees only knows the exit status of the command it ran,
+ * not what the hook reaps (ADR-0002).
+ */
+function formatReapWarning(orphanId: string, worktreePath: string, outcome: ReapOutcome): string {
+  const where = worktreePath !== "" ? ` (was at ${worktreePath})` : "";
+  const detail = outcome.failures
+    .map((f) => `  - ${f.process}: \`${f.command}\` ${f.reason}${f.message ? ` (${f.message})` : ""}`)
+    .join("\n");
+  return (
+    `devtrees: orphan '${orphanId}'${where} — its shutdown hook did not complete cleanly, ` +
+    `so out-of-band resources (e.g. containers/volumes) may still be running. ` +
+    `Inspect and reap them manually:\n${detail}`
+  );
 }
 
 /**
