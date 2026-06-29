@@ -1420,3 +1420,182 @@ describe("e2e — crash recovery: stale control sockets (#80)", () => {
     expect(existsSync(socketPath)).toBe(false);
   }, 30000);
 });
+
+/**
+ * Out-of-band resource reap on prune (#148). The leak: process-compose launches
+ * a process's `shutdown.command` from its `working_dir` (the worktree). Once
+ * `git worktree remove` has deleted that directory, the supervisor can't chdir
+ * in, so it silently skips the hook (exit 0) — the stack's out-of-band
+ * resources leak while prune reports a clean teardown. The fix: devtrees runs
+ * the hook itself, socket-free, from a cwd that exists (the anchor).
+ *
+ * The stub faithfully models this: its graceful `down` runs each
+ * `shutdown.command` from `working_dir`, silently skipping when that dir is
+ * gone (`runShutdownHooks`). So the only way the down-marker appears after the
+ * worktree is removed is devtrees' OWN direct reap firing from the anchor.
+ */
+describe("e2e — prune reaps out-of-band resources via the shutdown hook from a valid cwd (#148)", () => {
+  /**
+   * A worktree whose isolated `daemon` service launches (touching an up-marker)
+   * and declares a `shutdown.command` that touches a down-marker. Both marker
+   * paths are ABSOLUTE and worktree-independent (they live under the repo root,
+   * not the worktree), so the hook is launch-position-independent — the only
+   * thing stopping it is the cwd it is launched from (issue #148's root cause).
+   */
+  function writeShutdownHookStack(
+    worktreeRoot: string,
+    markers: { up: string; down: string },
+  ): void {
+    writeFileSync(
+      join(worktreeRoot, "devtrees.yaml"),
+      [
+        "services:",
+        "  daemon:",
+        "    tier: isolated",
+        `    command: ${JSON.stringify(`sh -c 'touch ${markers.up}; exec sleep 300'`)}`,
+        "    ports: [WEB_PORT]",
+        "    shutdown:",
+        `      command: ${JSON.stringify(`touch ${markers.down}`)}`,
+        "      timeout_seconds: 10",
+        "",
+      ].join("\n"),
+    );
+  }
+
+  /** Wait up to `timeoutMs` for a file to appear. */
+  async function waitForFile(path: string, timeoutMs = 4000): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (existsSync(path)) return true;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    return existsSync(path);
+  }
+
+  it("live supervisor: prune fires the shutdown hook from the anchor and removes the orphan record", async () => {
+    const repo = makeRepo("dt-reap-live-", ["login", "billing"]);
+    cleanups.push(() => rmSync(repo.root, { recursive: true, force: true }));
+    const loginWt = repo.worktrees.login;
+    const billingWt = repo.worktrees.billing;
+    if (loginWt === undefined || billingWt === undefined) {
+      throw new Error("expected login and billing worktrees");
+    }
+    // The shutdown hook's first action, like the real mvp stack, is to remove a
+    // ".project" record — a surviving record proves the hook never ran. We model
+    // it with a record file the hook `rm`s and a down-marker it then touches.
+    const upMarker = join(repo.root, "login-daemon-up.marker");
+    const downMarker = join(repo.root, "login-daemon-down.marker");
+    const projectRecord = join(repo.root, "login.project");
+    writeFileSync(projectRecord, "stack-id");
+    writeFileSync(
+      join(loginWt, "devtrees.yaml"),
+      [
+        "services:",
+        "  daemon:",
+        "    tier: isolated",
+        `    command: ${JSON.stringify(`sh -c 'touch ${upMarker}; exec sleep 300'`)}`,
+        "    ports: [WEB_PORT]",
+        "    shutdown:",
+        `      command: ${JSON.stringify(`rm -f ${projectRecord}; touch ${downMarker}`)}`,
+        "      timeout_seconds: 10",
+        "",
+      ].join("\n"),
+    );
+    writeStackConfig(billingWt);
+
+    const loginDeps = stubDriverDeps(loginWt);
+    const billingDeps = stubDriverDeps(billingWt);
+
+    const login = await runUp(loginDeps as never);
+    const billing = await runUp(billingDeps as never);
+    cleanups.push(() => runDown(billingDeps as never).catch(() => {}));
+
+    // The daemon launched; the hook has NOT fired yet.
+    expect(await waitForFile(upMarker)).toBe(true);
+    expect(existsSync(downMarker)).toBe(false);
+    expect(existsSync(projectRecord)).toBe(true);
+
+    // Remove the login worktree while the supervisor is still alive. (Removing
+    // the worktree does not kill the stub supervisor — same as the real binary.)
+    git(billingWt, "worktree", "remove", "--force", loginWt);
+    expect(existsSync(loginWt)).toBe(false);
+
+    const result = await runPrune({
+      cwd: billingWt,
+      driver: { binary: process.execPath, prefixArgs: [STUB] },
+    });
+
+    // Acceptance #1: the orphan was reported, and its out-of-band reap fired —
+    // the down-marker exists ONLY because devtrees ran the hook from the anchor
+    // (the stub's graceful down silently skips it: working_dir is gone).
+    expect(result.pruned.map((p) => p.id)).toEqual([login.worktreeId]);
+    expect(await waitForFile(downMarker)).toBe(true);
+    // Acceptance #3: the ".project" record is gone — proves the hook actually ran.
+    expect(existsSync(projectRecord)).toBe(false);
+    // Acceptance #5 (clean reap): no warnings reported.
+    expect(result.warnings).toEqual([]);
+
+    // The surviving worktree is untouched.
+    expect(await waitForHttp(Number(billing.env.WEB_PORT))).toBe(true);
+  }, 30000);
+
+  it("SIGKILLed (stale) supervisor: prune still fires the shutdown hook from the anchor", async () => {
+    const repo = makeRepo("dt-reap-stale-", ["login", "billing"]);
+    cleanups.push(() => rmSync(repo.root, { recursive: true, force: true }));
+    const loginWt = repo.worktrees.login;
+    const billingWt = repo.worktrees.billing;
+    if (loginWt === undefined || billingWt === undefined) {
+      throw new Error("expected login and billing worktrees");
+    }
+    const upMarker = join(repo.root, "login-daemon-up.marker");
+    const downMarker = join(repo.root, "login-daemon-down.marker");
+    writeShutdownHookStack(loginWt, { up: upMarker, down: downMarker });
+    writeStackConfig(billingWt);
+
+    const loginDeps = stubDriverDeps(loginWt);
+    const billingDeps = stubDriverDeps(billingWt);
+
+    const login = await runUp(loginDeps as never);
+    await runUp(billingDeps as never);
+    cleanups.push(() => runDown(billingDeps as never).catch(() => {}));
+    expect(await waitForFile(upMarker)).toBe(true);
+
+    // SIGKILL the login supervisor so its socket probes stale — the
+    // dead-supervisor path where `runPrune`'s old gate skipped `down` entirely.
+    const commonDir = git(billingWt, "rev-parse", "--git-common-dir");
+    const absCommon = commonDir.startsWith("/") ? commonDir : join(billingWt, commonDir);
+    const loginSocket = join(absCommon, "devtrees", "run", `${login.worktreeId}.sock`);
+    const parentPid = Number(readFileSync(`${loginSocket}.parent-pid`, "utf8"));
+    const childPids = JSON.parse(readFileSync(`${loginSocket}.pids`, "utf8")) as number[];
+    process.kill(parentPid, "SIGKILL");
+    for (const pid of childPids) {
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // already gone
+        }
+      }
+    }
+    await waitForReaped([parentPid, ...childPids], 4000);
+    // The crash left the socket file behind — a stale instance.
+    expect(existsSync(loginSocket)).toBe(true);
+    // The hook did NOT fire (SIGKILL bypasses the trap) — this is the leak.
+    expect(existsSync(downMarker)).toBe(false);
+
+    git(billingWt, "worktree", "remove", "--force", loginWt);
+
+    const result = await runPrune({
+      cwd: billingWt,
+      driver: { binary: process.execPath, prefixArgs: [STUB] },
+    });
+
+    // Acceptance #2: even with a stale/SIGKILLed supervisor, devtrees runs the
+    // hook directly from the anchor, so the reap fires.
+    expect(result.pruned.map((p) => p.id)).toEqual([login.worktreeId]);
+    expect(await waitForFile(downMarker)).toBe(true);
+    expect(existsSync(loginSocket)).toBe(false);
+  }, 30000);
+});

@@ -40,7 +40,7 @@ import {
 } from "./commands.js";
 import { withLifecycleLock } from "./registry.js";
 import { deriveWorktreeId } from "./anchor.js";
-import { deriveSharedConfig, deriveWorktreeConfig } from "./deriver.js";
+import { deriveSharedConfig, deriveWorktreeConfig, type DerivedConfig } from "./deriver.js";
 import type { RegistrySnapshot } from "./allocator.js";
 import type { LogEvent, SpawnedProcess } from "./driver.js";
 import { SHARED_REGISTRY_KEY, instancePaths, sharedInstancePaths } from "./paths.js";
@@ -1693,6 +1693,119 @@ describe("runDown — idempotent no-op when nothing is running (#92)", () => {
   });
 });
 
+describe("runDown — dead-supervisor reap of out-of-band resources (#148)", () => {
+  const hookStack: ResolvedStack = {
+    services: [
+      {
+        ...isolated("web", "node server.js", ["WEB_PORT"]),
+        shutdown: { command: "reap-stack.sh", timeout_seconds: 8 },
+      },
+    ],
+  };
+
+  /** Pre-stage the worktree instance's derived config + socket file on disk. */
+  function stageWorktreeInstance(deps: StubbedDeps): {
+    anchor: string;
+    socketPath: string;
+    configPath: string;
+    goneWorktree: string;
+  } {
+    const anchor = (deps.git!(["rev-parse", "--git-common-dir"]) as string).trim();
+    const paths = instancePaths(anchor, deps.expectedWorktreeId);
+    mkdirSync(paths.runDir, { recursive: true });
+    const goneWorktree = join(anchor, "..", "wt", "login");
+    writeFileSync(paths.socketPath, "");
+    writeFileSync(
+      paths.configPath,
+      stringifyYaml({
+        processes: {
+          web: {
+            command: "node server.js",
+            working_dir: goneWorktree,
+            environment: ["DEVTREES_WORKTREE_ID=login", "WEB_PORT=20000"],
+            shutdown: { command: "reap-stack.sh", timeout_seconds: 8 },
+          },
+        },
+        "x-devtrees": { ports_by_service: {} },
+      }),
+    );
+    return { anchor, socketPath: paths.socketPath, configPath: paths.configPath, goneWorktree };
+  }
+
+  it("runs the shutdown hook directly from the anchor when the supervisor socket is stale (SIGKILLed)", async () => {
+    const deps = stubDeps({ stack: hookStack, probeSocket: async () => "stale" as const });
+    const staged = stageWorktreeInstance(deps);
+    const reapCalls: Array<{ cwd: string; config: DerivedConfig }> = [];
+
+    const result = await runDown({
+      ...deps,
+      reap: async (config, rdeps) => {
+        reapCalls.push({ cwd: rdeps.cwd, config });
+        return { ranCount: 1, failures: [] };
+      },
+    });
+
+    // The dead supervisor never fired the hook; devtrees runs it directly,
+    // from the anchor — never the worktree path it pinned working_dir to.
+    expect(reapCalls).toHaveLength(1);
+    expect(reapCalls[0]?.cwd).toBe(staged.anchor);
+    expect(reapCalls[0]?.cwd).not.toBe(staged.goneWorktree);
+    expect(reapCalls[0]?.config.processes.web?.shutdown).toEqual({
+      command: "reap-stack.sh",
+      timeout_seconds: 8,
+    });
+    // The stale socket file is reclaimed; result is the worktree teardown.
+    expect(result.shared).toBe(false);
+    expect(result.stopped).toBe(false);
+  });
+
+  it("does NOT run the direct reap when the supervisor is live (graceful down fires the hook) — no regression on acceptance 4", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const baseDeps = stubDeps({
+      stack: hookStack,
+      track,
+      probeSocket: async () => "running" as const,
+    });
+    stageWorktreeInstance(baseDeps);
+    const reapCalls: unknown[] = [];
+
+    const result = await runDown({
+      ...baseDeps,
+      driver: { exists: () => Promise.resolve(true), spawner: () => spawnedOk() },
+      reap: async (config, rdeps) => {
+        reapCalls.push({ config, cwd: rdeps.cwd });
+        return { ranCount: 0, failures: [] };
+      },
+    });
+
+    // Live supervisor: the graceful `process-compose down` fires the hook from
+    // the (present) worktree, so devtrees must NOT also run it directly.
+    expect(reapCalls).toHaveLength(0);
+    expect(result.stopped).toBe(true);
+  });
+
+  it("reflects a failed dead-supervisor reap in DownResult.warning (acceptance 5)", async () => {
+    const deps = stubDeps({ stack: hookStack, probeSocket: async () => "stale" as const });
+    stageWorktreeInstance(deps);
+
+    const result = await runDown({
+      ...deps,
+      reap: async () => ({
+        ranCount: 1,
+        failures: [
+          { process: "web", command: "reap-stack.sh", reason: "timeout", message: "timed out" },
+        ],
+      }),
+    });
+
+    expect(result.shared).toBe(false);
+    if (result.shared === false) {
+      expect(result.warning?.orphanId).toBe(deps.expectedWorktreeId);
+      expect(result.warning?.failures[0]?.reason).toBe("timeout");
+    }
+  });
+});
+
 describe("runUpDryRun — derive the config(s) with no side effects (#124)", () => {
   it("returns the worktree config + env matching the deriver, without writing files or spawning", async () => {
     const stack: ResolvedStack = {
@@ -2420,6 +2533,122 @@ describe("runPrune — reconcile instances against git worktree list", () => {
     // Acceptance: __shared__ and the live worktree's reservation are preserved.
     expect(registryRef.snapshot[SHARED_REGISTRY_KEY]).toBe(30000);
     expect(registryRef.snapshot[liveId]).toBe(22048);
+  });
+
+  /**
+   * Issue #148 — `prune` must reap each orphan's out-of-band resources by
+   * running the derived `shutdown.command` itself, from a cwd that exists
+   * (the anchor), BEFORE deleting the derived config. process-compose can't
+   * fire the hook once `git worktree remove` deleted the `working_dir`, so a
+   * graceful `down` alone leaks the stack — regardless of supervisor liveness.
+   */
+  function reapFixture(status: "running" | "stale") {
+    const tmp = tmpAnchor();
+    mkdirSync(join(tmp.anchor, "devtrees", "run"), { recursive: true });
+    const orphanSocket = join(tmp.anchor, "devtrees", "run", "removed.sock");
+    const orphanConfig = join(tmp.anchor, "devtrees", "removed.yaml");
+    const goneWorktree = join(tmp.worktreeRoot, "removed");
+    writeFileSync(orphanSocket, "");
+    // A derived config whose process declares a shutdown.command and an
+    // embedded environment, pinned to a working_dir that no longer exists.
+    writeFileSync(
+      orphanConfig,
+      stringifyYaml({
+        processes: {
+          db: {
+            command: "node server.js",
+            working_dir: goneWorktree,
+            environment: ["DEVTREES_WORKTREE_ID=removed", "DB_PORT=20001"],
+            shutdown: { command: "reap-stack.sh", timeout_seconds: 9 },
+          },
+        },
+        "x-devtrees": { ports_by_service: {} },
+      }),
+    );
+    const git = pruneGit({
+      anchor: tmp.anchor,
+      worktreeRoot: tmp.worktreeRoot,
+      worktreeId: "live",
+      porcelain: [`worktree ${join(tmp.worktreeRoot, "live")}`, "HEAD x", ""].join("\n"),
+    });
+    const registryRef = { snapshot: { removed: 20000 } as RegistrySnapshot };
+    return { tmp, orphanSocket, orphanConfig, goneWorktree, git, registryRef, status };
+  }
+
+  for (const status of ["running", "stale"] as const) {
+    it(`runs each orphan's shutdown.command from the anchor (not the deleted working_dir) — ${status} supervisor (#148)`, async () => {
+      const fx = reapFixture(status);
+      const reapCalls: Array<{ cwd: string; config: DerivedConfig }> = [];
+
+      const { runPrune } = await import("./commands.js");
+      await runPrune({
+        cwd: join(fx.tmp.worktreeRoot, "live"),
+        git: fx.git,
+        discover: async () => [instance("removed", { status, socketPath: fx.orphanSocket })],
+        withRegistryLock: async (_anchor, mutate) => {
+          fx.registryRef.snapshot = await mutate(fx.registryRef.snapshot);
+          return fx.registryRef.snapshot;
+        },
+        driver: { exists: () => Promise.resolve(true), spawner: () => spawnedOk() },
+        reap: async (config, deps) => {
+          reapCalls.push({ cwd: deps.cwd, config });
+          return { ranCount: 1, failures: [] };
+        },
+      });
+
+      // Acceptance #1/#2: the hook reap fired regardless of supervisor liveness.
+      expect(reapCalls).toHaveLength(1);
+      // Acceptance: from a cwd that exists — the anchor, never the gone worktree.
+      expect(reapCalls[0]?.cwd).toBe(fx.tmp.anchor);
+      expect(reapCalls[0]?.cwd).not.toBe(fx.goneWorktree);
+      // The reaper saw the orphan's derived process + its shutdown.command.
+      expect(reapCalls[0]?.config.processes.db?.shutdown).toEqual({
+        command: "reap-stack.sh",
+        timeout_seconds: 9,
+      });
+      // Acceptance #3: the config (whose hook removes the .project record) is
+      // read before deletion, then removed afterwards.
+      expect(existsSync(fx.orphanConfig)).toBe(false);
+      expect(existsSync(fx.orphanSocket)).toBe(false);
+    });
+  }
+
+  it("reflects a failed orphan reap in PruneResult.warnings — NOT a silent clean teardown (#148 acceptance 5)", async () => {
+    const fx = reapFixture("running");
+
+    const { runPrune } = await import("./commands.js");
+    const result = await runPrune({
+      cwd: join(fx.tmp.worktreeRoot, "live"),
+      git: fx.git,
+      discover: async () => [
+        instance("removed", { status: "running", socketPath: fx.orphanSocket }),
+      ],
+      withRegistryLock: async (_anchor, mutate) => {
+        fx.registryRef.snapshot = await mutate(fx.registryRef.snapshot);
+        return fx.registryRef.snapshot;
+      },
+      driver: { exists: () => Promise.resolve(true), spawner: () => spawnedOk() },
+      reap: async () => ({
+        ranCount: 1,
+        failures: [
+          {
+            process: "db",
+            command: "reap-stack.sh",
+            reason: "exit",
+            message: "exited with code 1",
+          },
+        ],
+      }),
+    });
+
+    // Acceptance #5: the failure is reflected in the structured result so the
+    // CLI formatter can warn; the sweep does NOT report a clean teardown.
+    expect(result.warnings).toHaveLength(1);
+    expect(result.warnings[0]?.orphanId).toBe("removed");
+    expect(result.warnings[0]?.worktreePath).toBe(fx.goneWorktree);
+    expect(result.warnings[0]?.failures[0]?.process).toBe("db");
+    // The orphan is still reported pruned (state is reclaimed regardless).
+    expect(result.pruned.map((p) => p.id)).toEqual(["removed"]);
   });
 });
 

@@ -39,6 +39,7 @@ import {
   type LsInstanceRow,
   type LsServiceRow,
   type PrunedRow,
+  type ReapWarningRow,
 } from "./output.js";
 
 /**
@@ -138,10 +139,14 @@ export interface ExecuteDeps {
   }>;
   down: (options: {
     shared: boolean;
-  }) => Promise<{ worktreeId?: string; stopped?: boolean } | void>;
+  }) => Promise<{ worktreeId?: string; stopped?: boolean; warning?: ReapWarningRow } | void>;
   ls?: () => Promise<{ anchor: string; instances: ReadonlyArray<LsInstanceRow> }>;
   attach?: (options: { shared: boolean }) => Promise<void>;
-  prune?: () => Promise<{ anchor: string; pruned: ReadonlyArray<PrunedRow> }>;
+  prune?: () => Promise<{
+    anchor: string;
+    pruned: ReadonlyArray<PrunedRow>;
+    warnings?: ReadonlyArray<ReapWarningRow>;
+  }>;
   env?: () => Promise<{ worktreeId: string; env: Record<string, string> }>;
   logs?: (options: LogsCliOptions) => Promise<{
     services: ReadonlyArray<string>;
@@ -444,7 +449,15 @@ class DownCommand extends DevtreesCommand {
       // idempotent no-op and the formatter renders the notice.
       const stopped = result.stopped ?? true;
       const out = formatDown(
-        this.shared ? { shared: true, stopped } : { worktreeId: result.worktreeId ?? "", stopped },
+        this.shared
+          ? { shared: true, stopped }
+          : {
+              worktreeId: result.worktreeId ?? "",
+              stopped,
+              // Issue #148: a failed dead-supervisor reap surfaces as a stderr
+              // warning (human) / `down.warning` (JSON) — not a silent stop.
+              ...(result.warning !== undefined ? { warning: result.warning } : {}),
+            },
         this.mode,
       );
       if (out.stdout) this.context.stdout.write(out.stdout);
@@ -507,7 +520,10 @@ class PruneCommand extends DevtreesCommand {
     return this.dispatch(async () => {
       if (!this.context.deps.prune) return 0;
       const result = await this.context.deps.prune();
-      const out = formatPrune(result.pruned, this.mode);
+      // Issue #148: a failed orphan reap surfaces as a stderr warning (human) /
+      // `prune.warnings[]` (JSON) so the sweep never reports a clean teardown
+      // while out-of-band resources may have survived.
+      const out = formatPrune(result.pruned, this.mode, result.warnings ?? []);
       if (out.stdout) this.context.stdout.write(out.stdout);
       if (out.stderr) this.context.stderr.write(out.stderr);
       return 0;

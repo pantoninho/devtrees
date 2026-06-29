@@ -28,11 +28,46 @@
  *   - `down` signals the parent (its trap does the work) and waits for it
  *     to exit, so callers observe a fully reaped state.
  */
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { dirname } from "node:path";
 import { parse as parseYaml } from "yaml";
+
+/**
+ * Faithfully model how the real process-compose launches a process's
+ * `shutdown.command` on a graceful `down` (#148): it `chdir`s into the
+ * process's `working_dir` FIRST, then runs the hook through the shell with the
+ * process's `environment:` applied. Critically, if that `working_dir` no longer
+ * exists (e.g. `git worktree remove` deleted it), the `chdir` fails and
+ * process-compose **silently skips the hook** — it logs the chdir error at ERR
+ * and still exits 0. We reproduce that exactly: `spawnSync` with a non-existent
+ * `cwd` errors, and we swallow it. This is the leak the devtrees fix works
+ * around by running the hook itself from a cwd that exists.
+ */
+function envFromLines(lines) {
+  const env = { ...process.env };
+  for (const entry of lines ?? []) {
+    const eq = entry.indexOf("=");
+    if (eq !== -1) env[entry.slice(0, eq)] = entry.slice(eq + 1);
+  }
+  return env;
+}
+
+function runShutdownHooks(config) {
+  for (const proc of Object.values(config?.processes ?? {})) {
+    const command = proc?.shutdown?.command;
+    if (typeof command !== "string" || command === "") continue;
+    // cwd = the process's working_dir, exactly like process-compose. If it's
+    // gone, spawnSync reports an error in `.error` and the hook never runs
+    // (the real binary swallows it and still exits 0). We ignore the outcome.
+    spawnSync("/bin/sh", ["-c", command], {
+      cwd: proc.working_dir,
+      env: envFromLines(proc.environment),
+      stdio: "ignore",
+    });
+  }
+}
 
 function flag(name, short) {
   const argv = process.argv.slice(3);
@@ -104,6 +139,12 @@ if (cmd === "up") {
   function reapAndCleanup() {
     if (reaped) return;
     reaped = true;
+    // Graceful-shutdown contract (#134/#148): process-compose runs each
+    // process's `shutdown.command` from its `working_dir` BEFORE killing it.
+    // We model that — including the real binary's silent skip when the
+    // `working_dir` is gone (the #148 leak). The parent holds the original
+    // config from `up` time in memory, exactly as the real supervisor does.
+    runShutdownHooks(config);
     for (const pid of pids) killChild(pid);
     try {
       rmSync(`${socketPath}.pids`, { force: true });
@@ -156,11 +197,7 @@ if (cmd === "up") {
   server.listen(socketPath, () => {
     for (const proc of Object.values(config.processes ?? {})) {
       if (!selectedByNamespace(proc, namespaces)) continue;
-      const env = { ...process.env };
-      for (const entry of proc.environment ?? []) {
-        const eq = entry.indexOf("=");
-        env[entry.slice(0, eq)] = entry.slice(eq + 1);
-      }
+      const env = envFromLines(proc.environment);
       const child = spawn("/bin/sh", ["-c", proc.command], {
         cwd: proc.working_dir,
         env,

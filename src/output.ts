@@ -223,6 +223,55 @@ export interface PrunedRow {
   readonly worktreePath: string;
 }
 
+/**
+ * A failed shutdown-hook reap, as the formatters render it (issue #148). The
+ * reap is the author's `shutdown.command`; devtrees only knows the exit status
+ * of the command it ran (ADR-0002), so it names the orphan + the failing
+ * hook(s) and warns that out-of-band resources may survive.
+ */
+export interface ReapWarningRow {
+  readonly orphanId: string;
+  readonly worktreePath: string;
+  readonly failures: ReadonlyArray<{
+    readonly process: string;
+    readonly command: string;
+    readonly reason: "launch" | "exit" | "timeout";
+    readonly message?: string;
+  }>;
+}
+
+/**
+ * Render a reap warning to a human-readable stderr block (issue #148). Names
+ * the orphan, that out-of-band resources may survive, and each failing hook.
+ */
+function formatReapWarningStderr(w: ReapWarningRow): string {
+  const where = w.worktreePath !== "" ? ` (was at ${w.worktreePath})` : "";
+  const detail = w.failures
+    .map(
+      (f) => `  - ${f.process}: \`${f.command}\` ${f.reason}${f.message ? ` (${f.message})` : ""}`,
+    )
+    .join("\n");
+  return (
+    `devtrees: WARNING — orphan '${w.orphanId}'${where}: its shutdown hook did not complete ` +
+    `cleanly, so out-of-band resources (e.g. containers/volumes) may still be running. ` +
+    `Inspect and reap them manually:\n${detail}\n`
+  );
+}
+
+/** JSON shape for a reap warning — flat identity + failures, no wrapper. */
+function reapWarningJson(w: ReapWarningRow): Record<string, unknown> {
+  return {
+    orphanId: w.orphanId,
+    worktreePath: w.worktreePath,
+    failures: w.failures.map((f) => ({
+      process: f.process,
+      command: f.command,
+      reason: f.reason,
+      ...(f.message !== undefined ? { message: f.message } : {}),
+    })),
+  };
+}
+
 function formatPruneHuman(pruned: ReadonlyArray<PrunedRow>): string {
   if (pruned.length === 0) {
     return "devtrees prune: no orphans to clean up.\n";
@@ -241,7 +290,11 @@ function formatPruneHuman(pruned: ReadonlyArray<PrunedRow>): string {
  * list itself stays because `prune` is the only command that reconciles
  * devtrees-state vs `git worktree list`. Human output is unchanged.
  */
-export function formatPrune(pruned: ReadonlyArray<PrunedRow>, mode: FormatMode): OutputResult {
+export function formatPrune(
+  pruned: ReadonlyArray<PrunedRow>,
+  mode: FormatMode,
+  warnings: ReadonlyArray<ReapWarningRow> = [],
+): OutputResult {
   if (mode === "json") {
     const doc = {
       schema_version: SCHEMA_VERSION,
@@ -251,11 +304,17 @@ export function formatPrune(pruned: ReadonlyArray<PrunedRow>, mode: FormatMode):
           kind: p.kind,
           worktreePath: p.worktreePath,
         })),
+        // Issue #148: a failed shutdown-hook reap is reflected here so an agent
+        // does not read a clean teardown when out-of-band resources may survive.
+        warnings: warnings.map(reapWarningJson),
       },
     };
+    // Keep `--json` stdout byte-clean (ADR-0005): the warning goes only into the
+    // structured envelope, never to stderr, in JSON mode.
     return { stdout: `${JSON.stringify(doc)}\n`, stderr: "" };
   }
-  return { stdout: formatPruneHuman(pruned), stderr: "" };
+  const stderr = warnings.map(formatReapWarningStderr).join("");
+  return { stdout: formatPruneHuman(pruned), stderr };
 }
 
 // --- up / down (human path only for now) ------------------------------------
@@ -324,7 +383,17 @@ export function formatUp(payload: UpPayload, mode: FormatMode): OutputResult {
  */
 export type DownPayload =
   | { readonly shared: true; readonly worktreeId?: undefined; readonly stopped?: boolean }
-  | { readonly shared?: false; readonly worktreeId: string; readonly stopped?: boolean };
+  | {
+      readonly shared?: false;
+      readonly worktreeId: string;
+      readonly stopped?: boolean;
+      /**
+       * Present when the dead-supervisor reap failed for at least one shutdown
+       * hook (issue #148) — out-of-band resources may have survived. Human mode
+       * adds a stderr warning; JSON mode adds a `down.warning` object.
+       */
+      readonly warning?: ReapWarningRow;
+    };
 
 /**
  * Render `devtrees down` output.
@@ -344,11 +413,16 @@ export type DownPayload =
 export function formatDown(payload: DownPayload, mode: FormatMode): OutputResult {
   const shared = payload.shared === true;
   const stopped = payload.stopped ?? true;
+  // The reap warning lives on the worktree variant only (shared down runs from
+  // the anchor, which never disappears — issue #148).
+  const warning = !shared ? payload.warning : undefined;
   if (mode === "json") {
     const down: Record<string, unknown> = shared
       ? { shared: true, stopped }
       : { worktreeId: payload.worktreeId, stopped };
+    if (warning !== undefined) down.warning = reapWarningJson(warning);
     const doc = { schema_version: SCHEMA_VERSION, down };
+    // `--json` stdout stays byte-clean (ADR-0005): the warning is in the envelope.
     return { stdout: `${JSON.stringify(doc)}\n`, stderr: "" };
   }
   const text = shared
@@ -358,7 +432,8 @@ export function formatDown(payload: DownPayload, mode: FormatMode): OutputResult
     : stopped
       ? "devtrees down: worktree instance stopped.\n"
       : "devtrees down: no worktree instance running; nothing to do.\n";
-  return { stdout: text, stderr: "" };
+  const stderr = warning !== undefined ? formatReapWarningStderr(warning) : "";
+  return { stdout: text, stderr };
 }
 
 // --- up --dry-run -----------------------------------------------------------

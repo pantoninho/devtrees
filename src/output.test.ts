@@ -659,6 +659,52 @@ describe("output formatter — formatPrune", () => {
     expect(result.stdout.endsWith("\n")).toBe(true);
     expect(result.stdout.endsWith("\n\n")).toBe(false);
   });
+
+  /**
+   * Issue #148 — a failed orphan reap must surface a warning (human: stderr;
+   * JSON: a `warnings[]` array in the envelope), so prune does NOT silently
+   * report a clean teardown when out-of-band resources may have survived.
+   */
+  const reapWarnings = [
+    {
+      orphanId: "removed",
+      worktreePath: "/abs/path/removed",
+      failures: [
+        {
+          process: "db",
+          command: "reap.sh",
+          reason: "exit" as const,
+          message: "exited with code 1",
+        },
+      ],
+    },
+  ];
+
+  it("in human mode, a reap warning lands on stderr naming the orphan + that resources may survive (#148)", () => {
+    const result = formatPrune(rows, "human", reapWarnings);
+    expect(result.stdout).toContain("removed");
+    expect(result.stderr).toContain("removed");
+    expect(result.stderr.toLowerCase()).toMatch(/out-of-band|may.*surviv|still.*running/);
+  });
+
+  it("in JSON mode, a reap failure populates prune.warnings[] (#148)", () => {
+    const result = formatPrune(rows, "json", reapWarnings);
+    const parsed = JSON.parse(result.stdout) as {
+      prune: { pruned: unknown[]; warnings: Array<Record<string, unknown>> };
+    };
+    expect(parsed.prune.warnings).toHaveLength(1);
+    expect(parsed.prune.warnings[0]?.orphanId).toBe("removed");
+    const failures = parsed.prune.warnings[0]?.failures as Array<Record<string, unknown>>;
+    expect(failures[0]?.process).toBe("db");
+    expect(failures[0]?.reason).toBe("exit");
+  });
+
+  it("with no reap warnings, JSON emits an empty warnings[] and stderr stays clean (#148)", () => {
+    const result = formatPrune(rows, "json", []);
+    const parsed = JSON.parse(result.stdout) as { prune: { warnings: unknown[] } };
+    expect(parsed.prune.warnings).toEqual([]);
+    expect(result.stderr).toBe("");
+  });
 });
 
 /**
@@ -739,6 +785,46 @@ describe("output formatter — formatDown", () => {
     const result = formatDown({ worktreeId: "login" }, "json");
     expect(result.stdout.endsWith("\n")).toBe(true);
     expect(result.stdout.endsWith("\n\n")).toBe(false);
+  });
+
+  /**
+   * Issue #148 — a failed dead-supervisor reap on `down` must surface a warning
+   * (human: stderr; JSON: a `down.warning` object), not a silent clean stop.
+   */
+  const downWarning = {
+    orphanId: "login",
+    worktreePath: "/abs/path/login",
+    failures: [
+      { process: "db", command: "reap.sh", reason: "timeout" as const, message: "timed out" },
+    ],
+  };
+
+  it("in human mode, a down reap warning lands on stderr (#148)", () => {
+    const result = formatDown(
+      { worktreeId: "login", stopped: false, warning: downWarning },
+      "human",
+    );
+    expect(result.stderr).toContain("login");
+    expect(result.stderr.toLowerCase()).toMatch(/out-of-band|may.*surviv|still.*running/);
+  });
+
+  it("in JSON mode, a down reap warning populates down.warning (#148)", () => {
+    const result = formatDown(
+      { worktreeId: "login", stopped: false, warning: downWarning },
+      "json",
+    );
+    const parsed = JSON.parse(result.stdout) as { down: Record<string, unknown> };
+    const warning = parsed.down.warning as Record<string, unknown> | undefined;
+    expect(warning?.orphanId).toBe("login");
+    const failures = warning?.failures as Array<Record<string, unknown>>;
+    expect(failures[0]?.reason).toBe("timeout");
+  });
+
+  it("a clean down omits down.warning and keeps stderr empty (#148)", () => {
+    const result = formatDown({ worktreeId: "login", stopped: true }, "json");
+    const parsed = JSON.parse(result.stdout) as { down: Record<string, unknown> };
+    expect(parsed.down).not.toHaveProperty("warning");
+    expect(result.stderr).toBe("");
   });
 });
 
