@@ -1434,20 +1434,7 @@ export async function runDown(
   // reap happens even when the supervisor is gone. Idempotent: an already-gone
   // stack's hook reaps nothing.
   const reap = deps.reap ?? reapShutdownHooks;
-  const config = readDerivedConfig(paths.configPath);
-  let warning: ReapWarning | undefined;
-  if (config !== undefined) {
-    const outcome = await reap(config, { cwd: anchor.anchor });
-    if (outcome.failures.length > 0) {
-      // Reflect the failed reap in the structured result (acceptance #5); the
-      // CLI formatter renders the stderr warning from this.
-      warning = {
-        orphanId: anchor.worktreeId,
-        worktreePath: readWorktreePath(paths.configPath),
-        failures: outcome.failures,
-      };
-    }
-  }
+  const warning = await reapDerivedConfig(paths.configPath, anchor.worktreeId, anchor.anchor, reap);
 
   return {
     shared: false,
@@ -1689,52 +1676,8 @@ export async function runPrune(deps: PruneDeps = {}): Promise<PruneResult> {
 
   const warnings: ReapWarning[] = [];
   for (const orphan of orphans) {
-    const paths = instancePaths(anchor.anchor, orphan.id);
-
-    // Reap the orphan's out-of-band resources by running each derived
-    // `shutdown.command` ourselves (issue #148). This is socket-free and runs
-    // from the anchor — a directory that still exists — instead of relying on
-    // `process-compose down`'s graceful path, which cannot launch the hook
-    // once `git worktree remove` deleted the `working_dir`. We do this for
-    // BOTH a live and a stale supervisor: the leak happens regardless of
-    // supervisor liveness (acceptance #1/#2). Read the config BEFORE deletion;
-    // the author's hook removes the `.project` record, so a surviving record
-    // would prove it never ran (acceptance #3).
-    const config = readDerivedConfig(paths.configPath);
-    if (config !== undefined) {
-      const outcome = await reap(config, { cwd: anchor.anchor });
-      if (outcome.failures.length > 0) {
-        // Reflect the failed reap in the structured result (acceptance #5). The
-        // CLI formatter (single stderr owner) renders the human warning from
-        // this — devtrees does not write stderr from the orchestration layer.
-        warnings.push({
-          orphanId: orphan.id,
-          worktreePath: readWorktreePath(paths.configPath),
-          failures: outcome.failures,
-        });
-      }
-    }
-
-    if (orphan.status === "running") {
-      // Stop the supervisor too — a graceful `down` over its still-live socket.
-      // The direct hook run above IS the reap; this just reclaims the running
-      // process-compose. Best-effort: a failed/half-dead down must not abort
-      // the sweep, and the on-disk state is cleared below regardless.
-      try {
-        await driver.down({
-          configPath: paths.configPath,
-          socketPath: paths.socketPath,
-        });
-      } catch {
-        // Best-effort: a failed down still leaves us removing the on-disk
-        // state below, which is the whole point of prune.
-      }
-    }
-    // Remove the socket file (driver.down typically removes it on a clean
-    // exit, but stale/failed orphans need explicit cleanup).
-    rmSync(paths.socketPath, { force: true });
-    // Remove the derived config — a future `up` re-derives it.
-    rmSync(paths.configPath, { force: true });
+    const warning = await reapAndCleanupOrphan(orphan, anchor.anchor, reap, driver);
+    if (warning !== undefined) warnings.push(warning);
   }
 
   // Drop every orphan's registry entry under one lock acquire so concurrent
@@ -1754,6 +1697,68 @@ export async function runPrune(deps: PruneDeps = {}): Promise<PruneResult> {
   });
 
   return { anchor: anchor.anchor, pruned: reported, warnings };
+}
+
+/**
+ * Reap one orphan's out-of-band resources, stop its supervisor if live, and
+ * clear its on-disk state (issue #148). Factored out of `runPrune`'s loop so
+ * the orchestrator stays under the complexity gate. Returns a `ReapWarning`
+ * when the reap failed, else `undefined`.
+ *
+ * The reap runs each derived `shutdown.command` ourselves, socket-free, from
+ * the anchor — a directory that still exists — instead of relying on
+ * `process-compose down`'s graceful path, which cannot launch the hook once
+ * `git worktree remove` deleted the `working_dir`. Done for BOTH a live and a
+ * stale supervisor (acceptance #1/#2). The config is read BEFORE deletion: the
+ * author's hook removes the `.project` record, so a surviving record proves it
+ * never ran (acceptance #3).
+ */
+async function reapAndCleanupOrphan(
+  orphan: InstanceInfo,
+  anchor: string,
+  reap: Reaper,
+  driver: ReturnType<typeof createDriver>,
+): Promise<ReapWarning | undefined> {
+  const paths = instancePaths(anchor, orphan.id);
+  const warning = await reapDerivedConfig(paths.configPath, orphan.id, anchor, reap);
+
+  if (orphan.status === "running") {
+    // Stop the supervisor too — a graceful `down` over its still-live socket.
+    // The direct hook run above IS the reap; this just reclaims the running
+    // process-compose. Best-effort: a failed/half-dead down must not abort the
+    // sweep, and the on-disk state is cleared below regardless.
+    try {
+      await driver.down({ configPath: paths.configPath, socketPath: paths.socketPath });
+    } catch {
+      // Best-effort: a failed down still leaves us removing the on-disk state.
+    }
+  }
+  // Remove the socket file (driver.down typically removes it on a clean exit,
+  // but stale/failed orphans need explicit cleanup) and the derived config.
+  rmSync(paths.socketPath, { force: true });
+  rmSync(paths.configPath, { force: true });
+  return warning;
+}
+
+/**
+ * Read a torn-down instance's derived config and run its `shutdown.command`(s)
+ * directly from the anchor (issue #148). Returns a `ReapWarning` when at least
+ * one hook failed (so the caller can reflect it in the structured result —
+ * acceptance #5), else `undefined`. A missing/unparsable config (nothing to
+ * reap) yields `undefined`. Shared by `runPrune` and `runDown`'s dead-supervisor
+ * path so both reap identically.
+ */
+async function reapDerivedConfig(
+  configPath: string,
+  orphanId: string,
+  anchor: string,
+  reap: Reaper,
+): Promise<ReapWarning | undefined> {
+  const config = readDerivedConfig(configPath);
+  if (config === undefined) return undefined;
+  const outcome = await reap(config, { cwd: anchor });
+  if (outcome.failures.length === 0) return undefined;
+  return { orphanId, worktreePath: readWorktreePath(configPath), failures: outcome.failures };
 }
 
 /**

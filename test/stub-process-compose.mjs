@@ -45,23 +45,27 @@ import { parse as parseYaml } from "yaml";
  * `cwd` errors, and we swallow it. This is the leak the devtrees fix works
  * around by running the hook itself from a cwd that exists.
  */
+function envFromLines(lines) {
+  const env = { ...process.env };
+  for (const entry of lines ?? []) {
+    const eq = entry.indexOf("=");
+    if (eq !== -1) env[entry.slice(0, eq)] = entry.slice(eq + 1);
+  }
+  return env;
+}
+
 function runShutdownHooks(config) {
   for (const proc of Object.values(config?.processes ?? {})) {
     const command = proc?.shutdown?.command;
     if (typeof command !== "string" || command === "") continue;
-    const env = { ...process.env };
-    for (const entry of proc.environment ?? []) {
-      const eq = entry.indexOf("=");
-      if (eq !== -1) env[entry.slice(0, eq)] = entry.slice(eq + 1);
-    }
     // cwd = the process's working_dir, exactly like process-compose. If it's
-    // gone, spawnSync reports an error in `.error` and the hook never runs.
-    const res = spawnSync("/bin/sh", ["-c", command], {
+    // gone, spawnSync reports an error in `.error` and the hook never runs
+    // (the real binary swallows it and still exits 0). We ignore the outcome.
+    spawnSync("/bin/sh", ["-c", command], {
       cwd: proc.working_dir,
-      env,
+      env: envFromLines(proc.environment),
       stdio: "ignore",
     });
-    void res; // outcome is intentionally ignored — pc swallows it (exit 0).
   }
 }
 
@@ -193,11 +197,7 @@ if (cmd === "up") {
   server.listen(socketPath, () => {
     for (const proc of Object.values(config.processes ?? {})) {
       if (!selectedByNamespace(proc, namespaces)) continue;
-      const env = { ...process.env };
-      for (const entry of proc.environment ?? []) {
-        const eq = entry.indexOf("=");
-        env[entry.slice(0, eq)] = entry.slice(eq + 1);
-      }
+      const env = envFromLines(proc.environment);
       const child = spawn("/bin/sh", ["-c", proc.command], {
         cwd: proc.working_dir,
         env,
