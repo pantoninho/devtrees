@@ -1784,13 +1784,8 @@ describe("runDown — dead-supervisor reap of out-of-band resources (#148)", () 
     expect(result.stopped).toBe(true);
   });
 
-  it("surfaces a warning when the dead-supervisor reap hook fails (acceptance 5)", async () => {
-    const warnings: string[] = [];
-    const deps = stubDeps({
-      stack: hookStack,
-      probeSocket: async () => "stale" as const,
-      warn: (m) => warnings.push(m),
-    });
+  it("reflects a failed dead-supervisor reap in DownResult.warning (acceptance 5)", async () => {
+    const deps = stubDeps({ stack: hookStack, probeSocket: async () => "stale" as const });
     stageWorktreeInstance(deps);
 
     const result = await runDown({
@@ -1803,9 +1798,9 @@ describe("runDown — dead-supervisor reap of out-of-band resources (#148)", () 
       }),
     });
 
-    expect(warnings.some((w) => w.includes(deps.expectedWorktreeId))).toBe(true);
     expect(result.shared).toBe(false);
     if (result.shared === false) {
+      expect(result.warning?.orphanId).toBe(deps.expectedWorktreeId);
       expect(result.warning?.failures[0]?.reason).toBe("timeout");
     }
   });
@@ -2618,9 +2613,8 @@ describe("runPrune — reconcile instances against git worktree list", () => {
     });
   }
 
-  it("surfaces a warning + structured failure when an orphan's reap hook fails (#148 acceptance 5)", async () => {
+  it("reflects a failed orphan reap in PruneResult.warnings — NOT a silent clean teardown (#148 acceptance 5)", async () => {
     const fx = reapFixture("running");
-    const warnings: string[] = [];
 
     const { runPrune } = await import("./commands.js");
     const result = await runPrune({
@@ -2634,7 +2628,6 @@ describe("runPrune — reconcile instances against git worktree list", () => {
         return fx.registryRef.snapshot;
       },
       driver: { exists: () => Promise.resolve(true), spawner: () => spawnedOk() },
-      warn: (m) => warnings.push(m),
       reap: async () => ({
         ranCount: 1,
         failures: [
@@ -2648,11 +2641,11 @@ describe("runPrune — reconcile instances against git worktree list", () => {
       }),
     });
 
-    // Acceptance #5: a warning naming the orphan is surfaced, and the failure
-    // is reflected in the structured result — NOT a silent clean teardown.
-    expect(warnings.some((w) => w.includes("removed"))).toBe(true);
+    // Acceptance #5: the failure is reflected in the structured result so the
+    // CLI formatter can warn; the sweep does NOT report a clean teardown.
     expect(result.warnings).toHaveLength(1);
     expect(result.warnings[0]?.orphanId).toBe("removed");
+    expect(result.warnings[0]?.worktreePath).toBe(fx.goneWorktree);
     expect(result.warnings[0]?.failures[0]?.process).toBe("db");
     // The orphan is still reported pruned (state is reclaimed regardless).
     expect(result.pruned.map((p) => p.id)).toEqual(["removed"]);

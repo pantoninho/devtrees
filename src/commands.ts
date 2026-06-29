@@ -1434,15 +1434,18 @@ export async function runDown(
   // reap happens even when the supervisor is gone. Idempotent: an already-gone
   // stack's hook reaps nothing.
   const reap = deps.reap ?? reapShutdownHooks;
-  const warn = deps.warn ?? defaultWarn;
   const config = readDerivedConfig(paths.configPath);
   let warning: ReapWarning | undefined;
   if (config !== undefined) {
     const outcome = await reap(config, { cwd: anchor.anchor });
     if (outcome.failures.length > 0) {
-      const worktreePath = readWorktreePath(paths.configPath);
-      warning = { orphanId: anchor.worktreeId, worktreePath, failures: outcome.failures };
-      warn(formatReapWarning(anchor.worktreeId, worktreePath, outcome));
+      // Reflect the failed reap in the structured result (acceptance #5); the
+      // CLI formatter renders the stderr warning from this.
+      warning = {
+        orphanId: anchor.worktreeId,
+        worktreePath: readWorktreePath(paths.configPath),
+        failures: outcome.failures,
+      };
     }
   }
 
@@ -1552,8 +1555,6 @@ export interface PruneDeps {
    * observe the reap surface without spawning a shell.
    */
   readonly reap?: Reaper;
-  /** Sink for non-fatal warnings (e.g. a failed reap). Default: stderr. */
-  readonly warn?: (message: string) => void;
 }
 
 /** Type of the orphan-reap collaborator `runPrune`/`runDown` inject (issue #148). */
@@ -1644,7 +1645,6 @@ export async function runPrune(deps: PruneDeps = {}): Promise<PruneResult> {
   const readReg = deps.readRegistry ?? readRegistry;
   const driver = createDriver(deps.driver);
   const reap = deps.reap ?? reapShutdownHooks;
-  const warn = deps.warn ?? defaultWarn;
 
   const instances = await discover(anchor.anchor);
   const porcelain = git(["worktree", "list", "--porcelain"]);
@@ -1704,9 +1704,14 @@ export async function runPrune(deps: PruneDeps = {}): Promise<PruneResult> {
     if (config !== undefined) {
       const outcome = await reap(config, { cwd: anchor.anchor });
       if (outcome.failures.length > 0) {
-        const worktreePath = readWorktreePath(paths.configPath);
-        warnings.push({ orphanId: orphan.id, worktreePath, failures: outcome.failures });
-        warn(formatReapWarning(orphan.id, worktreePath, outcome));
+        // Reflect the failed reap in the structured result (acceptance #5). The
+        // CLI formatter (single stderr owner) renders the human warning from
+        // this — devtrees does not write stderr from the orchestration layer.
+        warnings.push({
+          orphanId: orphan.id,
+          worktreePath: readWorktreePath(paths.configPath),
+          failures: outcome.failures,
+        });
       }
     }
 
@@ -1769,26 +1774,6 @@ function readDerivedConfig(configPath: string): DerivedConfig | undefined {
   } catch {
     return undefined;
   }
-}
-
-/**
- * Human-readable warning for a failed orphan reap (issue #148, acceptance #5).
- * Names the orphan and that its out-of-band resources may survive, plus the
- * failing hook(s) — devtrees only knows the exit status of the command it ran,
- * not what the hook reaps (ADR-0002).
- */
-function formatReapWarning(orphanId: string, worktreePath: string, outcome: ReapOutcome): string {
-  const where = worktreePath !== "" ? ` (was at ${worktreePath})` : "";
-  const detail = outcome.failures
-    .map(
-      (f) => `  - ${f.process}: \`${f.command}\` ${f.reason}${f.message ? ` (${f.message})` : ""}`,
-    )
-    .join("\n");
-  return (
-    `devtrees: orphan '${orphanId}'${where} — its shutdown hook did not complete cleanly, ` +
-    `so out-of-band resources (e.g. containers/volumes) may still be running. ` +
-    `Inspect and reap them manually:\n${detail}`
-  );
 }
 
 /**
