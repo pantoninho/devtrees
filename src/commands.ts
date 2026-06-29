@@ -443,6 +443,14 @@ export interface CommandDeps {
    * starts every namespace (process-compose's default — unchanged behaviour).
    */
   readonly namespaces?: ReadonlyArray<string>;
+  /**
+   * Run a torn-down instance's derived `shutdown.command`(s) directly —
+   * socket-free, from the anchor — to reap out-of-band resources when the
+   * supervisor is dead (issue #148). On the dead-supervisor `down` path the
+   * hook never fired (no process-compose to launch it), so devtrees runs it
+   * itself. Default: the real `reapShutdownHooks`; injected for tests.
+   */
+  readonly reap?: Reaper;
 }
 
 export interface UpResult {
@@ -1330,7 +1338,18 @@ export function findUnmanagedPortBinds(
  */
 export type DownResult =
   | { readonly shared: true; readonly worktreeId?: undefined; readonly stopped: boolean }
-  | { readonly shared: false; readonly worktreeId: string; readonly stopped: boolean };
+  | {
+      readonly shared: false;
+      readonly worktreeId: string;
+      readonly stopped: boolean;
+      /**
+       * Present when the dead-supervisor direct reap (issue #148) failed for at
+       * least one shutdown hook — out-of-band resources may have survived. The
+       * teardown still completes (on-disk state reclaimed); this flags that the
+       * reap itself did not cleanly finish (acceptance #5).
+       */
+      readonly warning?: ReapWarning;
+    };
 
 /**
  * Stop this worktree's instance (default) or — with `{ shared: true }` — the
@@ -1400,10 +1419,39 @@ export async function runDown(
   const paths = instancePaths(anchor.anchor, anchor.worktreeId);
   const live = await socketIsLive(paths.socketPath, resolveProbe(deps));
   if (live) {
+    // Live supervisor: a graceful `process-compose down` fires each process's
+    // `shutdown.command` from its `working_dir` (the worktree, which is present
+    // on the normal `down` path). devtrees must NOT also run the hook directly
+    // here — that would double-run it (acceptance #4: no regression).
     await driver.down({ configPath: paths.configPath, socketPath: paths.socketPath });
+    return { shared: false, worktreeId: anchor.worktreeId, stopped: true };
   }
 
-  return { shared: false, worktreeId: anchor.worktreeId, stopped: live };
+  // Dead-supervisor `down` path (issue #148): the socket probed stale (a
+  // SIGKILLed/rebooted supervisor), so no process-compose remains to launch the
+  // `shutdown.command`. The hook never fired → out-of-band resources leak. Run
+  // it ourselves, socket-free, from the anchor (a directory that exists), so the
+  // reap happens even when the supervisor is gone. Idempotent: an already-gone
+  // stack's hook reaps nothing.
+  const reap = deps.reap ?? reapShutdownHooks;
+  const warn = deps.warn ?? defaultWarn;
+  const config = readDerivedConfig(paths.configPath);
+  let warning: ReapWarning | undefined;
+  if (config !== undefined) {
+    const outcome = await reap(config, { cwd: anchor.anchor });
+    if (outcome.failures.length > 0) {
+      const worktreePath = readWorktreePath(paths.configPath);
+      warning = { orphanId: anchor.worktreeId, worktreePath, failures: outcome.failures };
+      warn(formatReapWarning(anchor.worktreeId, worktreePath, outcome));
+    }
+  }
+
+  return {
+    shared: false,
+    worktreeId: anchor.worktreeId,
+    stopped: false,
+    ...(warning !== undefined ? { warning } : {}),
+  };
 }
 
 /** Inputs unique to `runLs` — same anchor resolution as the other commands. */

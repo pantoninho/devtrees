@@ -1693,6 +1693,115 @@ describe("runDown — idempotent no-op when nothing is running (#92)", () => {
   });
 });
 
+describe("runDown — dead-supervisor reap of out-of-band resources (#148)", () => {
+  const hookStack: ResolvedStack = {
+    services: [
+      {
+        ...isolated("web", "node server.js", ["WEB_PORT"]),
+        shutdown: { command: "reap-stack.sh", timeout_seconds: 8 },
+      },
+    ],
+  };
+
+  /** Pre-stage the worktree instance's derived config + socket file on disk. */
+  function stageWorktreeInstance(deps: StubbedDeps): {
+    anchor: string;
+    socketPath: string;
+    configPath: string;
+    goneWorktree: string;
+  } {
+    const anchor = (deps.git!(["rev-parse", "--git-common-dir"]) as string).trim();
+    const paths = instancePaths(anchor, deps.expectedWorktreeId);
+    mkdirSync(paths.runDir, { recursive: true });
+    const goneWorktree = join(anchor, "..", "wt", "login");
+    writeFileSync(paths.socketPath, "");
+    writeFileSync(
+      paths.configPath,
+      stringifyYaml({
+        processes: {
+          web: {
+            command: "node server.js",
+            working_dir: goneWorktree,
+            environment: ["DEVTREES_WORKTREE_ID=login", "WEB_PORT=20000"],
+            shutdown: { command: "reap-stack.sh", timeout_seconds: 8 },
+          },
+        },
+        "x-devtrees": { ports_by_service: {} },
+      }),
+    );
+    return { anchor, socketPath: paths.socketPath, configPath: paths.configPath, goneWorktree };
+  }
+
+  it("runs the shutdown hook directly from the anchor when the supervisor socket is stale (SIGKILLed)", async () => {
+    const deps = stubDeps({ stack: hookStack, probeSocket: async () => "stale" as const });
+    const staged = stageWorktreeInstance(deps);
+    const reapCalls: Array<{ cwd: string; config: DerivedConfig }> = [];
+
+    const result = await runDown({
+      ...deps,
+      reap: async (config, rdeps) => {
+        reapCalls.push({ cwd: rdeps.cwd, config });
+        return { ranCount: 1, failures: [] };
+      },
+    });
+
+    // The dead supervisor never fired the hook; devtrees runs it directly,
+    // from the anchor — never the worktree path it pinned working_dir to.
+    expect(reapCalls).toHaveLength(1);
+    expect(reapCalls[0]?.cwd).toBe(staged.anchor);
+    expect(reapCalls[0]?.cwd).not.toBe(staged.goneWorktree);
+    expect(reapCalls[0]?.config.processes.web?.shutdown).toEqual({
+      command: "reap-stack.sh",
+      timeout_seconds: 8,
+    });
+    // The stale socket file is reclaimed; result is the worktree teardown.
+    expect(result.shared).toBe(false);
+    expect(result.stopped).toBe(false);
+  });
+
+  it("does NOT run the direct reap when the supervisor is live (graceful down fires the hook) — no regression on acceptance 4", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const baseDeps = stubDeps({ stack: hookStack, track, probeSocket: async () => "running" as const });
+    stageWorktreeInstance(baseDeps);
+    const reapCalls: unknown[] = [];
+
+    const result = await runDown({
+      ...baseDeps,
+      driver: { exists: () => Promise.resolve(true), spawner: () => spawnedOk() },
+      reap: async (config, rdeps) => {
+        reapCalls.push({ config, cwd: rdeps.cwd });
+        return { ranCount: 0, failures: [] };
+      },
+    });
+
+    // Live supervisor: the graceful `process-compose down` fires the hook from
+    // the (present) worktree, so devtrees must NOT also run it directly.
+    expect(reapCalls).toHaveLength(0);
+    expect(result.stopped).toBe(true);
+  });
+
+  it("surfaces a warning when the dead-supervisor reap hook fails (acceptance 5)", async () => {
+    const warnings: string[] = [];
+    const deps = stubDeps({
+      stack: hookStack,
+      probeSocket: async () => "stale" as const,
+      warn: (m) => warnings.push(m),
+    });
+    stageWorktreeInstance(deps);
+
+    const result = await runDown({
+      ...deps,
+      reap: async () => ({
+        ranCount: 1,
+        failures: [{ process: "web", command: "reap-stack.sh", reason: "timeout", message: "timed out" }],
+      }),
+    });
+
+    expect(warnings.some((w) => w.includes(deps.expectedWorktreeId))).toBe(true);
+    expect(result.warning?.failures[0]?.reason).toBe("timeout");
+  });
+});
+
 describe("runUpDryRun — derive the config(s) with no side effects (#124)", () => {
   it("returns the worktree config + env matching the deriver, without writing files or spawning", async () => {
     const stack: ResolvedStack = {
