@@ -1761,7 +1761,11 @@ describe("runDown — dead-supervisor reap of out-of-band resources (#148)", () 
 
   it("does NOT run the direct reap when the supervisor is live (graceful down fires the hook) — no regression on acceptance 4", async () => {
     const track: StubSpawn = { invocations: [], touchSocket: true };
-    const baseDeps = stubDeps({ stack: hookStack, track, probeSocket: async () => "running" as const });
+    const baseDeps = stubDeps({
+      stack: hookStack,
+      track,
+      probeSocket: async () => "running" as const,
+    });
     stageWorktreeInstance(baseDeps);
     const reapCalls: unknown[] = [];
 
@@ -1793,12 +1797,17 @@ describe("runDown — dead-supervisor reap of out-of-band resources (#148)", () 
       ...deps,
       reap: async () => ({
         ranCount: 1,
-        failures: [{ process: "web", command: "reap-stack.sh", reason: "timeout", message: "timed out" }],
+        failures: [
+          { process: "web", command: "reap-stack.sh", reason: "timeout", message: "timed out" },
+        ],
       }),
     });
 
     expect(warnings.some((w) => w.includes(deps.expectedWorktreeId))).toBe(true);
-    expect(result.warning?.failures[0]?.reason).toBe("timeout");
+    expect(result.shared).toBe(false);
+    if (result.shared === false) {
+      expect(result.warning?.failures[0]?.reason).toBe("timeout");
+    }
   });
 });
 
@@ -2580,15 +2589,11 @@ describe("runPrune — reconcile instances against git worktree list", () => {
       await runPrune({
         cwd: join(fx.tmp.worktreeRoot, "live"),
         git: fx.git,
-        discover: async () => [
-          instance("removed", { status, socketPath: fx.orphanSocket }),
-        ],
+        discover: async () => [instance("removed", { status, socketPath: fx.orphanSocket })],
         withRegistryLock: async (_anchor, mutate) => {
           fx.registryRef.snapshot = await mutate(fx.registryRef.snapshot);
           return fx.registryRef.snapshot;
         },
-        // A live socket only for the running case; stale otherwise.
-        probeSocket: async () => (status === "running" ? "running" : "stale"),
         driver: { exists: () => Promise.resolve(true), spawner: () => spawnedOk() },
         reap: async (config, deps) => {
           reapCalls.push({ cwd: deps.cwd, config });
@@ -2621,17 +2626,25 @@ describe("runPrune — reconcile instances against git worktree list", () => {
     const result = await runPrune({
       cwd: join(fx.tmp.worktreeRoot, "live"),
       git: fx.git,
-      discover: async () => [instance("removed", { status: "running", socketPath: fx.orphanSocket })],
+      discover: async () => [
+        instance("removed", { status: "running", socketPath: fx.orphanSocket }),
+      ],
       withRegistryLock: async (_anchor, mutate) => {
         fx.registryRef.snapshot = await mutate(fx.registryRef.snapshot);
         return fx.registryRef.snapshot;
       },
-      probeSocket: async () => "running",
       driver: { exists: () => Promise.resolve(true), spawner: () => spawnedOk() },
       warn: (m) => warnings.push(m),
       reap: async () => ({
         ranCount: 1,
-        failures: [{ process: "db", command: "reap-stack.sh", reason: "exit", message: "exited with code 1" }],
+        failures: [
+          {
+            process: "db",
+            command: "reap-stack.sh",
+            reason: "exit",
+            message: "exited with code 1",
+          },
+        ],
       }),
     });
 

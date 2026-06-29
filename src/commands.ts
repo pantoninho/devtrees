@@ -1780,7 +1780,9 @@ function readDerivedConfig(configPath: string): DerivedConfig | undefined {
 function formatReapWarning(orphanId: string, worktreePath: string, outcome: ReapOutcome): string {
   const where = worktreePath !== "" ? ` (was at ${worktreePath})` : "";
   const detail = outcome.failures
-    .map((f) => `  - ${f.process}: \`${f.command}\` ${f.reason}${f.message ? ` (${f.message})` : ""}`)
+    .map(
+      (f) => `  - ${f.process}: \`${f.command}\` ${f.reason}${f.message ? ` (${f.message})` : ""}`,
+    )
     .join("\n");
   return (
     `devtrees: orphan '${orphanId}'${where} — its shutdown hook did not complete cleanly, ` +

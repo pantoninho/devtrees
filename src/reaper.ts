@@ -33,7 +33,9 @@ import type { DerivedConfig } from "./deriver.js";
 export type HookFailureReason = "launch" | "exit" | "timeout";
 
 /** Outcome of running a single shutdown hook. */
-export type HookResult = { readonly ok: true } | { readonly ok: false; readonly reason: HookFailureReason; readonly message?: string };
+export type HookResult =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly reason: HookFailureReason; readonly message?: string };
 
 /** One shutdown.command invocation the reaper asks the runner to perform. */
 export interface HookRun {
@@ -81,7 +83,9 @@ export interface ReapDeps {
 }
 
 /** Read a `shutdown.command` string off an opaque shutdown block, or `undefined`. */
-function shutdownCommand(shutdown: Readonly<Record<string, unknown>> | undefined): string | undefined {
+function shutdownCommand(
+  shutdown: Readonly<Record<string, unknown>> | undefined,
+): string | undefined {
   const command = shutdown?.command;
   return typeof command === "string" && command !== "" ? command : undefined;
 }
