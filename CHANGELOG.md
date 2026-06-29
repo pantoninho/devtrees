@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.5](https://github.com/pantoninho/devtrees/compare/v0.0.4...v0.0.5) (2026-06-29)
+
+
+### Bug Fixes
+
+* run shutdown hook from a valid cwd so prune reaps orphaned stacks ([#152](https://github.com/pantoninho/devtrees/issues/152)) ([c0f6698](https://github.com/pantoninho/devtrees/commit/c0f66987a44fc344810df0c97f8a0d3923428f45))
+
 ## [0.0.4](https://github.com/pantoninho/devtrees/compare/v0.0.3...v0.0.4) (2026-06-26)
 
 
