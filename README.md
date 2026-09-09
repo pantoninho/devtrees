@@ -56,6 +56,23 @@ Flag highlights (run `devtrees <cmd> --help` for the full per-command surface):
   instead of this worktree's.
 - Every command accepts `--json` (see below).
 
+### Where devtrees keeps its state
+
+Derived configs, the allocation registry and per-instance logs live in
+`<git-common-dir>/devtrees/` — inside the git dir, so no `.gitignore` entry is
+needed and bare-repo layouts work the same
+([ADR-0001](docs/adr/0001-shared-instance-anchored-at-git-common-dir.md)).
+
+Control sockets are the exception. A unix socket path has to fit in `sun_path`
+(104 bytes on macOS), which a deep checkout's git dir blows through, so they
+live in a short per-user run dir keyed by a hash of the repo:
+`$XDG_RUNTIME_DIR` (or `/tmp`) `/devtrees-<uid>/<repo-hash>/<instance>.sock`
+([ADR-0007](docs/adr/0007-control-sockets-in-a-short-runtime-dir.md)). Set
+**`DEVTREES_RUNTIME_DIR`** to move that dir — useful if your `XDG_RUNTIME_DIR`
+is itself long, or `/tmp` is unusable. If a socket path still cannot fit,
+`devtrees up` fails with `SOCKET_PATH_TOO_LONG` rather than letting
+process-compose die at `bind(2)` with no diagnostic.
+
 ## Agent surface (`--json`)
 
 devtrees treats coding agents as first-class users
@@ -103,6 +120,7 @@ footer lists the subset that command can actually emit.
 | `CONFIG_DRIFT`              | Running config differs from devtrees.yaml and hot-reload failed.                    |
 | `SHARED_DRIFT`              | This worktree's shared services diverge from the running shared instance; bring shared down and up again. |
 | `SHARED_START_FAILED`       | The lazy-started shared instance died before binding its control socket.            |
+| `SOCKET_PATH_TOO_LONG`      | The control socket path exceeds the platform's unix-socket limit; set `DEVTREES_RUNTIME_DIR` to a shorter directory. |
 | `STALE_PORT_BLOCK`          | Foreign listeners hold ports in this worktree's allocated block (likely orphans).   |
 | `LOCK_CONTENTION`           | Another devtrees process holds a devtrees lock (allocation registry or an instance's lifecycle lock). |
 | `CONFIG_INVALID`            | devtrees.yaml is malformed or rejected by the deriver.                              |

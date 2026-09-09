@@ -4,8 +4,9 @@
  * Exercise the pure discovery primitive that powers `devtrees ls` (and #9
  * prune): given an anchor with its `devtrees/` state dir on disk, enumerate
  * every instance — each worktree's and the shared one — purely by listing
- * control sockets under `<anchor>/devtrees/run/` and cross-referencing the
- * allocation registry. No central daemon, no PID tracking.
+ * control sockets under the repo's run dir (`runDir(anchor)` — a short runtime
+ * dir since #156) and cross-referencing the allocation registry. No central
+ * daemon, no PID tracking.
  */
 
 import { afterEach, describe, expect, it } from "vite-plus/test";
@@ -15,7 +16,13 @@ import { join } from "node:path";
 import { createServer, type Server } from "node:net";
 import { deriveWorktreeId } from "./anchor.js";
 import { discoverInstances } from "./instances.js";
-import { SHARED_INSTANCE_ID, SHARED_REGISTRY_KEY } from "./paths.js";
+import {
+  SHARED_INSTANCE_ID,
+  SHARED_REGISTRY_KEY,
+  instancePaths,
+  legacyRunDir,
+  runDir,
+} from "./paths.js";
 import type { ServiceStatus } from "./driver.js";
 
 // Cleanups may be sync (rmSync) or async (server.close); each is wrapped to a
@@ -32,7 +39,9 @@ function tmpAnchor(): string {
   const root = mkdtempSync(join(tmpdir(), "dt-disc-"));
   cleanups.push(() => rmSync(root, { recursive: true, force: true }));
   const anchor = join(root, ".git");
-  mkdirSync(join(anchor, "devtrees", "run"), { recursive: true });
+  mkdirSync(join(anchor, "devtrees"), { recursive: true });
+  mkdirSync(runDir(anchor), { recursive: true });
+  cleanups.push(() => rmSync(runDir(anchor), { recursive: true, force: true }));
   return anchor;
 }
 
@@ -83,7 +92,7 @@ function writeDerivedConfig(
 
 /** Touch a marker file at the control-socket path so discovery sees it. */
 function touchSocketMarker(anchor: string, id: string): void {
-  writeFileSync(join(anchor, "devtrees", "run", `${id}.sock`), "", "utf8");
+  writeFileSync(instancePaths(anchor, id).socketPath, "", "utf8");
 }
 
 /**
@@ -95,7 +104,7 @@ async function bindSocketServer(anchor: string, id: string): Promise<void> {
   const server: Server = createServer();
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
-    server.listen(join(anchor, "devtrees", "run", `${id}.sock`), () => resolve());
+    server.listen(instancePaths(anchor, id).socketPath, () => resolve());
   });
   cleanups.push(
     () =>
@@ -220,11 +229,38 @@ describe("discoverInstances", () => {
 
   it("ignores non-.sock entries under the run dir", async () => {
     const anchor = tmpAnchor();
-    writeFileSync(join(anchor, "devtrees", "run", "README"), "", "utf8");
-    writeFileSync(join(anchor, "devtrees", "run", "registry.lock"), "", "utf8");
+    writeFileSync(join(runDir(anchor), "README"), "", "utf8");
+    writeFileSync(join(runDir(anchor), "registry.lock"), "", "utf8");
 
     const instances = await discoverInstances(anchor);
     expect(instances).toEqual([]);
+  });
+
+  it("still sees a socket left in the pre-#156 run dir, and reports its real path", async () => {
+    // An instance started by a devtrees that predated the relocation has its
+    // socket in `<anchor>/devtrees/run`. Discovery reads that dir too, so `ls`
+    // shows the instance and `prune` can reclaim it across the upgrade instead
+    // of leaving an invisible orphan.
+    const anchor = tmpAnchor();
+    const legacy = legacyRunDir(anchor);
+    mkdirSync(legacy, { recursive: true });
+    writeFileSync(join(legacy, "login-abcd1234.sock"), "", "utf8");
+
+    const [instance] = await discoverInstances(anchor);
+    expect(instance?.id).toBe("login-abcd1234");
+    expect(instance?.socketPath).toBe(join(legacy, "login-abcd1234.sock"));
+  });
+
+  it("prefers the canonical run dir when the same id exists in both locations", async () => {
+    const anchor = tmpAnchor();
+    const legacy = legacyRunDir(anchor);
+    mkdirSync(legacy, { recursive: true });
+    writeFileSync(join(legacy, "login-abcd1234.sock"), "", "utf8");
+    touchSocketMarker(anchor, "login-abcd1234");
+
+    const instances = await discoverInstances(anchor);
+    expect(instances).toHaveLength(1);
+    expect(instances[0]?.socketPath).toBe(instancePaths(anchor, "login-abcd1234").socketPath);
   });
 
   it("populates services[] on each running instance via a single getServiceStatuses call per instance", async () => {

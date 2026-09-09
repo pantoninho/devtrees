@@ -26,6 +26,11 @@ export default defineConfig({
   },
   test: {
     include: ["src/**/*.test.ts"],
+    // Sandboxes DEVTREES_RUNTIME_DIR so the control sockets tests create land
+    // in one temp dir per run instead of the developer's real runtime dir, and
+    // are removed when the run ends (issue #156 / ADR-0007). Global (not a
+    // per-file setup) so it is set before any worker starts and torn down once.
+    globalSetup: ["src/test-setup.ts"],
   },
   fmt: {
     ignorePatterns,

@@ -31,6 +31,8 @@ import {
 import {
   SHARED_INSTANCE_ID,
   SHARED_REGISTRY_KEY,
+  assertSocketPathFits,
+  ensureRunDir,
   instancePaths,
   logsDir,
   sharedInstancePaths,
@@ -793,6 +795,12 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
   }
 
   const paths = instancePaths(anchor.anchor, anchor.worktreeId);
+  // Fail before any side effect if the control socket can't be bound at all
+  // (issue #156): an over-long `sun_path` makes process-compose die silently,
+  // which used to surface as an unrelated socket-wait timeout. Cheap, pure,
+  // and checked here rather than at the spawn so no config or logs dir is
+  // written for a start that cannot succeed.
+  assertSocketPathFits(paths.socketPath);
   const driver = createDriver(deps.driver);
   const inst = { configPath: paths.configPath, socketPath: paths.socketPath };
 
@@ -901,7 +909,11 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
       return { kind: "reconciled", result } as const;
     }
 
-    mkdirSync(paths.runDir, { recursive: true });
+    // The run dir now lives outside the git dir (issue #156), so the anchor
+    // state dir the derived config goes in has to be created on its own —
+    // creating the run dir no longer implies it.
+    mkdirSync(paths.stateDir, { recursive: true });
+    ensureRunDir(anchor.anchor);
     // Create this worktree instance's logs dir so process-compose can open any
     // `log_location` file the derived config points at (issue #136). Only the
     // isolated services land in this instance, so scope dir creation to them.
@@ -1212,13 +1224,21 @@ async function ensureSharedStarted(
       return { started: false, ports: state.ports };
     }
 
+    // Same bind-site guard the worktree instance gets (issue #156) — the
+    // shared socket lives in the same run dir, so a run dir that is too long
+    // for `sun_path` breaks both instances and must say so, not time out.
+    assertSocketPathFits(paths.socketPath);
+
     const derived = deriveSharedConfig(stack, {
       workingDir: anchor,
       anchor,
       portFor: sharedPortFor,
     });
 
-    mkdirSync(paths.runDir, { recursive: true });
+    // The run dir now lives outside the git dir (issue #156), so the anchor
+    // state dir the derived config goes in has to be created on its own.
+    mkdirSync(paths.stateDir, { recursive: true });
+    ensureRunDir(anchor);
     // Create the shared instance's logs dir so process-compose can open any
     // `log_location` file the derived config points at (issue #136). Only the
     // shared services land in this instance, so scope dir creation to them.
@@ -1720,6 +1740,11 @@ async function reapAndCleanupOrphan(
   driver: ReturnType<typeof createDriver>,
 ): Promise<ReapWarning | undefined> {
   const paths = instancePaths(anchor, orphan.id);
+  // Use the socket path discovery actually found, not the canonical one: an
+  // instance started before #156 still has its socket in the old
+  // `<anchor>/devtrees/run` dir, and prune is exactly the path that has to be
+  // able to reclaim it.
+  const socketPath = orphan.socketPath;
   const warning = await reapDerivedConfig(paths.configPath, orphan.id, anchor, reap);
 
   if (orphan.status === "running") {
@@ -1728,14 +1753,14 @@ async function reapAndCleanupOrphan(
     // process-compose. Best-effort: a failed/half-dead down must not abort the
     // sweep, and the on-disk state is cleared below regardless.
     try {
-      await driver.down({ configPath: paths.configPath, socketPath: paths.socketPath });
+      await driver.down({ configPath: paths.configPath, socketPath });
     } catch {
       // Best-effort: a failed down still leaves us removing the on-disk state.
     }
   }
   // Remove the socket file (driver.down typically removes it on a clean exit,
   // but stale/failed orphans need explicit cleanup) and the derived config.
-  rmSync(paths.socketPath, { force: true });
+  rmSync(socketPath, { force: true });
   rmSync(paths.configPath, { force: true });
   return warning;
 }
@@ -2139,7 +2164,6 @@ async function reconcileRunning(args: {
   readonly stack: ResolvedStack;
   readonly anchor: { readonly anchor: string; readonly worktreeId: string };
   readonly paths: {
-    readonly runDir: string;
     readonly configPath: string;
     readonly socketPath: string;
   };
@@ -2169,7 +2193,7 @@ async function reconcileRunning(args: {
     // the attempt; snapshot the old bytes first and restore them on failure
     // so a failed reload never leaves the file describing config the instance
     // is not running.
-    mkdirSync(paths.runDir, { recursive: true });
+    mkdirSync(dirname(paths.configPath), { recursive: true });
     const previousConfig = existsSync(paths.configPath)
       ? readFileSync(paths.configPath, "utf8")
       : undefined;
