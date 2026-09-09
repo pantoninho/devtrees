@@ -6,6 +6,8 @@ Devtrees resolves this at the orchestration layer instead of inside process-comp
 
 Connection info is carried by the same named-port mechanism: a shared service's named ports are injected repo-wide into every worktree instance, so an isolated service reaches a shared one via injected `${...}` values with no special wiring.
 
+Same-tier edges are untouched by this decision: they are re-emitted into the derived config with the `condition` their author wrote (issue #158 — devtrees used to overwrite every condition with `process_started`, silently downgrading health-gated edges). Only a cross-tier edge loses its condition, along with the rest of the edge; the shared-health wait below is the stand-in, and it already gates on the shared services' readiness probes — the same signal `condition: process_healthy` would have used.
+
 A `shared` service may not `depends_on` an `isolated` service — that would mean depending on N per-worktree copies. Devtrees rejects this as a config error at load time.
 
 ## Considered Options
