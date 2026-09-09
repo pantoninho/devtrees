@@ -37,6 +37,7 @@ export const ERROR_CODES = [
   "CONFIG_DRIFT",
   "SHARED_DRIFT",
   "SHARED_START_FAILED",
+  "WORKTREE_START_FAILED",
   "SOCKET_PATH_TOO_LONG",
   "STALE_PORT_BLOCK",
   "LOCK_CONTENTION",
@@ -69,6 +70,8 @@ export const ERROR_CODE_DESCRIPTIONS: Readonly<Record<ErrorCode, string>> = {
   SHARED_DRIFT:
     "This worktree's shared services diverge from the running shared instance; bring shared down and up again.",
   SHARED_START_FAILED: "The lazy-started shared instance died before binding its control socket.",
+  WORKTREE_START_FAILED:
+    "This worktree's instance died before binding its control socket; `details.config_path` is the config to run by hand.",
   SOCKET_PATH_TOO_LONG:
     "The control socket path exceeds the platform's unix-socket limit; set DEVTREES_RUNTIME_DIR to a shorter directory.",
   STALE_PORT_BLOCK:

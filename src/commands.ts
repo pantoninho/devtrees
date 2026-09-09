@@ -144,6 +144,42 @@ class SharedStartFailedError extends Error {
 }
 
 /**
+ * The worktree-instance counterpart of `SharedStartFailedError` (issue #157).
+ * Both instances are spawned fire-and-forget and both are only observable as
+ * "the socket never appeared", but they are different instances with
+ * different remediation: this one is torn down with `devtrees down` and
+ * debugged against *this worktree's* derived config, the shared one with
+ * `devtrees down --shared` and the shared config. Until #157 the worktree
+ * wait threw `SharedStartFailedError`, so a stack that declared no shared
+ * tier at all still failed with `SHARED_START_FAILED` pointing at its own
+ * socket — issue #154 was diagnosed against a shared instance that did not
+ * exist. `details` carries the worktree id and config path so an agent can
+ * act without a second round-trip.
+ */
+class WorktreeStartFailedError extends Error {
+  readonly code = "WORKTREE_START_FAILED" as const;
+  readonly details: {
+    readonly worktree_id: string;
+    readonly socket_path: string;
+    readonly config_path: string;
+    readonly timeout_ms: number;
+  };
+  constructor(
+    message: string,
+    details: {
+      worktree_id: string;
+      socket_path: string;
+      config_path: string;
+      timeout_ms: number;
+    },
+  ) {
+    super(message);
+    this.name = "WorktreeStartFailedError";
+    this.details = details;
+  }
+}
+
+/**
  * Compare this worktree's shared subset against the persisted identity of
  * the running shared instance; throw `SharedDriftError` on mismatch. The
  * hash is order-insensitive (`sharedStackHash`), so pure reordering in
@@ -203,6 +239,18 @@ export type WithLifecycleLock = <T>(
   instanceId: string,
   fn: () => Promise<T>,
 ) => Promise<T>;
+
+/**
+ * Which worktree instance a post-spawn socket wait is watching (issue #157).
+ * The wait used to know only the socket path, which is why its failure could
+ * not say whose socket it was and borrowed the shared instance's envelope;
+ * carrying the id and the derived config lets `WORKTREE_START_FAILED` name
+ * the instance and point at the file worth running by hand.
+ */
+export interface WorktreeInstanceRef {
+  readonly worktreeId: string;
+  readonly configPath: string;
+}
 
 /** One row of `details.collisions[]` in the `STALE_PORT_BLOCK` error envelope. */
 interface PortCollision {
@@ -352,10 +400,12 @@ export interface CommandDeps {
    * after `driver.up` (issue #91). Runs INSIDE the lifecycle lock: `driver.up`
    * is fire-and-forget, so releasing the lock before the socket exists would
    * let a concurrent up's liveness gate miss the spawn and double-start.
-   * Default: real `waitForSocket` poll. Injected so unit tests with a stub
-   * spawner that never binds a socket don't pay the poll timeout.
+   * Default: real `waitForWorktreeSocket` poll, which fails with
+   * `WORKTREE_START_FAILED` naming *this* instance (issue #157). Injected so
+   * unit tests with a stub spawner that never binds a socket don't pay the
+   * poll timeout.
    */
-  readonly waitForSocketFile?: (socketPath: string) => Promise<void>;
+  readonly waitForSocketFile?: (socketPath: string, instance: WorktreeInstanceRef) => Promise<void>;
   /**
    * Wait for shared services to be healthy before bringing the worktree
    * instance up — orchestration-layer stand-in for the dropped cross-tier
@@ -381,6 +431,14 @@ export interface CommandDeps {
    * full window.
    */
   readonly sharedSocketTimeoutMs?: number;
+  /**
+   * The worktree-instance counterpart of `sharedSocketTimeoutMs` — how long
+   * the post-spawn socket wait gives this worktree's instance before failing
+   * with `WORKTREE_START_FAILED` (issue #157). Same 3s default and same
+   * reason for the seam: tests that exercise the real wait shouldn't sit out
+   * the full window.
+   */
+  readonly worktreeSocketTimeoutMs?: number;
   /**
    * Read the per-service runtime state for the worktree instance after health
    * is reached, so `runUp` can publish `services[]` in the issue-#30 state
@@ -697,7 +755,10 @@ function resolveUpSeams(deps: CommandDeps) {
 function resolveLifecycleSeams(deps: CommandDeps) {
   return {
     lifecycleLock: deps.withLifecycleLock ?? defaultWithLifecycleLock,
-    waitForSocketFile: deps.waitForSocketFile ?? waitForSocket,
+    waitForSocketFile:
+      deps.waitForSocketFile ??
+      ((socketPath, instance) =>
+        waitForWorktreeSocket(socketPath, instance, deps.worktreeSocketTimeoutMs)),
   } as const;
 }
 
@@ -945,7 +1006,12 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     // UDS. Hold the lifecycle lock until the socket is observable so the next
     // contender's liveness gate sees this start as complete instead of racing
     // a second spawn against it (same reasoning as `ensureSharedStarted`).
-    await seams.waitForSocketFile(paths.socketPath);
+    // Fails with `WORKTREE_START_FAILED` on deadline — the failure belongs to
+    // THIS instance, not the shared one it used to be blamed on (issue #157).
+    await seams.waitForSocketFile(paths.socketPath, {
+      worktreeId: anchor.worktreeId,
+      configPath: paths.configPath,
+    });
 
     // Record the resolved-stack hash BEFORE releasing the lock: a loser that
     // reconciles the moment we release must see this config as current — a
@@ -1254,7 +1320,7 @@ async function ensureSharedStarted(
     // deadline (issue #92): a socket that never appears means the instance
     // died before binding, and reporting `shared_started: true` for a corpse
     // would leave the agent debugging healthy-looking output.
-    await waitForSocket(paths.socketPath, deps.socketTimeoutMs);
+    await waitForSharedSocket(paths.socketPath, deps.socketTimeoutMs);
 
     // Make the running instance the source of truth: persist what it was
     // started with so every subsequent `up`/`env` — on any branch — injects
@@ -1266,23 +1332,75 @@ async function ensureSharedStarted(
 }
 
 /**
- * Poll until `socketPath` exists, or throw `SharedStartFailedError` when the
- * deadline lapses (issue #92). Silently returning here used to let `up`
- * report a shared instance that died before binding as `shared_started:
- * true` — the failure must surface as an error envelope instead.
+ * The deadline both post-spawn socket waits run on. Kept as one constant so
+ * the worktree and shared waits can't drift apart: #156 established there is
+ * no timing component to the failures they report (a bind that can't succeed
+ * never succeeds), so this is a fail-fast bound, not a tuning knob.
  */
-async function waitForSocket(socketPath: string, timeoutMs = 3000): Promise<void> {
+const SOCKET_WAIT_TIMEOUT_MS = 3000;
+
+/**
+ * Poll until `socketPath` shows up on disk; `true` if it did, `false` on
+ * deadline. The two callers below turn `false` into their own envelope —
+ * this is deliberately the only shared part, because attributing the failure
+ * to the wrong instance is exactly the bug #157 fixed.
+ */
+async function pollForSocket(socketPath: string, timeoutMs: number): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (existsSync(socketPath)) return;
+    if (existsSync(socketPath)) return true;
     await new Promise((r) => setTimeout(r, 10));
   }
+  return false;
+}
+
+/**
+ * Poll until the *shared* instance's socket exists, or throw
+ * `SharedStartFailedError` when the deadline lapses (issue #92). Silently
+ * returning here used to let `up` report a shared instance that died before
+ * binding as `shared_started: true` — the failure must surface as an error
+ * envelope instead.
+ */
+async function waitForSharedSocket(
+  socketPath: string,
+  timeoutMs = SOCKET_WAIT_TIMEOUT_MS,
+): Promise<void> {
+  if (await pollForSocket(socketPath, timeoutMs)) return;
   throw new SharedStartFailedError(
     `devtrees up: the shared instance was spawned but did not bind its control socket ` +
       `within ${timeoutMs}ms — it most likely crashed on startup. ` +
       `Check the shared services' commands (e.g. run \`process-compose -f <shared config>\` by hand) ` +
       `and retry \`devtrees up\`.`,
     { socket_path: socketPath, timeout_ms: timeoutMs },
+  );
+}
+
+/**
+ * Poll until *this worktree's* instance socket exists, or throw
+ * `WorktreeStartFailedError` when the deadline lapses (issue #157). This wait
+ * used to share the shared instance's error, so a stack with no shared tier
+ * at all failed with `SHARED_START_FAILED` and sent its reader looking at an
+ * instance that was never started (issue #154). The remediation names the
+ * worktree's own derived config — running the shared one by hand would start
+ * the wrong services.
+ */
+async function waitForWorktreeSocket(
+  socketPath: string,
+  instance: WorktreeInstanceRef,
+  timeoutMs = SOCKET_WAIT_TIMEOUT_MS,
+): Promise<void> {
+  if (await pollForSocket(socketPath, timeoutMs)) return;
+  throw new WorktreeStartFailedError(
+    `devtrees up: this worktree's instance (${instance.worktreeId}) was spawned but did not ` +
+      `bind its control socket within ${timeoutMs}ms — it most likely crashed on startup. ` +
+      `Check the isolated services' commands (e.g. run ` +
+      `\`process-compose -f ${instance.configPath}\` by hand) and retry \`devtrees up\`.`,
+    {
+      worktree_id: instance.worktreeId,
+      socket_path: socketPath,
+      config_path: instance.configPath,
+      timeout_ms: timeoutMs,
+    },
   );
 }
 

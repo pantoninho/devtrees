@@ -617,6 +617,139 @@ describe("runUp — shared instance dies before binding its socket (#92)", () =>
   });
 });
 
+/**
+ * The worktree instance's post-spawn socket wait (#91) shares its shape with
+ * the shared instance's (#92) but not its identity. It used to throw
+ * `SharedStartFailedError` verbatim, so a worktree instance that died before
+ * binding was reported as a *shared* start failure — even for a stack with no
+ * shared tier at all, which sent issue #154's reporter looking for an
+ * instance that was never started. These tests pin the attribution in both
+ * directions: worktree failure → `WORKTREE_START_FAILED`, shared failure →
+ * `SHARED_START_FAILED` (issue #157).
+ */
+describe("runUp — worktree instance dies before binding its socket (#157)", () => {
+  const allIsolated: ResolvedStack = {
+    services: [
+      isolated("web", "node server.js", ["WEB_PORT"]),
+      isolated("api", "node api.js", ["API_PORT"]),
+    ],
+  };
+
+  /**
+   * `stubDeps` no-ops the socket wait so ordinary tests don't pay its
+   * timeout; these tests want the real one, so drop the override and shorten
+   * the deadline instead.
+   */
+  function withRealSocketWait(base: CommandDeps): CommandDeps {
+    const { waitForSocketFile: _stubbed, ...rest } = base;
+    return { ...rest, worktreeSocketTimeoutMs: 50 };
+  }
+
+  it("attributes the failure to the worktree instance on a stack with no shared tier", async () => {
+    // Exactly the reproduction from #157: two isolated services, no shared
+    // service anywhere, stub spawner that never binds. Before the fix this
+    // failed with SHARED_START_FAILED and a details.socket_path pointing at
+    // the worktree's own socket.
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const base = stubDeps({ stack: allIsolated, track });
+    const err = await runUp(withRealSocketWait(base)).then(
+      () => undefined,
+      (e: unknown) => e as Error & { code?: string; details?: Record<string, unknown> },
+    );
+    if (err === undefined) throw new Error("expected runUp to reject");
+
+    expect(err.code).toBe("WORKTREE_START_FAILED");
+    // The message must not send the reader after a shared instance that this
+    // stack never declares.
+    expect(err.message).not.toMatch(/shared/i);
+    expect(err.message).toContain(base.expectedWorktreeId);
+
+    // Details point at THIS instance: its own socket, its own derived config.
+    const details = err.details ?? {};
+    expect(details["worktree_id"]).toBe(base.expectedWorktreeId);
+    expect(String(details["socket_path"])).toContain(`${base.expectedWorktreeId}.sock`);
+    expect(String(details["socket_path"])).not.toContain("shared.sock");
+    // The remediation names the worktree's config, not the shared one — the
+    // file an agent (or human) actually runs `process-compose -f` against.
+    const configPath = String(details["config_path"]);
+    expect(configPath).toContain(base.expectedWorktreeId);
+    expect(err.message).toContain(configPath);
+    expect(details["timeout_ms"]).toBe(50);
+  });
+
+  it("still attributes a shared-instance socket failure to the shared instance", async () => {
+    // The other half of the contract: nothing about #157 may change the #92
+    // envelope, which something already branches on. Same stub, mixed stack,
+    // shared spawn is the one that never binds.
+    const mixedStack: ResolvedStack = {
+      services: [
+        isolated("web", "node server.js", ["WEB_PORT"]),
+        shared("postgres", "postgres", ["DB_PORT"]),
+      ],
+    };
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const deps: CommandDeps = {
+      ...withRealSocketWait(stubDeps({ stack: mixedStack, track })),
+      sharedSocketTimeoutMs: 50,
+    };
+    const err = await runUp(deps).then(
+      () => undefined,
+      (e: unknown) => e as Error & { code?: string; details?: Record<string, unknown> },
+    );
+    if (err === undefined) throw new Error("expected runUp to reject");
+
+    expect(err.code).toBe("SHARED_START_FAILED");
+    expect(err.message).toMatch(/shared instance/i);
+    expect(String((err.details ?? {})["socket_path"])).toContain("shared.sock");
+  });
+
+  it("blames the worktree when the shared instance came up fine and only the worktree died", async () => {
+    // The discriminating case: both instances are spawned, the shared one
+    // binds, the worktree one doesn't. One code covering both would report
+    // this as a shared failure against a demonstrably healthy shared
+    // instance — the exact misdirection #154 chased.
+    const mixedStack: ResolvedStack = {
+      services: [
+        isolated("web", "node server.js", ["WEB_PORT"]),
+        shared("postgres", "postgres", ["DB_PORT"]),
+      ],
+    };
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const base = stubDeps({ stack: mixedStack, track });
+    const inner = base.driver?.spawner;
+    if (inner === undefined) throw new Error("expected stub spawner");
+
+    const deps: CommandDeps = {
+      ...withRealSocketWait(base),
+      sharedSocketTimeoutMs: 50,
+      driver: {
+        ...base.driver,
+        spawner: (binary, args, options) => {
+          // Bind only the shared socket, so the shared lazy-start succeeds
+          // and the worktree wait is the one that lapses.
+          const socketPath = args[args.indexOf("-u") + 1] ?? "";
+          if (args[0] === "up" && socketPath.endsWith("shared.sock")) {
+            writeFileSync(socketPath, "");
+          }
+          return inner(binary, args, options);
+        },
+      },
+    };
+
+    const err = await runUp(deps).then(
+      () => undefined,
+      (e: unknown) => e as Error & { code?: string; details?: Record<string, unknown> },
+    );
+    if (err === undefined) throw new Error("expected runUp to reject");
+
+    expect(err.code).toBe("WORKTREE_START_FAILED");
+    expect(String((err.details ?? {})["socket_path"])).not.toContain("shared.sock");
+    // Both spawns happened — the shared one is not the failure.
+    expect(track.invocations.some((i) => i.socketPath.endsWith("shared.sock"))).toBe(true);
+    expect(track.invocations.some((i) => !i.socketPath.endsWith("shared.sock"))).toBe(true);
+  });
+});
+
 describe("runUp — cross-tier wiring (ADR-0003)", () => {
   /** isolated `web` depends on shared `postgres` — the canonical cross-tier edge. */
   const crossTierStack: ResolvedStack = {
