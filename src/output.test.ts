@@ -54,6 +54,14 @@ describe("output formatter — constants", () => {
   it("declares SOCKET_PATH_TOO_LONG so #156's over-long sun_path is discoverable, not silent", () => {
     expect(ERROR_CODES).toContain("SOCKET_PATH_TOO_LONG");
   });
+
+  it("declares WORKTREE_START_FAILED alongside SHARED_START_FAILED so #157 can name the right instance", () => {
+    // Two spawns, two instances, two codes: an agent branches on the code to
+    // decide whether to `down` or `down --shared`, so the worktree failure
+    // cannot keep borrowing the shared instance's envelope.
+    expect(ERROR_CODES).toContain("SHARED_START_FAILED");
+    expect(ERROR_CODES).toContain("WORKTREE_START_FAILED");
+  });
 });
 
 describe("output formatter — classifyError", () => {
@@ -74,6 +82,27 @@ describe("output formatter — classifyError", () => {
       block_base: 40256,
       worktree_id: "login",
       collisions: [{ port_name: "WEB_PORT", port: 40256, pid: 76705, command: "node server.mjs" }],
+    });
+  });
+
+  it("routes WORKTREE_START_FAILED through the typed-code short-circuit with its config_path (#157)", () => {
+    // `config_path` is the whole point of the separate code: it is the file an
+    // agent runs by hand, and it is NOT the shared config the old
+    // SHARED_START_FAILED envelope told it to reach for.
+    const err = Object.assign(new Error("this worktree's instance (login-a1b2) was spawned but…"), {
+      code: "WORKTREE_START_FAILED",
+      details: {
+        worktree_id: "login-a1b2",
+        socket_path: "/tmp/devtrees-501/abc/login-a1b2.sock",
+        config_path: "/repo/.git/devtrees/login-a1b2.yaml",
+        timeout_ms: 3000,
+      },
+    });
+    const payload = classifyError(err);
+    expect(payload.code).toBe("WORKTREE_START_FAILED");
+    expect(payload.details).toMatchObject({
+      worktree_id: "login-a1b2",
+      config_path: "/repo/.git/devtrees/login-a1b2.yaml",
     });
   });
 
