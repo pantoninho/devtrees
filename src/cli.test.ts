@@ -1229,6 +1229,68 @@ describe("devtrees CLI — up --dry-run (#124)", () => {
     expect(help).toMatch(/CONFIG_INVALID/);
     expect(help).toMatch(/LOCK_CONTENTION/);
   });
+
+  /**
+   * Issue #168: `--dry-run` is the diagnostic surface, so it has to explain the
+   * cross-tier edges it drops — the real `up` already does.
+   */
+  describe("dropped cross-tier depends_on edges (#168)", () => {
+    const withDrops = {
+      ...dryResult,
+      droppedEdges: [{ from: "web", to: "db", fromTier: "isolated", toTier: "shared" }],
+    };
+
+    it("human mode warns on stderr and leaves stdout the previewed YAML alone", async () => {
+      const upDryRun = vi.fn().mockResolvedValue(withDrops);
+      const result = await execute(["up", "--dry-run"], { up: vi.fn(), down: vi.fn(), upDryRun });
+      expect(result.code).toBe(0);
+      expect(result.stderr).toContain(
+        "dropped cross-tier depends_on 'web' (isolated) -> 'db' (shared)",
+      );
+      // stdout must stay pipe-safe: byte-identical to the drop-free render.
+      const clean = await execute(["up", "--dry-run"], {
+        up: vi.fn(),
+        down: vi.fn(),
+        upDryRun: vi.fn().mockResolvedValue(dryResult),
+      });
+      expect(result.stdout).toBe(clean.stdout);
+      expect(result.stdout).not.toContain("dropped cross-tier");
+    });
+
+    it("--json carries dropped_edges in the envelope and keeps stderr silent", async () => {
+      const upDryRun = vi.fn().mockResolvedValue(withDrops);
+      const result = await execute(["up", "--dry-run", "--json"], {
+        up: vi.fn(),
+        down: vi.fn(),
+        upDryRun,
+      });
+      expect(result.code).toBe(0);
+      expect(result.stderr).toBe("");
+      const parsed = JSON.parse(result.stdout) as {
+        up_dry_run: { dropped_edges: ReadonlyArray<Record<string, string>> };
+      };
+      expect(parsed.up_dry_run.dropped_edges).toEqual([
+        { from: "web", to: "db", from_tier: "isolated", to_tier: "shared" },
+      ]);
+    });
+
+    it("says nothing on stderr, and emits an empty dropped_edges, when no edge was dropped", async () => {
+      const human = await execute(["up", "--dry-run"], {
+        up: vi.fn(),
+        down: vi.fn(),
+        upDryRun: vi.fn().mockResolvedValue({ ...dryResult, droppedEdges: [] }),
+      });
+      expect(human.stderr).toBe("");
+
+      const json = await execute(["up", "--dry-run", "--json"], {
+        up: vi.fn(),
+        down: vi.fn(),
+        upDryRun: vi.fn().mockResolvedValue({ ...dryResult, droppedEdges: [] }),
+      });
+      const parsed = JSON.parse(json.stdout) as { up_dry_run: Record<string, unknown> };
+      expect(parsed.up_dry_run.dropped_edges).toEqual([]);
+    });
+  });
 });
 
 /**

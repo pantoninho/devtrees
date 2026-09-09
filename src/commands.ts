@@ -37,6 +37,7 @@ import {
   logsDir,
   sharedInstancePaths,
 } from "./paths.js";
+import { formatDroppedEdgeWarning } from "./output.js";
 import { findDeadReservations, findOrphans, parseWorktreeIds } from "./prune.js";
 import { reapShutdownHooks, type ReapDeps, type ReapOutcome } from "./reaper.js";
 import { loadStack, type ResolvedService, type ResolvedStack, type Tier } from "./stack.js";
@@ -584,6 +585,13 @@ export interface DryRunResult {
   readonly sharedEnv?: Record<string, string>;
   /** The derived shared process-compose config — present iff the stack has shared services. */
   readonly sharedConfig?: DerivedConfig;
+  /**
+   * Every cross-tier `depends_on` edge the derivation stripped (ADR-0003), the
+   * same list the real `up` warns about. Empty when nothing was dropped — a
+   * preview that silently loses an authored edge reads as a config typo rather
+   * than a documented design decision (issue #168).
+   */
+  readonly droppedEdges: ReadonlyArray<DroppedEdge>;
 }
 
 export interface DownOptions {
@@ -1182,6 +1190,7 @@ export async function runUpDryRun(deps: CommandDeps = {}): Promise<DryRunResult>
     anchor: anchor.anchor,
     env: derivedWt.env,
     config: derivedWt.config,
+    droppedEdges: derivedWt.droppedEdges,
   };
 
   if (!sharedNeeded) return base;
@@ -1191,7 +1200,16 @@ export async function runUpDryRun(deps: CommandDeps = {}): Promise<DryRunResult>
     anchor: anchor.anchor,
     portFor: sharedPortFor,
   });
-  return { ...base, sharedEnv: derivedShared.env, sharedConfig: derivedShared.config };
+  return {
+    ...base,
+    sharedEnv: derivedShared.env,
+    sharedConfig: derivedShared.config,
+    // `deriveSharedConfig` can only ever report `shared -> isolated` edges, and
+    // `validateStack` rejects those at load time, so this concatenation is a
+    // no-op today. It is written as a concatenation anyway so the preview stays
+    // exhaustive if that validation ever loosens.
+    droppedEdges: [...derivedWt.droppedEdges, ...derivedShared.droppedEdges],
+  };
 }
 
 /**
@@ -2461,20 +2479,6 @@ function probedNames(services: ReadonlyArray<ResolvedService>): string[] {
 /** Explicit `attach`/`no-attach` override wins; otherwise consult `isTTY()`. */
 function shouldAttachAfterUp(deps: CommandDeps): boolean {
   return deps.attach ?? (deps.isTTY ?? defaultIsTTY)();
-}
-
-/**
- * One human-readable line per dropped cross-tier edge. Tells the developer
- * which edge devtrees just lifted out of the derived config and why — the
- * orchestration layer is now responsible for the equivalent gating.
- */
-function formatDroppedEdgeWarning(edge: DroppedEdge): string {
-  return (
-    `devtrees: dropped cross-tier depends_on '${edge.from}' (${edge.fromTier}) -> ` +
-    `'${edge.to}' (${edge.toTier}). ` +
-    `Process-compose cannot express a dependency across instances (ADR-0003); ` +
-    `devtrees waits for shared services to be healthy before starting the worktree instance instead.`
-  );
 }
 
 /** Single notice that the worktree start is gated on the shared-health wait. */

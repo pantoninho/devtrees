@@ -2060,6 +2060,39 @@ describe("runUpDryRun — derive the config(s) with no side effects (#124)", () 
     expect(result.sharedEnv).toBeUndefined();
   });
 
+  /**
+   * Issue #168: the deriver hands back every cross-tier edge it stripped, and
+   * the dry run used to throw that list away — so the preview lost an authored
+   * `depends_on` with no explanation. The real `up` warns; the preview must
+   * carry the same information.
+   */
+  it("reports the cross-tier depends_on edges the derivation dropped", async () => {
+    const web = { ...isolated("web", "node x.js", ["WEB_PORT"]), dependsOn: [{ name: "db" }] };
+    const stack: ResolvedStack = {
+      services: [web, shared("db", "postgres", ["DB_PORT"])],
+    };
+    const result = await runUpDryRun(stubDeps({ stack }));
+
+    expect(result.droppedEdges).toEqual([
+      { from: "web", to: "db", fromTier: "isolated", toTier: "shared" },
+    ]);
+    // The edge really is gone from the previewed config — that is the whole
+    // reason the preview has to say so.
+    expect(result.config.processes.web?.depends_on).toBeUndefined();
+  });
+
+  it("reports no dropped edges when every depends_on stays within a tier", async () => {
+    const web = { ...isolated("web", "node x.js", ["WEB_PORT"]), dependsOn: [{ name: "api" }] };
+    const stack: ResolvedStack = {
+      services: [web, isolated("api", "node api.js", ["API_PORT"])],
+    };
+    const result = await runUpDryRun(stubDeps({ stack }));
+    expect(result.droppedEdges).toEqual([]);
+    expect(result.config.processes.web?.depends_on).toEqual({
+      api: { condition: expect.any(String) },
+    });
+  });
+
   it("does not register an instance, write a hash, take the lifecycle lock, or wait for health", async () => {
     const stack: ResolvedStack = {
       services: [
