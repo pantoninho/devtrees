@@ -20,7 +20,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { Writable } from "node:stream";
 import { Cli, Command, Option, Builtins, type BaseContext } from "clipanion";
 import type { LogEvent } from "./driver.js";
-import type { DerivedConfig } from "./deriver.js";
+import type { DerivedConfig, DroppedEdge } from "./deriver.js";
 import { maybeInitHint } from "./init-hint.js";
 import {
   classifyError,
@@ -136,6 +136,11 @@ export interface ExecuteDeps {
     config: DerivedConfig;
     sharedEnv?: Record<string, string>;
     sharedConfig?: DerivedConfig;
+    /**
+     * Cross-tier `depends_on` edges the derivation dropped (issue #168).
+     * Optional so a test stub can omit it; absent is read as "none dropped".
+     */
+    droppedEdges?: ReadonlyArray<DroppedEdge>;
   }>;
   down: (options: {
     shared: boolean;
@@ -419,6 +424,7 @@ class UpCommand extends DevtreesCommand {
         config: result.config,
         ...(result.sharedEnv !== undefined ? { sharedEnv: result.sharedEnv } : {}),
         ...(result.sharedConfig !== undefined ? { sharedConfig: result.sharedConfig } : {}),
+        droppedEdges: result.droppedEdges ?? [],
       },
       this.mode,
     );

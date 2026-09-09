@@ -20,6 +20,7 @@ import {
   formatLs,
   formatPrune,
   formatUp,
+  formatDroppedEdgeWarning,
   formatUpDryRun,
   type ErrorCode,
   type LsInstanceRow,
@@ -28,6 +29,7 @@ import {
   type UpDryRunPayload,
   type UpPayload,
 } from "./output.js";
+import type { DroppedEdge } from "./deriver.js";
 import { parse as parseYaml } from "yaml";
 
 describe("output formatter — constants", () => {
@@ -597,6 +599,77 @@ describe("output formatter — formatUpDryRun (#124)", () => {
     );
     expect(result.stdout).toContain("node server.js");
     expect(result.stdout).not.toContain("postgres");
+  });
+
+  /**
+   * Issue #168: the preview is the diagnostic surface, so it must explain the
+   * cross-tier edges it drops — the same explanation the real `up` prints.
+   */
+  describe("dropped cross-tier depends_on edges (#168)", () => {
+    const dropped = [
+      { from: "web", to: "db", fromTier: "isolated", toTier: "shared" },
+    ] as const satisfies ReadonlyArray<DroppedEdge>;
+
+    it("in human mode, reports the drop on stderr", () => {
+      const result = formatUpDryRun({ ...payload, droppedEdges: dropped }, "human");
+      expect(result.stderr).toBe(`${formatDroppedEdgeWarning(dropped[0])}\n`);
+      expect(result.stderr).toContain("dropped cross-tier depends_on 'web' (isolated) -> 'db'");
+      expect(result.stderr).toContain("ADR-0003");
+    });
+
+    it("in human mode, leaves stdout byte-identical to the drop-free render", () => {
+      // The invariant that lets `--dry-run > stack.yaml` (or a pipe into
+      // `process-compose -f -`) keep working: the warning never touches stdout.
+      const withDrops = formatUpDryRun({ ...payload, droppedEdges: dropped }, "human");
+      const without = formatUpDryRun(payload, "human");
+      expect(withDrops.stdout).toBe(without.stdout);
+      expect(withDrops.stdout).not.toContain("dropped cross-tier");
+    });
+
+    it("in human mode, emits one line per dropped edge", () => {
+      const two = [
+        ...dropped,
+        { from: "web", to: "cache", fromTier: "isolated", toTier: "shared" },
+      ] as const satisfies ReadonlyArray<DroppedEdge>;
+      const result = formatUpDryRun({ ...payload, droppedEdges: two }, "human");
+      expect(result.stderr.trimEnd().split("\n")).toHaveLength(2);
+      expect(result.stderr).toContain("-> 'cache' (shared)");
+    });
+
+    it("in human mode with nothing dropped, stderr stays empty", () => {
+      expect(formatUpDryRun({ ...payload, droppedEdges: [] }, "human").stderr).toBe("");
+      expect(formatUpDryRun(payload, "human").stderr).toBe("");
+    });
+
+    it("in JSON mode, carries dropped_edges in the envelope with snake_case tiers", () => {
+      const result = formatUpDryRun({ ...payload, droppedEdges: dropped }, "json");
+      const parsed = JSON.parse(result.stdout) as {
+        up_dry_run: { dropped_edges: ReadonlyArray<Record<string, string>> };
+      };
+      expect(parsed.up_dry_run.dropped_edges).toEqual([
+        { from: "web", to: "db", from_tier: "isolated", to_tier: "shared" },
+      ]);
+    });
+
+    it("in JSON mode, dropped_edges is always present — empty when nothing was dropped", () => {
+      // Unlike `shared_*` (absent means "no shared tier at all"), an empty list
+      // is a real answer, and always emitting it spares an agent from telling
+      // "nothing dropped" apart from "this devtrees never reported drops".
+      for (const p of [payload, { ...payload, droppedEdges: [] }]) {
+        const parsed = JSON.parse(formatUpDryRun(p, "json").stdout) as {
+          up_dry_run: Record<string, unknown>;
+        };
+        expect(parsed.up_dry_run.dropped_edges).toEqual([]);
+      }
+    });
+
+    it("in JSON mode, keeps stderr silent — the drop is already in the envelope", () => {
+      // ADR-0005: `--json` is a one-stream contract. Duplicating the prose on
+      // stderr would corrupt a naive `2>&1` capture of the document.
+      const result = formatUpDryRun({ ...payload, droppedEdges: dropped }, "json");
+      expect(result.stderr).toBe("");
+      expect(() => JSON.parse(result.stdout)).not.toThrow();
+    });
   });
 });
 

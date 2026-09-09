@@ -19,7 +19,7 @@
  * non-breaking; renames and removals bump this. New error codes are additive.
  */
 import { stringify as stringifyYaml } from "yaml";
-import type { DerivedConfig } from "./deriver.js";
+import type { DerivedConfig, DroppedEdge } from "./deriver.js";
 
 export const SCHEMA_VERSION = "1";
 
@@ -462,39 +462,85 @@ export interface UpDryRunPayload {
   readonly sharedEnv?: Readonly<Record<string, string>>;
   /** Present iff the stack declares shared services. */
   readonly sharedConfig?: DerivedConfig;
+  /**
+   * Cross-tier `depends_on` edges the derivation stripped (ADR-0003). Defaults
+   * to empty so a caller that has nothing to report can omit it (issue #168).
+   */
+  readonly droppedEdges?: ReadonlyArray<DroppedEdge>;
+}
+
+/**
+ * One human-readable line per dropped cross-tier edge. Tells the developer
+ * which edge devtrees lifted out of the derived config and why — the
+ * orchestration layer is now responsible for the equivalent gating.
+ *
+ * Lives here, not in `commands.ts`, because both the real `up` path (which
+ * warns as it derives) and `up --dry-run` (which warns as it previews) render
+ * it: one drop, one wording (issue #168).
+ */
+export function formatDroppedEdgeWarning(edge: DroppedEdge): string {
+  return (
+    `devtrees: dropped cross-tier depends_on '${edge.from}' (${edge.fromTier}) -> ` +
+    `'${edge.to}' (${edge.toTier}). ` +
+    `Process-compose cannot express a dependency across instances (ADR-0003); ` +
+    `devtrees waits for shared services to be healthy before starting the worktree instance instead.`
+  );
+}
+
+/** Snake_case row for the `up_dry_run.dropped_edges[]` envelope entry. */
+function droppedEdgeJson(edge: DroppedEdge): Record<string, string> {
+  return { from: edge.from, to: edge.to, from_tier: edge.fromTier, to_tier: edge.toTier };
 }
 
 /**
  * Render `devtrees up --dry-run` output.
  *
  *   - `json`: `{schema_version, up_dry_run: {worktree_id, env, config,
- *     shared_env?, shared_config?}}` — one byte-clean document on stdout, the
- *     agent-readable preview of what `up` would run. `shared_*` keys are
- *     omitted when the stack has no shared services. Stderr stays untouched.
+ *     dropped_edges, shared_env?, shared_config?}}` — one byte-clean document
+ *     on stdout, the agent-readable preview of what `up` would run. `shared_*`
+ *     keys are omitted when the stack has no shared services; `dropped_edges`
+ *     is always present (possibly empty). Stderr stays untouched.
  *   - `human`: the derived YAML document(s) — the worktree config, then the
  *     shared config (separated by a `---` document marker) when present. The
  *     same derived config `up` writes to disk; here it goes to stdout so a
- *     developer can eyeball it or pipe it into `process-compose -f -`.
+ *     developer can eyeball it or pipe it into `process-compose -f -`. Any
+ *     dropped cross-tier `depends_on` edge is reported on **stderr** (issue
+ *     #168) so stdout stays byte-identical to the document alone.
  */
 export function formatUpDryRun(payload: UpDryRunPayload, mode: FormatMode): OutputResult {
+  const droppedEdges = payload.droppedEdges ?? [];
   if (mode === "json") {
     const dry: Record<string, unknown> = {
       worktree_id: payload.worktreeId,
       env: payload.env,
       config: payload.config,
+      // Always present, even empty — unlike `shared_*`, whose absence means the
+      // stack has no shared tier at all. An empty list is a real answer ("the
+      // derivation dropped nothing"), and always emitting it spares an agent
+      // from having to tell that apart from an older devtrees that never
+      // reported drops. Same contract `prune.pruned[]` / `prune.warnings[]`
+      // already offer.
+      dropped_edges: droppedEdges.map(droppedEdgeJson),
     };
     if (payload.sharedConfig !== undefined) {
       dry.shared_env = payload.sharedEnv ?? {};
       dry.shared_config = payload.sharedConfig;
     }
     const doc = { schema_version: SCHEMA_VERSION, up_dry_run: dry };
+    // Keep `--json` stdout byte-clean AND stderr silent (ADR-0005): the drop is
+    // already in the envelope, so duplicating it on stderr would only pollute a
+    // naive `2>&1` capture of the document the agent is trying to parse.
     return { stdout: `${JSON.stringify(doc)}\n`, stderr: "" };
   }
   const worktreeYaml = stringifyYaml(payload.config);
   const sharedYaml =
     payload.sharedConfig !== undefined ? stringifyYaml(payload.sharedConfig) : undefined;
   const body = sharedYaml === undefined ? worktreeYaml : `${worktreeYaml}---\n${sharedYaml}`;
-  return { stdout: body, stderr: "" };
+  // Warnings go to stderr so stdout stays the previewed document verbatim —
+  // `devtrees up --dry-run > stack.yaml` (or a pipe into `process-compose -f -`)
+  // must not pick up prose.
+  const stderr = droppedEdges.map((e) => `${formatDroppedEdgeWarning(e)}\n`).join("");
+  return { stdout: body, stderr };
 }
 
 // --- init -------------------------------------------------------------------
