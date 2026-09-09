@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.0.6](https://github.com/pantoninho/devtrees/compare/v0.0.5...v0.0.6) (2026-09-09)
+
+
+### Bug Fixes
+
+* attribute a worktree-instance socket failure to the worktree, not shared ([#166](https://github.com/pantoninho/devtrees/issues/166)) ([8bfa50c](https://github.com/pantoninho/devtrees/commit/8bfa50c461ef8d882de8239b4477854841297692))
+* bind control sockets in a short runtime dir so deep checkouts can start ([#164](https://github.com/pantoninho/devtrees/issues/164)) ([560d3e5](https://github.com/pantoninho/devtrees/commit/560d3e5dc5f2c930a24264c6e487ed13809799fc))
+* pass depends_on conditions through for same-tier edges ([#167](https://github.com/pantoninho/devtrees/issues/167)) ([00febfb](https://github.com/pantoninho/devtrees/commit/00febfbd743779fac5a5713f3d6d95e8303b79b2)), closes [#158](https://github.com/pantoninho/devtrees/issues/158)
+* report dropped cross-tier depends_on edges from `up --dry-run` ([#169](https://github.com/pantoninho/devtrees/issues/169)) ([b9b22ab](https://github.com/pantoninho/devtrees/commit/b9b22ab833c352bb910ddf6c2e31d792341a689e)), closes [#168](https://github.com/pantoninho/devtrees/issues/168)
+
 ## [0.0.5](https://github.com/pantoninho/devtrees/compare/v0.0.4...v0.0.5) (2026-06-29)
 
 
