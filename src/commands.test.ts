@@ -43,7 +43,13 @@ import { deriveWorktreeId } from "./anchor.js";
 import { deriveSharedConfig, deriveWorktreeConfig, type DerivedConfig } from "./deriver.js";
 import type { RegistrySnapshot } from "./allocator.js";
 import type { LogEvent, SpawnedProcess } from "./driver.js";
-import { SHARED_REGISTRY_KEY, instancePaths, sharedInstancePaths } from "./paths.js";
+import {
+  SHARED_REGISTRY_KEY,
+  SOCKET_PATH_MAX_BYTES,
+  instancePaths,
+  runDir,
+  sharedInstancePaths,
+} from "./paths.js";
 import { sharedStackHash } from "./hash.js";
 import { readSharedState } from "./shared-state.js";
 import type { ResolvedStack } from "./stack.js";
@@ -70,7 +76,14 @@ const shared = (name: string, command: string, ports: string[] = []) =>
 function tmpAnchor(): { anchor: string; worktreeRoot: string } {
   const root = mkdtempSync(join(tmpdir(), "dt-cmd-"));
   cleanups.push(() => rmSync(root, { recursive: true, force: true }));
-  return { anchor: join(root, ".git"), worktreeRoot: join(root, "wt") };
+  const anchor = join(root, ".git");
+  // The anchor state dir used to appear as a side effect of creating the run
+  // dir under it; since #156 the run dir lives elsewhere, so tests that stage
+  // a derived config by hand need it created here. The run dir itself is
+  // outside the temp root, so it gets its own cleanup.
+  mkdirSync(join(anchor, "devtrees"), { recursive: true });
+  cleanups.push(() => rmSync(runDir(anchor), { recursive: true, force: true }));
+  return { anchor, worktreeRoot: join(root, "wt") };
 }
 
 /** A no-op shared lifecycle lock — wraps the callback without any contention. */
@@ -1713,6 +1726,9 @@ describe("runDown — dead-supervisor reap of out-of-band resources (#148)", () 
     const anchor = (deps.git!(["rev-parse", "--git-common-dir"]) as string).trim();
     const paths = instancePaths(anchor, deps.expectedWorktreeId);
     mkdirSync(paths.runDir, { recursive: true });
+    // The run dir no longer lives inside the state dir (#156), so the anchor
+    // state the derived config goes in has to be created explicitly.
+    mkdirSync(paths.stateDir, { recursive: true });
     const goneWorktree = join(anchor, "..", "wt", "login");
     writeFileSync(paths.socketPath, "");
     writeFileSync(
@@ -2113,13 +2129,13 @@ describe("runAttach — attach to a running instance", () => {
     const derivedId = idFor(tmp.worktreeRoot, worktreeId);
     const paths = {
       configPath: join(tmp.anchor, "devtrees", `${derivedId}.yaml`),
-      socketPath: join(tmp.anchor, "devtrees", "run", `${derivedId}.sock`),
+      socketPath: instancePaths(tmp.anchor, derivedId).socketPath,
     };
     // Mimic a running instance: the control socket file exists.
     mkdtempSync(join(tmpdir(), "dt-noop-")); // (no-op; keep symmetric with other tests)
     // Use the actual path layout — create the directory and socket file.
     const { mkdirSync } = await import("node:fs");
-    mkdirSync(join(tmp.anchor, "devtrees", "run"), { recursive: true });
+    mkdirSync(runDir(tmp.anchor), { recursive: true });
     writeFileSync(paths.socketPath, "");
 
     const track = { invocations: [] as AttachInvocation[] };
@@ -2138,8 +2154,8 @@ describe("runAttach — attach to a running instance", () => {
   it("attaches the shared instance with { shared: true }", async () => {
     const tmp = tmpAnchor();
     const { mkdirSync } = await import("node:fs");
-    const sharedSocket = join(tmp.anchor, "devtrees", "run", "shared.sock");
-    mkdirSync(join(tmp.anchor, "devtrees", "run"), { recursive: true });
+    const sharedSocket = sharedInstancePaths(tmp.anchor).socketPath;
+    mkdirSync(runDir(tmp.anchor), { recursive: true });
     writeFileSync(sharedSocket, "");
 
     const track = { invocations: [] as AttachInvocation[] };
@@ -2285,8 +2301,8 @@ describe("runPrune — reconcile instances against git worktree list", () => {
     // registry entry.
     const tmp = tmpAnchor();
     // Pre-stage the anchor state for the orphan instance.
-    mkdirSync(join(tmp.anchor, "devtrees", "run"), { recursive: true });
-    const orphanSocket = join(tmp.anchor, "devtrees", "run", "removed.sock");
+    mkdirSync(runDir(tmp.anchor), { recursive: true });
+    const orphanSocket = instancePaths(tmp.anchor, "removed").socketPath;
     const orphanConfig = join(tmp.anchor, "devtrees", "removed.yaml");
     writeFileSync(orphanSocket, "");
     writeFileSync(orphanConfig, "processes: {}\n");
@@ -2353,8 +2369,8 @@ describe("runPrune — reconcile instances against git worktree list", () => {
     // When the process-compose has already died, there is nothing to stop —
     // just leftover files to clear. The driver should not be invoked.
     const tmp = tmpAnchor();
-    mkdirSync(join(tmp.anchor, "devtrees", "run"), { recursive: true });
-    const orphanSocket = join(tmp.anchor, "devtrees", "run", "removed.sock");
+    mkdirSync(runDir(tmp.anchor), { recursive: true });
+    const orphanSocket = instancePaths(tmp.anchor, "removed").socketPath;
     const orphanConfig = join(tmp.anchor, "devtrees", "removed.yaml");
     writeFileSync(orphanSocket, "");
     writeFileSync(orphanConfig, "processes: {}\n");
@@ -2421,9 +2437,9 @@ describe("runPrune — reconcile instances against git worktree list", () => {
     // socket already half-dead), prune still removes anchor state and moves
     // on. The whole point of prune is to reclaim stale state.
     const tmp = tmpAnchor();
-    mkdirSync(join(tmp.anchor, "devtrees", "run"), { recursive: true });
-    const a = join(tmp.anchor, "devtrees", "run", "alpha.sock");
-    const b = join(tmp.anchor, "devtrees", "run", "beta.sock");
+    mkdirSync(runDir(tmp.anchor), { recursive: true });
+    const a = instancePaths(tmp.anchor, "alpha").socketPath;
+    const b = instancePaths(tmp.anchor, "beta").socketPath;
     writeFileSync(a, "");
     writeFileSync(b, "");
     writeFileSync(join(tmp.anchor, "devtrees", "alpha.yaml"), "");
@@ -2544,8 +2560,8 @@ describe("runPrune — reconcile instances against git worktree list", () => {
    */
   function reapFixture(status: "running" | "stale") {
     const tmp = tmpAnchor();
-    mkdirSync(join(tmp.anchor, "devtrees", "run"), { recursive: true });
-    const orphanSocket = join(tmp.anchor, "devtrees", "run", "removed.sock");
+    mkdirSync(runDir(tmp.anchor), { recursive: true });
+    const orphanSocket = instancePaths(tmp.anchor, "removed").socketPath;
     const orphanConfig = join(tmp.anchor, "devtrees", "removed.yaml");
     const goneWorktree = join(tmp.worktreeRoot, "removed");
     writeFileSync(orphanSocket, "");
@@ -2878,9 +2894,9 @@ function writeDerivedConfig(
 
 /** Touch the control socket file so existence checks pass. */
 function touchSocket(anchor: string, fileStem: string): string {
-  const runDir = join(anchor, "devtrees", "run");
-  mkdirSync(runDir, { recursive: true });
-  const path = join(runDir, `${fileStem}.sock`);
+  const dir = runDir(anchor);
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, `${fileStem}.sock`);
   writeFileSync(path, "");
   return path;
 }
@@ -4114,9 +4130,9 @@ describe("runUp / runEnv — shared port map persistence & drift (#83)", () => {
     const fixture = multiWorktreeFixture("dt-legacy-");
     // Simulate a shared instance started by an older devtrees: socket on
     // disk, no shared-state.json.
-    const runDir = join(fixture.sharedAnchor, "devtrees", "run");
-    mkdirSync(runDir, { recursive: true });
-    writeFileSync(join(runDir, "shared.sock"), "");
+    const dir = runDir(fixture.sharedAnchor);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "shared.sock"), "");
 
     const result = await runUp(worktreeDeps(fixture, stackA, "login"));
     expect(result.sharedStarted).toBe(false);
@@ -4164,6 +4180,65 @@ describe("runUp / runEnv — shared port map persistence & drift (#83)", () => {
  * the liveness-check → config-write → spawn → socket-wait window, so the
  * loser observes the winner's live instance and takes the idempotency path.
  */
+describe("runUp — control socket path length guard (issue #156)", () => {
+  const oneIsolatedService: ResolvedStack = {
+    services: [isolated("web", "node server.js", ["WEB_PORT"])],
+  };
+
+  /** Run `fn` with DEVTREES_RUNTIME_DIR pointed at `dir`, then restore it. */
+  async function withRuntimeDir(dir: string, fn: () => Promise<void>): Promise<void> {
+    const previous = process.env["DEVTREES_RUNTIME_DIR"];
+    process.env["DEVTREES_RUNTIME_DIR"] = dir;
+    try {
+      await fn();
+    } finally {
+      if (previous === undefined) delete process.env["DEVTREES_RUNTIME_DIR"];
+      else process.env["DEVTREES_RUNTIME_DIR"] = previous;
+    }
+  }
+
+  it("fails with SOCKET_PATH_TOO_LONG instead of spawning a doomed process-compose", async () => {
+    // Before #156 an over-long socket path made process-compose exit without
+    // binding and without saying why; `up` then reported an unrelated
+    // socket-wait timeout, which is what issue #154 misdiagnosed. The guard
+    // has to fire before the spawn and name the real cause.
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const deps = stubDeps({ stack: oneIsolatedService, track });
+
+    await withRuntimeDir(`/tmp/${"d".repeat(120)}`, async () => {
+      await expect(runUp(deps)).rejects.toThrow(/unix-socket limit/);
+    });
+
+    // Nothing was spawned: the failure is a pre-flight, not a dead instance.
+    expect(track.invocations).toHaveLength(0);
+  });
+
+  it("tags the failure with the SOCKET_PATH_TOO_LONG code and an actionable envelope", async () => {
+    const deps = stubDeps({ stack: oneIsolatedService });
+
+    await withRuntimeDir(`/tmp/${"d".repeat(120)}`, async () => {
+      const err = (await runUp(deps).catch((e: unknown) => e)) as Error & {
+        code?: string;
+        details?: { max_bytes?: number; runtime_dir_env?: string };
+      };
+      expect(err.code).toBe("SOCKET_PATH_TOO_LONG");
+      expect(err.details?.max_bytes).toBe(SOCKET_PATH_MAX_BYTES);
+      expect(err.details?.runtime_dir_env).toBe("DEVTREES_RUNTIME_DIR");
+    });
+  });
+
+  it("starts normally once the runtime dir is short enough", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const deps = stubDeps({ stack: oneIsolatedService, track });
+
+    const result = await runUp(deps);
+
+    expect(result.worktreeId).toBe(deps.expectedWorktreeId);
+    expect(Buffer.byteLength(result.socketPath)).toBeLessThanOrEqual(SOCKET_PATH_MAX_BYTES);
+    expect(track.invocations).toHaveLength(1);
+  });
+});
+
 describe("runUp — per-worktree lifecycle lock (issue #91)", () => {
   const oneIsolated: ResolvedStack = {
     services: [isolated("web", "node server.js", ["WEB_PORT"])],
@@ -4227,7 +4302,7 @@ describe("runUp — per-worktree lifecycle lock (issue #91)", () => {
     });
     // Fake an already-live instance: socket file present + probe says running.
     const socketPath = instancePaths(tmp.anchor, base.expectedWorktreeId).socketPath;
-    mkdirSync(join(tmp.anchor, "devtrees", "run"), { recursive: true });
+    mkdirSync(runDir(tmp.anchor), { recursive: true });
     writeFileSync(socketPath, "");
 
     const currentHashStore: Record<string, string> = {};

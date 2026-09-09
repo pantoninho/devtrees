@@ -39,9 +39,10 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { deriveWorktreeId } from "./anchor.js";
+import { instancePaths, runDir } from "./paths.js";
 
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
 // Assembled with `join` (not a URL literal) so static analysis doesn't treat
@@ -103,6 +104,20 @@ afterEach(async () => {
   }
 });
 
+/**
+ * What a scenario hands back: the worktree, its derived id, and the on-disk
+ * locations the assertions poke at. `anchor`/`stateDir` and `sock` are two
+ * different places since #156 — durable state stays in the git dir, the
+ * control socket lives in the short runtime run dir.
+ */
+interface Scenario {
+  readonly wt: string;
+  readonly id: string;
+  readonly anchor: string;
+  readonly sock: string;
+  readonly stateDir: string;
+}
+
 interface CliResult {
   readonly code: number;
   readonly stdout: string;
@@ -143,10 +158,7 @@ function devtrees(
  * --shared` cleanups, and returns the derived worktree id and control-socket
  * path so scenarios can assert against runtime state on disk.
  */
-function setupScenario(
-  prefix: string,
-  opts: { webProbe?: boolean } = {},
-): { wt: string; id: string; sock: string } {
+function setupScenario(prefix: string, opts: { webProbe?: boolean } = {}): Scenario {
   const webProbe = opts.webProbe ?? true;
   const scenario = setupRepoWithStack(
     prefix,
@@ -183,7 +195,7 @@ function setupScenario(
  * must start only `web` and must NOT HEALTH_TIMEOUT on the probed `api`,
  * which is excluded and never started. Returns the worktree id + socket path.
  */
-function setupNamespaceScenario(prefix: string): { wt: string; id: string; sock: string } {
+function setupNamespaceScenario(prefix: string): Scenario {
   return setupRepoWithStack(
     prefix,
     [
@@ -215,10 +227,7 @@ function setupNamespaceScenario(prefix: string): { wt: string; id: string; sock:
  * stack has a shared tier) and returns the derived worktree id + control-socket
  * path so scenarios can assert against on-disk runtime state.
  */
-function setupRepoWithStack(
-  prefix: string,
-  devtreesYaml: string,
-): { wt: string; id: string; sock: string } {
+function setupRepoWithStack(prefix: string, devtreesYaml: string): Scenario {
   const root = mkdtempSync(join(SHORT_TMP, prefix));
   const seed = join(root, "main");
   mkdirSync(seed, { recursive: true });
@@ -239,7 +248,8 @@ function setupRepoWithStack(
   const id = deriveWorktreeId(git(wt, "rev-parse", "--show-toplevel"));
   const common = git(wt, "rev-parse", "--git-common-dir");
   const absCommon = common.startsWith("/") ? common : join(wt, common);
-  return { wt, id, sock: join(absCommon, "devtrees", "run", `${id}.sock`) };
+  const paths = instancePaths(absCommon, id);
+  return { wt, id, anchor: absCommon, sock: paths.socketPath, stateDir: paths.stateDir };
 }
 
 interface UpDoc {
@@ -349,10 +359,9 @@ describe("built CLI e2e — argv→commands wiring over the stub process-compose
   }, 60_000);
 
   it("up --dry-run --json previews the config(s) + env with NO side effects (#124)", () => {
-    const { wt, id, sock } = setupScenario("dt-bcdry-");
-    // <absCommon>/devtrees holds the per-instance configs, registry, and the
-    // `run/` socket dir. sock = <devtreesDir>/run/<id>.sock.
-    const devtreesDir = dirname(dirname(sock));
+    const { wt, id, anchor, sock, stateDir: devtreesDir } = setupScenario("dt-bcdry-");
+    // <absCommon>/devtrees holds the per-instance configs and the registry;
+    // the control socket lives in the short runtime run dir (#156).
     const wtConfig = join(devtreesDir, `${id}.yaml`);
     const sharedConfig = join(devtreesDir, "shared.yaml");
 
@@ -383,10 +392,11 @@ describe("built CLI e2e — argv→commands wiring over the stub process-compose
     expect(existsSync(wtConfig), "no worktree config written").toBe(false);
     expect(existsSync(sharedConfig), "no shared config written").toBe(false);
     expect(existsSync(sock), "no control socket created").toBe(false);
-    // If devtrees/ exists at all (the allocation registry), it has no
-    // per-instance run sockets in it.
-    if (existsSync(join(devtreesDir, "run"))) {
-      expect(readdirSync(join(devtreesDir, "run"))).toEqual([]);
+    // The run dir lives outside the git dir since #156; if it exists at all
+    // (another instance of this repo), it holds no socket for this dry run.
+    const runDirPath = runDir(anchor);
+    if (existsSync(runDirPath)) {
+      expect(readdirSync(runDirPath)).not.toContain(`${id}.sock`);
     }
 
     // ls still shows nothing — the dry run registered no instance.
@@ -409,7 +419,12 @@ describe("built CLI e2e — argv→commands wiring over the stub process-compose
     // `namespace` on it is rejected at resolution time. Exercised through
     // `up --dry-run --json` — a resolve-only path — so the envelope must carry
     // CONFIG_INVALID (not UNKNOWN) and produce no config/socket side effects.
-    const { wt, id, sock } = setupRepoWithStack(
+    const {
+      wt,
+      id,
+      sock,
+      stateDir: devtreesDir,
+    } = setupRepoWithStack(
       "dt-bcns-",
       [
         "services:",
@@ -420,8 +435,6 @@ describe("built CLI e2e — argv→commands wiring over the stub process-compose
         "",
       ].join("\n"),
     );
-    const devtreesDir = dirname(dirname(sock));
-
     const dry = devtrees(wt, ["up", "--dry-run", "--json"]);
     expect(dry.code, `expected a non-zero exit; stdout=${dry.stdout}`).not.toBe(0);
     const err = (dry.doc as ErrorDoc).error;

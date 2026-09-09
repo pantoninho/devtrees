@@ -32,6 +32,7 @@ import { createServer } from "node:net";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { deriveWorktreeId } from "./anchor.js";
+import { instancePaths } from "./paths.js";
 
 // ---------------------------------------------------------------------------
 // Gating: skip the whole file unless the env var is set AND the binary works.
@@ -506,7 +507,7 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
     // Real-binary assertion: the worktree socket exists on disk.
     const commonDir = execGit(wt, ["rev-parse", "--git-common-dir"]);
     const absCommon = commonDir.startsWith("/") ? commonDir : join(wt, commonDir);
-    expect(existsSync(join(absCommon, "devtrees", "run", `${wtId(wt)}.sock`))).toBe(true);
+    expect(existsSync(instancePaths(absCommon, wtId(wt)).socketPath)).toBe(true);
   }, 90_000);
 
   it("scenario 2: re-up is idempotent — shared_started:false, same block_base", async () => {

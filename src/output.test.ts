@@ -50,6 +50,10 @@ describe("output formatter — constants", () => {
   it("declares SHARED_DRIFT so #83's shared-subset drift routes via the typed-code short-circuit", () => {
     expect(ERROR_CODES).toContain("SHARED_DRIFT");
   });
+
+  it("declares SOCKET_PATH_TOO_LONG so #156's over-long sun_path is discoverable, not silent", () => {
+    expect(ERROR_CODES).toContain("SOCKET_PATH_TOO_LONG");
+  });
 });
 
 describe("output formatter — classifyError", () => {

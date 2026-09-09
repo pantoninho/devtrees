@@ -14,12 +14,13 @@ import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 import { deriveWorktreeId } from "./anchor.js";
 import { runAttach, runDown, runLs, runPrune, runUp } from "./commands.js";
+import { instancePaths, runDir, sharedInstancePaths } from "./paths.js";
 
-// Unix domain socket paths are capped (~104 bytes on macOS, ~108 on Linux). The
-// control socket lives at `<git-common-dir>/devtrees/run/<id>.sock`, so the temp
-// repo must be rooted shallowly enough that the socket path fits. The OS tmpdir
-// (e.g. macOS `/var/folders/.../T`) is already deep enough to overflow, so we use
-// a short, fixed base dir instead.
+// Unix domain socket paths are capped (~104 bytes on macOS, ~108 on Linux).
+// Since #156 the control socket lives under a short runtime dir rather than the
+// git dir, so the repo's own depth no longer decides whether it fits — but the
+// temp repo still holds the derived configs and logs, and a short, fixed base
+// keeps the fixtures readable (the OS tmpdir on macOS is `/var/folders/.../T`).
 const SHORT_TMP = process.platform === "darwin" ? "/tmp" : (process.env.RUNNER_TEMP ?? "/tmp");
 
 const STUB = fileURLToPath(new URL("../test/stub-process-compose.mjs", import.meta.url));
@@ -352,7 +353,7 @@ describe("e2e — shared instance lifecycle across two worktrees", () => {
     // The shared socket lives at <anchor>/devtrees/run/shared.sock.
     const commonDir = git(loginWt, "rev-parse", "--git-common-dir");
     const absCommon = commonDir.startsWith("/") ? commonDir : join(loginWt, commonDir);
-    const sharedSocket = join(absCommon, "devtrees", "run", "shared.sock");
+    const sharedSocket = sharedInstancePaths(absCommon).socketPath;
     expect(existsSync(sharedSocket)).toBe(true);
 
     // Acceptance: a second worktree up reuses the running shared instance.
@@ -405,7 +406,7 @@ describe("e2e — shared instance lifecycle across two worktrees", () => {
     const deps = stubDriverDeps(loginWt);
     const commonDir = git(loginWt, "rev-parse", "--git-common-dir");
     const absCommon = commonDir.startsWith("/") ? commonDir : join(loginWt, commonDir);
-    const sharedSocket = join(absCommon, "devtrees", "run", "shared.sock");
+    const sharedSocket = sharedInstancePaths(absCommon).socketPath;
 
     const first = await runUp(deps as never);
     cleanups.push(async () => {
@@ -463,7 +464,7 @@ describe("e2e — shared instance lifecycle across two worktrees", () => {
     const deps = stubDriverDeps(loginWt);
     const commonDir = git(loginWt, "rev-parse", "--git-common-dir");
     const absCommon = commonDir.startsWith("/") ? commonDir : join(loginWt, commonDir);
-    const sharedSocket = join(absCommon, "devtrees", "run", "shared.sock");
+    const sharedSocket = sharedInstancePaths(absCommon).socketPath;
 
     const first = await runUp(deps as never);
     cleanups.push(async () => {
@@ -876,7 +877,7 @@ describe("e2e — devtrees prune reconciles against git worktree list", () => {
     // Pre-state: both instances visible at the anchor.
     const commonDir = git(billingWt, "rev-parse", "--git-common-dir");
     const absCommon = commonDir.startsWith("/") ? commonDir : join(billingWt, commonDir);
-    const loginSocket = join(absCommon, "devtrees", "run", `${login.worktreeId}.sock`);
+    const loginSocket = instancePaths(absCommon, login.worktreeId).socketPath;
     const loginConfig = join(absCommon, "devtrees", `${login.worktreeId}.yaml`);
     expect(existsSync(loginSocket)).toBe(true);
     expect(existsSync(loginConfig)).toBe(true);
@@ -901,7 +902,7 @@ describe("e2e — devtrees prune reconciles against git worktree list", () => {
 
     // Acceptance: the surviving instance is still up.
     expect(await waitForHttp(Number(billing.env.WEB_PORT))).toBe(true);
-    const billingSocket = join(absCommon, "devtrees", "run", `${billing.worktreeId}.sock`);
+    const billingSocket = instancePaths(absCommon, billing.worktreeId).socketPath;
     expect(existsSync(billingSocket)).toBe(true);
 
     // Acceptance: a follow-up prune is a no-op (idempotent).
@@ -977,7 +978,7 @@ describe("e2e — attach to a running worktree instance", () => {
     // `<socket>.attached` marker.
     const commonDir = git(worktree, "rev-parse", "--git-common-dir");
     const absCommon = commonDir.startsWith("/") ? commonDir : join(worktree, commonDir);
-    const sock = join(absCommon, "devtrees", "run", `${up.worktreeId}.sock`);
+    const sock = instancePaths(absCommon, up.worktreeId).socketPath;
     expect(existsSync(sock)).toBe(true);
 
     await runAttach(deps as never);
@@ -1048,7 +1049,7 @@ describe("e2e — teardown-leak invariant: stub parents and children are reaped 
     // records the service pids alongside the socket.
     const commonDir = git(worktree, "rev-parse", "--git-common-dir");
     const absCommon = commonDir.startsWith("/") ? commonDir : join(worktree, commonDir);
-    const sock = join(absCommon, "devtrees", "run", `${up.worktreeId}.sock`);
+    const sock = instancePaths(absCommon, up.worktreeId).socketPath;
     const recordedChildPids = JSON.parse(readFileSync(`${sock}.pids`, "utf8")) as number[];
     const stubParents = pgrepFull(sock);
     const ourPids = Array.from(new Set([...stubParents, ...recordedChildPids]));
@@ -1091,9 +1092,9 @@ describe("e2e — teardown-leak invariant: stub parents and children are reaped 
     // tags each stub parent; the stub records its service pids next to it.
     const commonDir = git(worktree, "rev-parse", "--git-common-dir");
     const absCommon = commonDir.startsWith("/") ? commonDir : join(worktree, commonDir);
-    const runDir = join(absCommon, "devtrees", "run");
-    const wtSock = join(runDir, `${up.worktreeId}.sock`);
-    const sharedSock = join(runDir, "shared.sock");
+    const dir = runDir(absCommon);
+    const wtSock = join(dir, `${up.worktreeId}.sock`);
+    const sharedSock = join(dir, "shared.sock");
     const childPids = [
       ...(JSON.parse(readFileSync(`${wtSock}.pids`, "utf8")) as number[]),
       ...(JSON.parse(readFileSync(`${sharedSock}.pids`, "utf8")) as number[]),
@@ -1155,7 +1156,7 @@ describe("e2e — attach to the shared instance", () => {
 
     const commonDir = git(worktree, "rev-parse", "--git-common-dir");
     const absCommon = commonDir.startsWith("/") ? commonDir : join(worktree, commonDir);
-    const sharedSock = join(absCommon, "devtrees", "run", "shared.sock");
+    const sharedSock = sharedInstancePaths(absCommon).socketPath;
     expect(existsSync(sharedSock)).toBe(true);
 
     await runAttach(deps as never, { shared: true });
@@ -1336,7 +1337,7 @@ describe("e2e — crash recovery: stale control sockets (#80)", () => {
       opts.socketName ?? `${deriveWorktreeId(git(worktree, "rev-parse", "--show-toplevel"))}.sock`;
     return {
       deps: stubDriverDeps(worktree),
-      socketPath: join(absCommon, "devtrees", "run", socketName),
+      socketPath: join(runDir(absCommon), socketName),
     };
   }
 
@@ -1564,7 +1565,7 @@ describe("e2e — prune reaps out-of-band resources via the shutdown hook from a
     // dead-supervisor path where `runPrune`'s old gate skipped `down` entirely.
     const commonDir = git(billingWt, "rev-parse", "--git-common-dir");
     const absCommon = commonDir.startsWith("/") ? commonDir : join(billingWt, commonDir);
-    const loginSocket = join(absCommon, "devtrees", "run", `${login.worktreeId}.sock`);
+    const loginSocket = instancePaths(absCommon, login.worktreeId).socketPath;
     const parentPid = Number(readFileSync(`${loginSocket}.parent-pid`, "utf8"));
     const childPids = JSON.parse(readFileSync(`${loginSocket}.pids`, "utf8")) as number[];
     process.kill(parentPid, "SIGKILL");

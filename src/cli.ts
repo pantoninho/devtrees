@@ -289,6 +289,7 @@ class UpCommand extends DevtreesCommand {
       "CONFIG_DRIFT",
       "SHARED_DRIFT",
       "SHARED_START_FAILED",
+      "SOCKET_PATH_TOO_LONG",
       "CONFIG_INVALID",
       "LOCK_CONTENTION",
       "HEALTH_TIMEOUT",

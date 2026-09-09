@@ -2,9 +2,10 @@
  * Instance discovery.
  *
  * Enumerates every devtrees instance — each worktree's and the shared one —
- * across the repo by listing control sockets under the anchor's run dir
- * (`<anchor>/devtrees/run/*.sock`). There is no central daemon and no PID
- * registry: the on-disk socket is the only authoritative liveness marker, so
+ * across the repo by listing control sockets under the repo's run dir
+ * (`<runtime-base>/devtrees-<uid>/<anchor-hash>/*.sock` since #156, ADR-0007).
+ * There is no central daemon and no PID registry: the on-disk socket is the
+ * only authoritative liveness marker, so
  * discovery is the same primitive `devtrees ls` reads to render its table and
  * `devtrees prune` (#9) walks to reconcile against `git worktree list`.
  *
@@ -26,7 +27,13 @@ import { parse as parseYaml } from "yaml";
 import { DEVTREES_METADATA_KEY } from "./deriver.js";
 import type { ServiceStatus } from "./driver.js";
 import { readRegistry } from "./registry.js";
-import { SHARED_INSTANCE_ID, SHARED_REGISTRY_KEY, instancePaths, stateDir } from "./paths.js";
+import {
+  SHARED_INSTANCE_ID,
+  SHARED_REGISTRY_KEY,
+  instancePaths,
+  legacyRunDir,
+  runDir,
+} from "./paths.js";
 
 /** Whether an instance hosts the shared services or one worktree's isolated ones. */
 export type InstanceKind = "worktree" | "shared";
@@ -114,13 +121,39 @@ function kindFor(socketStem: string): InstanceKind {
   return socketStem === SHARED_INSTANCE_ID ? "shared" : "worktree";
 }
 
-/** Read every `*.sock` filename stem under the anchor's run dir, sorted. */
-function listSocketStems(anchor: string): string[] {
-  const runDir = join(stateDir(anchor), "run");
-  if (!existsSync(runDir)) return [];
-  return readdirSync(runDir)
+/** One control socket found on disk: its filename stem and where it actually is. */
+interface DiscoveredSocket {
+  readonly stem: string;
+  readonly socketPath: string;
+}
+
+/** Read every `*.sock` filename stem in `dir`, or `[]` when the dir is absent. */
+function readSocketStems(dir: string): string[] {
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir)
     .filter((entry) => entry.endsWith(".sock"))
     .map((entry) => entry.slice(0, -".sock".length));
+}
+
+/**
+ * Find every control socket for `anchor`, canonical location first.
+ *
+ * Since #156 devtrees binds sockets under a short runtime dir (ADR-0007); the
+ * pre-#156 location (`<anchor>/devtrees/run`) is still *read* so an instance
+ * started by an older devtrees stays visible to `ls` and reclaimable by
+ * `prune` across the upgrade instead of turning into an invisible orphan.
+ * Nothing is ever written there again, and a stem present in both places
+ * resolves to the canonical path — the legacy file is then a leftover, not a
+ * live instance.
+ */
+function listSockets(anchor: string): DiscoveredSocket[] {
+  const found = new Map<string, string>();
+  for (const dir of [runDir(anchor), legacyRunDir(anchor)]) {
+    for (const stem of readSocketStems(dir)) {
+      if (!found.has(stem)) found.set(stem, join(dir, `${stem}.sock`));
+    }
+  }
+  return [...found].map(([stem, socketPath]) => ({ stem, socketPath }));
 }
 
 /**
@@ -308,21 +341,21 @@ export async function discoverInstances(
   anchor: string,
   deps: DiscoverDeps = {},
 ): Promise<InstanceInfo[]> {
-  const stems = listSocketStems(anchor);
-  if (stems.length === 0) return [];
+  const sockets = listSockets(anchor);
+  if (sockets.length === 0) return [];
 
   const registry = readRegistry(anchor);
 
   const infos = await Promise.all(
-    stems.map(async (stem): Promise<InstanceInfo> => {
+    sockets.map(async ({ stem, socketPath }): Promise<InstanceInfo> => {
       const paths = instancePaths(anchor, stem);
-      const status = await probeSocket(paths.socketPath);
+      const status = await probeSocket(socketPath);
       const blockBase = registry[registryKeyFor(stem)];
       const configDoc = readDerivedConfig(paths.configPath);
       const services =
         status === "running" && deps.getServiceStatuses
           ? buildServices(
-              await safeGetServiceStatuses(paths.socketPath, deps.getServiceStatuses),
+              await safeGetServiceStatuses(socketPath, deps.getServiceStatuses),
               readPortsByService(configDoc),
             )
           : [];
@@ -330,7 +363,7 @@ export async function discoverInstances(
         id: stem,
         kind: kindFor(stem),
         status,
-        socketPath: paths.socketPath,
+        socketPath,
         ports: flattenPorts(readPortsByProcess(configDoc)),
         blockBase,
         services,
