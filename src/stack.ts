@@ -31,6 +31,27 @@ import { DEFAULT_ALLOCATOR, MAX_PORT } from "./allocator.js";
 /** A service's tier: where devtrees runs it. Defaults to `isolated`. */
 export type Tier = "isolated" | "shared";
 
+/**
+ * One normalized `depends_on` edge: the target service, plus the
+ * process-compose `condition` the author gated it on when they used the map
+ * form (`{ api: { condition: process_healthy } }`).
+ *
+ * `condition` is absent when the author used the array shorthand (`[api]`) or
+ * a map entry with no condition (`{ api: {} }`, `{ api: null }`); the deriver
+ * then emits process-compose's own default, `process_started` — same
+ * behaviour as before conditions were preserved (#158).
+ *
+ * The value is passed through verbatim and never checked against an allowlist:
+ * process-compose owns the vocabulary of conditions, exactly as it owns the
+ * inner shape of the probe blocks, so a condition devtrees has never heard of
+ * still reaches it (and an invalid one is rejected there, with its message).
+ */
+export interface ServiceDependency {
+  readonly name: string;
+  /** Verbatim process-compose condition, e.g. `process_healthy`. Absent = the default. */
+  readonly condition?: string;
+}
+
 /** A single normalized service in the stack. */
 export interface ResolvedService {
   readonly name: string;
@@ -38,7 +59,7 @@ export interface ResolvedService {
   /** Verbatim env-var names this service exposes as named ports, e.g. `["WEB_PORT"]`. */
   readonly ports: ReadonlyArray<string>;
   readonly command: string;
-  readonly dependsOn: ReadonlyArray<string>;
+  readonly dependsOn: ReadonlyArray<ServiceDependency>;
   /** Author-declared environment entries, `KEY=VALUE`, passed through untouched. */
   readonly environment: ReadonlyArray<string>;
   /**
@@ -330,18 +351,45 @@ function resolveScalarPassthrough(
 }
 
 /**
- * Normalize a `depends_on` field into a list of dependency names. Accepts:
- *  - the array shorthand `[a, b]`
+ * Normalize a `depends_on` field into a list of edges. Accepts:
+ *  - the array shorthand `[a, b]` — no condition, so the deriver emits
+ *    process-compose's default `process_started` for each;
  *  - the canonical process-compose map form `{ a: { condition: ... }, b: ... }`
- * Conditions are not surfaced here — same-tier edges flow through to process-compose
- * unchanged (deriver re-emits them), and cross-tier edges are dropped (ADR-0003).
+ *    — an authored `condition` is preserved verbatim on the edge.
+ *
+ * Same-tier edges flow through to process-compose with their condition intact
+ * (the deriver re-emits them, filling in the default when none was authored);
+ * cross-tier edges — condition or not — are dropped and resolved at the
+ * orchestration layer instead (ADR-0003). Before #158 the condition was parsed
+ * and discarded, so a health-gated edge was silently downgraded to
+ * `process_started`.
  */
-function asDependencyList(value: unknown): string[] {
-  if (Array.isArray(value)) return value.map(asString).filter((n) => n !== "");
+function asDependencyList(value: unknown): ServiceDependency[] {
+  if (Array.isArray(value)) {
+    return value
+      .map(asString)
+      .filter((name) => name !== "")
+      .map((name) => ({ name }));
+  }
   if (value !== null && typeof value === "object") {
-    return Object.keys(value as Record<string, unknown>);
+    return Object.entries(value as Record<string, unknown>).map(([name, spec]) => {
+      const condition = asDependencyCondition(spec);
+      return condition === undefined ? { name } : { name, condition };
+    });
   }
   return [];
+}
+
+/**
+ * Pull the `condition` out of one `depends_on` map entry, or `undefined` when
+ * the entry declares none (`{}`, `null`, a non-object) — those keep the
+ * process-compose default. The value is not validated against an allowlist:
+ * unknown conditions are process-compose's to reject.
+ */
+function asDependencyCondition(spec: unknown): string | undefined {
+  if (spec === null || typeof spec !== "object") return undefined;
+  const raw = (spec as { condition?: unknown }).condition;
+  return typeof raw === "string" && raw !== "" ? raw : undefined;
 }
 
 /** Optional inputs to `parseStack`, currently the extend-mode base config. */
@@ -525,11 +573,11 @@ function validateStack(stack: ResolvedStack): void {
       );
     }
     for (const dep of service.dependsOn) {
-      if (tierOf.get(dep) === "isolated") {
+      if (tierOf.get(dep.name) === "isolated") {
         throw new StackConfigError(
-          `shared service '${service.name}' cannot depends_on isolated service '${dep}': ` +
+          `shared service '${service.name}' cannot depends_on isolated service '${dep.name}': ` +
             `a shared service is a single instance and an isolated service has one copy per worktree, ` +
-            `so the dependency is undefined. Either move '${dep}' to the shared tier or drop the edge.`,
+            `so the dependency is undefined. Either move '${dep.name}' to the shared tier or drop the edge.`,
         );
       }
     }

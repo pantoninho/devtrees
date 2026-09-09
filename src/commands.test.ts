@@ -52,7 +52,7 @@ import {
 } from "./paths.js";
 import { sharedStackHash } from "./hash.js";
 import { readSharedState } from "./shared-state.js";
-import type { ResolvedStack } from "./stack.js";
+import type { ResolvedStack, ServiceDependency } from "./stack.js";
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
@@ -66,7 +66,14 @@ function service(
   ports: string[] = [],
   tier: "isolated" | "shared" = "isolated",
 ) {
-  return { name, tier, command, ports, dependsOn: [] as string[], environment: [] as string[] };
+  return {
+    name,
+    tier,
+    command,
+    ports,
+    dependsOn: [] as ServiceDependency[],
+    environment: [] as string[],
+  };
 }
 const isolated = (name: string, command: string, ports: string[] = []) =>
   service(name, command, ports, "isolated");
@@ -788,7 +795,7 @@ describe("runUp — cross-tier wiring (ADR-0003)", () => {
         tier: "isolated",
         command: "node server.js",
         ports: ["WEB_PORT"],
-        dependsOn: ["postgres"],
+        dependsOn: [{ name: "postgres" }],
         environment: [],
       },
       {
@@ -915,7 +922,7 @@ describe("runUp — cross-tier wiring (ADR-0003)", () => {
           tier: "isolated",
           command: "node web.js",
           ports: ["WEB_PORT"],
-          dependsOn: ["api"],
+          dependsOn: [{ name: "api" }],
           environment: [],
         },
       ],
@@ -1039,7 +1046,7 @@ describe("runUp — wait-for-healthy (worktree instance, #28)", () => {
           tier: "isolated",
           command: "node server.js",
           ports: ["WEB_PORT"],
-          dependsOn: ["postgres"],
+          dependsOn: [{ name: "postgres" }],
           environment: [],
         },
         {

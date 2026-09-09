@@ -23,7 +23,7 @@
 
 import { join } from "node:path";
 import { SHARED_INSTANCE_ID, logsDir } from "./paths.js";
-import type { ResolvedStack, Tier } from "./stack.js";
+import type { ResolvedStack, ServiceDependency, Tier } from "./stack.js";
 
 /** Env-var name devtrees injects the stable worktree id under. */
 const WORKTREE_ID_ENV = "DEVTREES_WORKTREE_ID";
@@ -341,7 +341,7 @@ function buildTierProcesses(input: {
     name: string;
     command: string;
     environment: ReadonlyArray<string>;
-    dependsOn: ReadonlyArray<string>;
+    dependsOn: ReadonlyArray<ServiceDependency>;
     readinessProbe?: Readonly<Record<string, unknown>>;
     livenessProbe?: Readonly<Record<string, unknown>>;
     availability?: Readonly<Record<string, unknown>>;
@@ -471,40 +471,50 @@ function buildTierIndex(stack: ResolvedStack): Map<string, Tier> {
 }
 
 /**
- * Split a service's `depends_on` list into edges to keep (same-tier, named
- * target exists) and edges to drop (cross-tier). Targets that aren't in the
+ * Split a service's `depends_on` edges into ones to keep (same-tier, named
+ * target exists) and ones to drop (cross-tier). Targets that aren't in the
  * stack at all are silently skipped: this slice rejects neither nor relays
  * them; a future "dangling deps" pass can lift them out.
+ *
+ * Kept edges carry their authored condition through unchanged (#158) — the
+ * split must not flatten an edge back to a bare name. Dropped edges lose it
+ * with the rest of the edge; the orchestration-layer shared-health wait
+ * (ADR-0003) is the stand-in, and the drop is warned about at `up`.
  */
 function partitionDependsOn(
   from: string,
   fromTier: Tier,
-  deps: ReadonlyArray<string>,
+  deps: ReadonlyArray<ServiceDependency>,
   tierIndex: Map<string, Tier>,
-): { kept: string[]; dropped: DroppedEdge[] } {
-  const kept: string[] = [];
+): { kept: ServiceDependency[]; dropped: DroppedEdge[] } {
+  const kept: ServiceDependency[] = [];
   const dropped: DroppedEdge[] = [];
-  for (const to of deps) {
-    const toTier = tierIndex.get(to);
+  for (const dep of deps) {
+    const toTier = tierIndex.get(dep.name);
     if (toTier === undefined) continue; // dangling; skip silently for now
     if (toTier === fromTier) {
-      kept.push(to);
+      kept.push(dep);
     } else {
-      dropped.push({ from, to, fromTier, toTier });
+      dropped.push({ from, to: dep.name, fromTier, toTier });
     }
   }
   return { kept, dropped };
 }
 
-/** Attach a `depends_on` map keyed by `kept` names, or omit the field when empty. */
+/**
+ * Attach a `depends_on` map keyed by the `kept` edges' names, or omit the field
+ * when empty. Each edge keeps the condition its author wrote; an edge with no
+ * authored condition (the array shorthand, or a map entry without one) gets
+ * process-compose's default.
+ */
 function withOptionalDependsOn(
   base: Omit<DerivedProcess, "depends_on">,
-  kept: ReadonlyArray<string>,
+  kept: ReadonlyArray<ServiceDependency>,
 ): DerivedProcess {
   if (kept.length === 0) return base;
   const depends_on: Record<string, { condition: string }> = {};
-  for (const name of kept) {
-    depends_on[name] = { condition: DEFAULT_DEPENDS_ON_CONDITION };
+  for (const dep of kept) {
+    depends_on[dep.name] = { condition: dep.condition ?? DEFAULT_DEPENDS_ON_CONDITION };
   }
   return { ...base, depends_on };
 }

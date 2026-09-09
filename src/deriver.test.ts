@@ -773,7 +773,7 @@ describe("config deriver — cross-tier depends_on handling (ADR-0003)", () => {
           command: "node server.js",
           ports: ["WEB_PORT"],
           // api (isolated → same tier), postgres + cache (isolated → shared, cross-tier)
-          dependsOn: ["api", "postgres", "cache"],
+          dependsOn: [{ name: "api" }, { name: "postgres" }, { name: "cache" }],
           environment: [],
         },
         {
@@ -790,7 +790,7 @@ describe("config deriver — cross-tier depends_on handling (ADR-0003)", () => {
           command: "redis",
           ports: ["CACHE_PORT"],
           // shared → shared, same tier
-          dependsOn: ["postgres"],
+          dependsOn: [{ name: "postgres" }],
           environment: [],
         },
       ],
@@ -863,7 +863,7 @@ describe("config deriver — cross-tier depends_on handling (ADR-0003)", () => {
           tier: "isolated",
           command: "node server.js",
           ports: [],
-          dependsOn: ["postgres"],
+          dependsOn: [{ name: "postgres" }],
           environment: [],
         },
         {
@@ -899,7 +899,7 @@ describe("config deriver — cross-tier depends_on handling (ADR-0003)", () => {
           tier: "isolated",
           command: "node server.js",
           ports: [],
-          dependsOn: ["does-not-exist"],
+          dependsOn: [{ name: "does-not-exist" }],
           environment: [],
         },
       ],
@@ -912,6 +912,149 @@ describe("config deriver — cross-tier depends_on handling (ADR-0003)", () => {
     const web = derived.config.processes.web;
     if (web === undefined) throw new Error("expected 'web'");
     expect("depends_on" in web).toBe(false);
+  });
+});
+
+describe("config deriver — depends_on conditions (#158)", () => {
+  /** `web -> api` same-tier, `web -> db` cross-tier, both health-gated by the author. */
+  function conditionStack(): ResolvedStack {
+    return {
+      services: [
+        {
+          name: "api",
+          tier: "isolated",
+          command: "node api.js",
+          ports: [],
+          dependsOn: [],
+          environment: [],
+        },
+        {
+          name: "web",
+          tier: "isolated",
+          command: "node server.js",
+          ports: [],
+          dependsOn: [
+            { name: "api", condition: "process_healthy" },
+            { name: "db", condition: "process_healthy" },
+          ],
+          environment: [],
+        },
+        {
+          name: "db",
+          tier: "shared",
+          command: "postgres",
+          ports: [],
+          dependsOn: [],
+          environment: [],
+        },
+      ],
+    };
+  }
+
+  const derive = (stack: ResolvedStack) =>
+    deriveWorktreeConfig(stack, {
+      worktreeId: "login",
+      worktreeRoot: "/wt/login",
+      portFor: () => 20512,
+      sharedPortFor: () => 19000,
+    });
+
+  it("re-emits an authored condition on a same-tier edge verbatim", () => {
+    const web = derive(conditionStack()).config.processes.web;
+    if (web === undefined) throw new Error("expected 'web'");
+    expect(web.depends_on).toEqual({ api: { condition: "process_healthy" } });
+  });
+
+  it("defaults an edge with no authored condition to process_started", () => {
+    // The array shorthand and a condition-less map entry both land here.
+    const stack = conditionStack();
+    const plain: ResolvedStack = {
+      services: stack.services.map((s) =>
+        s.name === "web" ? { ...s, dependsOn: [{ name: "api" }] } : s,
+      ),
+    };
+    const web = derive(plain).config.processes.web;
+    if (web === undefined) throw new Error("expected 'web'");
+    expect(web.depends_on).toEqual({ api: { condition: "process_started" } });
+  });
+
+  it("passes a condition devtrees has never heard of straight through", () => {
+    const stack = conditionStack();
+    const exotic: ResolvedStack = {
+      services: stack.services.map((s) =>
+        s.name === "web"
+          ? { ...s, dependsOn: [{ name: "api", condition: "process_completed_successfully" }] }
+          : s,
+      ),
+    };
+    const web = derive(exotic).config.processes.web;
+    if (web === undefined) throw new Error("expected 'web'");
+    expect(web.depends_on).toEqual({ api: { condition: "process_completed_successfully" } });
+  });
+
+  it("mixes conditioned and unconditioned edges on one process", () => {
+    const stack = conditionStack();
+    const mixed: ResolvedStack = {
+      services: [
+        ...stack.services.map((s) =>
+          s.name === "web"
+            ? {
+                ...s,
+                dependsOn: [{ name: "api", condition: "process_healthy" }, { name: "worker" }],
+              }
+            : s,
+        ),
+        {
+          name: "worker",
+          tier: "isolated" as const,
+          command: "node worker.js",
+          ports: [],
+          dependsOn: [],
+          environment: [],
+        },
+      ],
+    };
+    const web = derive(mixed).config.processes.web;
+    if (web === undefined) throw new Error("expected 'web'");
+    expect(web.depends_on).toEqual({
+      api: { condition: "process_healthy" },
+      worker: { condition: "process_started" },
+    });
+  });
+
+  it("still drops a cross-tier edge even when it carries a condition (ADR-0003)", () => {
+    const derived = derive(conditionStack());
+    const web = derived.config.processes.web;
+    if (web === undefined) throw new Error("expected 'web'");
+    // The health-gated shared dep is not expressible across instances; the
+    // orchestration-layer shared-health wait stands in for it, and the drop is
+    // still reported so `up` can warn about it.
+    expect(web.depends_on?.db).toBeUndefined();
+    expect(derived.droppedEdges).toEqual([
+      { from: "web", to: "db", fromTier: "isolated", toTier: "shared" },
+    ]);
+  });
+
+  it("carries conditions from devtrees.yaml through parse and derive end-to-end", () => {
+    const stack = parseStack(`
+services:
+  a:
+    tier: isolated
+    command: "sleep 300"
+  b:
+    tier: isolated
+    command: "sleep 300"
+    depends_on:
+      a:
+        condition: process_healthy
+  c:
+    tier: isolated
+    command: "sleep 300"
+    depends_on: [a]
+`);
+    const processes = derive(stack).config.processes;
+    expect(processes.b?.depends_on).toEqual({ a: { condition: "process_healthy" } });
+    expect(processes.c?.depends_on).toEqual({ a: { condition: "process_started" } });
   });
 });
 

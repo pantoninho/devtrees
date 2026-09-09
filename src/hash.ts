@@ -11,7 +11,7 @@
  */
 
 import { createHash } from "node:crypto";
-import type { ResolvedService, ResolvedStack } from "./stack.js";
+import type { ResolvedService, ResolvedStack, ServiceDependency } from "./stack.js";
 
 /**
  * Recursively sort object keys so the JSON form of an opaque passthrough
@@ -32,13 +32,26 @@ function canonicalValue(value: unknown): unknown {
   return value;
 }
 
+/**
+ * Canonical form of one `depends_on` edge. An edge with no authored condition
+ * hashes as its bare name — exactly what it hashed as before conditions were
+ * preserved (#158) — so every stack that never used a condition keeps the hash
+ * it already has on disk and reports no spurious drift. An authored condition
+ * hashes as `{name, condition}`: it reaches the derived config verbatim, so
+ * editing it (`process_started` -> `process_healthy`) is a real config change
+ * and must register as drift.
+ */
+function canonicalDependency(dep: ServiceDependency): unknown {
+  return dep.condition === undefined ? dep.name : { name: dep.name, condition: dep.condition };
+}
+
 function canonicalService(s: ResolvedService): unknown {
   return {
     name: s.name,
     tier: s.tier,
     command: s.command,
     ports: [...s.ports],
-    dependsOn: [...s.dependsOn],
+    dependsOn: s.dependsOn.map(canonicalDependency),
     environment: [...s.environment],
     // Opaque passthrough blocks flow into the derived config, so an edit to
     // any of them must register as drift (#86). Absent blocks hash as null.

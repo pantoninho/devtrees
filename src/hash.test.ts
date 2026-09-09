@@ -1,13 +1,20 @@
 import { describe, expect, it } from "vite-plus/test";
 import { sharedStackHash, stackHash } from "./hash.js";
-import type { ResolvedStack } from "./stack.js";
+import type { ResolvedStack, ServiceDependency } from "./stack.js";
 
 const svc = (
   name: string,
   command: string,
   ports: string[] = [],
   tier: "isolated" | "shared" = "isolated",
-) => ({ name, tier, command, ports, dependsOn: [] as string[], environment: [] as string[] });
+) => ({
+  name,
+  tier,
+  command,
+  ports,
+  dependsOn: [] as ServiceDependency[],
+  environment: [] as string[],
+});
 
 describe("stackHash", () => {
   it("is deterministic for the same stack", () => {
@@ -124,6 +131,46 @@ describe("stackHash", () => {
         services: [{ ...svc("web", "node x.js"), availability: { restart: "always" } }],
       };
       expect(stackHash(a)).not.toBe(stackHash(b));
+    });
+  });
+
+  describe("depends_on conditions (#158)", () => {
+    /** `web -> api`, with whatever condition the caller passes (none by default). */
+    const stackWithEdge = (condition?: string): ResolvedStack => ({
+      services: [
+        {
+          ...svc("web", "node web.js", ["WEB_PORT"]),
+          dependsOn: [condition === undefined ? { name: "api" } : { name: "api", condition }],
+        },
+        svc("api", "node api.js"),
+      ],
+    });
+
+    it("hashes a condition-free stack exactly as it did before conditions existed", () => {
+      // Pinned against the digest produced by the pre-#158 code (`dependsOn`
+      // was a bare `string[]`) for this same stack. Every user whose stack
+      // never used a condition keeps the hash already stored next to their
+      // allocation entry — no spurious CONFIG_DRIFT on upgrade.
+      expect(stackHash(stackWithEdge())).toBe(
+        "fea226a76cf3e0dd1a2987264998d2093d3a54648307e6263db3837a7db5a28f",
+      );
+    });
+
+    it("hashes an explicit condition differently from no condition", () => {
+      // An authored condition reaches the derived config, so it is real config.
+      expect(stackHash(stackWithEdge("process_healthy"))).not.toBe(stackHash(stackWithEdge()));
+    });
+
+    it("changes when a condition is edited (process_started -> process_healthy)", () => {
+      expect(stackHash(stackWithEdge("process_healthy"))).not.toBe(
+        stackHash(stackWithEdge("process_started")),
+      );
+    });
+
+    it("is deterministic for the same conditioned stack", () => {
+      expect(stackHash(stackWithEdge("process_healthy"))).toBe(
+        stackHash(stackWithEdge("process_healthy")),
+      );
     });
   });
 });

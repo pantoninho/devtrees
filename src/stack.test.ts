@@ -505,7 +505,7 @@ services:
       tier: "isolated",
       command: "node server.js",
       ports: ["WEB_PORT"],
-      dependsOn: ["api"],
+      dependsOn: [{ name: "api" }],
       environment: ["LOG_LEVEL=debug"],
       readinessProbe: { exec: { command: "/r" } },
       livenessProbe: { exec: { command: "/l" } },
@@ -813,9 +813,10 @@ processes:
 });
 
 describe("stack model — depends_on parsing (process-compose map form)", () => {
-  it("parses depends_on map form (name -> { condition }) into a name list", () => {
-    // The canonical process-compose form is a map. Tier-aware deriving needs the
-    // dependency *names*; conditions are preserved through the derived config later.
+  it("keeps the authored condition on each edge of the map form (#158)", () => {
+    // The canonical process-compose form is a map. Conditions used to be parsed
+    // and thrown away, so a health-gated edge was silently downgraded to
+    // `process_started` in the derived config; they now ride on the edge.
     const yaml = `
 services:
   web:
@@ -827,10 +828,47 @@ services:
         condition: process_started
 `;
     const stack = parseStack(yaml);
-    expect(stack.services[0]?.dependsOn).toEqual(["postgres", "redis"]);
+    expect(stack.services[0]?.dependsOn).toEqual([
+      { name: "postgres", condition: "process_healthy" },
+      { name: "redis", condition: "process_started" },
+    ]);
   });
 
-  it("still accepts the array shorthand", () => {
+  it("passes an unknown condition through unvalidated (process-compose owns the vocabulary)", () => {
+    const yaml = `
+services:
+  web:
+    command: "node server.js"
+    depends_on:
+      postgres:
+        condition: process_completed_successfully
+`;
+    const stack = parseStack(yaml);
+    expect(stack.services[0]?.dependsOn).toEqual([
+      { name: "postgres", condition: "process_completed_successfully" },
+    ]);
+  });
+
+  it("leaves a map entry with no condition unconditioned (deriver fills the default)", () => {
+    const yaml = `
+services:
+  web:
+    command: "node server.js"
+    depends_on:
+      postgres: {}
+      redis:
+      cache:
+        condition: ""
+`;
+    const stack = parseStack(yaml);
+    expect(stack.services[0]?.dependsOn).toEqual([
+      { name: "postgres" },
+      { name: "redis" },
+      { name: "cache" },
+    ]);
+  });
+
+  it("still accepts the array shorthand, which carries no condition", () => {
     const yaml = `
 services:
   web:
@@ -838,7 +876,22 @@ services:
     depends_on: [postgres, redis]
 `;
     const stack = parseStack(yaml);
-    expect(stack.services[0]?.dependsOn).toEqual(["postgres", "redis"]);
+    expect(stack.services[0]?.dependsOn).toEqual([{ name: "postgres" }, { name: "redis" }]);
+  });
+
+  it("carries conditions through the extends base's depends_on too", () => {
+    const base = `
+processes:
+  web:
+    command: "node server.js"
+    depends_on:
+      postgres:
+        condition: process_healthy
+`;
+    const stack = parseStack(`services:\n  web:\n    tier: isolated\n`, { baseYaml: base });
+    expect(stack.services[0]?.dependsOn).toEqual([
+      { name: "postgres", condition: "process_healthy" },
+    ]);
   });
 });
 
