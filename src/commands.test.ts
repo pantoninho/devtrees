@@ -596,6 +596,32 @@ describe("runUp — shared instance dies before binding its socket (#92)", () =>
     expect(worktreeSpawn).toBeUndefined();
   });
 
+  it("names the shared instance's real config in the remediation, not a placeholder", async () => {
+    // The message used to print a literal `process-compose -f <shared config>`,
+    // which is advice nobody can copy-paste. It must be the file the lazy-start
+    // just wrote and spawned against — the same one `details.config_path`
+    // publishes, mirroring the worktree envelope's shape (#157 follow-up).
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const deps: CommandDeps = {
+      ...stubDeps({ stack: mixedStack, track }),
+      sharedSocketTimeoutMs: 50,
+    };
+    const err = await runUp(deps).then(
+      () => undefined,
+      (e: unknown) => e as Error & { code?: string; details?: Record<string, unknown> },
+    );
+    if (err === undefined) throw new Error("expected runUp to reject");
+
+    expect(err.code).toBe("SHARED_START_FAILED");
+    const configPath = String((err.details ?? {})["config_path"]);
+    // The path the driver was actually spawned with, not a reconstruction.
+    const sharedSpawn = track.invocations.find((i) => i.socketPath.endsWith("/shared.sock"));
+    expect(configPath).toBe(sharedSpawn?.configPath);
+    expect(existsSync(configPath)).toBe(true);
+    expect(err.message).toContain(`process-compose -f ${configPath}`);
+    expect(err.message).not.toContain("<shared config>");
+  });
+
   it("does not persist shared state when the start failed", async () => {
     // The persisted name→port map is the running instance's identity (#83);
     // a failed start must not record one, or the next `up` would inject
@@ -701,6 +727,9 @@ describe("runUp — worktree instance dies before binding its socket (#157)", ()
     expect(err.code).toBe("SHARED_START_FAILED");
     expect(err.message).toMatch(/shared instance/i);
     expect(String((err.details ?? {})["socket_path"])).toContain("shared.sock");
+    // Both envelopes now carry a real `config_path`; the discriminator is
+    // which instance's config it is, so pin that rather than its presence.
+    expect(String((err.details ?? {})["config_path"])).toContain("shared");
   });
 
   it("blames the worktree when the shared instance came up fine and only the worktree died", async () => {

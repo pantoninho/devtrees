@@ -69,7 +69,8 @@ export const ERROR_CODE_DESCRIPTIONS: Readonly<Record<ErrorCode, string>> = {
   CONFIG_DRIFT: "Running config differs from devtrees.yaml and hot-reload failed.",
   SHARED_DRIFT:
     "This worktree's shared services diverge from the running shared instance; bring shared down and up again.",
-  SHARED_START_FAILED: "The lazy-started shared instance died before binding its control socket.",
+  SHARED_START_FAILED:
+    "The lazy-started shared instance died before binding its control socket; `details.config_path` is the config to run by hand.",
   WORKTREE_START_FAILED:
     "This worktree's instance died before binding its control socket; `details.config_path` is the config to run by hand.",
   SOCKET_PATH_TOO_LONG:

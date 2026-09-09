@@ -119,7 +119,7 @@ footer lists the subset that command can actually emit.
 | `HEALTH_TIMEOUT`            | Stack started but services did not report healthy before the wait window expired.   |
 | `CONFIG_DRIFT`              | Running config differs from devtrees.yaml and hot-reload failed.                    |
 | `SHARED_DRIFT`              | This worktree's shared services diverge from the running shared instance; bring shared down and up again. |
-| `SHARED_START_FAILED`       | The lazy-started shared instance died before binding its control socket.            |
+| `SHARED_START_FAILED`       | The lazy-started shared instance died before binding its control socket; `details.config_path` is the config to run by hand. |
 | `WORKTREE_START_FAILED`     | This worktree's instance died before binding its control socket; `details.config_path` is the config to run by hand. |
 | `SOCKET_PATH_TOO_LONG`      | The control socket path exceeds the platform's unix-socket limit; set `DEVTREES_RUNTIME_DIR` to a shorter directory. |
 | `STALE_PORT_BLOCK`          | Foreign listeners hold ports in this worktree's allocated block (likely orphans).   |

@@ -129,14 +129,24 @@ class SharedDriftError extends Error {
  * wait used to return silently on deadline, letting `up` report
  * `shared_started: true` for an instance that was already dead; now the
  * deadline surfaces as the `SHARED_START_FAILED` envelope (ADR-0005).
+ *
+ * `details.config_path` is the shared instance's derived config — the file
+ * the remediation tells you to run by hand. It was a literal `<shared
+ * config>` placeholder until #157's follow-up, which is a remediation nobody
+ * can copy-paste; the worktree envelope carries the same field for the same
+ * reason (additive under ADR-0005).
  */
 class SharedStartFailedError extends Error {
   readonly code = "SHARED_START_FAILED" as const;
   readonly details: {
     readonly socket_path: string;
+    readonly config_path: string;
     readonly timeout_ms: number;
   };
-  constructor(message: string, details: { socket_path: string; timeout_ms: number }) {
+  constructor(
+    message: string,
+    details: { socket_path: string; config_path: string; timeout_ms: number },
+  ) {
     super(message);
     this.name = "SharedStartFailedError";
     this.details = details;
@@ -1320,7 +1330,7 @@ async function ensureSharedStarted(
     // deadline (issue #92): a socket that never appears means the instance
     // died before binding, and reporting `shared_started: true` for a corpse
     // would leave the agent debugging healthy-looking output.
-    await waitForSharedSocket(paths.socketPath, deps.socketTimeoutMs);
+    await waitForSharedSocket(paths.socketPath, paths.configPath, deps.socketTimeoutMs);
 
     // Make the running instance the source of truth: persist what it was
     // started with so every subsequent `up`/`env` — on any branch — injects
@@ -1363,15 +1373,16 @@ async function pollForSocket(socketPath: string, timeoutMs: number): Promise<boo
  */
 async function waitForSharedSocket(
   socketPath: string,
+  configPath: string,
   timeoutMs = SOCKET_WAIT_TIMEOUT_MS,
 ): Promise<void> {
   if (await pollForSocket(socketPath, timeoutMs)) return;
   throw new SharedStartFailedError(
     `devtrees up: the shared instance was spawned but did not bind its control socket ` +
       `within ${timeoutMs}ms — it most likely crashed on startup. ` +
-      `Check the shared services' commands (e.g. run \`process-compose -f <shared config>\` by hand) ` +
-      `and retry \`devtrees up\`.`,
-    { socket_path: socketPath, timeout_ms: timeoutMs },
+      `Check the shared services' commands (e.g. run ` +
+      `\`process-compose -f ${configPath}\` by hand) and retry \`devtrees up\`.`,
+    { socket_path: socketPath, config_path: configPath, timeout_ms: timeoutMs },
   );
 }
 
