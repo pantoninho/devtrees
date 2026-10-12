@@ -85,7 +85,7 @@ export const ERROR_CODE_DESCRIPTIONS: Readonly<Record<ErrorCode, string>> = {
   SERVICE_START_FAILED:
     "`up` tried to restart a dead service on the running instance and process-compose refused; `details.services` names each one, `details.remedy` is the `down` + `up` that restarts the stack.",
   CONFIG_DRIFT:
-    "Running config differs from devtrees.yaml and hot-reload failed; `details.reason` is `timeout`, `not_supported`, `error`, or `reload_pending` (an earlier timed-out reload is still waiting on `details.pids`; nothing was reloaded).",
+    "Running config differs from devtrees.yaml and hot-reload failed, or an earlier reload is still pending; `details.reason` is `timeout`, `not_supported`, `error`, or `reload_pending` (nothing was reloaded: kill `details.pids`, then retry; empty `pids` means the old process is gone and process-compose is still starting the new one, so retry shortly).",
   SHARED_DRIFT:
     "This worktree's shared services diverge from the running shared instance; bring shared down and up again.",
   SHARED_START_FAILED:

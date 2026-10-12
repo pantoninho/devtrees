@@ -17,20 +17,22 @@
  *
  *  1. **The marker** (primary). When a reload times out, `up` persists which
  *     changed services must reappear and the PIDs of their old runs, taken
- *     from a `process list` snapshot made just before the reload. The reload
- *     is pending while any of those PIDs is alive or any of those services is
- *     absent from the project. Once a read shows neither, the marker is
- *     cleared. `down` and a fresh start clear it too: the instance it
- *     describes is gone.
+ *     from a `process list` snapshot made just before the reload. An entry is
+ *     pending while its service is absent from the project, or while its old
+ *     PID is alive and the project does not show the service back under a
+ *     different PID (process-compose re-adds it only once the old process has
+ *     exited, so a new PID there means a reused PID is not ours). Once a read
+ *     shows nothing pending, the marker is cleared. `down` and a fresh start
+ *     clear it too: the instance it describes is gone.
  *  2. **The stateless check** (fallback, for a timeout no marker recorded,
  *     e.g. from an older build). A service the on-disk config declares is
  *     absent from the project although its namespace is booted. A namespace
  *     is "booted" when a present service declares it as its only namespace:
  *     a list-valued service (#179) is present when ANY of its namespaces is
- *     booted, so it proves nothing about which. An empty project on a live
- *     instance also counts, because a fresh start never boots an empty
- *     selection (#176). Unselected namespaces are absent by design and never
- *     trip it.
+ *     booted, so it proves nothing about which. Unselected namespaces are
+ *     absent by design and never trip it. An empty project counts only when
+ *     a marker exists: `up -n <ns>` on a namespace with no services boots an
+ *     empty project legitimately (#176), so on its own it proves nothing.
  *
  * Pure apart from the marker file I/O. The process list is read by the
  * caller and handed in, as is the liveness check.
@@ -61,7 +63,11 @@ export interface PendingReload {
 /** The verdict when a reload is still pending: who is stuck, and on what. */
 export interface StuckReload {
   readonly services: ReadonlyArray<string>;
-  /** Old PIDs still alive. Empty when only the stateless check fired. */
+  /**
+   * Old PIDs still alive. Empty when the old process has exited but the
+   * update has not brought the service back yet, or when only the stateless
+   * check fired.
+   */
   readonly pids: ReadonlyArray<number>;
 }
 
@@ -76,6 +82,22 @@ function namespaceOf(entry: Readonly<Record<string, unknown>> | undefined): {
   if (typeof ns === "string") return { namespace: ns };
   if (Array.isArray(ns) && ns.every((n) => typeof n === "string")) return { namespace: ns };
   return {};
+}
+
+/**
+ * The namespaces `rows` proves booted against the derived config `declared`:
+ * those a present service declares as its only namespace.
+ */
+export function provenNamespaces(
+  declared: DerivedProcesses,
+  rows: ReadonlyArray<ServiceStatus>,
+): string[] {
+  const present = new Set(rows.map((r) => r.name));
+  const proven = Object.keys(declared).flatMap((name) => {
+    const ns = serviceNamespaces(namespaceOf(declared[name]));
+    return present.has(name) && ns.length === 1 ? ns : [];
+  });
+  return [...new Set(proven)].sort();
 }
 
 function markerFile(anchor: string, worktreeId: string): string {
@@ -117,14 +139,17 @@ export function clearPendingReload(anchor: string, worktreeId: string): void {
  * The marker for a reload from `before` to `after` that timed out. `rows` is
  * the `process list` snapshot taken before the reload, or `undefined` if that
  * read failed. A changed service is one whose process entry differs or is
- * gone in `after`. Only services the snapshot shows are expected back (an
- * unselected one never appears), and only their snapshot PIDs are waited on.
+ * gone in `after`. Only their snapshot PIDs are waited on. A service is
+ * expected back only if the snapshot shows it (an unselected one never
+ * appears), `after` still declares it, and it stays in a booted namespace:
+ * its namespaces are unchanged, or one of them is proven booted by the
+ * snapshot. A service moved into an unbooted namespace never reappears.
  * Without a snapshot the marker records nothing specific, and the stateless
  * check decides.
  */
 export function planPendingReload(
   before: DerivedProcesses | undefined,
-  after: Readonly<Record<string, unknown>>,
+  after: DerivedProcesses,
   rows: ReadonlyArray<ServiceStatus> | undefined,
 ): PendingReload {
   if (before === undefined || rows === undefined) return { services: [], oldRuns: [] };
@@ -134,8 +159,18 @@ export function planPendingReload(
     ),
   );
   const snapshot = rows.filter((r) => changed.has(r.name));
+  const booted = provenNamespaces(before, rows);
+  const staysBooted = (name: string): boolean => {
+    const next = namespaceOf(after[name]);
+    const sameNamespaces =
+      JSON.stringify(serviceNamespaces(namespaceOf(before[name]))) ===
+      JSON.stringify(serviceNamespaces(next));
+    return sameNamespaces || namespaceSelected(next, booted);
+  };
   return {
-    services: snapshot.map((r) => r.name).filter((name) => after[name] !== undefined),
+    services: snapshot
+      .map((r) => r.name)
+      .filter((name) => after[name] !== undefined && staysBooted(name)),
     oldRuns: snapshot.flatMap((r) => (r.pid !== undefined ? [{ name: r.name, pid: r.pid }] : [])),
   };
 }
@@ -150,7 +185,14 @@ export function stuckFromMarker(
   rows: ReadonlyArray<ServiceStatus> | undefined,
   isAlive: (pid: number) => boolean,
 ): StuckReload | undefined {
-  const alive = marker.oldRuns.filter((r) => isAlive(r.pid));
+  // A row back under a different PID means the old run exited (process-compose
+  // re-adds the service only then): a live PID with that number is a reuse.
+  const current = new Map(rows?.map((r) => [r.name, r.pid]));
+  const replaced = (r: OldRun): boolean => {
+    const pid = current.get(r.name);
+    return pid !== undefined && pid !== r.pid;
+  };
+  const alive = marker.oldRuns.filter((r) => !replaced(r) && isAlive(r.pid));
   const present = new Set(rows?.map((r) => r.name));
   const absent = rows === undefined ? [] : marker.services.filter((name) => !present.has(name));
   const services = [...new Set([...alive.map((r) => r.name), ...absent])];
@@ -162,20 +204,19 @@ export function stuckFromMarker(
  * The stateless fallback: services `declared` (the on-disk derived config,
  * which describes the running instance) that are absent from `rows` although
  * their namespace is booted. See the module doc for what counts as booted.
+ * `emptyIsPending` makes an empty project count too (only when a marker says
+ * a reload timed out here).
  */
 export function stuckFromProject(
   declared: DerivedProcesses,
   rows: ReadonlyArray<ServiceStatus>,
+  opts: { readonly emptyIsPending: boolean },
 ): StuckReload | undefined {
   const names = Object.keys(declared);
   if (names.length === 0) return undefined;
-  if (rows.length === 0) return { services: names, pids: [] };
+  if (rows.length === 0) return opts.emptyIsPending ? { services: names, pids: [] } : undefined;
   const present = new Set(rows.map((r) => r.name));
-  // A present service with exactly one namespace proves that namespace booted.
-  const booted = names.flatMap((name) => {
-    const ns = serviceNamespaces(namespaceOf(declared[name]));
-    return present.has(name) && ns.length === 1 ? ns : [];
-  });
+  const booted = provenNamespaces(declared, rows);
   const missing = names.filter(
     (name) => !present.has(name) && namespaceSelected(namespaceOf(declared[name]), booted),
   );

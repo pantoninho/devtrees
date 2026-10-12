@@ -4190,7 +4190,7 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     expect(parsed.processes.web?.command).toBe("node a.js");
   });
 
-  it("on drift, a reload that never answers is bounded: CONFIG_DRIFT, request aborted, config + hash restored", async () => {
+  it("on drift, a reload that never answers is bounded: CONFIG_DRIFT, request aborted, config restored, hash invalidated (#191)", async () => {
     // process-compose's config reload blocks until each changed process's old
     // incarnation exits. When it never exits (a shutdown.command that does not stop
     // it, or SIGTERM ignored with no shutdown.timeout_seconds), `up` used to hang.
@@ -4217,6 +4217,7 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     if (worktreeSpawn === undefined) throw new Error("expected a worktree spawn");
     const configBefore = readFileSync(worktreeSpawn.configPath, "utf8");
     const storedBefore = Object.values(hashes.raw)[0]?.[baseDeps.expectedWorktreeId];
+    expect(storedBefore).toMatch(/^[0-9a-f]{64}$/);
 
     const err = await runUp({ ...firstDeps, readStack: () => stackB }).then(
       () => undefined,
@@ -4230,7 +4231,11 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     expect(err.message).toMatch(/shutdown\.command/);
     expect(aborted).toEqual([true]);
     expect(readFileSync(worktreeSpawn.configPath, "utf8")).toBe(configBefore);
-    expect(Object.values(hashes.raw)[0]?.[baseDeps.expectedWorktreeId]).toBe(storedBefore);
+    // Neither the old hash nor the new one: process-compose is still applying
+    // the new config, so the next `up` must see drift once that converges.
+    const storedAfter = Object.values(hashes.raw)[0]?.[baseDeps.expectedWorktreeId];
+    expect(storedAfter).not.toBe(storedBefore);
+    expect(storedAfter).not.toBe(stackHash(stackB));
   });
 
   it("on successful reload, the new derived config is on disk (#92)", async () => {
@@ -4386,8 +4391,8 @@ describe("runUp — pending-reload guard (#191)", () => {
     expect(marker()).toBeUndefined();
   });
 
-  it("an unconverged marker refuses even when the config no longer drifts", async () => {
-    const { state, deps, marker } = fixture(stackA, [row("web", 100), row("api", 200)]);
+  it("reverting devtrees.yaml mid-reload: refused while pending, then the reverted config is re-applied", async () => {
+    const { state, deps, marker, where } = fixture(stackA, [row("web", 100), row("api", 200)]);
     await runUp(deps);
     state.stack = stackB;
     state.reload = "hang";
@@ -4398,6 +4403,25 @@ describe("runUp — pending-reload guard (#191)", () => {
     const err = await upError(deps);
     expect(err.details).toMatchObject({ reason: "reload_pending", services: ["web"] });
     expect(marker()).toBeDefined();
+
+    // The old process exits and process-compose finishes applying stackB.
+    // devtrees.yaml, the derived config and (before #191's fix) the stored
+    // hash all said stackA, so `up` used to see no drift and leave B running.
+    state.alive.delete(100);
+    state.rows = [row("web", 101), row("api", 200)];
+    state.alive.add(101);
+    state.reload = 200;
+    await runUp(deps);
+    expect(state.reloads).toBe(2);
+    expect(marker()).toBeUndefined();
+    const { anchor, id } = where();
+    const onDisk = parseYaml(readFileSync(join(anchor, "devtrees", `${id}.yaml`), "utf8")) as {
+      processes: Record<string, { command: string }>;
+    };
+    expect(onDisk.processes.web?.command).toBe("node a.js");
+    // Converged: the next `up` is a noop.
+    await runUp(deps);
+    expect(state.reloads).toBe(2);
   });
 
   it("down clears the marker", async () => {
@@ -4430,18 +4454,31 @@ describe("runUp — pending-reload guard (#191)", () => {
     state.stack = stackB;
     const err = await upError(deps);
     expect(err.details).toEqual({ reason: "reload_pending", services: ["web"], pids: [] });
-    expect(err.message).toMatch(/devtrees down && devtrees up/);
+    expect(err.message).toMatch(/devtrees down && devtrees up`/);
     expect(state.reloads).toBe(0);
   });
 
-  it("no marker: an empty project on a live instance refuses", async () => {
-    const { state, deps } = fixture(stackA, [row("web", 100), row("api", 200)]);
-    await runUp(deps);
-    state.rows = [];
-    state.stack = stackB;
+  it("the no-PID remedy keeps the namespaces the instance was booted with", async () => {
+    const one: ResolvedStack = {
+      services: [svc("web", "node a.js", "one"), svc("api", "node api.js", "one")],
+    };
+    const { state, deps } = fixture(one, [row("web", 100), row("api", 200)]);
+    await runUp({ ...deps, namespaces: ["one"] });
+    state.rows = [row("api", 200)];
+    state.stack = {
+      services: [svc("web", "node b.js", "one"), svc("api", "node api.js", "one")],
+    };
     const err = await upError(deps);
-    expect(err.details).toMatchObject({ reason: "reload_pending" });
-    expect(state.reloads).toBe(0);
+    expect(err.message).toContain("`devtrees down && devtrees up -n one`");
+  });
+
+  it("no marker: an instance booted on a namespace with no services reloads normally (#176)", async () => {
+    // `up -n nope` boots an empty project; that is not a pending reload.
+    const { state, deps } = fixture(stackA, []);
+    await runUp({ ...deps, namespaces: ["nope"] });
+    state.stack = stackB;
+    await runUp({ ...deps, namespaces: ["nope"] });
+    expect(state.reloads).toBe(1);
   });
 
   it("an unselected namespace's absent services do not trip the fallback", async () => {
