@@ -61,6 +61,8 @@ import { readSharedState, writeSharedState, type SharedState } from "./shared-st
 import {
   createWaitForHealth,
   createWaitForSharedHealth,
+  readStatusesWithin,
+  sharedServiceDeadError,
   type WaitForHealth,
   type WaitForSharedHealth,
 } from "./health.js";
@@ -72,7 +74,7 @@ import {
   resolveRunningSelection,
   type NamespaceNotRunning,
 } from "./selection.js";
-import { deadServicesDetails, describeDeadServices, findDeadServices } from "./service-state.js";
+import { findDeadServices } from "./service-state.js";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -296,29 +298,6 @@ function resolveFreshSelection(
     throw new NoServicesSelectedError(worktreeId, declaredNamespaces(isolated));
   }
   return { namespaces, services };
-}
-
-/**
- * Thrown when `up` on a running instance finds a dead shared service
- * (ADR-0008). Shared services are reported, never restarted: the shared
- * instance serves every worktree, so a worktree's `up` must not bounce it.
- * A code of its own, not `HEALTH_TIMEOUT`, because the remedy tears down a
- * different instance (`devtrees down --shared`) — the same reason
- * `WORKTREE_START_FAILED` was split from `SHARED_START_FAILED` (ADR-0005):
- * agents branch on `error.code`, not on prose.
- */
-class SharedServiceDeadError extends Error {
-  readonly code = "SHARED_SERVICE_DEAD" as const;
-  constructor(
-    message: string,
-    readonly details: {
-      readonly dead_services: ReadonlyArray<{ name: string; status: string; exit_code?: number }>;
-      readonly remedy: string;
-    },
-  ) {
-    super(message);
-    this.name = "SharedServiceDeadError";
-  }
 }
 
 /**
@@ -975,10 +954,15 @@ async function socketIsLive(
  *    the instance running unchanged.
  *
  * Verifying a running instance (issue #177): selection read back from the
- * project, `NAMESPACE_NOT_RUNNING` for an unbooted `-n`, `SHARED_SERVICE_DEAD`
- * for a dead shared service, and the same health wait as a fresh headless
- * start, failing with `HEALTH_TIMEOUT` on a dead selected service. Never
- * attaches, never stops or restarts anything.
+ * project, `NAMESPACE_NOT_RUNNING` for an unbooted `-n`, and the same health
+ * wait as a fresh headless start, failing with `HEALTH_TIMEOUT` on a dead
+ * selected service. Never attaches, never stops or restarts anything.
+ *
+ * Dead shared services (ADR-0008), on both paths: a shared instance found
+ * already running is checked inside the lock right after
+ * `ensureSharedStarted` and fails with `SHARED_SERVICE_DEAD`; one this call
+ * lazy-started is covered by the shared-health wait, which fails fast with
+ * the same code.
  *
  * Pre-flight stale-port-block check (issue #58): when the worktree's
  * control socket is absent (first up — not the idempotent re-up path),
@@ -1122,6 +1106,18 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
         const ports = ensured.ports;
         effectiveSharedPortFor = (name) => ports[name];
       }
+      // A shared instance found already running may be carrying a dead
+      // service (ADR-0008). Fail here, on the fresh path as much as the
+      // running one, before this worktree derives or spawns anything against
+      // it. One read; reported, never restarted. A shared instance this call
+      // just started is covered by the shared-health wait instead.
+      if (!sharedStarted) {
+        await assertSharedServicesAlive(
+          stack,
+          sharedInstancePaths(anchor.anchor).socketPath,
+          statusReader(deps, driver),
+        );
+      }
     }
 
     const derived = deriveWorktreeConfig(stack, {
@@ -1172,7 +1168,9 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
       const sharedServices = stack.services.filter((s) => s.tier === "shared");
       const sharedNames = sharedServices.map((s) => s.name);
       warn(formatHealthWaitNotice(sharedNames));
-      const wait = deps.waitForSharedHealth ?? createWaitForSharedHealth(driver);
+      const wait =
+        deps.waitForSharedHealth ??
+        createWaitForSharedHealth({ getServiceStatuses: statusReader(deps, driver) });
       await wait({
         anchor: anchor.anchor,
         socketPath: sharedPaths.socketPath,
@@ -1224,15 +1222,21 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     // it exists. Runs AFTER the lifecycle lock is released, like the fresh
     // path's health wait, so a slow wait never shows up as LOCK_CONTENTION to
     // a concurrent `up`. Headless always — this path never attaches a TTY.
-    await verifyRunning({
+    const rows = await verifyRunning({
       stack,
       anchor,
       socketPath: paths.socketPath,
       deps,
       driver,
-      sharedStarted: outcome.sharedStarted,
     });
-    const services = await collectIsolatedServices(stack, paths.socketPath, portFor, deps, driver);
+    const services = await collectIsolatedServices(
+      stack,
+      paths.socketPath,
+      portFor,
+      deps,
+      driver,
+      rows,
+    );
     return { ...result, services };
   }
 
@@ -1286,11 +1290,12 @@ async function collectIsolatedServices(
   portFor: (name: string) => number | undefined,
   deps: CommandDeps,
   driver: ReturnType<typeof createDriver>,
+  /** Rows the caller already read from this instance; skips the re-read. */
+  preRead?: ServiceStatus[],
 ): Promise<Service[]> {
-  const fetch = deps.getServiceStatuses ?? ((s: string) => driver.getServiceStatuses(s));
   let statuses: ServiceStatus[];
   try {
-    statuses = await fetch(socketPath);
+    statuses = preRead ?? (await statusReader(deps, driver)(socketPath));
   } catch {
     return [];
   }
@@ -2570,18 +2575,20 @@ async function reconcileRunning(args: {
  * for (ADR-0008, issue #177). `up` never reports success on the strength of
  * the instance merely existing:
  *
- *  1. **Selection.** Read the project back from process-compose. A bare `up`
+ *  1. **Selection.** Read the project back from process-compose, retrying a
+ *     failed read up to `--wait-timeout` (then `HEALTH_TIMEOUT`). A bare `up`
  *     targets the namespaces whose declared services are all present (the
  *     boot-time selection); `-n` is exact, and a requested namespace whose
  *     services are absent fails with `NAMESPACE_NOT_RUNNING` (#170) — they
  *     cannot be added to a running instance.
- *  2. **Shared tier.** A dead shared service fails with `SHARED_SERVICE_DEAD`
- *     and the `devtrees down --shared && devtrees up` remedy. Reported, never
- *     restarted. Skipped when this very call just started shared.
- *  3. **Health.** Wait on every selected isolated service with the same
+ *  2. **Health.** Wait on every selected isolated service with the same
  *     machinery and `--wait-timeout` as a fresh headless start. A healthy
  *     instance passes on the first poll; a dead selected service fails with
  *     `HEALTH_TIMEOUT` naming it (#162).
+ *
+ * Dead shared services are checked earlier, inside the lifecycle lock, on
+ * both paths (`assertSharedServicesAlive`). Returns the rows the last poll
+ * saw, so the envelope needs no extra read.
  *
  * Never stops or restarts anything: a narrower `-n` than what is running only
  * narrows what is checked.
@@ -2592,36 +2599,30 @@ async function verifyRunning(args: {
   readonly socketPath: string;
   readonly deps: CommandDeps;
   readonly driver: ReturnType<typeof createDriver>;
-  readonly sharedStarted: boolean;
-}): Promise<void> {
+}): Promise<ServiceStatus[] | undefined> {
   const { stack, anchor, socketPath, deps, driver } = args;
-  const fetch = statusReader(deps, driver);
   const isolated = stack.services.filter((s) => s.tier === "isolated");
+  const timeoutMs = deps.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS;
 
-  // A failed read leaves nothing to resolve the boot-time selection against;
-  // fall back to the requested one and let the health wait (which keeps
-  // polling through read failures) decide.
-  const rows = await fetch(socketPath).catch(() => undefined);
-  const selection =
-    rows === undefined
-      ? {
-          namespaces: deps.namespaces ?? [],
-          services: isolated.filter((s) =>
-            namespaceSelected(s, deps.namespaces?.length ? deps.namespaces : [DEFAULT_NAMESPACE]),
-          ),
-          notRunning: [],
-        }
-      : resolveRunningSelection(isolated, new Set(rows.map((r) => r.name)), deps.namespaces);
+  // The boot-time selection only exists in the live project, so `up` needs
+  // one successful read before it can say anything; a read that keeps
+  // failing is HEALTH_TIMEOUT, never a success over an unknown selection.
+  const rows = await readStatusesWithin(
+    { getServiceStatuses: statusReader(deps, driver) },
+    socketPath,
+    timeoutMs,
+  );
+  const selection = resolveRunningSelection(
+    isolated,
+    new Set(rows.map((r) => r.name)),
+    deps.namespaces,
+  );
 
   if (selection.notRunning.length > 0) {
     throw namespaceNotRunningError(anchor.worktreeId, selection.notRunning, deps.namespaces ?? []);
   }
 
-  if (!args.sharedStarted && hasTier(stack, "shared")) {
-    await assertSharedServicesAlive(stack, sharedInstancePaths(anchor.anchor).socketPath, fetch);
-  }
-
-  await waitForSelectedHealth(selection.services, socketPath, deps, driver, {
+  return await waitForSelectedHealth(selection.services, socketPath, deps, driver, {
     remedy: `devtrees down && ${formatUpCommand(stack.services, selection.namespaces)}`,
     firstRead: rows,
   });
@@ -2649,7 +2650,9 @@ function namespaceNotRunningError(
 
 /**
  * Fail with `SHARED_SERVICE_DEAD` when a declared shared service is dead in
- * the running shared instance (ADR-0008). One read, no wait: shared services
+ * an already-running shared instance (ADR-0008). Runs on the fresh and the
+ * running path alike, inside the lifecycle lock right after
+ * `ensureSharedStarted`. One read, no wait: shared services
  * are reported, not restarted or waited on. Every declared shared service is
  * checked — the shared instance is booted without `-n`, so namespace
  * selection does not narrow it. A failed read is not evidence of a dead
@@ -2664,14 +2667,7 @@ async function assertSharedServicesAlive(
   if (rows === undefined) return;
   const names = stack.services.filter((s) => s.tier === "shared").map((s) => s.name);
   const dead = findDeadServices(rows, names);
-  if (dead.length === 0) return;
-  const remedy = "devtrees down --shared && devtrees up";
-  throw new SharedServiceDeadError(
-    `devtrees up: shared service(s) not running: ${describeDeadServices(dead)}. devtrees ` +
-      `does not restart shared services from a worktree's \`up\` — every worktree uses ` +
-      `them. Run \`${remedy}\` to bring the shared instance back.`,
-    { dead_services: deadServicesDetails(dead), remedy },
-  );
+  if (dead.length > 0) throw sharedServiceDeadError(dead);
 }
 
 // --- default I/O implementations -------------------------------------------
@@ -2760,14 +2756,20 @@ async function waitForSelectedHealth(
      */
     readonly firstRead?: ServiceStatus[];
   },
-): Promise<void> {
+): Promise<ServiceStatus[] | undefined> {
   const read = statusReader(deps, driver);
   let primed = opts.firstRead;
-  const getServiceStatuses = (path: string): Promise<ServiceStatus[]> => {
-    if (primed === undefined) return read(path);
-    const rows = primed;
-    primed = undefined;
-    return Promise.resolve(rows);
+  // The rows the wait last saw — on success, the poll that passed — so the
+  // caller can build its envelope without another process-compose round-trip.
+  let lastRows = opts.firstRead;
+  const getServiceStatuses = async (path: string): Promise<ServiceStatus[]> => {
+    if (primed !== undefined) {
+      const rows = primed;
+      primed = undefined;
+      return rows;
+    }
+    lastRows = await read(path);
+    return lastRows;
   };
   const wait = deps.waitForHealth ?? createWaitForHealth({ getServiceStatuses });
   await wait({
@@ -2777,6 +2779,7 @@ async function waitForSelectedHealth(
     timeoutMs: deps.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS,
     remedy: opts.remedy,
   });
+  return lastRows;
 }
 
 /** The per-service status read: the injected seam, else the driver. */

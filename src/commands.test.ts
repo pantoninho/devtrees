@@ -4176,17 +4176,6 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
     expect(spawned.filter((a) => a[0] !== "process")).toEqual([]);
   });
 
-  it("a healthy running instance passes on the first status check", async () => {
-    const stack: ResolvedStack = { services: [isolated("web", "node a.js", ["WEB_PORT"])] };
-    const { deps, statusReads } = liveInstance(stack, {
-      worktree: [{ name: "web", status: "Running", health: "unknown" }],
-    });
-    const result = await runUp(deps);
-    expect(result.services.map((s) => s.name)).toEqual(["web"]);
-    // selection read + one health poll + envelope rows: no polling loop.
-    expect(statusReads.length).toBeLessThanOrEqual(3);
-  });
-
   it("a completed exit-0 one-shot does not fail up", async () => {
     const stack: ResolvedStack = {
       services: [isolated("migrate", "true"), isolated("web", "node a.js")],
@@ -4230,6 +4219,53 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
       remedy: "devtrees down --shared && devtrees up",
     });
     expect(spawned.filter((a) => a[0] !== "process")).toEqual([]);
+  });
+
+  it("a FRESH up against an already-running shared instance with a dead service fails SHARED_SERVICE_DEAD before spawning", async () => {
+    // Same check, other path: after `down`, a fresh `up` used to start the
+    // worktree over the dead shared service and report `is up`.
+    const stack: ResolvedStack = {
+      services: [
+        shared("db", "postgres", ["DB_PORT"]),
+        { ...isolated("web", "node a.js"), namespace: "test" },
+      ],
+    };
+    const { deps, spawned, wtSocket } = liveInstance(
+      stack,
+      { worktree: [], shared: [killed("db")] },
+      { namespaces: ["test"] },
+    );
+    rmSync(wtSocket, { force: true });
+    const err = await failure(deps);
+    expect(err?.code).toBe("SHARED_SERVICE_DEAD");
+    expect(err?.details).toMatchObject({ remedy: "devtrees down --shared && devtrees up" });
+    // Nothing spawned: neither the worktree instance nor a shared restart.
+    expect(spawned.filter((a) => a[0] !== "process")).toEqual([]);
+  });
+
+  it("a selection read that keeps failing is HEALTH_TIMEOUT, never a success over an unknown selection", async () => {
+    const stack: ResolvedStack = { services: [isolated("web", "node a.js")] };
+    const { deps } = liveInstance(
+      stack,
+      { worktree: [] },
+      {
+        waitTimeoutMs: 300,
+        getServiceStatuses: async () => {
+          throw new Error("connect ECONNREFUSED");
+        },
+      },
+    );
+    await expect(runUp(deps)).rejects.toMatchObject({ code: "HEALTH_TIMEOUT" });
+  });
+
+  it("a healthy re-up reads the instance once: the selection read is the health poll and the envelope", async () => {
+    const stack: ResolvedStack = { services: [isolated("web", "node a.js", ["WEB_PORT"])] };
+    const { deps, statusReads, wtSocket } = liveInstance(stack, { worktree: [running("web")] });
+    const result = await runUp(deps);
+    expect(statusReads.filter((p) => p === wtSocket)).toHaveLength(1);
+    expect(result.services).toEqual([
+      { name: "web", status: "Running", health: "unknown", ports: { WEB_PORT: result.blockBase } },
+    ]);
   });
 
   it("a live shared tier does not fail up", async () => {

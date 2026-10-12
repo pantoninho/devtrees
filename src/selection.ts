@@ -30,7 +30,7 @@ export const DEFAULT_NAMESPACE = "default";
  * if ANY of its namespaces is", which is what list-valued `namespace:`
  * (ADR-0008, #179) needs.
  */
-export function serviceNamespaces(service: Pick<ResolvedService, "namespace">): string[] {
+function serviceNamespaces(service: Pick<ResolvedService, "namespace">): string[] {
   return [service.namespace ?? DEFAULT_NAMESPACE];
 }
 
@@ -125,15 +125,20 @@ export function resolveRunningSelection<S extends Pick<ResolvedService, "name" |
 
 /**
  * The `devtrees up` invocation that reproduces a namespace selection, for
- * remedy text. A stack that declares no named namespace needs no flag; any
- * other selection is spelled out with one `-n` per namespace, which is exact
- * whatever a bare `up` happens to default to.
+ * remedy text. Since #176 a bare `up` means exactly `-n default`, so that
+ * selection needs no flag; any other is spelled out with one `-n` per
+ * namespace. An empty selection (nothing booted) has no exact spelling, so it
+ * falls back to every namespace the stack declares — the widest boot that
+ * brings everything back.
  */
 export function formatUpCommand(
   stackServices: ReadonlyArray<Pick<ResolvedService, "namespace">>,
   namespaces: ReadonlyArray<string>,
 ): string {
-  const named = declaredNamespaces(stackServices).some((ns) => ns !== DEFAULT_NAMESPACE);
-  if (!named || namespaces.length === 0) return "devtrees up";
-  return ["devtrees up", ...namespaces.map((ns) => `-n ${ns}`)].join(" ");
+  const target =
+    namespaces.length > 0 ? [...new Set(namespaces)] : declaredNamespaces(stackServices);
+  if (target.length === 0 || (target.length === 1 && target[0] === DEFAULT_NAMESPACE)) {
+    return "devtrees up";
+  }
+  return ["devtrees up", ...target.map((ns) => `-n ${ns}`)].join(" ");
 }

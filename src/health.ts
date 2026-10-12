@@ -44,7 +44,7 @@ export type WaitForSharedHealth = (args: {
   /**
    * The subset of `sharedServiceNames` that declares a readiness probe in the
    * resolved stack. These gate on `health === "ready"` instead of process
-   * state (issue #108) — see `allHealthy`.
+   * state (issue #108) — see `poll`.
    */
   readonly probedServiceNames: ReadonlyArray<string>;
 }) => Promise<void>;
@@ -62,7 +62,7 @@ export type WaitForHealth = (args: {
   /**
    * The subset of `serviceNames` that declares a readiness probe in the
    * resolved stack. These gate on `health === "ready"` instead of process
-   * state (issue #108) — see `allHealthy`.
+   * state (issue #108) — see `poll`.
    */
   readonly probedServiceNames: ReadonlyArray<string>;
   readonly timeoutMs: number;
@@ -90,6 +90,42 @@ class HealthTimeoutError extends Error {
     super(message);
     this.name = "HealthTimeoutError";
   }
+}
+
+/**
+ * One successful read of an instance's per-service state, retrying failed
+ * reads (a busy or briefly unreachable socket). `timeoutMs` bounds the
+ * retrying only: it is checked between attempts, so no new attempt starts
+ * after the deadline, but a single read that hangs (a `process list` that
+ * never returns) has no timeout of its own and is waited on until it
+ * settles. `up` on a running instance needs this read to know what was
+ * booted (ADR-0008), and must never report success without it. When the
+ * deadline passes after a failed read it throws `HEALTH_TIMEOUT`, leaving
+ * the instance running like any other wait failure.
+ */
+export async function readStatusesWithin(
+  source: ServiceStatusSource,
+  socketPath: string,
+  timeoutMs: number,
+  tuning: Pick<PollerTuning, "pollMs"> = {},
+): Promise<ServiceStatus[]> {
+  const pollMs = tuning.pollMs ?? HEALTH_POLL_MS;
+  const deadline = Date.now() + timeoutMs;
+  let lastError: unknown;
+  do {
+    try {
+      return await source.getServiceStatuses(socketPath);
+    } catch (err) {
+      lastError = err;
+    }
+    await sleep(pollMs);
+  } while (Date.now() < deadline);
+  const reason = lastError instanceof Error ? ` (${lastError.message})` : "";
+  throw new HealthTimeoutError(
+    `could not read the running instance's service state within ${timeoutMs}ms${reason}. ` +
+      `The worktree instance is still running — inspect it with \`devtrees ls --json\`, ` +
+      `or restart it with \`devtrees down\` and \`devtrees up\`.`,
+  );
 }
 
 /**
@@ -163,15 +199,6 @@ async function poll(
   return { healthy, dead };
 }
 
-async function allHealthy(
-  source: ServiceStatusSource,
-  socketPath: string,
-  serviceNames: ReadonlyArray<string>,
-  probedServiceNames: ReadonlyArray<string>,
-): Promise<boolean> {
-  return (await poll(source, socketPath, serviceNames, probedServiceNames)).healthy;
-}
-
 /** Same names in the same order — a dead set that held still across two polls. */
 function sameDead(a: ReadonlyArray<DeadService>, b: ReadonlyArray<DeadService>): boolean {
   return a.length === b.length && a.every((d, i) => d.name === b[i]?.name);
@@ -195,10 +222,20 @@ export function createWaitForSharedHealth(
   return async ({ socketPath, sharedServiceNames, probedServiceNames }) => {
     if (sharedServiceNames.length === 0) return;
     const deadline = Date.now() + timeoutMs;
+    let lastDead: ReadonlyArray<DeadService> = [];
     while (Date.now() < deadline) {
-      if (await allHealthy(source, socketPath, sharedServiceNames, probedServiceNames)) return;
+      const verdict = await poll(source, socketPath, sharedServiceNames, probedServiceNames);
+      if (verdict.healthy) return;
+      // Same two-consecutive-reads rule as the worktree wait: a shared service
+      // that died (e.g. right after this `up` lazy-started it) will not come
+      // back by waiting, and it is reported, never restarted (ADR-0008).
+      if (verdict.dead.length > 0 && sameDead(verdict.dead, lastDead)) {
+        throw sharedServiceDeadError(verdict.dead);
+      }
+      lastDead = verdict.dead;
       await sleep(pollMs);
     }
+    if (lastDead.length > 0) throw sharedServiceDeadError(lastDead);
     throw new Error(
       `timed out waiting for shared services to be healthy [${sharedServiceNames.join(", ")}] ` +
         `after ${timeoutMs}ms. Check the shared instance's logs (\`devtrees attach --shared\`).`,
@@ -247,6 +284,43 @@ export function createWaitForHealth(
         `inspect it with \`devtrees logs <service>\` or \`devtrees ls --json\`.`,
     );
   };
+}
+
+/**
+ * Thrown when a shared service is dead (ADR-0008): by the dead-shared check
+ * `up` runs whenever it finds the shared instance already running, and by
+ * the shared-health wait when a service dies after this `up` started it.
+ * Shared services are reported, never restarted: the shared instance serves
+ * every worktree, so a worktree's `up` must not bounce it. A code of its own,
+ * not `HEALTH_TIMEOUT`, because the remedy tears down a different instance
+ * (`devtrees down --shared`) — the same reason `WORKTREE_START_FAILED` was
+ * split from `SHARED_START_FAILED` (ADR-0005): agents branch on `error.code`,
+ * not on prose. Module-private like `HealthTimeoutError`; build it with
+ * `sharedServiceDeadError`.
+ */
+class SharedServiceDeadError extends Error {
+  readonly code = "SHARED_SERVICE_DEAD" as const;
+  constructor(
+    message: string,
+    readonly details: {
+      readonly dead_services: ReadonlyArray<{ name: string; status: string; exit_code?: number }>;
+      readonly remedy: string;
+    },
+  ) {
+    super(message);
+    this.name = "SharedServiceDeadError";
+  }
+}
+
+/** The `SHARED_SERVICE_DEAD` error for the given dead shared services. */
+export function sharedServiceDeadError(dead: ReadonlyArray<DeadService>): Error {
+  const remedy = "devtrees down --shared && devtrees up";
+  return new SharedServiceDeadError(
+    `devtrees up: shared service(s) not running: ${describeDeadServices(dead)}. devtrees ` +
+      `does not restart shared services from a worktree's \`up\` — every worktree uses ` +
+      `them. Run \`${remedy}\` to bring the shared instance back.`,
+    { dead_services: deadServicesDetails(dead), remedy },
+  );
 }
 
 /**

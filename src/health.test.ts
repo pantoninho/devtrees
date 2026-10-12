@@ -4,6 +4,7 @@ import { Readable } from "node:stream";
 import {
   createWaitForHealth,
   createWaitForSharedHealth,
+  readStatusesWithin,
   type ServiceStatusSource,
 } from "./health.js";
 import {
@@ -342,6 +343,35 @@ describe("health — createWaitForHealth fails fast on a dead service (ADR-0008,
 });
 
 describe("health — createWaitForSharedHealth (cross-tier gate)", () => {
+  it("fails fast with SHARED_SERVICE_DEAD when a shared service reads dead twice (ADR-0008)", async () => {
+    // A shared service that died right after this `up` lazy-started it: the
+    // old wait sat out its 30s window and failed with a plain Error (UNKNOWN).
+    const source = sourceFromQueue([
+      [
+        { name: "db", status: "Completed", health: "unknown", exitCode: -1 },
+        row("cache", "Running"),
+      ],
+    ]);
+    const wait = createWaitForSharedHealth(source, { pollMs: 1, timeoutMs: 60_000 });
+    const started = Date.now();
+    const err = await wait({
+      anchor: "/a",
+      socketPath: "/run/shared.sock",
+      sharedServiceNames: ["db", "cache"],
+      probedServiceNames: [],
+    }).then(
+      () => undefined,
+      (e: unknown) => e as Error & { code?: string; details?: unknown },
+    );
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(err?.code).toBe("SHARED_SERVICE_DEAD");
+    expect(err?.message).toContain("db (Completed, exit -1)");
+    expect(err?.details).toEqual({
+      dead_services: [{ name: "db", status: "Completed", exit_code: -1 }],
+      remedy: "devtrees down --shared && devtrees up",
+    });
+  });
+
   it("resolves once every shared service is healthy", async () => {
     const source = sourceFromQueue([[row("db", "Pending")], [row("db", "Running")]]);
     const wait = createWaitForSharedHealth(source, { pollMs: 1 });
@@ -458,5 +488,22 @@ describe("health — default waits go through the driver (issue #87)", () => {
     expect(call?.binary).toBe("/opt/custom/process-compose");
     expect(call?.args.slice(0, 2)).toEqual(["--flavor", "fork"]);
     expect(call?.args).toContain("list");
+  });
+});
+
+describe("health — readStatusesWithin (running-instance selection read, #177)", () => {
+  it("retries a failed read until one succeeds", async () => {
+    const source = sourceFromQueue([new Error("busy"), new Error("busy"), [row("web", "Running")]]);
+    await expect(readStatusesWithin(source, "/s", 1000, { pollMs: 1 })).resolves.toEqual([
+      row("web", "Running"),
+    ]);
+  });
+
+  it("fails with HEALTH_TIMEOUT when no read succeeds in time — never an empty success", async () => {
+    const source = sourceFromQueue([new Error("connect ECONNREFUSED /s")]);
+    await expect(readStatusesWithin(source, "/s", 20, { pollMs: 1 })).rejects.toMatchObject({
+      code: "HEALTH_TIMEOUT",
+      message: expect.stringContaining("ECONNREFUSED"),
+    });
   });
 });

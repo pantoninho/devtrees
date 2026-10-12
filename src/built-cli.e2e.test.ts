@@ -997,4 +997,57 @@ describe("built CLI e2e — up verifies a running instance (#177)", () => {
       remedy: "devtrees down --shared && devtrees up",
     });
   }, 60_000);
+
+  it("a FRESH up against a running shared instance with a dead service fails SHARED_SERVICE_DEAD, not `is up`", () => {
+    // Review repro (a): after `down`, the worktree's next up is a fresh start
+    // over an already-running shared instance. It used to exit 0.
+    const { wt, sock } = setupScenario("dt-bcv8-", { webProbe: false });
+    expect(devtrees(wt, ["up", "--json", "--wait-timeout", "10"]).code).toBe(0);
+    expect(devtrees(wt, ["down"]).code).toBe(0);
+
+    const r = devtrees(wt, ["up", "--json", "--wait-timeout", "10"], {
+      env: { DEVTREES_STUB_DEAD: "db" },
+    });
+    expect(r.code, `fresh up should fail: ${r.stdout} ${r.stderr}`).toBe(1);
+    const err = (r.doc as VerifyErrorDoc).error;
+    expect(err?.code).toBe("SHARED_SERVICE_DEAD");
+    expect(err?.details).toMatchObject({ remedy: "devtrees down --shared && devtrees up" });
+    // Failed before spawning the worktree instance.
+    expect(existsSync(sock)).toBe(false);
+  }, 60_000);
+
+  it("a shared service dead right after this up lazy-started it fails fast with SHARED_SERVICE_DEAD (cross-tier wait)", () => {
+    // Review repro (b): with a cross-tier edge the shared pre-wait used to sit
+    // out 30s inside the lifecycle lock and fail with UNKNOWN and no remedy.
+    const { wt, sock } = setupRepoWithStack(
+      "dt-bcv9-",
+      [
+        "services:",
+        "  db:",
+        "    tier: shared",
+        '    command: "sleep 300"',
+        "    ports: [DB_PORT]",
+        "  web:",
+        "    tier: isolated",
+        '    command: "sleep 300"',
+        "    depends_on: [db]",
+        "",
+      ].join("\n"),
+    );
+    cleanups.push(() => devtrees(wt, ["down", "--shared"]));
+
+    const started = Date.now();
+    const r = devtrees(wt, ["up", "--json", "--wait-timeout", "10"], {
+      env: { DEVTREES_STUB_DEAD: "db" },
+    });
+    expect(Date.now() - started).toBeLessThan(15_000);
+    expect(r.code, `up should fail: ${r.stdout} ${r.stderr}`).toBe(1);
+    const err = (r.doc as VerifyErrorDoc).error;
+    expect(err?.code).toBe("SHARED_SERVICE_DEAD");
+    expect(err?.details).toEqual({
+      dead_services: [{ name: "db", status: "Completed", exit_code: -1 }],
+      remedy: "devtrees down --shared && devtrees up",
+    });
+    expect(existsSync(sock)).toBe(false);
+  }, 60_000);
 });

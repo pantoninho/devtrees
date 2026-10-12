@@ -80,6 +80,13 @@ describe("formatUpCommand", () => {
     expect(formatUpCommand([svc("a"), svc("b")], ["default"])).toBe("devtrees up");
   });
 
+  it("an empty selection falls back to every declared namespace, never a bare `up` for a namespaced stack", () => {
+    expect(formatUpCommand([svc("a", "one"), svc("b", "two")], [])).toBe(
+      "devtrees up -n one -n two",
+    );
+    expect(formatUpCommand([svc("a")], [])).toBe("devtrees up");
+  });
+
   it("one -n per namespace otherwise", () => {
     expect(formatUpCommand([svc("a", "one"), svc("b")], ["one", "default"])).toBe(
       "devtrees up -n one -n default",
