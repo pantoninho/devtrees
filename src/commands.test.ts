@@ -3859,6 +3859,8 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     );
     if (err === undefined) throw new Error("expected runUp to reject");
     expect(err.code).toBe("CONFIG_DRIFT");
+    // A refused reload stays distinguishable from a timed-out one.
+    expect((err as Error & { details?: unknown }).details).toEqual({ reason: "not_supported" });
 
     // Hash store unchanged — the stored hash still reflects stackA.
     expect(Object.values(hashes.raw)[0]?.[baseDeps.expectedWorktreeId]).toBe(storedAfterFirst);
@@ -3907,6 +3909,56 @@ describe("runUp — idempotency + drift detection (#31)", () => {
       processes: Record<string, { command: string }>;
     };
     expect(parsed.processes.web?.command).toBe("node a.js");
+  });
+
+  it("on drift, a `project update` that never exits is bounded: CONFIG_DRIFT, child killed, config + hash restored", async () => {
+    // process-compose's `project update` blocks until each changed process's old
+    // incarnation exits. When it never exits (a shutdown.command that does not stop
+    // it, or SIGTERM ignored with no shutdown.timeout_seconds), `up` used to hang.
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const hashes = hashStore();
+    const baseDeps = stubDeps({ stack: stackA, track });
+    const innerSpawner = baseDeps.driver?.spawner;
+    if (innerSpawner === undefined) throw new Error("expected stub spawner");
+
+    const killed: Array<NodeJS.Signals | number | undefined> = [];
+    const spawner = (binary: string, args: ReadonlyArray<string>, options: SpawnOptions) => {
+      if (args[0] === "project" && args[1] === "update") {
+        const emitter = new EventEmitter() as EventEmitter & SpawnedProcess;
+        emitter.kill = (signal) => {
+          killed.push(signal);
+          return true;
+        };
+        return emitter;
+      }
+      return innerSpawner(binary, args, options);
+    };
+    const firstDeps: CommandDeps = {
+      ...baseDeps,
+      driver: { ...baseDeps.driver, spawner, reloadTimeoutMs: 50 },
+      readStoredHash: hashes.read,
+      writeStoredHash: hashes.write,
+    };
+
+    await runUp(firstDeps);
+    const worktreeSpawn = track.invocations.find((i) => !i.socketPath.endsWith("/shared.sock"));
+    if (worktreeSpawn === undefined) throw new Error("expected a worktree spawn");
+    const configBefore = readFileSync(worktreeSpawn.configPath, "utf8");
+    const storedBefore = Object.values(hashes.raw)[0]?.[baseDeps.expectedWorktreeId];
+
+    const err = await runUp({ ...firstDeps, readStack: () => stackB }).then(
+      () => undefined,
+      (e: unknown) => e as Error & { code?: string },
+    );
+    if (err === undefined) throw new Error("expected runUp to reject");
+    expect(err.code).toBe("CONFIG_DRIFT");
+    expect((err as Error & { details?: unknown }).details).toEqual({ reason: "timeout" });
+    expect(err.message).toMatch(/did not finish within/);
+    expect(err.message).toMatch(/Do NOT re-run `devtrees up`/);
+    expect(err.message).toMatch(/shutdown\.command/);
+    expect(killed).toEqual(["SIGTERM"]);
+    expect(readFileSync(worktreeSpawn.configPath, "utf8")).toBe(configBefore);
+    expect(Object.values(hashes.raw)[0]?.[baseDeps.expectedWorktreeId]).toBe(storedBefore);
   });
 
   it("on successful reload, the new derived config is on disk (#92)", async () => {

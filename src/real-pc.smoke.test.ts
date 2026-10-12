@@ -183,6 +183,40 @@ function writeLogLocationStack(worktreeRoot: string, opts: { marker: string }): 
   writeFileSync(join(worktreeRoot, "devtrees.yaml"), yaml);
 }
 
+/**
+ * A one-service isolated stack for the hot-reload scenarios. `web` tails a
+ * per-scenario file (`hold`), so its argv names that file. The test can tell
+ * the old and the new incarnation apart by PID needle and kill exactly one
+ * of them. `shutdownCommand`, when set, is a `shutdown.command` that exits 0
+ * without stopping the process.
+ */
+function writeReloadStack(
+  worktreeRoot: string,
+  opts: { readonly hold: string; readonly shutdownCommand?: string },
+): void {
+  writeFileSync(opts.hold, "");
+  const yaml = [
+    "services:",
+    "  web:",
+    "    tier: isolated",
+    `    command: "tail -f ${opts.hold}"`,
+    "    ports: [WEB_PORT]",
+    ...(opts.shutdownCommand ? ["    shutdown:", `      command: "${opts.shutdownCommand}"`] : []),
+    "",
+  ].join("\n");
+  writeFileSync(join(worktreeRoot, "devtrees.yaml"), yaml);
+}
+
+/** Poll until some live process's argv contains `needle`. */
+async function waitForPid(needle: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (pidsMatching(needle).length > 0) return true;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return false;
+}
+
 interface CliResult {
   readonly code: number;
   readonly stdout: string;
@@ -849,6 +883,69 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
       .error;
     expect(err?.code).toBe("NO_SERVICES_SELECTED");
     expect(err?.details?.namespaces).toEqual(["local-backend"]);
+  }, 120_000);
+
+  it("scenario 14: editing a service's command on a running instance hot-reloads it", async () => {
+    const repo = buildSmokeRepo("dt-rpc14-", ["login"]);
+    currentCtx = { pidNeedle: repo.root, root: repo.root };
+    const wt = repo.worktrees.login!;
+    const [holdA, holdB] = [join(repo.root, "hold-a"), join(repo.root, "hold-b")];
+    writeReloadStack(wt, { hold: holdA });
+    cleanupStack.push(() => devtrees(wt, ["down"]));
+
+    expect(up(wt).code).toBe(0);
+    expect(await waitForPid(holdA, 10_000), "old command should be running").toBe(true);
+
+    writeReloadStack(wt, { hold: holdB });
+    const reload = up(wt);
+    expect(reload.code, `drifted up should hot-reload: ${reload.stderr}`).toBe(0);
+    expect(await waitForPid(holdB, 10_000), "new command should be running").toBe(true);
+    expect(await waitForNoPids(holdA, 10_000), "old command should be stopped").toEqual([]);
+  }, 120_000);
+
+  it("scenario 15: a reload whose old process never stops is bounded to CONFIG_DRIFT, not a hang", async () => {
+    // process-compose v1.122.0's `project update` waits for each changed
+    // process's old incarnation to exit, and a `shutdown.command` that exits 0
+    // without stopping the process never escalates to SIGKILL. `up` used to
+    // block on that forever (and `down` with it).
+    const repo = buildSmokeRepo("dt-rpc15-", ["login"]);
+    currentCtx = { pidNeedle: repo.root, root: repo.root };
+    const wt = repo.worktrees.login!;
+    const [holdA, holdB] = [join(repo.root, "hold-a"), join(repo.root, "hold-b")];
+    writeReloadStack(wt, { hold: holdA, shutdownCommand: "echo bye" });
+    // `devtrees down` would block on the same never-stopping process, so tear
+    // down by killing everything this scenario spawned.
+    cleanupStack.push(() => reapPids(pidsMatching(repo.root)));
+
+    expect(up(wt).code).toBe(0);
+    expect(await waitForPid(holdA, 10_000), "old command should be running").toBe(true);
+
+    writeReloadStack(wt, { hold: holdB, shutdownCommand: "echo bye" });
+    const started = Date.now();
+    const reload = up(wt);
+    const elapsed = Date.now() - started;
+    expect(reload.code, `drifted up should fail, not hang: ${reload.stderr}`).not.toBe(-1);
+    expect(reload.code).not.toBe(0);
+    const doc = reload.doc as
+      | { error?: { code?: string; message?: string; details?: { reason?: string } } }
+      | undefined;
+    expect(doc?.error?.code).toBe("CONFIG_DRIFT");
+    expect(doc?.error?.details?.reason).toBe("timeout");
+    expect(doc?.error?.message).toMatch(/did not finish within/);
+    expect(elapsed).toBeLessThan(50_000);
+
+    // The documented remediation: killing the old process lets process-compose
+    // finish the pending update and start the new command.
+    reapPids(pidsMatching(holdA));
+    expect(await waitForPid(holdB, 15_000), "update should finish once the old process dies").toBe(
+      true,
+    );
+
+    // ...and the documented final step, a further `up`, converges: it resyncs
+    // the on-disk config and stored hash without starting a second copy.
+    const resync = up(wt);
+    expect(resync.code, `resync up should succeed: ${resync.stderr}`).toBe(0);
+    expect(pidsMatching(holdB), "exactly one copy of the new command").toHaveLength(1);
   }, 120_000);
 });
 

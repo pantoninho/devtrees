@@ -14,6 +14,7 @@ import {
   createDriver,
   mergeAsyncIterables,
   parseServiceStatuses,
+  reloadTimeoutMs,
   type LogEvent,
   type SpawnedProcess,
 } from "./driver.js";
@@ -382,6 +383,57 @@ describe("process-compose driver — reloadConfig", () => {
     });
     const result = await driver.reloadConfig(inst);
     expect(result.ok).toBe(false);
+  });
+
+  /** A `project update` child that never exits on its own; records kill signals. */
+  function spawnerHanging(killed: Array<NodeJS.Signals | number | undefined>) {
+    return (): SpawnedProcess => {
+      const emitter = new EventEmitter() as EventEmitter & SpawnedProcess;
+      emitter.kill = (signal) => {
+        killed.push(signal);
+        queueMicrotask(() => emitter.emit("exit", null));
+        return true;
+      };
+      return emitter;
+    };
+  }
+
+  it("bounds a `project update` that never exits: kills the child and returns reason:'timeout'", async () => {
+    const killed: Array<NodeJS.Signals | number | undefined> = [];
+    const driver = createDriver({
+      exists: () => Promise.resolve(true),
+      spawner: spawnerHanging(killed),
+    });
+    const result = await driver.reloadConfig(inst, { timeoutMs: 20 });
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok:false");
+    expect(result.reason).toBe("timeout");
+    expect(result.message).toMatch(/did not finish within/);
+    expect(killed).toEqual(["SIGTERM"]);
+  });
+
+  it("the reloadTimeoutMs dep wins over the per-call budget", async () => {
+    const killed: Array<NodeJS.Signals | number | undefined> = [];
+    const driver = createDriver({
+      exists: () => Promise.resolve(true),
+      spawner: spawnerHanging(killed),
+      reloadTimeoutMs: 20,
+    });
+    const result = await driver.reloadConfig(inst, { timeoutMs: 60_000 });
+    expect(result).toMatchObject({ ok: false, reason: "timeout" });
+  });
+
+  it("reloadTimeoutMs adds every explicit shutdown.timeout_seconds to the 30s base", () => {
+    expect(reloadTimeoutMs({ processes: { web: {} } })).toBe(30_000);
+    expect(
+      reloadTimeoutMs({
+        processes: {
+          web: { shutdown: { timeout_seconds: 45 } },
+          api: { shutdown: { command: "echo bye" } },
+          db: { shutdown: { timeout_seconds: 5 } },
+        },
+      }),
+    ).toBe(80_000);
   });
 
   it("refuses to spawn when the binary is missing", async () => {

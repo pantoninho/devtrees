@@ -70,7 +70,8 @@ export const ERROR_CODE_DESCRIPTIONS: Readonly<Record<ErrorCode, string>> = {
     "The named service does not exist in the target instance; `details.valid_services` lists the known ones.",
   HEALTH_TIMEOUT:
     "Stack started but services did not report healthy before the wait window expired.",
-  CONFIG_DRIFT: "Running config differs from devtrees.yaml and hot-reload failed.",
+  CONFIG_DRIFT:
+    "Running config differs from devtrees.yaml and hot-reload failed; `details.reason` is `timeout`, `not_supported` or `error`.",
   SHARED_DRIFT:
     "This worktree's shared services diverge from the running shared instance; bring shared down and up again.",
   SHARED_START_FAILED:

@@ -80,7 +80,7 @@ Branch on \`error.code\`:
 | \`HEALTH_TIMEOUT\`            | A service never reported ready. The stack is **left running** — read \`devtrees logs <service> --tail=N\` to see why, then retry or \`down\`. |
 | \`STALE_PORT_BLOCK\`          | Foreign listeners hold this worktree's ports. \`details.collisions[]\` lists \`{port_name, port, pid, command}\`; kill the orphans and retry. |
 | \`SHARED_DRIFT\`              | This worktree's shared services diverge from the running shared instance. Follow the message: \`devtrees down --shared && devtrees up\`. |
-| \`CONFIG_DRIFT\`              | The running config differs from \`devtrees.yaml\` and hot-reload failed. Follow the message — usually \`devtrees down && devtrees up\`. |
+| \`CONFIG_DRIFT\`              | The running config differs from \`devtrees.yaml\` and hot-reload failed. Branch on \`details.reason\`: \`not_supported\`/\`error\` → \`devtrees down && devtrees up\`. \`timeout\` → a changed service's old process won't stop and \`down\` would hang too: do **not** re-run \`up\` (it starts an untracked second copy); kill that process, then run \`devtrees up\` again to resync. |
 | \`SERVICE_NOT_FOUND\`         | You named a service that isn't in the instance. \`details.valid_services\` lists the real names; pick one. |
 | \`NO_SERVICES_SELECTED\`      | A bare \`up\` starts only services with no \`namespace:\`, and there are none. \`details.namespaces\` lists the namespaces; retry with \`devtrees up -n <ns>\`. |
 | \`INSTANCE_NOT_FOUND\`        | No instance is running for this worktree. Run \`devtrees up\` first.                            |

@@ -44,6 +44,7 @@ import { loadStack, type ResolvedService, type ResolvedStack, type Tier } from "
 import {
   createDriver,
   mergeAsyncIterables,
+  reloadTimeoutMs,
   type DriverDeps,
   type LogEvent,
   type ServiceStatus,
@@ -81,12 +82,22 @@ export type { WaitForHealth, WaitForSharedHealth } from "./health.js";
  * running unchanged; the CLI maps this to the `CONFIG_DRIFT` error
  * envelope so an agent can decide whether to `down` + `up` or hand off to
  * a human (ADR-0005).
+ *
+ * `details.reason` lets an agent branch without parsing the message:
+ * `timeout` means process-compose is still waiting for a changed service's
+ * old process to exit (`down` would block too). `not_supported` / `error`
+ * mean the reload was refused and the instance is untouched.
  */
 class ConfigDriftError extends Error {
   readonly code = "CONFIG_DRIFT";
-  constructor(message: string) {
+  readonly details: { readonly reason: "timeout" | "not_supported" | "error" };
+  constructor(
+    message: string,
+    details: { readonly reason: "timeout" | "not_supported" | "error" },
+  ) {
     super(message);
     this.name = "ConfigDriftError";
+    this.details = details;
   }
 }
 
@@ -2414,6 +2425,29 @@ function readDerivedServices(configPath: string): string[] {
   }
 }
 
+/** Remediation for a reload process-compose refused: the instance is untouched. */
+const RELOAD_FAILED_REMEDIATION =
+  ". The instance is still running — run `devtrees down && devtrees up` to apply the new config.";
+
+/**
+ * A timed-out reload means process-compose is still waiting for an old process
+ * to exit, and `down` would wait on the same process. Killing that process
+ * unblocks process-compose, which then finishes applying the new config. A
+ * retried `up` before then is unsafe: process-compose has already dropped the
+ * old process from its list, so a second `project update` starts a new copy
+ * next to it, and the pending update later starts another one, leaving the
+ * first copy orphaned.
+ */
+const RELOAD_TIMEOUT_REMEDIATION =
+  ". The instance is still running, but process-compose stays blocked until the old " +
+  "process exits, and `devtrees down` would block on it too. Do NOT re-run `devtrees up` " +
+  "until that process has exited: process-compose would start a second, untracked copy of " +
+  "the service. Kill the service's old process to let the reload finish, then run " +
+  "`devtrees up` again to resync the on-disk config and stored hash. To prevent this, give " +
+  "the service a `shutdown.command` that really stops the process; `shutdown.timeout_seconds` " +
+  "does not help when a `shutdown.command` exits 0 without stopping it (it only bounds the " +
+  "command itself, and only the plain SIGTERM path escalates to SIGKILL after it).";
+
 /**
  * Idempotency / drift dispatch for a `runUp` whose worktree instance is
  * already running. Two outcomes:
@@ -2466,7 +2500,7 @@ async function reconcileRunning(args: {
       ? readFileSync(paths.configPath, "utf8")
       : undefined;
     writeFileSync(paths.configPath, stringifyYaml(derived.config), "utf8");
-    const reload = await driver.reloadConfig(inst);
+    const reload = await driver.reloadConfig(inst, { timeoutMs: reloadTimeoutMs(derived.config) });
     if (!reload.ok) {
       if (previousConfig === undefined) rmSync(paths.configPath, { force: true });
       else writeFileSync(paths.configPath, previousConfig, "utf8");
@@ -2474,7 +2508,8 @@ async function reconcileRunning(args: {
         `devtrees up: config drift detected for '${anchor.worktreeId}' and the running ` +
           `process-compose could not hot-reload the new config` +
           (reload.message ? ` (${reload.message})` : "") +
-          ". The instance is still running — run `devtrees down && devtrees up` to apply the new config.",
+          (reload.reason === "timeout" ? RELOAD_TIMEOUT_REMEDIATION : RELOAD_FAILED_REMEDIATION),
+        { reason: reload.reason },
       );
     }
     args.writeHash(anchor.anchor, anchor.worktreeId, currentHash);

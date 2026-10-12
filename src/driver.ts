@@ -127,7 +127,47 @@ export function buildReloadConfigArgs(inst: InstanceRef): string[] {
  */
 type ReloadResult =
   | { readonly ok: true }
-  | { readonly ok: false; readonly reason: "not_supported" | "error"; readonly message?: string };
+  | {
+      readonly ok: false;
+      readonly reason: "not_supported" | "error" | "timeout";
+      readonly message?: string;
+    };
+
+/**
+ * Base budget for a `project update` call. process-compose's update stops
+ * every changed or removed process, one after another, and returns only once
+ * each old process has exited. It escalates to SIGKILL only on the plain
+ * SIGTERM path, and only when `shutdown.timeout_seconds` is set explicitly.
+ * Two shapes therefore never finish:
+ *  - a process that ignores SIGTERM and declares no `shutdown.timeout_seconds`;
+ *  - a `shutdown.command` that exits 0 without stopping the process. Here
+ *    `shutdown.timeout_seconds` only bounds the command itself, and there is
+ *    no SIGKILL fallback whatever its value.
+ * In those cases the update (and every later `down`) blocks forever. The
+ * budget turns that wait into a bounded `CONFIG_DRIFT`.
+ */
+const RELOAD_BASE_TIMEOUT_MS = 30_000;
+
+/**
+ * Reload budget for a derived config: the base budget plus every explicit
+ * `shutdown.timeout_seconds`. That value bounds a legitimately slow stop:
+ * on the SIGTERM path, process-compose waits up to that long before SIGKILL;
+ * with a `shutdown.command`, it is the command's own timeout. Each changed
+ * process is stopped in turn, so the values add up, and a reload that is
+ * merely slow is never cut short.
+ */
+export function reloadTimeoutMs(config: {
+  readonly processes: Readonly<
+    Record<string, { readonly shutdown?: Readonly<Record<string, unknown>> }>
+  >;
+}): number {
+  let total = RELOAD_BASE_TIMEOUT_MS;
+  for (const proc of Object.values(config.processes)) {
+    const seconds = proc.shutdown?.timeout_seconds;
+    if (typeof seconds === "number" && seconds > 0) total += seconds * 1000;
+  }
+  return total;
+}
 
 /**
  * List the running processes of an instance over its UDS, in JSON. devtrees
@@ -274,6 +314,11 @@ export interface DriverDeps {
   /** Resolve whether `binary` exists on PATH. Default: probes the real PATH. */
   readonly exists?: (binary: string) => Promise<boolean>;
   readonly spawner?: Spawner;
+  /**
+   * Fixed `reloadConfig` budget in milliseconds, for tests. When set, it wins
+   * over the per-call `timeoutMs`.
+   */
+  readonly reloadTimeoutMs?: number;
 }
 
 async function ensureBinary(deps: Required<Pick<DriverDeps, "binary" | "exists">>): Promise<void> {
@@ -409,10 +454,18 @@ export function createDriver(deps: DriverDeps = {}) {
      * `inst.configPath`. Returns a structured `ReloadResult` — `ok:true` on a
      * clean exit, `ok:false` on any failure (missing subcommand, invalid
      * config, child crashed). Distinguishing the failure cause is best-effort;
-     * both `not_supported` and `error` map to `CONFIG_DRIFT` at the CLI.
+     * `not_supported`, `error` and `timeout` all map to `CONFIG_DRIFT` at the CLI.
+     *
+     * Bounded by `timeoutMs` (default: the base reload budget). When the budget
+     * runs out, the `project update` client is killed and `timeout` is returned.
+     * process-compose keeps applying the update server-side.
      */
-    reloadConfig(inst: InstanceRef): Promise<ReloadResult> {
-      return reloadConfigImpl(inst, { binary, prefix, exists, spawner });
+    reloadConfig(
+      inst: InstanceRef,
+      opts: { readonly timeoutMs?: number } = {},
+    ): Promise<ReloadResult> {
+      const timeoutMs = deps.reloadTimeoutMs ?? opts.timeoutMs ?? RELOAD_BASE_TIMEOUT_MS;
+      return reloadConfigImpl(inst, { binary, prefix, exists, spawner, timeoutMs });
     },
   };
 }
@@ -424,6 +477,7 @@ async function reloadConfigImpl(
     readonly prefix: ReadonlyArray<string>;
     readonly exists: (binary: string) => Promise<boolean>;
     readonly spawner: Spawner;
+    readonly timeoutMs: number;
   },
 ): Promise<ReloadResult> {
   await ensureBinary({ binary: deps.binary, exists: deps.exists });
@@ -435,10 +489,22 @@ async function reloadConfigImpl(
     child.stderr?.on("data", (chunk: Buffer | string) => {
       stderr += typeof chunk === "string" ? chunk : chunk.toString("utf8");
     });
-    child.on("error", (err) =>
-      resolve({ ok: false, reason: "not_supported", message: err.message }),
-    );
+    const timer = setTimeout(() => {
+      child.kill?.("SIGTERM");
+      resolve({
+        ok: false,
+        reason: "timeout",
+        message:
+          `${deps.binary} project update did not finish within ` +
+          `${Math.round(deps.timeoutMs / 1000)}s; a changed service's old process has not stopped`,
+      });
+    }, deps.timeoutMs);
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      resolve({ ok: false, reason: "not_supported", message: err.message });
+    });
     child.on("exit", (code) => {
+      clearTimeout(timer);
       if (code === 0 || code === null) {
         resolve({ ok: true });
         return;
