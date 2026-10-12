@@ -1000,10 +1000,11 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     const ownInstanceLive = await socketIsLive(paths.socketPath, seams.probe);
 
     // Fresh-start namespace selection (issue #176, ADR-0008): resolved here,
-    // before any start-side effect (shared lazy-start, config write, spawn),
     // so a bare `up` that would select nothing fails with
-    // NO_SERVICES_SELECTED without touching anything. `undefined` on the
-    // running-instance path, whose bare-`up` target is #177's to define.
+    // NO_SERVICES_SELECTED before any spawn, config write or shared lazy-start
+    // (the port reservation has already been made, as for every
+    // post-allocation failure). `undefined` on the running-instance path,
+    // whose bare-`up` target is #177's to define.
     const freshSelection = ownInstanceLive
       ? undefined
       : resolveFreshSelection(stack, anchor.worktreeId, deps.namespaces);

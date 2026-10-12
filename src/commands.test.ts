@@ -1492,6 +1492,23 @@ describe("runUp — namespace selection (#128)", () => {
     expect(observed).toEqual(["web", "worker"]);
   });
 
+  it("`-n` naming a namespace with NO services is not an error today (ADR-0008 leaves it undecided)", async () => {
+    // Pins current behaviour so any later change (e.g. making this
+    // NO_SERVICES_SELECTED too) is a deliberate decision, not an accident.
+    let observed: string[] | undefined;
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const result = await runUp({
+      ...stubDeps({ stack: allNamespaced, track }),
+      namespaces: ["nope"],
+      waitForHealth: async ({ serviceNames }) => {
+        observed = [...serviceNames];
+      },
+    });
+    expect(result.worktreeId).toBeDefined();
+    expect(observed).toEqual([]);
+    expect(track.invocations.length).toBeGreaterThan(0);
+  });
+
   it("a bare up on a RUNNING instance is not a fresh start: no NO_SERVICES_SELECTED, no spawn (#177's scope)", async () => {
     const track: StubSpawn = { invocations: [], touchSocket: true };
     const baseDeps = stubDeps({ stack: allNamespaced, track });
