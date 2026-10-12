@@ -134,6 +134,51 @@ describe("stackHash", () => {
     });
   });
 
+  describe("forwarded process-compose fields (#175)", () => {
+    const web = (extra: Record<string, unknown> = {}): ResolvedStack => ({
+      services: [{ ...svc("web", "node x.js"), ...extra }],
+    });
+
+    const cases: Array<[string, Record<string, unknown>, Record<string, unknown>]> = [
+      ["namespace", { namespace: "a" }, { namespace: "b" }],
+      ["shutdown", { shutdown: { command: "stop-a" } }, { shutdown: { command: "stop-b" } }],
+      ["is_daemon", { isDaemon: true }, { isDaemon: false }],
+      ["launch_timeout_seconds", { launchTimeoutSeconds: 5 }, { launchTimeoutSeconds: 10 }],
+      ["log_location", { logLocation: "a.log" }, { logLocation: "b.log" }],
+      [
+        "log_configuration",
+        { logConfiguration: { rotation: { max_size_mb: 1 } } },
+        { logConfiguration: { rotation: { max_size_mb: 2 } } },
+      ],
+    ];
+
+    for (const [field, before, after] of cases) {
+      it(`changes when ${field} is edited`, () => {
+        expect(stackHash(web(before))).not.toBe(stackHash(web(after)));
+      });
+
+      it(`changes when ${field} is added or removed`, () => {
+        expect(stackHash(web())).not.toBe(stackHash(web(before)));
+      });
+
+      it(`is stable across runs for the same ${field}`, () => {
+        expect(stackHash(web(before))).toBe(stackHash(web({ ...before })));
+      });
+    }
+
+    it("is independent of key order inside shutdown and log_configuration", () => {
+      const a = web({
+        shutdown: { command: "x", timeout_seconds: 3 },
+        logConfiguration: { rotation: { max_size_mb: 1, max_age_days: 2 }, flush: true },
+      });
+      const b = web({
+        shutdown: { timeout_seconds: 3, command: "x" },
+        logConfiguration: { flush: true, rotation: { max_age_days: 2, max_size_mb: 1 } },
+      });
+      expect(stackHash(a)).toBe(stackHash(b));
+    });
+  });
+
   describe("depends_on conditions (#158)", () => {
     /** `web -> api`, with whatever condition the caller passes (none by default). */
     const stackWithEdge = (condition?: string): ResolvedStack => ({
@@ -151,8 +196,13 @@ describe("stackHash", () => {
       // was a bare `string[]`) for this same stack. Every user whose stack
       // never used a condition keeps the hash already stored next to their
       // allocation entry — no spurious CONFIG_DRIFT on upgrade.
+      //
+      // Re-pinned in #175: that change added six always-present (null when
+      // absent) fields to the canonical form, so this digest moved once and
+      // every instance hot-reloads once on upgrade. The pre-#175 digest was
+      // fea226a76cf3e0dd1a2987264998d2093d3a54648307e6263db3837a7db5a28f.
       expect(stackHash(stackWithEdge())).toBe(
-        "fea226a76cf3e0dd1a2987264998d2093d3a54648307e6263db3837a7db5a28f",
+        "0effb4027cf6e581c53c8f4484d02820897dd41f9756c9b833b867190ea630a4",
       );
     });
 
@@ -242,6 +292,23 @@ describe("sharedStackHash (#83)", () => {
     };
     const b: ResolvedStack = {
       services: [pg, { ...web, livenessProbe: { exec: { command: "nope" } } }],
+    };
+    expect(sharedStackHash(a)).toBe(sharedStackHash(b));
+  });
+});
+
+describe("sharedStackHash vs forwarded fields (#175)", () => {
+  it("ignores process-compose fields that never affect the shared port map", () => {
+    const a: ResolvedStack = { services: [svc("pg", "postgres", ["DB_PORT"], "shared")] };
+    const b: ResolvedStack = {
+      services: [
+        {
+          ...svc("pg", "postgres", ["DB_PORT"], "shared"),
+          shutdown: { command: "pg_ctl stop" },
+          isDaemon: true,
+          logLocation: "pg.log",
+        },
+      ],
     };
     expect(sharedStackHash(a)).toBe(sharedStackHash(b));
   });

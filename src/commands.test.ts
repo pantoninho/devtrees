@@ -3632,6 +3632,43 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     expect(anchorStore[baseDeps.expectedWorktreeId]).toBe(stackHash(probed));
   });
 
+  it("a namespace-only edit triggers the drift/reload path on the next up (#175)", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const hashes = hashStore();
+    const baseDeps = stubDeps({ stack: stackA, track });
+    const innerSpawner = baseDeps.driver?.spawner;
+    if (innerSpawner === undefined) throw new Error("expected stub spawner");
+
+    const reloadCalls: Array<{ args: ReadonlyArray<string> }> = [];
+    const spawner = (binary: string, args: ReadonlyArray<string>, options: SpawnOptions) => {
+      if (args[0] === "project" && args[1] === "update") {
+        reloadCalls.push({ args });
+        return spawnedOk();
+      }
+      return innerSpawner(binary, args, options);
+    };
+    const firstDeps: CommandDeps = {
+      ...baseDeps,
+      driver: { ...baseDeps.driver, spawner },
+      readStoredHash: hashes.read,
+      writeStoredHash: hashes.write,
+    };
+    await runUp(firstDeps);
+    const upInvocationsAfterFirst = track.invocations.length;
+
+    const moved: ResolvedStack = {
+      services: [{ ...isolated("web", "node a.js", ["WEB_PORT"]), namespace: "backend" }],
+    };
+    await runUp({ ...firstDeps, readStack: () => moved });
+
+    expect(reloadCalls).toHaveLength(1);
+    expect(track.invocations.length).toBe(upInvocationsAfterFirst);
+    const anchorStore = Object.values(hashes.raw)[0];
+    if (!anchorStore) throw new Error("expected hash store entry");
+    const { stackHash } = await import("./hash.js");
+    expect(anchorStore[baseDeps.expectedWorktreeId]).toBe(stackHash(moved));
+  });
+
   it("on drift, if driver.reloadConfig reports not_supported, throws an Error tagged code:CONFIG_DRIFT and does not update the stored hash", async () => {
     const track: StubSpawn = { invocations: [], touchSocket: true };
     const hashes = hashStore();
