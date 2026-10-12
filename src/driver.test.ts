@@ -119,7 +119,7 @@ describe("process-compose driver — parseServiceStatuses", () => {
       { name: "api", status: "Completed", ready: true, is_running: false },
     ]);
     expect(parseServiceStatuses(stdout)).toEqual([
-      { name: "web", status: "Completed", health: "not_ready" },
+      { name: "web", status: "Completed", health: "not_ready", exitCode: -1 },
       { name: "api", status: "Completed", health: "not_ready" },
     ]);
   });
@@ -131,7 +131,7 @@ describe("process-compose driver — parseServiceStatuses", () => {
     ]);
     expect(parseServiceStatuses(stdout)).toEqual([
       { name: "web", status: "Running", health: "ready" },
-      { name: "migrate", status: "Completed", health: "unknown" },
+      { name: "migrate", status: "Completed", health: "unknown", exitCode: 0 },
     ]);
   });
 

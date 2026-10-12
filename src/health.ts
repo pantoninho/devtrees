@@ -14,6 +14,12 @@
  */
 
 import type { ServiceStatus } from "./driver.js";
+import {
+  deadServicesDetails,
+  describeDeadServices,
+  findDeadServices,
+  type DeadService,
+} from "./service-state.js";
 
 /**
  * The slice of the driver the pollers need: one async read of an instance's
@@ -38,7 +44,7 @@ export type WaitForSharedHealth = (args: {
   /**
    * The subset of `sharedServiceNames` that declares a readiness probe in the
    * resolved stack. These gate on `health === "ready"` instead of process
-   * state (issue #108) — see `allHealthy`.
+   * state (issue #108) — see `poll`.
    */
   readonly probedServiceNames: ReadonlyArray<string>;
 }) => Promise<void>;
@@ -56,10 +62,16 @@ export type WaitForHealth = (args: {
   /**
    * The subset of `serviceNames` that declares a readiness probe in the
    * resolved stack. These gate on `health === "ready"` instead of process
-   * state (issue #108) — see `allHealthy`.
+   * state (issue #108) — see `poll`.
    */
   readonly probedServiceNames: ReadonlyArray<string>;
   readonly timeoutMs: number;
+  /**
+   * The command that brings the stack back, named when a waited-on service
+   * is dead (ADR-0008) — e.g. `devtrees down && devtrees up -n app`. Default:
+   * `devtrees down && devtrees up`.
+   */
+  readonly remedy?: string;
 }) => Promise<void>;
 
 /**
@@ -71,10 +83,49 @@ export type WaitForHealth = (args: {
  */
 class HealthTimeoutError extends Error {
   readonly code = "HEALTH_TIMEOUT" as const;
-  constructor(message: string) {
+  constructor(
+    message: string,
+    readonly details?: Readonly<Record<string, unknown>>,
+  ) {
     super(message);
     this.name = "HealthTimeoutError";
   }
+}
+
+/**
+ * One successful read of an instance's per-service state, retrying failed
+ * reads (a busy or briefly unreachable socket). `timeoutMs` bounds the
+ * retrying only: it is checked between attempts, so no new attempt starts
+ * after the deadline, but a single read that hangs (a `process list` that
+ * never returns) has no timeout of its own and is waited on until it
+ * settles. `up` on a running instance needs this read to know what was
+ * booted (ADR-0008), and must never report success without it. When the
+ * deadline passes after a failed read it throws `HEALTH_TIMEOUT`, leaving
+ * the instance running like any other wait failure.
+ */
+export async function readStatusesWithin(
+  source: ServiceStatusSource,
+  socketPath: string,
+  timeoutMs: number,
+  tuning: Pick<PollerTuning, "pollMs"> = {},
+): Promise<ServiceStatus[]> {
+  const pollMs = tuning.pollMs ?? HEALTH_POLL_MS;
+  const deadline = Date.now() + timeoutMs;
+  let lastError: unknown;
+  do {
+    try {
+      return await source.getServiceStatuses(socketPath);
+    } catch (err) {
+      lastError = err;
+    }
+    await sleep(pollMs);
+  } while (Date.now() < deadline);
+  const reason = lastError instanceof Error ? ` (${lastError.message})` : "";
+  throw new HealthTimeoutError(
+    `could not read the running instance's service state within ${timeoutMs}ms${reason}. ` +
+      `The worktree instance is still running — inspect it with \`devtrees ls --json\`, ` +
+      `or restart it with \`devtrees down\` and \`devtrees up\`.`,
+  );
 }
 
 /**
@@ -104,34 +155,53 @@ export interface PollerTuning {
   readonly timeoutMs?: number;
 }
 
+/** One poll's verdict over the named services. */
+interface PollVerdict {
+  readonly healthy: boolean;
+  /** Named services that are dead (`classifyService`), in `serviceNames` order. */
+  readonly dead: ReadonlyArray<DeadService>;
+}
+
 /**
  * One poll: read the instance's per-service state through the driver and
- * report whether every named service is healthy. Probed services (those in
- * `probedServiceNames`) require `health === "ready"`; the rest gate on
- * process state (`HEALTHY_STATES`). A failed read (socket not reachable yet —
- * the instance is still starting) is "not ready, keep polling", never an
- * error.
+ * report whether every named service is healthy, and which are dead. Probed
+ * services (those in `probedServiceNames`) require `health === "ready"`; the
+ * rest gate on process state (`HEALTHY_STATES`). A failed read (socket not
+ * reachable yet — the instance is still starting) is "not ready, keep
+ * polling", never an error.
+ *
+ * A dead service is never healthy, whatever its status string: a crashed
+ * `Completed` (non-zero exit) would otherwise pass the status gate the same
+ * way a finished one-shot does (ADR-0008).
  */
-async function allHealthy(
+async function poll(
   source: ServiceStatusSource,
   socketPath: string,
   serviceNames: ReadonlyArray<string>,
   probedServiceNames: ReadonlyArray<string>,
-): Promise<boolean> {
+): Promise<PollVerdict> {
   let statuses: ServiceStatus[];
   try {
     statuses = await source.getServiceStatuses(socketPath);
   } catch {
-    return false;
+    return { healthy: false, dead: [] };
   }
+  const dead = findDeadServices(statuses, serviceNames);
+  if (dead.length > 0) return { healthy: false, dead };
   const probed = new Set(probedServiceNames);
   const rows = new Map(statuses.map((s) => [s.name, s]));
-  return serviceNames.every((name) => {
+  const healthy = serviceNames.every((name) => {
     const row = rows.get(name);
     if (row === undefined) return false;
     if (probed.has(name)) return row.health === "ready";
     return HEALTHY_STATES.has(row.status.toLowerCase());
   });
+  return { healthy, dead };
+}
+
+/** Same names in the same order — a dead set that held still across two polls. */
+function sameDead(a: ReadonlyArray<DeadService>, b: ReadonlyArray<DeadService>): boolean {
+  return a.length === b.length && a.every((d, i) => d.name === b[i]?.name);
 }
 
 function sleep(ms: number): Promise<void> {
@@ -152,10 +222,20 @@ export function createWaitForSharedHealth(
   return async ({ socketPath, sharedServiceNames, probedServiceNames }) => {
     if (sharedServiceNames.length === 0) return;
     const deadline = Date.now() + timeoutMs;
+    let lastDead: ReadonlyArray<DeadService> = [];
     while (Date.now() < deadline) {
-      if (await allHealthy(source, socketPath, sharedServiceNames, probedServiceNames)) return;
+      const verdict = await poll(source, socketPath, sharedServiceNames, probedServiceNames);
+      if (verdict.healthy) return;
+      // Same two-consecutive-reads rule as the worktree wait: a shared service
+      // that died (e.g. right after this `up` lazy-started it) will not come
+      // back by waiting, and it is reported, never restarted (ADR-0008).
+      if (verdict.dead.length > 0 && sameDead(verdict.dead, lastDead)) {
+        throw sharedServiceDeadError(verdict.dead);
+      }
+      lastDead = verdict.dead;
       await sleep(pollMs);
     }
+    if (lastDead.length > 0) throw sharedServiceDeadError(lastDead);
     throw new Error(
       `timed out waiting for shared services to be healthy [${sharedServiceNames.join(", ")}] ` +
         `after ${timeoutMs}ms. Check the shared instance's logs (\`devtrees attach --shared\`).`,
@@ -170,23 +250,89 @@ export function createWaitForSharedHealth(
  * `HEALTH_TIMEOUT` envelope without pattern-matching on the message
  * (ADR-0005). A zero-service wait returns immediately so a stack with no
  * isolated services does not synthesize a timeout out of thin air.
+ *
+ * Fails fast on a dead service (ADR-0008): a crashed process is not going to
+ * become healthy by waiting, so once the same services read dead on two
+ * consecutive polls the wait throws `HEALTH_TIMEOUT` straight away, naming
+ * them and `remedy`. Two reads, not one, so the instant between a crash and
+ * process-compose flipping a restartable process to `Restarting` is never
+ * mistaken for a final state. Nothing is restarted here.
  */
 export function createWaitForHealth(
   source: ServiceStatusSource,
   tuning: PollerTuning = {},
 ): WaitForHealth {
   const pollMs = tuning.pollMs ?? HEALTH_POLL_MS;
-  return async ({ socketPath, serviceNames, probedServiceNames, timeoutMs }) => {
+  return async ({ socketPath, serviceNames, probedServiceNames, timeoutMs, remedy }) => {
     if (serviceNames.length === 0) return;
+    const fix = remedy ?? "devtrees down && devtrees up";
     const deadline = Date.now() + timeoutMs;
+    let lastDead: ReadonlyArray<DeadService> = [];
     while (Date.now() < deadline) {
-      if (await allHealthy(source, socketPath, serviceNames, probedServiceNames)) return;
+      const verdict = await poll(source, socketPath, serviceNames, probedServiceNames);
+      if (verdict.healthy) return;
+      if (verdict.dead.length > 0 && sameDead(verdict.dead, lastDead)) {
+        throw deadServicesError(verdict.dead, fix);
+      }
+      lastDead = verdict.dead;
       await sleep(pollMs);
     }
+    if (lastDead.length > 0) throw deadServicesError(lastDead, fix);
     throw new HealthTimeoutError(
       `timed out waiting for services to be healthy [${serviceNames.join(", ")}] ` +
         `after ${timeoutMs}ms. The worktree instance is still running — ` +
         `inspect it with \`devtrees logs <service>\` or \`devtrees ls --json\`.`,
     );
   };
+}
+
+/**
+ * Thrown when a shared service is dead (ADR-0008): by the dead-shared check
+ * `up` runs whenever it finds the shared instance already running, and by
+ * the shared-health wait when a service dies after this `up` started it.
+ * Shared services are reported, never restarted: the shared instance serves
+ * every worktree, so a worktree's `up` must not bounce it. A code of its own,
+ * not `HEALTH_TIMEOUT`, because the remedy tears down a different instance
+ * (`devtrees down --shared`) — the same reason `WORKTREE_START_FAILED` was
+ * split from `SHARED_START_FAILED` (ADR-0005): agents branch on `error.code`,
+ * not on prose. Module-private like `HealthTimeoutError`; build it with
+ * `sharedServiceDeadError`.
+ */
+class SharedServiceDeadError extends Error {
+  readonly code = "SHARED_SERVICE_DEAD" as const;
+  constructor(
+    message: string,
+    readonly details: {
+      readonly dead_services: ReadonlyArray<{ name: string; status: string; exit_code?: number }>;
+      readonly remedy: string;
+    },
+  ) {
+    super(message);
+    this.name = "SharedServiceDeadError";
+  }
+}
+
+/** The `SHARED_SERVICE_DEAD` error for the given dead shared services. */
+export function sharedServiceDeadError(dead: ReadonlyArray<DeadService>): Error {
+  const remedy = "devtrees down --shared && devtrees up";
+  return new SharedServiceDeadError(
+    `devtrees up: shared service(s) not running: ${describeDeadServices(dead)}. devtrees ` +
+      `does not restart shared services from a worktree's \`up\` — every worktree uses ` +
+      `them. Run \`${remedy}\` to bring the shared instance back.`,
+    { dead_services: deadServicesDetails(dead), remedy },
+  );
+}
+
+/**
+ * The `HEALTH_TIMEOUT` a dead service produces: names each dead service with
+ * its status and exit code, and the `down` + `up` that brings it back. The
+ * instance is left running (ADR-0005) so its logs stay readable.
+ */
+function deadServicesError(dead: ReadonlyArray<DeadService>, remedy: string): HealthTimeoutError {
+  return new HealthTimeoutError(
+    `service(s) not running: ${describeDeadServices(dead)}. devtrees does not restart ` +
+      `them yet; run \`${remedy}\` to bring the stack back. The worktree instance is still ` +
+      `running — read why with \`devtrees logs <service>\`.`,
+    { dead_services: deadServicesDetails(dead), remedy },
+  );
 }

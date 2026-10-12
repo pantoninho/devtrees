@@ -314,9 +314,27 @@ if (cmd === "up") {
     const probedReady =
       process.env.DEVTREES_STUB_NEVER_READY !== "1" &&
       (!Number.isFinite(readyAfterMs) || instanceAgeMs >= readyAfterMs);
+    //   DEVTREES_STUB_DEAD=a,b          the named services model a killed
+    //                                   process (issue #162): "Completed",
+    //                                   exit_code -1, is_running false. Any
+    //                                   instance, shared or worktree.
+    //   DEVTREES_STUB_DONE=a,b          the named services model a finished
+    //                                   one-shot: "Completed", exit_code 0.
+    const namesFrom = (v) => new Set((v ?? "").split(",").filter((n) => n !== ""));
+    const deadNames = namesFrom(process.env.DEVTREES_STUB_DEAD);
+    const doneNames = namesFrom(process.env.DEVTREES_STUB_DONE);
     const procs = Object.entries(config.processes ?? {})
       .filter(([, proc]) => selectedByNamespace(proc, namespaces))
       .map(([name, proc]) => {
+        if (deadNames.has(name) || doneNames.has(name)) {
+          return {
+            name,
+            status: "Completed",
+            is_ready: "-",
+            exit_code: deadNames.has(name) ? -1 : 0,
+            is_running: false,
+          };
+        }
         const probed = proc?.readiness_probe !== undefined;
         if (probed && process.env.DEVTREES_STUB_DEAD_PROBED === "1") {
           return {

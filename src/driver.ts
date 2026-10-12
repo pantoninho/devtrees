@@ -193,6 +193,13 @@ export interface ServiceStatus {
   readonly name: string;
   readonly status: string;
   readonly health: HealthState;
+  /**
+   * process-compose's `exit_code`, when the row carries one. Only meaningful
+   * once the process has stopped: it is what tells a crashed `Completed`
+   * (non-zero, `-1` for a signal) from a finished one-shot (`0`) — see
+   * `classifyService` (ADR-0008). Never published in `ls`/`up --json` rows.
+   */
+  readonly exitCode?: number;
 }
 
 interface RawProc {
@@ -201,6 +208,7 @@ interface RawProc {
   readonly is_ready?: unknown;
   readonly ready?: unknown;
   readonly is_running?: unknown;
+  readonly exit_code?: unknown;
 }
 
 function readProbeVerdict(raw: RawProc): HealthState {
@@ -240,7 +248,8 @@ export function parseServiceStatuses(stdout: string): ServiceStatus[] {
   const out: ServiceStatus[] = [];
   for (const raw of items) {
     if (typeof raw.name !== "string" || typeof raw.status !== "string") continue;
-    out.push({ name: raw.name, status: raw.status, health: readHealth(raw) });
+    const row = { name: raw.name, status: raw.status, health: readHealth(raw) };
+    out.push(typeof raw.exit_code === "number" ? { ...row, exitCode: raw.exit_code } : row);
   }
   return out;
 }

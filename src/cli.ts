@@ -309,6 +309,8 @@ class UpCommand extends DevtreesCommand {
       "CONFIG_INVALID",
       "LOCK_CONTENTION",
       "HEALTH_TIMEOUT",
+      "NAMESPACE_NOT_RUNNING",
+      "SHARED_SERVICE_DEAD",
       "PROCESS_COMPOSE_NOT_FOUND",
       "INVALID_ARGS",
       "UNKNOWN",
@@ -349,7 +351,9 @@ class UpCommand extends DevtreesCommand {
     description:
       "Start exactly the given process-compose namespace(s). Repeatable (`-n a -n b`); " +
       "`-n app` does not imply `default`. Omitted, a fresh `up` starts only the `default` " +
-      "namespace (services with no `namespace:`) and fails with NO_SERVICES_SELECTED if it has none.",
+      "namespace (services with no `namespace:`) and fails with NO_SERVICES_SELECTED if it has none. " +
+      "On a running instance, omitted checks the namespaces it was booted with, and `-n` naming one " +
+      "it was not booted with fails with NAMESPACE_NOT_RUNNING.",
   });
   dryRun = Option.Boolean("--dry-run", false, {
     description:

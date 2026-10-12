@@ -509,6 +509,7 @@ interface UpDoc {
 
 interface LsServiceRow {
   readonly name: string;
+  readonly status: string;
   readonly health: string;
   readonly ports: Readonly<Record<string, number>>;
 }
@@ -946,6 +947,116 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
     const resync = up(wt);
     expect(resync.code, `resync up should succeed: ${resync.stderr}`).toBe(0);
     expect(pidsMatching(holdB), "exactly one copy of the new command").toHaveLength(1);
+  }, 120_000);
+
+  it("scenario 16: re-up after one of two services is killed fails with HEALTH_TIMEOUT naming it (#162, #177)", async () => {
+    // #162's two-service shape: `keeper` keeps the instance alive after `toy`
+    // is killed, so the re-up takes the already-running path. Before #177 it
+    // printed `is up.` and exited 0 over the corpse.
+    const repo = buildSmokeRepo("dt-rpc16-", ["login"]);
+    currentCtx = { pidNeedle: repo.root, root: repo.root };
+    const wt = repo.worktrees.login!;
+    writeFileSync(
+      join(wt, "devtrees.yaml"),
+      [
+        "services:",
+        "  toy:",
+        "    tier: isolated",
+        "    namespace: test",
+        // `--directory <root>` puts the scenario root in argv so the kill
+        // below (and the PID-hygiene check) can find exactly this process.
+        `    command: "python3 -m http.server $TOY_PORT --bind 127.0.0.1 --directory ${repo.root}"`,
+        "    ports: [TOY_PORT]",
+        "    readiness_probe:",
+        "      exec:",
+        `        command: "sh -c 'curl -fsS --max-time 2 -o /dev/null http://127.0.0.1:$TOY_PORT/'"`,
+        "      initial_delay_seconds: 1",
+        "      period_seconds: 1",
+        "      timeout_seconds: 3",
+        "      success_threshold: 1",
+        "      failure_threshold: 30",
+        "  keeper:",
+        "    tier: isolated",
+        "    namespace: test",
+        '    command: "sleep 300"',
+        "",
+      ].join("\n"),
+    );
+    cleanupStack.push(() => devtrees(wt, ["down"]));
+
+    const first = devtrees(wt, ["up", "-n", "test", "--json", "--wait-timeout", "60"]);
+    expect(first.code, `first up failed: ${first.stderr} ${first.stdout}`).toBe(0);
+
+    // Match on the server's own argv, not the bare root: process-compose's
+    // argv carries the root too (its `-f` config path), and killing it would
+    // take the whole instance down — not #162's shape.
+    const toyNeedle = `--directory ${repo.root}`;
+    const toyPids = pidsMatching(toyNeedle);
+    expect(toyPids.length, "toy should be running").toBeGreaterThan(0);
+    reapPids(toyPids);
+    expect(await waitForNoPids(toyNeedle, 5000)).toEqual([]);
+
+    const started = Date.now();
+    const again = devtrees(wt, ["up", "-n", "test", "--json", "--wait-timeout", "60"]);
+    const elapsed = Date.now() - started;
+    expect(again.code, `re-up should fail: ${again.stdout}`).toBe(1);
+    const err = (again.doc as { error?: { code?: string; message?: string; details?: unknown } })
+      .error;
+    expect(err?.code).toBe("HEALTH_TIMEOUT");
+    expect(err?.message).toContain("toy");
+    expect(err?.message).toContain("devtrees down && devtrees up -n test");
+    expect(err?.details).toMatchObject({ dead_services: [{ name: "toy", exit_code: -1 }] });
+    // Fail-fast: a corpse is not waited on for the full 60s window.
+    expect(elapsed).toBeLessThan(30_000);
+
+    // Reported, not restarted; the surviving service is untouched.
+    const ls = devtrees(wt, ["ls", "--json"]).doc as LsDoc;
+    const rows = ls.ls.instances.find((i) => i.id === wtId(wt))?.services ?? [];
+    expect(rows.find((s) => s.name === "keeper")?.status).toBe("Running");
+    expect(pidsMatching(toyNeedle)).toEqual([]);
+  }, 180_000);
+
+  it("scenario 17: up -n one, then up -n one -n two fails with NAMESPACE_NOT_RUNNING (#170, #177)", async () => {
+    const repo = buildSmokeRepo("dt-rpc17-", ["login"]);
+    currentCtx = { pidNeedle: repo.root, root: repo.root };
+    const wt = repo.worktrees.login!;
+    writeFileSync(
+      join(wt, "devtrees.yaml"),
+      [
+        "services:",
+        "  a:",
+        "    tier: isolated",
+        "    namespace: one",
+        '    command: "sleep 300"',
+        "  b:",
+        "    tier: isolated",
+        "    namespace: two",
+        `    command: "python3 -m http.server $B_PORT --bind 127.0.0.1 --directory ${repo.root}"`,
+        "    ports: [B_PORT]",
+        "",
+      ].join("\n"),
+    );
+    cleanupStack.push(() => devtrees(wt, ["down"]));
+
+    const first = devtrees(wt, ["up", "-n", "one", "--json", "--wait-timeout", "30"]);
+    expect(first.code, `first up failed: ${first.stderr} ${first.stdout}`).toBe(0);
+
+    const widen = devtrees(wt, ["up", "-n", "one", "-n", "two", "--json", "--wait-timeout", "20"]);
+    expect(widen.code).toBe(1);
+    const err = (widen.doc as { error?: { code?: string; details?: unknown } }).error;
+    expect(err?.code).toBe("NAMESPACE_NOT_RUNNING");
+    expect(err?.details).toMatchObject({
+      namespaces: ["two"],
+      services: ["b"],
+      remedy: "devtrees down && devtrees up -n one -n two",
+    });
+    // Nothing was started: `b` never ran.
+    expect(pidsMatching(`--directory ${repo.root}`)).toEqual([]);
+
+    // A bare re-up reads the boot-time selection back and targets `one` only.
+    const bare = devtrees(wt, ["up", "--json", "--wait-timeout", "20"]);
+    expect(bare.code, `bare re-up failed: ${bare.stderr} ${bare.stdout}`).toBe(0);
+    expect((bare.doc as UpDoc).up.services.map((s) => s.name)).toEqual(["a"]);
   }, 120_000);
 });
 
