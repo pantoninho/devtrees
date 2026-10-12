@@ -4360,16 +4360,27 @@ describe("runUp — pending-reload guard (#191)", () => {
         signal.addEventListener("abort", () => reject(new Error("aborted")));
       });
     };
+    const worktreeSpawn = () => {
+      const spawn = track.invocations.find((i) => !i.socketPath.endsWith("/shared.sock"));
+      if (spawn === undefined) throw new Error("expected a worktree spawn");
+      return spawn;
+    };
+    // `ps`: the instance's process-compose (pid 9) and each live pid as its
+    // child, so a timed-out reload can record the old runs' identity (#206).
+    const readProcessTable = async () => [
+      { pid: 9, ppid: 1, pgid: 9, command: `process-compose up -u ${worktreeSpawn().socketPath}` },
+      ...[...state.alive].map((pid) => ({ pid, ppid: 9, pgid: pid, command: `cmd-${pid}` })),
+    ];
     const deps: CommandDeps = {
       ...base,
       readStack: () => state.stack,
       driver: { ...base.driver, controlRequest, reloadTimeoutMs: 50 },
       getServiceStatuses: async () => state.rows,
       isProcessAlive: (pid) => state.alive.has(pid),
+      stop: { readProcessTable },
     };
     const where = (): { anchor: string; id: string } => {
-      const spawn = track.invocations.find((i) => !i.socketPath.endsWith("/shared.sock"));
-      if (spawn === undefined) throw new Error("expected a worktree spawn");
+      const spawn = worktreeSpawn();
       return { anchor: dirname(dirname(spawn.configPath)), id: base.expectedWorktreeId };
     };
     const marker = (): PendingReload | undefined => {
@@ -4396,7 +4407,10 @@ describe("runUp — pending-reload guard (#191)", () => {
     state.reload = "hang";
     const timedOut = await upError(deps);
     expect(timedOut.details).toEqual({ reason: "timeout" });
-    expect(marker()).toEqual({ services: ["web"], oldRuns: [{ name: "web", pid: 100 }] });
+    expect(marker()).toEqual({
+      services: ["web"],
+      oldRuns: [{ name: "web", pid: 100, identity: { ppid: 9, pgid: 100, command: "cmd-100" } }],
+    });
 
     // process-compose dropped `web` and is waiting for pid 100 to exit.
     state.rows = [row("api", 200)];
@@ -4497,7 +4511,10 @@ describe("runUp — pending-reload guard (#191)", () => {
     state.stack = { services: [svc("keeper", "node k.js"), svc("web2", "node a.js")] };
     state.reload = "hang";
     await upError(deps);
-    expect(marker()).toEqual({ services: [], oldRuns: [{ name: "web", pid: 100 }] });
+    expect(marker()).toEqual({
+      services: [],
+      oldRuns: [{ name: "web", pid: 100, identity: { ppid: 9, pgid: 100, command: "cmd-100" } }],
+    });
 
     // Still pending while the old pid lives...
     state.rows = [row("keeper", 50)];
@@ -6425,7 +6442,13 @@ describe("bounded down — force-kill and DOWN_TIMEOUT (#190)", () => {
    * `socketPath`, `web` its child. `pcExits` decides whether process-compose
    * exits once `web` is killed.
    */
-  function stopSeams(socketPath: string, opts: { pcExits: boolean }) {
+  function stopSeams(
+    socketPath: string,
+    opts: {
+      pcExits: boolean;
+      extra?: ReadonlyArray<{ pid: number; ppid: number; pgid: number; command: string }>;
+    },
+  ) {
     const kills: Array<[number, string]> = [];
     const seams: NonNullable<CommandDeps["stop"]> = {
       readProcessTable: async () => [
@@ -6436,6 +6459,7 @@ describe("bounded down — force-kill and DOWN_TIMEOUT (#190)", () => {
           command: `process-compose up -f x.yaml -U -u ${socketPath} -t=false`,
         },
         { pid: WEB_PID, ppid: PC_PID, pgid: WEB_PID, command: "bash -c tail -f hold" },
+        ...(opts.extra ?? []),
       ],
       kill: (target, signal) => {
         kills.push([target, signal]);
@@ -6479,6 +6503,31 @@ describe("bounded down — force-kill and DOWN_TIMEOUT (#190)", () => {
     expect(result.forceKilled).toEqual([{ service: "web", pid: WEB_PID }]);
     // The service's process group, never process-compose itself.
     expect(kills).toEqual([[-WEB_PID, "SIGKILL"]]);
+    expect(readPendingReload(anchorOf(deps), deps.expectedWorktreeId)).toBeUndefined();
+  });
+
+  it("worktree down also force-kills a pending reload's unlisted old run, then clears the marker (#206)", async () => {
+    const deps = stubDeps({ stack: isolatedStack, track: { invocations: [], touchSocket: true } });
+    await runUp(deps);
+    const paths = instancePaths(anchorOf(deps), deps.expectedWorktreeId);
+    // process-compose no longer lists the old `api` run; only the marker knows it.
+    const old = { pid: 77, ppid: PC_PID, pgid: 77, command: "bash -c sleep 300" };
+    const { seams, kills } = stopSeams(paths.socketPath, { pcExits: true, extra: [old] });
+    writePendingReload(anchorOf(deps), deps.expectedWorktreeId, {
+      services: ["api"],
+      oldRuns: [
+        { name: "api", pid: 77, identity: { ppid: PC_PID, pgid: 77, command: old.command } },
+      ],
+    });
+    const result = await runDown({ ...deps, driver: stuckDriver(), stop: seams });
+    expect(result.forceKilled).toEqual([
+      { service: "web", pid: WEB_PID },
+      { service: "api", pid: 77 },
+    ]);
+    expect(kills).toEqual([
+      [-WEB_PID, "SIGKILL"],
+      [-77, "SIGKILL"],
+    ]);
     expect(readPendingReload(anchorOf(deps), deps.expectedWorktreeId)).toBeUndefined();
   });
 

@@ -33,6 +33,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { deriveWorktreeId } from "./anchor.js";
 import { instancePaths } from "./paths.js";
+import { readPendingReload } from "./reload-pending.js";
 
 // ---------------------------------------------------------------------------
 // Gating: skip the whole file unless the env var is set AND the binary works.
@@ -982,9 +983,8 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
     const wt = repo.worktrees.login!;
     const [holdA, holdB] = [join(repo.root, "hold-a"), join(repo.root, "hold-b")];
     writeReloadStack(wt, { hold: holdA, shutdownCommand: "echo bye" });
-    // `devtrees down` cannot force-kill the old process (process-compose no
-    // longer lists it) and would fail DOWN_TIMEOUT after its budget, so tear
-    // down by killing everything this scenario spawned.
+    // The scenario kills the old process by hand; tear down by killing
+    // everything it spawned (scenario 60 covers `down` in this state).
     cleanupStack.push(() => reapPids(pidsMatching(repo.root)));
 
     expect(up(wt).code).toBe(0);
@@ -1484,6 +1484,65 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
     });
   }, 120_000);
 });
+
+// Issue #206: after a hot-reload times out (#188), process-compose no longer
+// lists the changed service's old process, yet its `down` waits on it. The
+// bounded `down` (#190) now also force-kills the old runs the pending-reload
+// marker (#191) recorded, so it finishes within budget.
+describe.skipIf(!ENABLED)("real-pc smoke — down after a timed-out reload (#206)", () => {
+  it("scenario 60: down force-kills the old process a timed-out reload left behind (#206)", async () => {
+    const repo = buildSmokeRepo("dt-rpc60-", ["login"]);
+    currentCtx = { pidNeedle: repo.root, root: repo.root };
+    const wt = repo.worktrees.login!;
+    const [holdA, holdB] = [join(repo.root, "hold-a"), join(repo.root, "hold-b")];
+    writeReloadStack(wt, { hold: holdA, shutdownCommand: "echo bye" });
+    // If the escalation regressed, `down` would fail: kill what we started.
+    cleanupStack.push(() => reapPids(pidsMatching(repo.root)));
+
+    expect(up(wt).code).toBe(0);
+    expect(await waitForPid(holdA, 10_000), "old command should be running").toBe(true);
+    const oldPids = pidsMatching(holdA);
+
+    // The #188 hang shape: the edited service's old process never stops.
+    writeReloadStack(wt, { hold: holdB, shutdownCommand: "echo bye" });
+    const reload = up(wt);
+    const reloadErr = (
+      reload.doc as { error?: { code?: string; details?: { reason?: string } } } | undefined
+    )?.error;
+    expect(reloadErr?.code, `drifted up should time out: ${reload.stderr}`).toBe("CONFIG_DRIFT");
+    expect(reloadErr?.details?.reason).toBe("timeout");
+
+    const commonDir = execGit(wt, ["rev-parse", "--git-common-dir"]);
+    const anchor = commonDir.startsWith("/") ? commonDir : join(wt, commonDir);
+    const marker = readPendingReload(anchor, wtId(wt));
+    const oldRun = marker?.oldRuns.find((r) => r.name === "web");
+    expect(oldRuns(marker), "the marker records the old run's identity").toEqual(["web"]);
+    expect(oldPids).toContain(oldRun?.pid);
+    expect(oldRun?.identity?.command).toContain(holdA);
+
+    const started = Date.now();
+    const down = devtrees(wt, ["down", "--json"], { DEVTREES_DOWN_BASE_TIMEOUT_MS: "3000" });
+    const elapsed = Date.now() - started;
+    expect(
+      down.code,
+      `down should finish, not fail DOWN_TIMEOUT: ${down.stdout}${down.stderr}`,
+    ).toBe(0);
+    const doc = down.doc as { down: { stopped: boolean; force_killed: unknown[] } };
+    expect(doc.down.stopped).toBe(true);
+    expect(doc.down.force_killed).toContainEqual({ service: "web", pid: oldRun?.pid });
+    // Budget (3s) plus the grace and process-compose's own work.
+    expect(elapsed).toBeLessThan(30_000);
+    expect(await waitForNoPids(repo.root, 10_000), "nothing should survive down").toEqual([]);
+    expect(orphanedServices(repo.root)).toEqual([]);
+    expect(readPendingReload(anchor, wtId(wt)), "down clears the marker").toBeUndefined();
+    expect(existsSync(instancePaths(anchor, wtId(wt)).socketPath)).toBe(false);
+  }, 120_000);
+});
+
+/** Names of the marker's old runs that carry a recorded identity. */
+function oldRuns(marker: ReturnType<typeof readPendingReload>): string[] {
+  return (marker?.oldRuns ?? []).filter((r) => r.identity).map((r) => r.name);
+}
 
 // Without the gate, log once so a developer running `vp test run` locally
 // knows why no scenarios fired.

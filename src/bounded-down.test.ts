@@ -10,6 +10,7 @@ import {
   DownTimeoutError,
   findSupervisorPid,
   parseProcessTable,
+  pendingRunsToKill,
   snapshotServiceProcesses,
   stillRunning,
   type ProcessRow,
@@ -17,6 +18,7 @@ import {
   type StopTarget,
 } from "./bounded-down.js";
 import type { DownOutcome, ServiceStatus } from "./driver.js";
+import type { OldRun } from "./reload-pending.js";
 
 const SOCK = "/tmp/devtrees-501/abc/login-1234.sock";
 const PC: ProcessRow = {
@@ -122,6 +124,59 @@ describe("stillRunning (pid-reuse protection)", () => {
   });
 });
 
+/** The old `web` run a timed-out reload left behind: process-compose no longer lists it. */
+const OLD: ProcessRow = { pid: 301, ppid: 100, pgid: 301, command: "bash -c tail -f hold-a" };
+const OLD_RUN: OldRun = {
+  name: "web",
+  pid: 301,
+  identity: { ppid: 100, pgid: 301, command: OLD.command },
+};
+
+describe("pendingRunsToKill (#206)", () => {
+  it("keeps an old run that is still the same child of the supervisor", () => {
+    expect(pendingRunsToKill([OLD_RUN], [], [PC, OLD], 100)).toEqual([{ service: "web", ...OLD }]);
+  });
+
+  it("drops a reused pid: another command, process group or parent", () => {
+    for (const now of [
+      { ...OLD, command: "vim notes" },
+      { ...OLD, pgid: 999 },
+      { ...OLD, ppid: 1 },
+    ]) {
+      expect(pendingRunsToKill([OLD_RUN], [], [PC, now], 100)).toEqual([]);
+    }
+  });
+
+  it("drops a run that has exited, or any run when the supervisor is unknown", () => {
+    expect(pendingRunsToKill([OLD_RUN], [], [PC], 100)).toEqual([]);
+    expect(pendingRunsToKill([OLD_RUN], [], [PC, OLD], undefined)).toEqual([]);
+  });
+
+  it("never kills a run the marker could not identify when it was written", () => {
+    const unknown: OldRun = { name: "web", pid: 301, identity: null };
+    expect(pendingRunsToKill([unknown], [], [PC, OLD], 100)).toEqual([]);
+  });
+
+  it("a marker from before #206 (no identity) kills on parentage alone", () => {
+    const legacy: OldRun = { name: "web", pid: 301 };
+    expect(pendingRunsToKill([legacy], [], [PC, OLD], 100)).toEqual([{ service: "web", ...OLD }]);
+    // ...but never a pid that is not a direct child of this supervisor.
+    expect(pendingRunsToKill([legacy], [], [PC, { ...OLD, ppid: 1 }], 100)).toEqual([]);
+  });
+
+  it("a legacy run is spared once the snapshot shows its service back under another pid", () => {
+    const legacy: OldRun = { name: "web", pid: 301 };
+    const back = [{ service: "web", ...WEB }];
+    expect(pendingRunsToKill([legacy], back, [PC, WEB, OLD], 100)).toEqual([]);
+  });
+
+  it("leaves a pid the snapshot already covers to it, and lists each pid once", () => {
+    const listed = [{ service: "web", ...OLD }];
+    expect(pendingRunsToKill([OLD_RUN], listed, [PC, OLD], 100)).toEqual([]);
+    expect(pendingRunsToKill([OLD_RUN, OLD_RUN], [], [PC, OLD], 100)).toHaveLength(1);
+  });
+});
+
 /** A scripted world: the process table over time, the down outcome, and the kills. */
 function world(opts: {
   readonly statuses?: ServiceStatus[] | Error;
@@ -221,6 +276,46 @@ describe("boundedDown", () => {
       outcome: { stopped: false, reason: "timeout" },
     });
     expect(await boundedDown(target, w.driver, w.seams)).toEqual({ forceKilled: [] });
+    expect(w.kills).toEqual([]);
+  });
+
+  it("on timeout also SIGKILLs a pending reload's unlisted old run, by process group (#206)", async () => {
+    const w = world({
+      statuses: [status("api", 202)],
+      tables: [
+        [PC, API, OLD],
+        [PC, API, OLD],
+      ],
+      outcome: { stopped: false, reason: "timeout" },
+    });
+    const result = await boundedDown({ ...target, pendingOldRuns: [OLD_RUN] }, w.driver, w.seams);
+    expect(result).toEqual({
+      forceKilled: [
+        { service: "api", pid: 202 },
+        { service: "web", pid: 301 },
+      ],
+    });
+    expect(w.kills).toEqual([
+      [-202, "SIGKILL"],
+      [-301, "SIGKILL"],
+    ]);
+  });
+
+  it("never kills a pending reload's old pid once it is reused (#206)", async () => {
+    const w = world({
+      statuses: [],
+      tables: [[PC, { ...OLD, command: "vim notes" }]],
+      outcome: { stopped: false, reason: "timeout" },
+    });
+    const result = await boundedDown({ ...target, pendingOldRuns: [OLD_RUN] }, w.driver, w.seams);
+    expect(result).toEqual({ forceKilled: [] });
+    expect(w.kills).toEqual([]);
+  });
+
+  it("a clean stop never touches a pending reload's old run", async () => {
+    const w = world({ statuses: [], tables: [[PC, OLD]], outcome: { stopped: true } });
+    const result = await boundedDown({ ...target, pendingOldRuns: [OLD_RUN] }, w.driver, w.seams);
+    expect(result).toEqual({ forceKilled: [] });
     expect(w.kills).toEqual([]);
   });
 

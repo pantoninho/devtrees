@@ -23,6 +23,13 @@
  * Once a read shows nothing pending, the marker is cleared. `down` and a fresh
  * start clear it too: the instance it describes is gone.
  *
+ * The marker also lets `down` finish (#206). process-compose no longer lists
+ * the old runs, yet its `down` waits on them, so the bounded `down` kills
+ * them along with its own snapshot once its budget runs out. To make that
+ * safe against pid reuse, the marker records each old run's parent, process
+ * group and command line, read from `ps` when the reload times out
+ * (`identifyOldRuns`).
+ *
  * There is deliberately no stateless fallback (reading the project's shape
  * against the on-disk config): the restored on-disk config is stale after a
  * timed-out rename or removal, and an empty project is legitimate after
@@ -36,16 +43,36 @@
 
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import type { ProcessRow } from "./bounded-down.js";
 import type { ServiceStatus } from "./driver.js";
 import { stateDir } from "./paths.js";
 import { writeAtomic } from "./registry.js";
 import { namespaceSelected, serviceNamespaces } from "./selection.js";
 import type { Namespace } from "./stack.js";
 
+/**
+ * The old run's process-table identity when the reload timed out (#206):
+ * its parent (this instance's process-compose), process group and command
+ * line. `down` kills the run only while all three still match, so a reused
+ * pid is never hit.
+ */
+export interface OldRunIdentity {
+  readonly ppid: number;
+  readonly pgid: number;
+  readonly command: string;
+}
+
 /** One old run a pending reload is waiting on. */
-interface OldRun {
+export interface OldRun {
   readonly name: string;
   readonly pid: number;
+  /**
+   * Set by `identifyOldRuns` when the marker is written (#206). `null`: the
+   * run could not be identified as a child of the instance's process-compose
+   * then (already gone, or `ps` failed), so `down` never kills it. Absent: a
+   * marker from a build before #206, see `pendingRunsToKill`.
+   */
+  readonly identity?: OldRunIdentity | null;
 }
 
 /** What a timed-out reload leaves behind (persisted, see the module doc). */
@@ -166,6 +193,34 @@ export function planPendingReload(
       .map((r) => r.name)
       .filter((name) => after[name] !== undefined && staysBooted(name)),
     oldRuns: snapshot.flatMap((r) => (r.pid !== undefined ? [{ name: r.name, pid: r.pid }] : [])),
+  };
+}
+
+/**
+ * Record each old run's process-table identity (#206), from a `ps` read
+ * taken when the reload timed out. The old run is still running then (it is
+ * what the reload is waiting on), as a direct child of the instance's
+ * process-compose (`supervisorPid`). A run that is not such a child in
+ * `table` (it exited, or the read failed) gets `identity: null`: `down`
+ * must never kill it on the pid alone.
+ */
+export function identifyOldRuns(
+  marker: PendingReload,
+  table: ReadonlyArray<ProcessRow>,
+  supervisorPid: number | undefined,
+): PendingReload {
+  const byPid = new Map(table.map((row) => [row.pid, row]));
+  return {
+    ...marker,
+    oldRuns: marker.oldRuns.map((run) => {
+      const row = byPid.get(run.pid);
+      const child = supervisorPid !== undefined && row !== undefined && row.ppid === supervisorPid;
+      return {
+        name: run.name,
+        pid: run.pid,
+        identity: child ? { ppid: row.ppid, pgid: row.pgid, command: row.command } : null,
+      };
+    }),
   };
 }
 
