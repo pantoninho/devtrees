@@ -136,19 +136,25 @@ type ReloadResult =
 /**
  * Base budget for a `project update` call. process-compose's update stops
  * every changed or removed process, one after another, and returns only once
- * each old process has exited. It never escalates to SIGKILL when a
- * `shutdown.command` exits 0 without stopping the process, or when a process
- * ignores SIGTERM and declares no `shutdown.timeout_seconds`. In those cases
- * the update (and every later `down`) blocks forever. The budget turns that
- * wait into a bounded `CONFIG_DRIFT`.
+ * each old process has exited. It escalates to SIGKILL only on the plain
+ * SIGTERM path, and only when `shutdown.timeout_seconds` is set explicitly.
+ * Two shapes therefore never finish:
+ *  - a process that ignores SIGTERM and declares no `shutdown.timeout_seconds`;
+ *  - a `shutdown.command` that exits 0 without stopping the process. Here
+ *    `shutdown.timeout_seconds` only bounds the command itself, and there is
+ *    no SIGKILL fallback whatever its value.
+ * In those cases the update (and every later `down`) blocks forever. The
+ * budget turns that wait into a bounded `CONFIG_DRIFT`.
  */
 const RELOAD_BASE_TIMEOUT_MS = 30_000;
 
 /**
  * Reload budget for a derived config: the base budget plus every explicit
- * `shutdown.timeout_seconds`. process-compose waits up to that long for each
- * changed process before SIGKILL, so a reload that is merely slow is never
- * cut short.
+ * `shutdown.timeout_seconds`. That value bounds a legitimately slow stop:
+ * on the SIGTERM path, process-compose waits up to that long before SIGKILL;
+ * with a `shutdown.command`, it is the command's own timeout. Each changed
+ * process is stopped in turn, so the values add up, and a reload that is
+ * merely slow is never cut short.
  */
 export function reloadTimeoutMs(config: {
   readonly processes: Readonly<

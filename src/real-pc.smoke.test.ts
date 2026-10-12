@@ -926,8 +926,11 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
     const elapsed = Date.now() - started;
     expect(reload.code, `drifted up should fail, not hang: ${reload.stderr}`).not.toBe(-1);
     expect(reload.code).not.toBe(0);
-    const doc = reload.doc as { error?: { code?: string; message?: string } } | undefined;
+    const doc = reload.doc as
+      | { error?: { code?: string; message?: string; details?: { reason?: string } } }
+      | undefined;
     expect(doc?.error?.code).toBe("CONFIG_DRIFT");
+    expect(doc?.error?.details?.reason).toBe("timeout");
     expect(doc?.error?.message).toMatch(/did not finish within/);
     expect(elapsed).toBeLessThan(50_000);
 
@@ -937,6 +940,12 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
     expect(await waitForPid(holdB, 15_000), "update should finish once the old process dies").toBe(
       true,
     );
+
+    // ...and the documented final step, a further `up`, converges: it resyncs
+    // the on-disk config and stored hash without starting a second copy.
+    const resync = up(wt);
+    expect(resync.code, `resync up should succeed: ${resync.stderr}`).toBe(0);
+    expect(pidsMatching(holdB), "exactly one copy of the new command").toHaveLength(1);
   }, 120_000);
 });
 

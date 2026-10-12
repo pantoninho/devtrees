@@ -82,12 +82,22 @@ export type { WaitForHealth, WaitForSharedHealth } from "./health.js";
  * running unchanged; the CLI maps this to the `CONFIG_DRIFT` error
  * envelope so an agent can decide whether to `down` + `up` or hand off to
  * a human (ADR-0005).
+ *
+ * `details.reason` lets an agent branch without parsing the message:
+ * `timeout` means process-compose is still waiting for a changed service's
+ * old process to exit (`down` would block too). `not_supported` / `error`
+ * mean the reload was refused and the instance is untouched.
  */
 class ConfigDriftError extends Error {
   readonly code = "CONFIG_DRIFT";
-  constructor(message: string) {
+  readonly details: { readonly reason: "timeout" | "not_supported" | "error" };
+  constructor(
+    message: string,
+    details: { readonly reason: "timeout" | "not_supported" | "error" },
+  ) {
     super(message);
     this.name = "ConfigDriftError";
+    this.details = details;
   }
 }
 
@@ -2415,6 +2425,29 @@ function readDerivedServices(configPath: string): string[] {
   }
 }
 
+/** Remediation for a reload process-compose refused: the instance is untouched. */
+const RELOAD_FAILED_REMEDIATION =
+  ". The instance is still running — run `devtrees down && devtrees up` to apply the new config.";
+
+/**
+ * A timed-out reload means process-compose is still waiting for an old process
+ * to exit, and `down` would wait on the same process. Killing that process
+ * unblocks process-compose, which then finishes applying the new config. A
+ * retried `up` before then is unsafe: process-compose has already dropped the
+ * old process from its list, so a second `project update` starts a new copy
+ * next to it, and the pending update later starts another one, leaving the
+ * first copy orphaned.
+ */
+const RELOAD_TIMEOUT_REMEDIATION =
+  ". The instance is still running, but process-compose stays blocked until the old " +
+  "process exits, and `devtrees down` would block on it too. Do NOT re-run `devtrees up` " +
+  "until that process has exited: process-compose would start a second, untracked copy of " +
+  "the service. Kill the service's old process to let the reload finish, then run " +
+  "`devtrees up` again to resync the on-disk config and stored hash. To prevent this, give " +
+  "the service a `shutdown.command` that really stops the process; `shutdown.timeout_seconds` " +
+  "does not help when a `shutdown.command` exits 0 without stopping it (it only bounds the " +
+  "command itself, and only the plain SIGTERM path escalates to SIGKILL after it).";
+
 /**
  * Idempotency / drift dispatch for a `runUp` whose worktree instance is
  * already running. Two outcomes:
@@ -2429,21 +2462,6 @@ function readDerivedServices(configPath: string): string[] {
  *    throw `ConfigDriftError` so the CLI emits the `CONFIG_DRIFT` envelope
  *    and the instance keeps running (ADR-0005).
  */
-const RELOAD_FAILED_REMEDIATION =
-  ". The instance is still running — run `devtrees down && devtrees up` to apply the new config.";
-
-/**
- * A timed-out reload means process-compose is still waiting for an old process
- * to exit, and `down` would wait on the same process. Killing that process
- * unblocks process-compose, which then finishes applying the new config.
- */
-const RELOAD_TIMEOUT_REMEDIATION =
-  ". The instance is still running, but process-compose stays blocked until that process " +
-  "exits, and `devtrees down` would block on it too. Kill the service's old process to " +
-  "let the reload finish. To prevent this, make sure a `shutdown.command` actually stops " +
-  "the process (process-compose never SIGKILLs it once the command exits 0), and give a " +
-  "process that ignores SIGTERM a `shutdown.timeout_seconds` so it is SIGKILLed.";
-
 async function reconcileRunning(args: {
   readonly stack: ResolvedStack;
   readonly anchor: { readonly anchor: string; readonly worktreeId: string };
@@ -2491,6 +2509,7 @@ async function reconcileRunning(args: {
           `process-compose could not hot-reload the new config` +
           (reload.message ? ` (${reload.message})` : "") +
           (reload.reason === "timeout" ? RELOAD_TIMEOUT_REMEDIATION : RELOAD_FAILED_REMEDIATION),
+        { reason: reload.reason },
       );
     }
     args.writeHash(anchor.anchor, anchor.worktreeId, currentHash);

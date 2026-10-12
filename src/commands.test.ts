@@ -3859,6 +3859,8 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     );
     if (err === undefined) throw new Error("expected runUp to reject");
     expect(err.code).toBe("CONFIG_DRIFT");
+    // A refused reload stays distinguishable from a timed-out one.
+    expect((err as Error & { details?: unknown }).details).toEqual({ reason: "not_supported" });
 
     // Hash store unchanged — the stored hash still reflects stackA.
     expect(Object.values(hashes.raw)[0]?.[baseDeps.expectedWorktreeId]).toBe(storedAfterFirst);
@@ -3950,7 +3952,9 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     );
     if (err === undefined) throw new Error("expected runUp to reject");
     expect(err.code).toBe("CONFIG_DRIFT");
+    expect((err as Error & { details?: unknown }).details).toEqual({ reason: "timeout" });
     expect(err.message).toMatch(/did not finish within/);
+    expect(err.message).toMatch(/Do NOT re-run `devtrees up`/);
     expect(err.message).toMatch(/shutdown\.command/);
     expect(killed).toEqual(["SIGTERM"]);
     expect(readFileSync(worktreeSpawn.configPath, "utf8")).toBe(configBefore);
