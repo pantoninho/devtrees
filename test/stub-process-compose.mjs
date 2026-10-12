@@ -12,7 +12,8 @@
  *   down -U -u <socket>
  *        Signals the running instance to stop and removes the control socket.
  *   version
- *        Prints a version so the binary-presence probe succeeds.
+ *        Prints a version (`$STUB_PC_VERSION`, default v1.122.0; `--short`
+ *        prints it bare) so the presence and minimum-version probes work.
  *
  * The processes here are expected to be simple shell commands; the e2e uses a
  * tiny HTTP server that binds ${PORT} and writes a relative file, so the test
@@ -118,7 +119,13 @@ function killChild(pid) {
 const cmd = process.argv[2];
 
 if (cmd === "version") {
-  process.stdout.write("stub-process-compose 0.0.0\n");
+  // Reported version is configurable so the too-old path is testable (#173).
+  const version = process.env.STUB_PC_VERSION ?? "v1.122.0";
+  process.stdout.write(
+    process.argv.includes("--short") || process.argv.includes("-s")
+      ? `${version}\n`
+      : `Process Compose\nVersion:        ${version}\n`,
+  );
   process.exit(0);
 }
 

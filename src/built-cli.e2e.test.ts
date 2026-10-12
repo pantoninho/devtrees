@@ -449,6 +449,37 @@ describe("built CLI e2e — argv→commands wiring over the stub process-compose
     expect(existsSync(sock), "no control socket").toBe(false);
   }, 60_000);
 
+  it("up refuses a process-compose older than v1.122.0 before starting anything (#173)", () => {
+    const { wt, id, sock, stateDir: devtreesDir } = setupScenario("dt-bcold-", { webProbe: false });
+    const env = { STUB_PC_VERSION: "v1.110.0" };
+
+    const human = devtrees(wt, ["up"], { env });
+    expect(human.code).not.toBe(0);
+    expect(human.stderr).toContain("v1.110.0");
+    expect(human.stderr).toContain("v1.122.0");
+
+    const json = devtrees(wt, ["up", "--json"], { env });
+    expect(json.code).not.toBe(0);
+    const err = (json.doc as { error?: { code?: string; details?: Record<string, unknown> } })
+      .error;
+    expect(err?.code).toBe("PROCESS_COMPOSE_TOO_OLD");
+    expect(err?.details).toMatchObject({
+      installed_version: "1.110.0",
+      minimum_version: "1.122.0",
+    });
+
+    // Nothing was allocated, written or spawned.
+    expect(existsSync(join(devtreesDir, `${id}.yaml`)), "no worktree config").toBe(false);
+    expect(existsSync(sock), "no control socket").toBe(false);
+    expect(existsSync(join(devtreesDir, "registry.json")), "no allocation").toBe(false);
+  }, 60_000);
+
+  it("up is unaffected by a process-compose at exactly v1.122.0 (#173)", () => {
+    const { wt } = setupScenario("dt-bmin-", { webProbe: false });
+    const up = devtrees(wt, ["up", "--json"], { env: { STUB_PC_VERSION: "v1.122.0" } });
+    expect(up.code, `stdout=${up.stdout} stderr=${up.stderr}`).toBe(0);
+  }, 60_000);
+
   it("--wait-timeout reaches the health gate: never-ready probed service times out at 1s, not 120s", () => {
     const { wt, sock } = setupScenario("dt-bc2-");
 

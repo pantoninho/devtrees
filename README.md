@@ -13,9 +13,9 @@ for the full vision.
 ## Requirements
 
 - **Node.js** >= 22
-- **`process-compose`** — devtrees shells out to the external `process-compose`
-  binary; it does not embed it. You must have `process-compose` installed and on
-  your `PATH`. See the [process-compose installation guide](https://f1bonacc1.github.io/process-compose/installation/).
+- **`process-compose` >= v1.122.0** — devtrees shells out to the external
+  `process-compose` binary; it does not embed it. You must have `process-compose`
+  installed and on your `PATH`; `devtrees up` refuses to start on an older release. See the [process-compose installation guide](https://f1bonacc1.github.io/process-compose/installation/).
 
 ## Install
 
@@ -114,6 +114,7 @@ footer lists the subset that command can actually emit.
 | Code                        | Meaning                                                                             |
 | --------------------------- | ----------------------------------------------------------------------------------- |
 | `PROCESS_COMPOSE_NOT_FOUND` | The `process-compose` binary is not on PATH.                                        |
+| `PROCESS_COMPOSE_TOO_OLD`   | The installed `process-compose` is older than v1.122.0; `details` has `installed_version`, `minimum_version`, `upgrade_url`. |
 | `INSTANCE_NOT_FOUND`        | No worktree (or shared) instance is running for this anchor.                        |
 | `SERVICE_NOT_FOUND`         | The named service does not exist in the target instance; `details.valid_services` lists the known ones. |
 | `HEALTH_TIMEOUT`            | Stack started but services did not report healthy before the wait window expired.   |
@@ -203,6 +204,7 @@ Branch on `error.code`:
 | `SERVICE_NOT_FOUND`         | You named a service that isn't in the instance. `details.valid_services` lists the real names; pick one. |
 | `INSTANCE_NOT_FOUND`        | No instance is running for this worktree. Run `devtrees up` first.                            |
 | `PROCESS_COMPOSE_NOT_FOUND` | The `process-compose` binary is missing. **Surface this to the human** — it's an environment setup gap you can't fix.   |
+| `PROCESS_COMPOSE_TOO_OLD`   | The installed `process-compose` is below the minimum (v1.122.0). **Surface this to the human** — they need to upgrade it. |
 | `CONFIG_INVALID` / `INVALID_ARGS` | The config or your arguments are malformed. Fix the input; don't retry blindly.        |
 
 For the full error enum and the per-command subset each can emit, run
@@ -244,7 +246,7 @@ by default so a local `vp test run` is unaffected.
 Prerequisites:
 
 - [`process-compose`](https://github.com/F1bonacc1/process-compose) on `PATH`
-  (run `process-compose version` to confirm). The CI workflow installs a
+  v1.122.0 or newer (run `process-compose version` to confirm). The CI workflow installs a
   pinned release; see [`.github/workflows/smoke-real-pc.yml`](.github/workflows/smoke-real-pc.yml).
 
 Run it locally:

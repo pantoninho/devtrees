@@ -77,9 +77,9 @@ jobs:
         env:
           # Pinned so a process-compose release that changes the agent surface
           # surfaces as a red check here, not silently in production. Bump
-          # deliberately; the smoke test is the canary. Last verified locally
-          # against v1.110.0; we pin to a recent stable tag in CI.
-          PC_VERSION: v1.110.0
+          # deliberately; the smoke test is the canary. This is also devtrees' minimum
+          # supported version (issue #173), so CI exercises the floor.
+          PC_VERSION: v1.122.0
         run: |
           set -euo pipefail
           # Download the release tarball directly so the install script's
