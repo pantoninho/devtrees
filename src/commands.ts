@@ -44,6 +44,7 @@ import { loadStack, type ResolvedService, type ResolvedStack, type Tier } from "
 import {
   createDriver,
   mergeAsyncIterables,
+  reloadTimeoutMs,
   type DriverDeps,
   type LogEvent,
   type ServiceStatus,
@@ -2428,6 +2429,21 @@ function readDerivedServices(configPath: string): string[] {
  *    throw `ConfigDriftError` so the CLI emits the `CONFIG_DRIFT` envelope
  *    and the instance keeps running (ADR-0005).
  */
+const RELOAD_FAILED_REMEDIATION =
+  ". The instance is still running — run `devtrees down && devtrees up` to apply the new config.";
+
+/**
+ * A timed-out reload means process-compose is still waiting for an old process
+ * to exit, and `down` would wait on the same process. Killing that process
+ * unblocks process-compose, which then finishes applying the new config.
+ */
+const RELOAD_TIMEOUT_REMEDIATION =
+  ". The instance is still running, but process-compose stays blocked until that process " +
+  "exits, and `devtrees down` would block on it too. Kill the service's old process to " +
+  "let the reload finish. To prevent this, make sure a `shutdown.command` actually stops " +
+  "the process (process-compose never SIGKILLs it once the command exits 0), and give a " +
+  "process that ignores SIGTERM a `shutdown.timeout_seconds` so it is SIGKILLed.";
+
 async function reconcileRunning(args: {
   readonly stack: ResolvedStack;
   readonly anchor: { readonly anchor: string; readonly worktreeId: string };
@@ -2466,7 +2482,7 @@ async function reconcileRunning(args: {
       ? readFileSync(paths.configPath, "utf8")
       : undefined;
     writeFileSync(paths.configPath, stringifyYaml(derived.config), "utf8");
-    const reload = await driver.reloadConfig(inst);
+    const reload = await driver.reloadConfig(inst, { timeoutMs: reloadTimeoutMs(derived.config) });
     if (!reload.ok) {
       if (previousConfig === undefined) rmSync(paths.configPath, { force: true });
       else writeFileSync(paths.configPath, previousConfig, "utf8");
@@ -2474,7 +2490,7 @@ async function reconcileRunning(args: {
         `devtrees up: config drift detected for '${anchor.worktreeId}' and the running ` +
           `process-compose could not hot-reload the new config` +
           (reload.message ? ` (${reload.message})` : "") +
-          ". The instance is still running — run `devtrees down && devtrees up` to apply the new config.",
+          (reload.reason === "timeout" ? RELOAD_TIMEOUT_REMEDIATION : RELOAD_FAILED_REMEDIATION),
       );
     }
     args.writeHash(anchor.anchor, anchor.worktreeId, currentHash);
