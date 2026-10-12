@@ -9,6 +9,7 @@
  */
 
 import { spawn, type SpawnOptions } from "node:child_process";
+import { request as httpRequest } from "node:http";
 import { createInterface } from "node:readline";
 
 /** Identifies one process-compose instance: its derived config and control socket. */
@@ -107,23 +108,33 @@ export function buildAttachArgs(inst: InstanceRef): string[] {
 }
 
 /**
- * Hot-reload the running instance's config from `inst.configPath` over its
- * UDS. Uses process-compose's `project update -f <file>` — present on
- * recent versions; older builds reject the subcommand, which the driver
- * surfaces as `not_supported` so `runUp` can fall back to `CONFIG_DRIFT`
- * (issue #31).
+ * process-compose's REST route that makes the server re-read its own config
+ * files (the `-f` paths it was booted with) and apply the difference.
+ *
+ * devtrees hot-reloads through this route and not through the
+ * `project update -f <file>` CLI (issue #194). The CLI loads the file
+ * client-side and sends the project to the server as JSON. The loader sets
+ * every process's `vars.PC_REPLICA_NUM` to a Go `int`, and the JSON round
+ * trip turns it into a `float64`. process-compose compares old and new
+ * process configs with `reflect.DeepEqual`, so on the first CLI update after
+ * boot every process looks changed and the whole selected stack restarts.
+ * This route loads the file inside the server, so both sides hold an `int`
+ * and only processes that really changed restart. Never mix the two: after
+ * one CLI update the server holds `float64`s, and the next reload through
+ * this route would restart everything again.
+ *
+ * The server's loader expands `${VAR}` references with the server's own
+ * environment, the one `devtrees up` booted it with, not the caller's.
  */
-export function buildReloadConfigArgs(inst: InstanceRef): string[] {
-  return ["project", "update", "-U", "-u", inst.socketPath, "-f", inst.configPath];
-}
+export const RELOAD_CONFIG_ROUTE = "/project/configuration";
 
 /**
  * Outcome of a `reloadConfig` call. `ok:true` means process-compose swapped
- * the running graph in-place; `ok:false` means it refused — either because
- * the running build does not implement `project update` (`not_supported`)
- * or because the new config could not be applied (`error`). Both failure
- * branches route through `runUp` to the `CONFIG_DRIFT` envelope; the
- * `reason` is preserved for diagnostics only.
+ * the running graph in-place; `ok:false` means it did not: the running build
+ * has no reload route (`not_supported`), the control socket could not be
+ * reached or the new config could not be applied (`error`), or the reload
+ * did not finish within its budget (`timeout`). Every failure routes through
+ * `runUp` to the `CONFIG_DRIFT` envelope, with the reason in its details.
  */
 type ReloadResult =
   | { readonly ok: true }
@@ -134,7 +145,7 @@ type ReloadResult =
     };
 
 /**
- * Base budget for a `project update` call. process-compose's update stops
+ * Base budget for a config reload. process-compose's update stops
  * every changed or removed process, one after another, and returns only once
  * each old process has exited. It escalates to SIGKILL only on the plain
  * SIGTERM path, and only when `shutdown.timeout_seconds` is set explicitly.
@@ -390,6 +401,52 @@ export type Spawner = (
   options: SpawnOptions,
 ) => SpawnedProcess;
 
+/** One HTTP request to an instance's REST API over its control socket. */
+export interface ControlRequest {
+  readonly socketPath: string;
+  readonly method: "POST";
+  readonly path: string;
+  /** Aborts the request when the caller's budget runs out. */
+  readonly signal: AbortSignal;
+}
+
+/** The status and body process-compose answered a `ControlRequest` with. */
+export interface ControlResponse {
+  readonly status: number;
+  readonly body: string;
+}
+
+/**
+ * Send a `ControlRequest`. Rejects when the socket cannot be reached or the
+ * request is aborted. Injected so tests can stub the REST API.
+ */
+export type ControlRequester = (request: ControlRequest) => Promise<ControlResponse>;
+
+/** Default `ControlRequester`: plain HTTP over the unix socket. */
+function httpOverSocket(request: ControlRequest): Promise<ControlResponse> {
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(
+      {
+        socketPath: request.socketPath,
+        method: request.method,
+        path: request.path,
+        signal: request.signal,
+      },
+      (res) => {
+        let body = "";
+        res.setEncoding("utf8");
+        res.on("data", (chunk: string) => {
+          body += chunk;
+        });
+        res.on("end", () => resolve({ status: res.statusCode ?? 0, body }));
+        res.on("error", reject);
+      },
+    );
+    req.on("error", reject);
+    req.end();
+  });
+}
+
 export interface DriverDeps {
   /** Path/name of the process-compose binary. Default: "process-compose". */
   readonly binary?: string;
@@ -401,6 +458,8 @@ export interface DriverDeps {
   /** Resolve whether `binary` exists on PATH. Default: probes the real PATH. */
   readonly exists?: (binary: string) => Promise<boolean>;
   readonly spawner?: Spawner;
+  /** Talks to an instance's REST API. Default: HTTP over the control socket. */
+  readonly controlRequest?: ControlRequester;
   /**
    * Fixed `reloadConfig` budget in milliseconds, for tests. When set, it wins
    * over the per-call `timeoutMs`.
@@ -543,14 +602,15 @@ export function createDriver(deps: DriverDeps = {}) {
       return streamLogsImpl(socketPath, opts, { binary, prefix, exists, spawner });
     },
     /**
-     * Ask the running instance to swap its config in-place from
-     * `inst.configPath`. Returns a structured `ReloadResult` — `ok:true` on a
-     * clean exit, `ok:false` on any failure (missing subcommand, invalid
-     * config, child crashed). Distinguishing the failure cause is best-effort;
-     * `not_supported`, `error` and `timeout` all map to `CONFIG_DRIFT` at the CLI.
+     * Ask the running instance to re-read its config and swap it in-place,
+     * over `RELOAD_CONFIG_ROUTE` (issue #194). The server re-reads the `-f`
+     * path it was booted with, which is `inst.configPath`: write the new
+     * config there first. Returns a structured `ReloadResult`: `ok:true`
+     * on a 200, `ok:false` on any failure. `not_supported`, `error` and
+     * `timeout` all map to `CONFIG_DRIFT` at the CLI.
      *
      * Bounded by `timeoutMs` (default: the base reload budget). When the budget
-     * runs out, the `project update` client is killed and `timeout` is returned.
+     * runs out, the request is aborted and `timeout` is returned.
      * process-compose keeps applying the update server-side.
      */
     reloadConfig(
@@ -558,7 +618,7 @@ export function createDriver(deps: DriverDeps = {}) {
       opts: { readonly timeoutMs?: number } = {},
     ): Promise<ReloadResult> {
       const timeoutMs = deps.reloadTimeoutMs ?? opts.timeoutMs ?? RELOAD_BASE_TIMEOUT_MS;
-      return reloadConfigImpl(inst, { binary, prefix, exists, spawner, timeoutMs });
+      return reloadConfigImpl(inst, { request: deps.controlRequest ?? httpOverSocket, timeoutMs });
     },
   };
 }
@@ -669,40 +729,59 @@ function describeStartFailure(stderr: string, binary: string, code: number): str
   return plain === "" ? `${binary} process start exited with code ${code}` : plain;
 }
 
+/**
+ * process-compose's complaint from a refused reload. A load failure answers
+ * 400 with `{"error": "..."}`. A partial failure answers 207 with the
+ * per-process status map. Anything else is passed through as-is.
+ */
+function describeReloadRefusal(response: ControlResponse): string {
+  const prefix = `process-compose config reload answered HTTP ${response.status}`;
+  const body = response.body.trim();
+  if (body === "") return prefix;
+  try {
+    const parsed = JSON.parse(body) as unknown;
+    if (parsed !== null && typeof parsed === "object" && "error" in parsed) {
+      return `${prefix}: ${String((parsed as { error: unknown }).error)}`;
+    }
+  } catch {
+    // Not JSON: fall through to the raw body.
+  }
+  return `${prefix}: ${body}`;
+}
+
 async function reloadConfigImpl(
   inst: InstanceRef,
-  deps: ShellDeps & { readonly timeoutMs: number },
+  deps: { readonly request: ControlRequester; readonly timeoutMs: number },
 ): Promise<ReloadResult> {
-  await ensureBinary({ binary: deps.binary, exists: deps.exists });
-  return new Promise<ReloadResult>((resolve) => {
-    const child = deps.spawner(deps.binary, [...deps.prefix, ...buildReloadConfigArgs(inst)], {
-      stdio: ["ignore", "ignore", "pipe"],
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), deps.timeoutMs);
+  try {
+    const response = await deps.request({
+      socketPath: inst.socketPath,
+      method: "POST",
+      path: RELOAD_CONFIG_ROUTE,
+      signal: controller.signal,
     });
-    const stderr = captureOutput(child.stderr);
-    const timer = setTimeout(() => {
-      child.kill?.("SIGTERM");
-      resolve({
+    if (response.status === 200) return { ok: true };
+    return {
+      ok: false,
+      reason: response.status === 404 ? "not_supported" : "error",
+      message: describeReloadRefusal(response),
+    };
+  } catch (err) {
+    if (controller.signal.aborted) {
+      return {
         ok: false,
         reason: "timeout",
         message:
-          `${deps.binary} project update did not finish within ` +
+          `process-compose config reload did not finish within ` +
           `${Math.round(deps.timeoutMs / 1000)}s; a changed service's old process has not stopped`,
-      });
-    }, deps.timeoutMs);
-    child.on("error", (err) => {
-      clearTimeout(timer);
-      resolve({ ok: false, reason: "not_supported", message: err.message });
-    });
-    child.on("exit", (code) => {
-      clearTimeout(timer);
-      if (code === 0 || code === null) {
-        resolve({ ok: true });
-        return;
-      }
-      const message = stderr().trim() || `${deps.binary} project update exited with code ${code}`;
-      resolve({ ok: false, reason: "not_supported", message });
-    });
-  });
+      };
+    }
+    return { ok: false, reason: "error", message: (err as Error).message };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**

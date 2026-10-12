@@ -42,7 +42,13 @@ import { withLifecycleLock } from "./registry.js";
 import { deriveWorktreeId } from "./anchor.js";
 import { deriveSharedConfig, deriveWorktreeConfig, type DerivedConfig } from "./deriver.js";
 import type { RegistrySnapshot } from "./allocator.js";
-import type { LogEvent, ServiceStatus, SpawnedProcess } from "./driver.js";
+import type {
+  ControlRequest,
+  ControlRequester,
+  LogEvent,
+  ServiceStatus,
+  SpawnedProcess,
+} from "./driver.js";
 import {
   SHARED_REGISTRY_KEY,
   SOCKET_PATH_MAX_BYTES,
@@ -127,6 +133,17 @@ function spawnedOk(): SpawnedProcess {
       if (event === "exit") exitHandlers.push(cb as (code: number | null) => void);
     },
     unref: () => {},
+  };
+}
+
+/**
+ * A stub for process-compose's REST API (the hot-reload goes over it, #194):
+ * answers every request with `status`, recording each one in `seen`.
+ */
+function reloadAnswering(status: number, seen: ControlRequest[] = []): ControlRequester {
+  return (request) => {
+    seen.push(request);
+    return Promise.resolve({ status, body: status === 200 ? "{}" : "" });
   };
 }
 
@@ -277,10 +294,12 @@ function stubDeps(opts: {
     // The version probe (#173) would run through the stub spawner, which
     // prints nothing; the check itself is covered in its own describe block.
     assertProcessComposeVersion: () => Promise.resolve(),
-    // Driver that records every spawn but doesn't actually run anything.
+    // Driver that records every spawn but doesn't actually run anything; a
+    // hot-reload (#194) is accepted without touching any socket.
     driver: {
       exists: () => Promise.resolve(true),
       spawner: makeStubSpawner(track),
+      controlRequest: reloadAnswering(200),
     },
   };
 }
@@ -3846,20 +3865,11 @@ describe("runUp — idempotency + drift detection (#31)", () => {
 
     // Seed the hash store with the OLD stack's hash so the second up sees drift.
     const baseDeps = stubDeps({ stack: stackA, track });
-    const innerSpawner = baseDeps.driver?.spawner;
-    if (innerSpawner === undefined) throw new Error("expected stub spawner");
-
-    const reloadCalls: Array<{ args: ReadonlyArray<string> }> = [];
-    const spawner = (binary: string, args: ReadonlyArray<string>, options: SpawnOptions) => {
-      if (args[0] === "project" && args[1] === "update") {
-        reloadCalls.push({ args });
-        return spawnedOk();
-      }
-      return innerSpawner(binary, args, options);
-    };
+    const reloadCalls: ControlRequest[] = [];
+    const controlRequest = reloadAnswering(200, reloadCalls);
     const firstDeps: CommandDeps = {
       ...baseDeps,
-      driver: { ...baseDeps.driver, spawner },
+      driver: { ...baseDeps.driver, controlRequest },
       readStoredHash: hashes.read,
       writeStoredHash: hashes.write,
     };
@@ -3873,9 +3883,14 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     const result = await runUp(secondDeps);
 
     expect(reloadCalls).toHaveLength(1);
-    // The reload argv targets the worktree's socket and a -f config path.
-    const args = reloadCalls[0]?.args ?? [];
-    expect(args.slice(0, 2)).toEqual(["project", "update"]);
+    // The reload asks the worktree's own instance to re-read its config
+    // server-side, never via `project update` (#194).
+    const worktreeSpawn = track.invocations.find((i) => !i.socketPath.endsWith("/shared.sock"));
+    expect(reloadCalls[0]).toMatchObject({
+      socketPath: worktreeSpawn?.socketPath,
+      method: "POST",
+      path: "/project/configuration",
+    });
     // Driver.up was NOT called a second time — reload, not restart.
     expect(track.invocations.length).toBe(upInvocationsAfterFirst);
     // Envelope is well-formed.
@@ -3892,20 +3907,11 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     const hashes = hashStore();
 
     const baseDeps = stubDeps({ stack: stackA, track });
-    const innerSpawner = baseDeps.driver?.spawner;
-    if (innerSpawner === undefined) throw new Error("expected stub spawner");
-
-    const reloadCalls: Array<{ args: ReadonlyArray<string> }> = [];
-    const spawner = (binary: string, args: ReadonlyArray<string>, options: SpawnOptions) => {
-      if (args[0] === "project" && args[1] === "update") {
-        reloadCalls.push({ args });
-        return spawnedOk();
-      }
-      return innerSpawner(binary, args, options);
-    };
+    const reloadCalls: ControlRequest[] = [];
+    const controlRequest = reloadAnswering(200, reloadCalls);
     const firstDeps: CommandDeps = {
       ...baseDeps,
-      driver: { ...baseDeps.driver, spawner },
+      driver: { ...baseDeps.driver, controlRequest },
       readStoredHash: hashes.read,
       writeStoredHash: hashes.write,
     };
@@ -3941,20 +3947,11 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     const track: StubSpawn = { invocations: [], touchSocket: true };
     const hashes = hashStore();
     const baseDeps = stubDeps({ stack: stackA, track });
-    const innerSpawner = baseDeps.driver?.spawner;
-    if (innerSpawner === undefined) throw new Error("expected stub spawner");
-
-    const reloadCalls: Array<{ args: ReadonlyArray<string> }> = [];
-    const spawner = (binary: string, args: ReadonlyArray<string>, options: SpawnOptions) => {
-      if (args[0] === "project" && args[1] === "update") {
-        reloadCalls.push({ args });
-        return spawnedOk();
-      }
-      return innerSpawner(binary, args, options);
-    };
+    const reloadCalls: ControlRequest[] = [];
+    const controlRequest = reloadAnswering(200, reloadCalls);
     const firstDeps: CommandDeps = {
       ...baseDeps,
-      driver: { ...baseDeps.driver, spawner },
+      driver: { ...baseDeps.driver, controlRequest },
       readStoredHash: hashes.read,
       writeStoredHash: hashes.write,
     };
@@ -3979,21 +3976,11 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     const hashes = hashStore();
 
     const baseDeps = stubDeps({ stack: stackA, track });
-    const innerSpawner = baseDeps.driver?.spawner;
-    if (innerSpawner === undefined) throw new Error("expected stub spawner");
-
-    // Reload always returns exit 1 → driver classifies as not_supported.
-    const spawner = (binary: string, args: ReadonlyArray<string>, options: SpawnOptions) => {
-      if (args[0] === "project" && args[1] === "update") {
-        const emitter = new (require("node:events").EventEmitter)();
-        queueMicrotask(() => emitter.emit("exit", 1));
-        return emitter as unknown as SpawnedProcess;
-      }
-      return innerSpawner(binary, args, options);
-    };
+    // The reload route answers 404 → driver classifies as not_supported.
+    const controlRequest = reloadAnswering(404);
     const firstDeps: CommandDeps = {
       ...baseDeps,
-      driver: { ...baseDeps.driver, spawner },
+      driver: { ...baseDeps.driver, controlRequest },
       readStoredHash: hashes.read,
       writeStoredHash: hashes.write,
     };
@@ -4025,21 +4012,11 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     const hashes = hashStore();
 
     const baseDeps = stubDeps({ stack: stackA, track });
-    const innerSpawner = baseDeps.driver?.spawner;
-    if (innerSpawner === undefined) throw new Error("expected stub spawner");
-
-    // Reload always exits 1 → reloadConfig reports failure.
-    const spawner = (binary: string, args: ReadonlyArray<string>, options: SpawnOptions) => {
-      if (args[0] === "project" && args[1] === "update") {
-        const emitter = new EventEmitter();
-        queueMicrotask(() => emitter.emit("exit", 1));
-        return emitter as unknown as SpawnedProcess;
-      }
-      return innerSpawner(binary, args, options);
-    };
+    // process-compose refuses the reload → reloadConfig reports failure.
+    const controlRequest = reloadAnswering(400);
     const firstDeps: CommandDeps = {
       ...baseDeps,
-      driver: { ...baseDeps.driver, spawner },
+      driver: { ...baseDeps.driver, controlRequest },
       readStoredHash: hashes.read,
       writeStoredHash: hashes.write,
     };
@@ -4061,31 +4038,24 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     expect(parsed.processes.web?.command).toBe("node a.js");
   });
 
-  it("on drift, a `project update` that never exits is bounded: CONFIG_DRIFT, child killed, config + hash restored", async () => {
-    // process-compose's `project update` blocks until each changed process's old
+  it("on drift, a reload that never answers is bounded: CONFIG_DRIFT, request aborted, config + hash restored", async () => {
+    // process-compose's config reload blocks until each changed process's old
     // incarnation exits. When it never exits (a shutdown.command that does not stop
     // it, or SIGTERM ignored with no shutdown.timeout_seconds), `up` used to hang.
     const track: StubSpawn = { invocations: [], touchSocket: true };
     const hashes = hashStore();
     const baseDeps = stubDeps({ stack: stackA, track });
-    const innerSpawner = baseDeps.driver?.spawner;
-    if (innerSpawner === undefined) throw new Error("expected stub spawner");
-
-    const killed: Array<NodeJS.Signals | number | undefined> = [];
-    const spawner = (binary: string, args: ReadonlyArray<string>, options: SpawnOptions) => {
-      if (args[0] === "project" && args[1] === "update") {
-        const emitter = new EventEmitter() as EventEmitter & SpawnedProcess;
-        emitter.kill = (signal) => {
-          killed.push(signal);
-          return true;
-        };
-        return emitter;
-      }
-      return innerSpawner(binary, args, options);
-    };
+    const aborted: boolean[] = [];
+    const controlRequest: ControlRequester = ({ signal }) =>
+      new Promise((_resolve, reject) => {
+        signal.addEventListener("abort", () => {
+          aborted.push(true);
+          reject(new Error("aborted"));
+        });
+      });
     const firstDeps: CommandDeps = {
       ...baseDeps,
-      driver: { ...baseDeps.driver, spawner, reloadTimeoutMs: 50 },
+      driver: { ...baseDeps.driver, controlRequest, reloadTimeoutMs: 50 },
       readStoredHash: hashes.read,
       writeStoredHash: hashes.write,
     };
@@ -4106,7 +4076,7 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     expect(err.message).toMatch(/did not finish within/);
     expect(err.message).toMatch(/Do NOT re-run `devtrees up`/);
     expect(err.message).toMatch(/shutdown\.command/);
-    expect(killed).toEqual(["SIGTERM"]);
+    expect(aborted).toEqual([true]);
     expect(readFileSync(worktreeSpawn.configPath, "utf8")).toBe(configBefore);
     expect(Object.values(hashes.raw)[0]?.[baseDeps.expectedWorktreeId]).toBe(storedBefore);
   });
@@ -4116,16 +4086,10 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     const hashes = hashStore();
 
     const baseDeps = stubDeps({ stack: stackA, track });
-    const innerSpawner = baseDeps.driver?.spawner;
-    if (innerSpawner === undefined) throw new Error("expected stub spawner");
-
-    const spawner = (binary: string, args: ReadonlyArray<string>, options: SpawnOptions) => {
-      if (args[0] === "project" && args[1] === "update") return spawnedOk();
-      return innerSpawner(binary, args, options);
-    };
+    const controlRequest = reloadAnswering(200);
     const firstDeps: CommandDeps = {
       ...baseDeps,
-      driver: { ...baseDeps.driver, spawner },
+      driver: { ...baseDeps.driver, controlRequest },
       readStoredHash: hashes.read,
       writeStoredHash: hashes.write,
     };
@@ -4147,25 +4111,17 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     const track: StubSpawn = { invocations: [], touchSocket: true };
     const hashes = hashStore();
     const baseDeps = stubDeps({ stack: stackA, track });
-    const innerSpawner = baseDeps.driver?.spawner;
-    if (innerSpawner === undefined) throw new Error("expected stub spawner");
-
-    let reloadCount = 0;
-    const spawner = (binary: string, args: ReadonlyArray<string>, options: SpawnOptions) => {
-      if (args[0] === "project" && args[1] === "update") {
-        reloadCount++;
-      }
-      return innerSpawner(binary, args, options);
-    };
+    const reloadCalls: ControlRequest[] = [];
+    const controlRequest = reloadAnswering(200, reloadCalls);
     const deps: CommandDeps = {
       ...baseDeps,
-      driver: { ...baseDeps.driver, spawner },
+      driver: { ...baseDeps.driver, controlRequest },
       readStoredHash: hashes.read,
       writeStoredHash: hashes.write,
     };
     await runUp(deps);
     await runUp(deps);
-    expect(reloadCount).toBe(0);
+    expect(reloadCalls).toHaveLength(0);
   });
 });
 

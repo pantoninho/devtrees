@@ -2638,7 +2638,7 @@ const RELOAD_FAILED_REMEDIATION =
  * to exit, and `down` would wait on the same process. Killing that process
  * unblocks process-compose, which then finishes applying the new config. A
  * retried `up` before then is unsafe: process-compose has already dropped the
- * old process from its list, so a second `project update` starts a new copy
+ * old process from its list, so a second reload starts a new copy
  * next to it, and the pending update later starts another one, leaving the
  * first copy orphaned.
  */

@@ -8,7 +8,9 @@
  *   up   -f <config> -U -u <socket> -t=false
  *        Reads the derived config, runs each process's `command` (with its
  *        `working_dir` and `environment` applied), and creates the control
- *        socket as a liveness marker. Backgrounds itself and returns.
+ *        socket as a liveness marker. Backgrounds itself and returns. The
+ *        socket answers `POST /project/configuration` (the hot-reload,
+ *        issue #194) by re-reading the `-f` config, like the real server.
  *   down -U -u <socket>
  *        Signals the running instance to stop and removes the control socket.
  *   process start <name> -U -u <socket>
@@ -34,7 +36,7 @@
  */
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { createServer } from "node:net";
+import { createServer } from "node:http";
 import { dirname } from "node:path";
 import { parse as parseYaml } from "yaml";
 
@@ -223,7 +225,18 @@ if (cmd === "up") {
   // a child can become observable before discovery can find this instance via
   // its socket on disk, and `runLs` races the bind.
   mkdirSync(dirname(socketPath), { recursive: true });
-  const server = createServer();
+  const server = createServer((req, res) => {
+    if (req.method === "POST" && req.url === "/project/configuration") {
+      // Hot-reload: persist the re-read config alongside the socket so a
+      // follow-up `process list` reflects the new service set.
+      writeFileSync(`${socketPath}.config`, readFileSync(configPath, "utf8"));
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{}");
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
   server.listen(socketPath, () => {
     for (const proc of Object.values(config.processes ?? {})) {
       if (!selectedByNamespace(proc, namespaces)) continue;
@@ -439,36 +452,6 @@ if (cmd === "up") {
     process.exit(0);
   }
   process.stderr.write(`stub-process-compose: unknown subcommand 'process ${sub}'\n`);
-  process.exit(1);
-} else if (cmd === "project") {
-  const sub = process.argv[3];
-  if (sub === "update") {
-    // `project update -U -u <socket> -f <config>` — hot-reload the running
-    // instance with a new derived config (issue #31). Setting
-    // STUB_RELOAD_UNSUPPORTED=1 emulates an older process-compose that
-    // doesn't implement this subcommand: exit non-zero with a clear stderr
-    // so the driver classifies the failure as `not_supported`.
-    if (process.env.STUB_RELOAD_UNSUPPORTED === "1") {
-      process.stderr.write(
-        `stub-process-compose: 'project update' is not supported by this build\n`,
-      );
-      process.exit(1);
-    }
-    const configPath = flag("-f", "-f");
-    if (!configPath || !existsSync(configPath)) {
-      process.stderr.write(`stub-process-compose: missing config at ${configPath}\n`);
-      process.exit(1);
-    }
-    if (!existsSync(socketPath)) {
-      process.stderr.write(`stub-process-compose: no instance at ${socketPath}\n`);
-      process.exit(1);
-    }
-    // Persist the swapped config alongside the socket so a follow-up `process
-    // list` reflects the new service set.
-    writeFileSync(`${socketPath}.config`, readFileSync(configPath, "utf8"));
-    process.exit(0);
-  }
-  process.stderr.write(`stub-process-compose: unknown subcommand 'project ${sub}'\n`);
   process.exit(1);
 } else if (cmd === "down") {
   // Prefer signalling the parent: its trap reaps children and removes files
