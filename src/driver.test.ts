@@ -110,6 +110,28 @@ describe("process-compose driver — parseServiceStatuses", () => {
     ]);
   });
 
+  it("never reports ready for a process that is not running, even with a stale is_ready (#174)", () => {
+    const stdout = JSON.stringify([
+      { name: "web", status: "Completed", is_ready: "Ready", exit_code: -1, is_running: false },
+      { name: "api", status: "Completed", ready: true, is_running: false },
+    ]);
+    expect(parseServiceStatuses(stdout)).toEqual([
+      { name: "web", status: "Completed", health: "not_ready" },
+      { name: "api", status: "Completed", health: "not_ready" },
+    ]);
+  });
+
+  it("keeps a running probed process ready and a finished one-shot unknown (#174)", () => {
+    const stdout = JSON.stringify([
+      { name: "web", status: "Running", is_ready: "Ready", is_running: true },
+      { name: "migrate", status: "Completed", is_ready: "-", exit_code: 0, is_running: false },
+    ]);
+    expect(parseServiceStatuses(stdout)).toEqual([
+      { name: "web", status: "Running", health: "ready" },
+      { name: "migrate", status: "Completed", health: "unknown" },
+    ]);
+  });
+
   it("skips entries missing a name or status — the driver only surfaces well-formed rows", () => {
     const stdout = JSON.stringify([
       { name: "web", status: "Running" },
