@@ -1,82 +1,96 @@
 /**
- * Driver integration tests against the stub process-compose binary.
+ * Driver integration tests for `reloadConfig`'s default transport.
  *
- * Covers the issue-#31 `reloadConfig` happy-path and the "not supported"
- * branch end-to-end: the driver spawns `node test/stub-process-compose.mjs`
- * (via the same prefix-args hook the rest of the e2e uses), waits for
- * the child's exit, and classifies the outcome from the exit code.
+ * `reloadConfig` talks to process-compose's REST API over the instance's
+ * unix socket (issue #194). These tests stand up a real HTTP server on a
+ * short-path UDS that answers like process-compose's
+ * `POST /project/configuration`, and drive the driver's default requester
+ * against it: the happy path, a refusal, a server that never answers, and
+ * a socket nobody listens on.
  *
- * Kept separate from the pure `driver.test.ts` argv/parse unit tests so the
- * file's scope is "do real subprocess invocations work" rather than "does
- * argv construction round-trip."
+ * Kept separate from the pure `driver.test.ts` unit tests so this file's
+ * scope is "do real socket round-trips work".
  */
 
 import { afterEach, describe, expect, it } from "vite-plus/test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { createDriver } from "./driver.js";
 
-const STUB = fileURLToPath(new URL("../test/stub-process-compose.mjs", import.meta.url));
 const SHORT_TMP = process.platform === "darwin" ? "/tmp" : (process.env.RUNNER_TEMP ?? "/tmp");
 
-const cleanups: Array<() => void> = [];
-afterEach(() => {
-  while (cleanups.length) cleanups.pop()?.();
+const cleanups: Array<() => void | Promise<void>> = [];
+afterEach(async () => {
+  while (cleanups.length) await cleanups.pop()?.();
 });
 
-/** Lay out a running instance at <root>/devtrees/{run,login.yaml} as `up` would. */
-function makeRunningInstance(): { configPath: string; socketPath: string } {
+/** A fresh instance layout; nothing listens on its socket yet. */
+function makeInstance(): { configPath: string; socketPath: string } {
   const root = mkdtempSync(join(SHORT_TMP, "dt-reload-"));
   cleanups.push(() => rmSync(root, { recursive: true, force: true }));
-  const devtreesDir = join(root, "devtrees");
-  const runDir = join(devtreesDir, "run");
-  mkdirSync(runDir, { recursive: true });
-  const configPath = join(devtreesDir, "login.yaml");
-  const socketPath = join(runDir, "login.sock");
-  writeFileSync(configPath, 'processes:\n  web:\n    command: "sleep 30"\n', "utf8");
-  // Pretend the instance is running by laying down the socket marker file +
-  // the .config sibling the stub maintains. The stub's `project update`
-  // requires both to be present.
-  writeFileSync(socketPath, "");
-  writeFileSync(`${socketPath}.config`, "processes: {}\n");
-  return { configPath, socketPath };
+  return { configPath: join(root, "login.yaml"), socketPath: join(root, "login.sock") };
 }
 
-describe("driver.reloadConfig — integration against stub process-compose", () => {
-  it("happy path: stub accepts `project update` and the driver returns ok:true", async () => {
-    const inst = makeRunningInstance();
-    const driver = createDriver({
-      binary: process.execPath,
-      prefixArgs: [STUB],
-    });
-    const result = await driver.reloadConfig(inst);
+/** Serve `handler` on `socketPath`; records every `METHOD path` it receives. */
+async function serve(
+  socketPath: string,
+  handler: (req: IncomingMessage, res: ServerResponse) => void,
+): Promise<string[]> {
+  const seen: string[] = [];
+  const server = createServer((req, res) => {
+    seen.push(`${req.method} ${req.url}`);
+    handler(req, res);
+  });
+  await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+  cleanups.push(
+    () =>
+      new Promise<void>((resolve) => {
+        server.closeAllConnections();
+        server.close(() => resolve());
+      }),
+  );
+  return seen;
+}
+
+function json(res: ServerResponse, status: number, body: unknown): void {
+  res.writeHead(status, { "content-type": "application/json" });
+  res.end(JSON.stringify(body));
+}
+
+describe("driver.reloadConfig — HTTP over the control socket", () => {
+  it("happy path: POSTs /project/configuration and returns ok:true on a 200", async () => {
+    const inst = makeInstance();
+    const seen = await serve(inst.socketPath, (_req, res) => json(res, 200, { web: "updated" }));
+    const result = await createDriver().reloadConfig(inst);
     expect(result).toEqual({ ok: true });
-    // Side-effect: the stub mirrors the new config alongside the socket.
-    expect(existsSync(`${inst.socketPath}.config`)).toBe(true);
+    expect(seen).toEqual(["POST /project/configuration"]);
   });
 
-  it("not-supported branch: stub exits non-zero, driver returns ok:false with reason:not_supported", async () => {
-    const inst = makeRunningInstance();
-    const driver = createDriver({
-      binary: process.execPath,
-      prefixArgs: [STUB],
+  it("a 400 from process-compose is reason:error with its complaint", async () => {
+    const inst = makeInstance();
+    await serve(inst.socketPath, (_req, res) => json(res, 400, { error: "bad config" }));
+    expect(await createDriver().reloadConfig(inst)).toEqual({
+      ok: false,
+      reason: "error",
+      message: "process-compose config reload answered HTTP 400: bad config",
     });
-    // Run with STUB_RELOAD_UNSUPPORTED=1 in the child's env to mimic an older
-    // process-compose missing the `project update` subcommand.
-    const prevEnv = process.env.STUB_RELOAD_UNSUPPORTED;
-    process.env.STUB_RELOAD_UNSUPPORTED = "1";
-    try {
-      const result = await driver.reloadConfig(inst);
-      expect(result.ok).toBe(false);
-      if (result.ok) throw new Error("expected ok:false");
-      expect(result.reason).toBe("not_supported");
-      // Diagnostic message is preserved verbatim from the child's stderr —
-      // useful for surfacing in the CONFIG_DRIFT error envelope's details.
-      expect(result.message).toMatch(/not supported/i);
-    } finally {
-      if (prevEnv === undefined) delete process.env.STUB_RELOAD_UNSUPPORTED;
-      else process.env.STUB_RELOAD_UNSUPPORTED = prevEnv;
-    }
+  });
+
+  it("a server that never answers is aborted at the budget: reason:timeout", async () => {
+    const inst = makeInstance();
+    await serve(inst.socketPath, () => {
+      // Like an update stuck on an old process that never exits: no answer.
+    });
+    const result = await createDriver({ reloadTimeoutMs: 100 }).reloadConfig(inst);
+    expect(result).toMatchObject({ ok: false, reason: "timeout" });
+  });
+
+  it("a socket nobody listens on is reason:error", async () => {
+    const inst = makeInstance();
+    const result = await createDriver().reloadConfig(inst);
+    expect(result).toMatchObject({ ok: false, reason: "error" });
+    if (result.ok) throw new Error("expected ok:false");
+    expect(result.message).toMatch(/ENOENT|ECONNREFUSED/);
   });
 });

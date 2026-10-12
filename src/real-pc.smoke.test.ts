@@ -1334,6 +1334,49 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
     expect(pidsMatching(`rpc179-web ${repo.root}`).length).toBeGreaterThan(0);
     expect(pidsMatching(`rpc179-api ${repo.root}`)).toEqual([]);
   }, 120_000);
+
+  it("scenario 40: the first hot-reload after boot restarts only the edited service (#194)", async () => {
+    // process-compose v1.122.0's `project update` CLI restarted every process
+    // on the first update after boot, even an unchanged one: its JSON round
+    // trip turns `vars.PC_REPLICA_NUM` from an int into a float64, and the
+    // server's reflect.DeepEqual then sees every process as changed.
+    const repo = buildSmokeRepo("dt-rpc40-", ["login"]);
+    currentCtx = { pidNeedle: repo.root, root: repo.root };
+    const wt = repo.worktrees.login!;
+    const [holdWeb, holdApiA, holdApiB] = ["hold-web", "hold-api-a", "hold-api-b"].map((n) =>
+      join(repo.root, n),
+    );
+    for (const hold of [holdWeb, holdApiA, holdApiB]) writeFileSync(hold!, "");
+    const writeStack = (apiHold: string): void =>
+      writeFileSync(
+        join(wt, "devtrees.yaml"),
+        [
+          "services:",
+          "  web:",
+          "    tier: isolated",
+          `    command: "tail -f ${holdWeb}"`,
+          "  api:",
+          "    tier: isolated",
+          `    command: "tail -f ${apiHold}"`,
+          "",
+        ].join("\n"),
+      );
+    writeStack(holdApiA!);
+    cleanupStack.push(() => devtrees(wt, ["down"]));
+
+    expect(up(wt).code).toBe(0);
+    expect(await waitForPid(holdWeb!, 10_000), "web should be running").toBe(true);
+    expect(await waitForPid(holdApiA!, 10_000), "api should be running").toBe(true);
+    const webPids = pidsMatching(holdWeb!);
+
+    writeStack(holdApiB!);
+    const reload = up(wt);
+    expect(reload.code, `drifted up should hot-reload: ${reload.stderr}`).toBe(0);
+    expect(await waitForPid(holdApiB!, 10_000), "edited api should run its new command").toBe(true);
+    expect(await waitForNoPids(holdApiA!, 10_000), "old api should be stopped").toEqual([]);
+    // The unchanged service was not restarted: the same process still runs.
+    expect(pidsMatching(holdWeb!)).toEqual(webPids);
+  }, 120_000);
 });
 
 // Without the gate, log once so a developer running `vp test run` locally

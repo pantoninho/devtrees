@@ -11,11 +11,14 @@ import {
   buildLogsArgs,
   buildProcessListArgs,
   buildProcessStartArgs,
-  buildReloadConfigArgs,
   createDriver,
   mergeAsyncIterables,
   parseServiceStatuses,
+  RELOAD_CONFIG_ROUTE,
   reloadTimeoutMs,
+  type ControlRequest,
+  type ControlRequester,
+  type ControlResponse,
   type LogEvent,
   type SpawnedProcess,
 } from "./driver.js";
@@ -451,95 +454,110 @@ describe("process-compose driver — reloadConfig", () => {
     socketPath: "/anchor/devtrees/run/login.sock",
   };
 
-  it("targets `project update` over the instance's UDS, pointing at the new config file", () => {
-    const args = buildReloadConfigArgs(inst);
-    expect(args.slice(0, 2)).toEqual(["project", "update"]);
-    expect(args).toContain("-U");
-    expect(args).toContain("-u");
-    expect(args).toContain(inst.socketPath);
-    expect(args).toContain("-f");
-    expect(args).toContain(inst.configPath);
-  });
-
-  function spawnerExiting(
-    code: number,
-    deps: { onArgs?: (args: ReadonlyArray<string>) => void } = {},
-  ) {
-    return (_b: string, args: ReadonlyArray<string>): SpawnedProcess => {
-      deps.onArgs?.(args);
-      const emitter = new EventEmitter() as EventEmitter & SpawnedProcess;
-      queueMicrotask(() => emitter.emit("exit", code));
-      return emitter;
+  /** A `ControlRequester` answering every request with `response`; records each request. */
+  function answering(response: ControlResponse, seen: ControlRequest[] = []): ControlRequester {
+    return (request) => {
+      seen.push(request);
+      return Promise.resolve(response);
     };
   }
 
-  it("returns {ok:true} on a clean exit", async () => {
-    const driver = createDriver({
-      exists: () => Promise.resolve(true),
-      spawner: spawnerExiting(0),
-    });
-    const result = await driver.reloadConfig(inst);
-    expect(result).toEqual({ ok: true });
-  });
-
-  it("returns {ok:false, reason:'not_supported'} on a non-zero exit (older process-compose without project update)", async () => {
-    const driver = createDriver({
-      exists: () => Promise.resolve(true),
-      spawner: spawnerExiting(1),
-    });
-    const result = await driver.reloadConfig(inst);
-    expect(result.ok).toBe(false);
-    if (result.ok) throw new Error("expected ok:false");
-    expect(result.reason).toBe("not_supported");
-  });
-
-  it("returns {ok:false, reason:'not_supported'} on spawn error (missing subcommand)", async () => {
+  it("asks the server to re-read its own config over the instance's UDS, never spawning `project update` (#194)", async () => {
+    const seen: ControlRequest[] = [];
+    let spawned = false;
     const driver = createDriver({
       exists: () => Promise.resolve(true),
       spawner: () => {
-        const emitter = new EventEmitter() as EventEmitter & SpawnedProcess;
-        queueMicrotask(() => emitter.emit("error", new Error("ENOENT")));
-        return emitter;
+        spawned = true;
+        return { on: () => {} };
       },
+      controlRequest: answering({ status: 200, body: "{}" }, seen),
     });
-    const result = await driver.reloadConfig(inst);
-    expect(result.ok).toBe(false);
+    expect(await driver.reloadConfig(inst)).toEqual({ ok: true });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({
+      socketPath: inst.socketPath,
+      method: "POST",
+      path: "/project/configuration",
+    });
+    expect(RELOAD_CONFIG_ROUTE).toBe("/project/configuration");
+    expect(spawned).toBe(false);
   });
 
-  /** A `project update` child that never exits on its own; records kill signals. */
-  function spawnerHanging(killed: Array<NodeJS.Signals | number | undefined>) {
-    return (): SpawnedProcess => {
-      const emitter = new EventEmitter() as EventEmitter & SpawnedProcess;
-      emitter.kill = (signal) => {
-        killed.push(signal);
-        queueMicrotask(() => emitter.emit("exit", null));
-        return true;
-      };
-      return emitter;
-    };
+  it("returns {ok:true} when process-compose answers 200, whatever it updated", async () => {
+    const driver = createDriver({
+      controlRequest: answering({ status: 200, body: '{"web":"updated"}' }),
+    });
+    expect(await driver.reloadConfig(inst)).toEqual({ ok: true });
+  });
+
+  it("a 400 is reason:'error' carrying process-compose's own complaint", async () => {
+    const driver = createDriver({
+      controlRequest: answering({ status: 400, body: '{"error":"yaml: line 3: bad indent"}' }),
+    });
+    expect(await driver.reloadConfig(inst)).toEqual({
+      ok: false,
+      reason: "error",
+      message: "process-compose config reload answered HTTP 400: yaml: line 3: bad indent",
+    });
+  });
+
+  it("a 207 (some processes failed to update) is reason:'error' with the status map", async () => {
+    const driver = createDriver({
+      controlRequest: answering({ status: 207, body: '{"web":"error"}' }),
+    });
+    expect(await driver.reloadConfig(inst)).toEqual({
+      ok: false,
+      reason: "error",
+      message: 'process-compose config reload answered HTTP 207: {"web":"error"}',
+    });
+  });
+
+  it("a 404 (a build without the reload route) is reason:'not_supported'", async () => {
+    const driver = createDriver({ controlRequest: answering({ status: 404, body: "" }) });
+    expect(await driver.reloadConfig(inst)).toEqual({
+      ok: false,
+      reason: "not_supported",
+      message: "process-compose config reload answered HTTP 404",
+    });
+  });
+
+  it("an unreachable socket is reason:'error' with the transport error", async () => {
+    const driver = createDriver({
+      controlRequest: () =>
+        Promise.reject(new Error("connect ENOENT /anchor/devtrees/run/login.sock")),
+    });
+    expect(await driver.reloadConfig(inst)).toEqual({
+      ok: false,
+      reason: "error",
+      message: "connect ENOENT /anchor/devtrees/run/login.sock",
+    });
+  });
+
+  /** A reload request that only settles when aborted; records whether it was. */
+  function hanging(aborted: boolean[]): ControlRequester {
+    return ({ signal }) =>
+      new Promise((_resolve, reject) => {
+        signal.addEventListener("abort", () => {
+          aborted.push(true);
+          reject(new Error("aborted"));
+        });
+      });
   }
 
-  it("bounds a `project update` that never exits: kills the child and returns reason:'timeout'", async () => {
-    const killed: Array<NodeJS.Signals | number | undefined> = [];
-    const driver = createDriver({
-      exists: () => Promise.resolve(true),
-      spawner: spawnerHanging(killed),
-    });
+  it("bounds a reload that never answers: aborts the request and returns reason:'timeout'", async () => {
+    const aborted: boolean[] = [];
+    const driver = createDriver({ controlRequest: hanging(aborted) });
     const result = await driver.reloadConfig(inst, { timeoutMs: 20 });
     expect(result.ok).toBe(false);
     if (result.ok) throw new Error("expected ok:false");
     expect(result.reason).toBe("timeout");
     expect(result.message).toMatch(/did not finish within/);
-    expect(killed).toEqual(["SIGTERM"]);
+    expect(aborted).toEqual([true]);
   });
 
   it("the reloadTimeoutMs dep wins over the per-call budget", async () => {
-    const killed: Array<NodeJS.Signals | number | undefined> = [];
-    const driver = createDriver({
-      exists: () => Promise.resolve(true),
-      spawner: spawnerHanging(killed),
-      reloadTimeoutMs: 20,
-    });
+    const driver = createDriver({ controlRequest: hanging([]), reloadTimeoutMs: 20 });
     const result = await driver.reloadConfig(inst, { timeoutMs: 60_000 });
     expect(result).toMatchObject({ ok: false, reason: "timeout" });
   });
@@ -555,19 +573,6 @@ describe("process-compose driver — reloadConfig", () => {
         },
       }),
     ).toBe(80_000);
-  });
-
-  it("refuses to spawn when the binary is missing", async () => {
-    let spawned = false;
-    const driver = createDriver({
-      exists: () => Promise.resolve(false),
-      spawner: () => {
-        spawned = true;
-        return { on: () => {}, unref: () => {} };
-      },
-    });
-    await expect(driver.reloadConfig(inst)).rejects.toBeInstanceOf(MissingProcessComposeError);
-    expect(spawned).toBe(false);
   });
 });
 
