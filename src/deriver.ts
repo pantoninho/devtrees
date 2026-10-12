@@ -323,6 +323,51 @@ export function deriveSharedConfig(stack: ResolvedStack, ctx: SharedDeriveContex
   };
 }
 
+/**
+ * A `${NAME}` in a service `command` where `NAME` is a variable devtrees
+ * injects (#200). process-compose expands `${NAME}` in `command` at config
+ * load from its OWN server environment, not from the process's `environment:`
+ * list where devtrees injects the value, so it runs empty. Bare `$NAME` (the
+ * shell expands it at run time) and `$${NAME}` (process-compose's escape)
+ * both work.
+ */
+export interface BracedEnvVar {
+  readonly service: string;
+  readonly variable: string;
+}
+
+/**
+ * Every `${NAME}` in a service `command` that names a variable devtrees
+ * injects into that service: its own ports, the cross-tier ports it can see,
+ * and `DEVTREES_WORKTREE_ID` (isolated services only; the shared instance
+ * does not carry it). One entry per service and variable, in declaration
+ * order. `$${NAME}` is the escape and is not reported; neither is bare `$NAME`.
+ * Pure: names only, no allocation needed. Never rewrites the command (ADR-0002).
+ */
+export function bracedEnvVars(stack: ResolvedStack): BracedEnvVar[] {
+  const sharedPorts = stack.services.filter((s) => s.tier === "shared").flatMap((s) => s.ports);
+  const isolatedPorts = stack.services.filter((s) => s.tier === "isolated").flatMap((s) => s.ports);
+  const found: BracedEnvVar[] = [];
+  for (const service of stack.services) {
+    const injected = new Set(
+      service.tier === "isolated"
+        ? [WORKTREE_ID_ENV, ...isolatedPorts, ...sharedPorts]
+        : sharedPorts,
+    );
+    const seen = new Set<string>();
+    for (const match of service.command.matchAll(/(\$+)\{([A-Za-z_][A-Za-z0-9_]*)\}/g)) {
+      const [, dollars, variable] = match;
+      // `$$` is one literal `$`, so an even run is escaped and an odd run
+      // leaves one live `$` before the brace.
+      if (dollars === undefined || variable === undefined) continue;
+      if (dollars.length % 2 === 0 || !injected.has(variable) || seen.has(variable)) continue;
+      seen.add(variable);
+      found.push({ service: service.name, variable });
+    }
+  }
+  return found;
+}
+
 /** Flatten an env map into the `KEY=VALUE` lines process-compose's `environment` accepts. */
 function envLines(env: Record<string, string>): string[] {
   return Object.entries(env).map(([k, v]) => `${k}=${v}`);

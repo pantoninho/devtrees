@@ -21,7 +21,7 @@
  *        prints it bare) so the presence and minimum-version probes work.
  *
  * The processes here are expected to be simple shell commands; the e2e uses a
- * tiny HTTP server that binds ${PORT} and writes a relative file, so the test
+ * tiny HTTP server that binds $PORT and writes a relative file, so the test
  * can assert reachability and working-directory isolation.
  *
  * Teardown contract (see #41):

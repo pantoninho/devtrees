@@ -20,7 +20,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { Writable } from "node:stream";
 import { Cli, Command, Option, Builtins, type BaseContext } from "clipanion";
 import type { LogEvent } from "./driver.js";
-import type { DerivedConfig, DroppedEdge } from "./deriver.js";
+import type { BracedEnvVar, DerivedConfig, DroppedEdge } from "./deriver.js";
 import type { DroppedNamespaceEdge } from "./selection.js";
 import type { SharedFieldChange } from "./shared-state.js";
 import { maybeInitHint } from "./init-hint.js";
@@ -127,6 +127,8 @@ export interface ExecuteDeps {
     services?: ReadonlyArray<LsServiceRow>;
     /** `depends_on` edges lost to namespace selection (#179). */
     droppedNamespaceEdges?: ReadonlyArray<DroppedNamespaceEdge>;
+    /** `${NAME}` references to injected variables in commands (#200). */
+    bracedEnvVars?: ReadonlyArray<BracedEnvVar>;
     /** Shared fields edited since shared started (#185). */
     sharedFieldChanges?: ReadonlyArray<SharedFieldChange>;
     restarted?: ReadonlyArray<string>;
@@ -152,6 +154,8 @@ export interface ExecuteDeps {
     droppedEdges?: ReadonlyArray<DroppedEdge>;
     /** `depends_on` edges a fresh `up` would lose to namespace selection (#179). */
     droppedNamespaceEdges?: ReadonlyArray<DroppedNamespaceEdge>;
+    /** `${NAME}` references to injected variables in commands (#200). */
+    bracedEnvVars?: ReadonlyArray<BracedEnvVar>;
     /**
      * The namespace selection a fresh `up` would apply (issue #176) and the
      * isolated services it starts. Optional so a test stub can omit them.
@@ -469,6 +473,7 @@ function dryRunPayload(
     ...(result.sharedConfig !== undefined ? { sharedConfig: result.sharedConfig } : {}),
     droppedEdges: result.droppedEdges ?? [],
     droppedNamespaceEdges: result.droppedNamespaceEdges ?? [],
+    bracedEnvVars: result.bracedEnvVars ?? [],
     ...(result.namespaces !== undefined
       ? {
           selection: {

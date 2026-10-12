@@ -131,6 +131,28 @@ Before ADR-0008, a bare `up` started every namespace. Stacks that relied on
 that now need `-n`. Only isolated services can declare a namespace, as a
 string or a list; shared services always run.
 
+### Referencing ports in a command
+
+devtrees injects each allocated port (and `DEVTREES_WORKTREE_ID`) into the
+process environment. In a `command`, reference it as bare `$WEB_PORT`, or as
+`$${WEB_PORT}` to get a braced form through process-compose. Plain
+`${WEB_PORT}` runs empty: process-compose expands it when it loads the config,
+from its own environment, before the process environment exists.
+
+```yaml
+services:
+  web:
+    tier: isolated
+    ports: [WEB_PORT]
+    command: npm run dev -- --port $WEB_PORT # not ${WEB_PORT}
+```
+
+`up` and `up --dry-run` warn on stderr about each `${NAME}` in a command where
+`NAME` is a variable devtrees injects into that service, naming the service
+and the variable. Under `--json`, the same are in `braced_env_vars`
+(`[{service, variable}]`, always present) on both the `up` and `up_dry_run`
+envelopes. The command is never rewritten.
+
 ### Where devtrees keeps its state
 
 Derived configs, the allocation registry and per-instance logs live in

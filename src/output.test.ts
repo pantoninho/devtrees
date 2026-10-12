@@ -23,6 +23,7 @@ import {
   formatDroppedEdgeWarning,
   formatUpDryRun,
   formatDroppedNamespaceEdgeWarning,
+  formatBracedEnvVarWarning,
   type ErrorCode,
   type LsInstanceRow,
   type LsServiceRow,
@@ -1142,5 +1143,45 @@ describe("output formatter — formatInit (issue #118)", () => {
       init: { target: "AGENTS.md", path: "/p/AGENTS.md", action: "created" },
     });
     expect(result.stderr).toBe("");
+  });
+});
+
+describe("output formatter — braced injected variables (#200)", () => {
+  const v = { service: "web", variable: "WEB_PORT" };
+  const dry: UpDryRunPayload = {
+    worktreeId: "login",
+    env: {},
+    config: { processes: {} } as UpDryRunPayload["config"],
+  };
+  const up: UpPayload = { worktreeId: "login", env: {}, sharedStarted: false };
+
+  it("names the service and variable and gives the fix", () => {
+    const line = formatBracedEnvVarWarning(v);
+    expect(line).toContain("service 'web'");
+    expect(line).toContain("'${WEB_PORT}'");
+    expect(line).toContain("'$WEB_PORT'");
+    expect(line).toContain("'$${WEB_PORT}'");
+  });
+
+  it("up --dry-run: human warns on stderr, stdout stays the document", () => {
+    const out = formatUpDryRun({ ...dry, bracedEnvVars: [v] }, "human");
+    expect(out.stderr).toContain(formatBracedEnvVarWarning(v));
+    expect(out.stdout).toBe(formatUpDryRun(dry, "human").stdout);
+  });
+
+  it("up --dry-run: JSON carries braced_env_vars, always present, stderr silent", () => {
+    const parse = (p: UpDryRunPayload) =>
+      JSON.parse(formatUpDryRun(p, "json").stdout) as { up_dry_run: { braced_env_vars: unknown } };
+    expect(parse({ ...dry, bracedEnvVars: [v] }).up_dry_run.braced_env_vars).toEqual([v]);
+    expect(parse(dry).up_dry_run.braced_env_vars).toEqual([]);
+    expect(formatUpDryRun({ ...dry, bracedEnvVars: [v] }, "json").stderr).toBe("");
+  });
+
+  it("up: JSON carries braced_env_vars, always present; human output unchanged", () => {
+    const parse = (p: UpPayload) =>
+      JSON.parse(formatUp(p, "json").stdout) as { up: { braced_env_vars: unknown } };
+    expect(parse({ ...up, bracedEnvVars: [v] }).up.braced_env_vars).toEqual([v]);
+    expect(parse(up).up.braced_env_vars).toEqual([]);
+    expect(formatUp({ ...up, bracedEnvVars: [v] }, "human")).toEqual(formatUp(up, "human"));
   });
 });
