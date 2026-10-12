@@ -15,6 +15,7 @@
 
 import type { ServiceStatus } from "./driver.js";
 import {
+  classifyService,
   deadServicesDetails,
   describeDeadServices,
   findDeadServices,
@@ -72,7 +73,19 @@ export type WaitForHealth = (args: {
    * `devtrees down && devtrees up`.
    */
   readonly remedy?: string;
+  /**
+   * Services this `up` just restarted (issue #178). Their pre-restart dead
+   * row may still be what a poll reads, so it does not count towards the
+   * fail-fast — see `createRestartTracker`.
+   */
+  readonly restarted?: ReadonlyArray<RestartedService>;
 }) => Promise<void>;
+
+/** A service `up` restarted, and the pid of the run that died (when known). */
+export interface RestartedService {
+  readonly name: string;
+  readonly stalePid?: number;
+}
 
 /**
  * Throw on health-wait timeout; carries the `HEALTH_TIMEOUT` error code so the
@@ -160,6 +173,10 @@ interface PollVerdict {
   readonly healthy: boolean;
   /** Named services that are dead (`classifyService`), in `serviceNames` order. */
   readonly dead: ReadonlyArray<DeadService>;
+  /** Named services not yet healthy (dead ones included), in `serviceNames` order. */
+  readonly pending: ReadonlyArray<string>;
+  /** The rows the poll read; empty when the read failed. */
+  readonly rows: ReadonlyArray<ServiceStatus>;
 }
 
 /**
@@ -184,19 +201,56 @@ async function poll(
   try {
     statuses = await source.getServiceStatuses(socketPath);
   } catch {
-    return { healthy: false, dead: [] };
+    return { healthy: false, dead: [], pending: serviceNames, rows: [] };
   }
   const dead = findDeadServices(statuses, serviceNames);
-  if (dead.length > 0) return { healthy: false, dead };
+  const deadNames = new Set(dead.map((d) => d.name));
   const probed = new Set(probedServiceNames);
   const rows = new Map(statuses.map((s) => [s.name, s]));
-  const healthy = serviceNames.every((name) => {
+  const pending = serviceNames.filter((name) => {
     const row = rows.get(name);
-    if (row === undefined) return false;
-    if (probed.has(name)) return row.health === "ready";
-    return HEALTHY_STATES.has(row.status.toLowerCase());
+    if (row === undefined || deadNames.has(name)) return true;
+    if (probed.has(name)) return row.health !== "ready";
+    return !HEALTHY_STATES.has(row.status.toLowerCase());
   });
-  return { healthy, dead };
+  return { healthy: pending.length === 0, dead, pending, rows: statuses };
+}
+
+/**
+ * Fail-fast guard for services `up` just restarted (issue #178). Right after
+ * `process start`, a poll could still read the run that died (`Completed`,
+ * exit `-1`), and two such reads would fail-fast a service that is in fact
+ * starting. So a restarted service's dead row is **stale**, and ignored by
+ * the fail-fast, until either:
+ *
+ *   - the service has been read alive (any non-dead verdict) since the
+ *     restart, so a later dead row is the restarted run dying; or
+ *   - the dead row carries a pid other than the one that died before the
+ *     restart, so it is the restarted run's own exit (a process that dies
+ *     too fast to ever be read running).
+ *
+ * Without a pid on either side only the first applies. A stale row is still
+ * not healthy, and is reported as dead if the deadline passes.
+ *
+ * Returns a filter from one poll's verdict to the dead services that count.
+ */
+function createRestartTracker(
+  restarted: ReadonlyArray<RestartedService>,
+): (verdict: PollVerdict) => ReadonlyArray<DeadService> {
+  const awaiting = new Map(restarted.map((r) => [r.name, r.stalePid]));
+  return (verdict) => {
+    const rows = new Map(verdict.rows.map((r) => [r.name, r]));
+    for (const name of awaiting.keys()) {
+      const row = rows.get(name);
+      if (row !== undefined && classifyService(row) !== "dead") awaiting.delete(name);
+    }
+    return verdict.dead.filter((d) => {
+      if (!awaiting.has(d.name)) return true;
+      const stalePid = awaiting.get(d.name);
+      const pid = rows.get(d.name)?.pid;
+      return stalePid !== undefined && pid !== undefined && pid !== stalePid;
+    });
+  };
 }
 
 /** Same names in the same order — a dead set that held still across two polls. */
@@ -256,34 +310,63 @@ export function createWaitForSharedHealth(
  * consecutive polls the wait throws `HEALTH_TIMEOUT` straight away, naming
  * them and `remedy`. Two reads, not one, so the instant between a crash and
  * process-compose flipping a restartable process to `Restarting` is never
- * mistaken for a final state. Nothing is restarted here.
+ * mistaken for a final state. Nothing is restarted here: `up` restarts dead
+ * services before the wait (issue #178) and names them in `restarted`, whose
+ * stale pre-restart rows do not count (`createRestartTracker`).
  */
 export function createWaitForHealth(
   source: ServiceStatusSource,
   tuning: PollerTuning = {},
 ): WaitForHealth {
   const pollMs = tuning.pollMs ?? HEALTH_POLL_MS;
-  return async ({ socketPath, serviceNames, probedServiceNames, timeoutMs, remedy }) => {
+  return async (args) => {
+    const { socketPath, serviceNames, probedServiceNames, timeoutMs } = args;
     if (serviceNames.length === 0) return;
-    const fix = remedy ?? "devtrees down && devtrees up";
+    const countable = createRestartTracker(args.restarted ?? []);
+    const dying = deadServicesErrorFor(args);
     const deadline = Date.now() + timeoutMs;
     let lastDead: ReadonlyArray<DeadService> = [];
+    let last: PollVerdict | undefined;
     while (Date.now() < deadline) {
-      const verdict = await poll(source, socketPath, serviceNames, probedServiceNames);
-      if (verdict.healthy) return;
-      if (verdict.dead.length > 0 && sameDead(verdict.dead, lastDead)) {
-        throw deadServicesError(verdict.dead, fix);
-      }
-      lastDead = verdict.dead;
+      last = await poll(source, socketPath, serviceNames, probedServiceNames);
+      if (last.healthy) return;
+      const dead = countable(last);
+      if (dead.length > 0 && sameDead(dead, lastDead)) throw dying(dead);
+      lastDead = dead;
       await sleep(pollMs);
     }
-    if (lastDead.length > 0) throw deadServicesError(lastDead, fix);
-    throw new HealthTimeoutError(
-      `timed out waiting for services to be healthy [${serviceNames.join(", ")}] ` +
-        `after ${timeoutMs}ms. The worktree instance is still running — ` +
-        `inspect it with \`devtrees logs <service>\` or \`devtrees ls --json\`.`,
-    );
+    throw deadlineError(last, serviceNames, timeoutMs, dying);
   };
+}
+
+/** Build the dead-service `HEALTH_TIMEOUT` for one wait's remedy and restarts. */
+function deadServicesErrorFor(args: {
+  readonly remedy?: string;
+  readonly restarted?: ReadonlyArray<RestartedService>;
+}): (dead: ReadonlyArray<DeadService>) => HealthTimeoutError {
+  const fix = args.remedy ?? "devtrees down && devtrees up";
+  const restartedNames = new Set((args.restarted ?? []).map((r) => r.name));
+  return (dead) => deadServicesError(dead, fix, restartedNames);
+}
+
+/**
+ * The `HEALTH_TIMEOUT` once the wait window has run out. A service the last
+ * poll read dead is reported as dead, stale pre-restart row or not; otherwise
+ * it names the services that never became healthy.
+ */
+function deadlineError(
+  last: PollVerdict | undefined,
+  serviceNames: ReadonlyArray<string>,
+  timeoutMs: number,
+  dying: (dead: ReadonlyArray<DeadService>) => HealthTimeoutError,
+): HealthTimeoutError {
+  if (last !== undefined && last.dead.length > 0) return dying(last.dead);
+  const pending = last?.pending ?? serviceNames;
+  return new HealthTimeoutError(
+    `timed out waiting for services to be healthy [${pending.join(", ")}] ` +
+      `after ${timeoutMs}ms. The worktree instance is still running — ` +
+      `inspect it with \`devtrees logs <service>\` or \`devtrees ls --json\`.`,
+  );
 }
 
 /**
@@ -325,14 +408,22 @@ export function sharedServiceDeadError(dead: ReadonlyArray<DeadService>): Error 
 
 /**
  * The `HEALTH_TIMEOUT` a dead service produces: names each dead service with
- * its status and exit code, and the `down` + `up` that brings it back. The
- * instance is left running (ADR-0005) so its logs stay readable.
+ * its status and exit code, which of them this `up` already restarted, and
+ * the `down` + `up` that restarts the whole stack. The instance is left
+ * running (ADR-0005) so its logs stay readable.
  */
-function deadServicesError(dead: ReadonlyArray<DeadService>, remedy: string): HealthTimeoutError {
+function deadServicesError(
+  dead: ReadonlyArray<DeadService>,
+  remedy: string,
+  restarted: ReadonlySet<string>,
+): HealthTimeoutError {
+  const again = dead.filter((d) => restarted.has(d.name)).map((d) => d.name);
+  const againNote =
+    again.length > 0 ? ` This \`up\` restarted ${again.join(", ")}, and it died again.` : "";
   return new HealthTimeoutError(
-    `service(s) not running: ${describeDeadServices(dead)}. devtrees does not restart ` +
-      `them yet; run \`${remedy}\` to bring the stack back. The worktree instance is still ` +
-      `running — read why with \`devtrees logs <service>\`.`,
+    `service(s) not running: ${describeDeadServices(dead)}.${againNote} Read why with ` +
+      `\`devtrees logs <service>\`. Re-running \`devtrees up\` restarts dead services; ` +
+      `\`${remedy}\` restarts the whole stack. The worktree instance is still running.`,
     { dead_services: deadServicesDetails(dead), remedy },
   );
 }

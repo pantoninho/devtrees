@@ -945,24 +945,96 @@ describe("built CLI e2e — up verifies a running instance (#177)", () => {
     expect(names).toEqual(["a", "b"]);
   }, 60_000);
 
-  it("#162: a killed service makes the re-up fail with HEALTH_TIMEOUT naming it, without waiting out the timeout", () => {
-    const { wt } = setupScenario("dt-bcv4-", { webProbe: false });
+  it("#162/#178: a killed service is restarted by the re-up, which exits 0 and reports it", () => {
+    const { wt } = setupScenario("dt-bcv4-");
+    expect(devtrees(wt, ["up", "--json", "--wait-timeout", "10"]).code).toBe(0);
+
+    const r = devtrees(wt, ["up", "--json", "--wait-timeout", "30"], {
+      env: { DEVTREES_STUB_DEAD: "web" },
+    });
+    expect(r.code, `re-up failed: ${r.stderr} ${r.stdout}`).toBe(0);
+    const doc = r.doc as UpDoc & { up: { restarted: string[] } };
+    expect(doc.up.restarted).toEqual(["web"]);
+    expect(doc.up.services.find((s) => s.name === "web")?.health).toBe("ready");
+
+    // Converged: the next re-up restarts nothing, and the human summary says
+    // nothing about restarts.
+    const human = devtrees(wt, ["up", "--no-attach", "--wait-timeout", "10"], {
+      env: { DEVTREES_STUB_DEAD: "web" },
+    });
+    expect(human.code).toBe(0);
+    expect(human.stdout).not.toContain("restarted");
+  }, 90_000);
+
+  it("the human summary names the services the re-up restarted", () => {
+    const { wt } = setupScenario("dt-bcva-", { webProbe: false });
+    expect(devtrees(wt, ["up", "--json", "--wait-timeout", "10"]).code).toBe(0);
+    const r = devtrees(wt, ["up", "--no-attach", "--wait-timeout", "10"], {
+      env: { DEVTREES_STUB_DEAD: "web" },
+    });
+    expect(r.code, `re-up failed: ${r.stderr} ${r.stdout}`).toBe(0);
+    expect(r.stdout).toContain("devtrees up: restarted dead service(s): web.");
+    expect(r.stdout).toContain("is up.");
+  }, 60_000);
+
+  it("a refused restart fails with SERVICE_START_FAILED in --json and human output", () => {
+    const { wt, id } = setupScenario("dt-bcvb-", { webProbe: false });
+    expect(devtrees(wt, ["up", "--json", "--wait-timeout", "10"]).code).toBe(0);
+    const env = { DEVTREES_STUB_DEAD: "web", DEVTREES_STUB_START_FAIL: "web" };
+
+    const json = devtrees(wt, ["up", "--json", "--wait-timeout", "10"], { env });
+    expect(json.code).toBe(1);
+    const err = (json.doc as VerifyErrorDoc).error;
+    expect(err?.code).toBe("SERVICE_START_FAILED");
+    expect(err?.details).toEqual({
+      worktree_id: id,
+      services: [
+        {
+          name: "web",
+          message: 'FTL failed to start process web error="stub refused to start web"',
+        },
+      ],
+      remedy: "devtrees down && devtrees up",
+    });
+
+    const human = devtrees(wt, ["up", "--no-attach", "--wait-timeout", "10"], { env });
+    expect(human.code).toBe(1);
+    expect(human.stderr).toContain("web");
+    expect(human.stderr).toContain("devtrees down && devtrees up");
+    expect(human.stdout).not.toContain("is up");
+  }, 60_000);
+
+  it("a restarted service that dies again fails fast with HEALTH_TIMEOUT naming it", () => {
+    const { wt } = setupScenario("dt-bcvc-", { webProbe: false });
     expect(devtrees(wt, ["up", "--json", "--wait-timeout", "10"]).code).toBe(0);
 
     const started = Date.now();
     const r = devtrees(wt, ["up", "--json", "--wait-timeout", "60"], {
-      env: { DEVTREES_STUB_DEAD: "web" },
+      env: { DEVTREES_STUB_DEAD: "web", DEVTREES_STUB_DIES_AGAIN: "web" },
     });
     expect(Date.now() - started).toBeLessThan(20_000);
     expect(r.code).toBe(1);
     const err = (r.doc as VerifyErrorDoc).error;
     expect(err?.code).toBe("HEALTH_TIMEOUT");
-    expect(err?.message).toContain("web (Completed, exit -1)");
-    expect(err?.message).toContain("devtrees down && devtrees up");
+    expect(err?.message).toContain("web (Completed, exit 1)");
+    expect(err?.message).toContain("died again");
     expect(err?.details).toMatchObject({
-      dead_services: [{ name: "web", status: "Completed", exit_code: -1 }],
+      dead_services: [{ name: "web", status: "Completed", exit_code: 1 }],
     });
   }, 90_000);
+
+  it("a restarted service that never becomes healthy fails HEALTH_TIMEOUT naming it, instance left running", () => {
+    const { wt, sock } = setupScenario("dt-bcvd-");
+    expect(devtrees(wt, ["up", "--json", "--wait-timeout", "10"]).code).toBe(0);
+    const r = devtrees(wt, ["up", "--json", "--wait-timeout", "2"], {
+      env: { DEVTREES_STUB_DEAD: "web", [NEVER_READY]: "1" },
+    });
+    expect(r.code).toBe(1);
+    const err = (r.doc as VerifyErrorDoc).error;
+    expect(err?.code).toBe("HEALTH_TIMEOUT");
+    expect(err?.message).toContain("healthy [web] after 2000ms");
+    expect(existsSync(sock)).toBe(true);
+  }, 60_000);
 
   it("a healthy running instance re-ups with exit 0 quickly", () => {
     const { wt } = setupScenario("dt-bcv5-");
@@ -981,6 +1053,8 @@ describe("built CLI e2e — up verifies a running instance (#177)", () => {
       env: { DEVTREES_STUB_DONE: "web" },
     });
     expect(r.code, `re-up failed: ${r.stderr} ${r.stdout}`).toBe(0);
+    // Done, not dead: never restarted (#178).
+    expect((r.doc as { up: { restarted: string[] } }).up.restarted).toEqual([]);
   }, 60_000);
 
   it("a dead shared service fails the re-up with SHARED_SERVICE_DEAD and the down --shared remedy", () => {

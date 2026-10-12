@@ -178,6 +178,29 @@ export function buildProcessListArgs(socketPath: string): string[] {
   return ["process", "list", "-U", "-u", socketPath, "-o", "json"];
 }
 
+/**
+ * Start one process of a running instance over its UDS (issue #178). On
+ * v1.122.0 this brings a dead process (killed, crashed, failed) back to
+ * `Running`, and refuses a process that is already running.
+ */
+export function buildProcessStartArgs(socketPath: string, service: string): string[] {
+  return ["process", "start", service, "-U", "-u", socketPath];
+}
+
+/**
+ * Outcome of a `startProcess` call. `ok:false` carries process-compose's own
+ * complaint (its stderr, or the exit code) for the `SERVICE_START_FAILED`
+ * envelope.
+ */
+type StartResult = { readonly ok: true } | { readonly ok: false; readonly message: string };
+
+/**
+ * process-compose's refusal to start a process that is already running. Not a
+ * failure for `up`: another `up`, or the process's own restart policy, got
+ * there first, and the health wait judges the result like any other run.
+ */
+const ALREADY_RUNNING = /already running/i;
+
 /** Health-state surface devtrees exposes for a service in a running instance. */
 export type HealthState = "ready" | "not_ready" | "unknown";
 
@@ -207,6 +230,13 @@ export interface ServiceStatus {
    * usable `namespace`. Not published in `ls`/`up --json` rows.
    */
   readonly namespaces?: ReadonlyArray<string>;
+  /**
+   * process-compose's `pid` for the row's latest run, when it reported one. A
+   * dead row keeps the pid of the run that died, so after `up` restarts a
+   * service (#178) a dead row with the OLD pid is the stale pre-restart
+   * state, and one with a NEW pid is the restarted run dying again.
+   */
+  readonly pid?: number;
 }
 
 interface RawProc {
@@ -217,6 +247,7 @@ interface RawProc {
   readonly is_running?: unknown;
   readonly exit_code?: unknown;
   readonly namespace?: unknown;
+  readonly pid?: unknown;
 }
 
 /**
@@ -275,6 +306,7 @@ export function parseServiceStatuses(stdout: string): ServiceStatus[] {
       health: readHealth(raw),
       ...(typeof raw.exit_code === "number" ? { exitCode: raw.exit_code } : {}),
       ...(namespaces !== undefined ? { namespaces } : {}),
+      ...(typeof raw.pid === "number" && raw.pid > 0 ? { pid: raw.pid } : {}),
     });
   }
   return out;
@@ -472,6 +504,15 @@ export function createDriver(deps: DriverDeps = {}) {
       });
     },
     /**
+     * Start one process of the running instance at `socketPath`
+     * (`process-compose process start <name>`, issue #178). Resolves
+     * `ok:false` with process-compose's message when it refuses or errors;
+     * a refusal because the process is already running counts as `ok`.
+     */
+    startProcess(socketPath: string, service: string): Promise<StartResult> {
+      return startProcessImpl(socketPath, service, { binary, prefix, exists, spawner });
+    },
+    /**
      * Stream a service's logs from the instance at `socketPath` as an async
      * iterable of `LogEvent`s. Spawns `process-compose process logs <service>`
      * with piped stdout, reads it line-by-line, and emits one event per line
@@ -505,25 +546,65 @@ export function createDriver(deps: DriverDeps = {}) {
   };
 }
 
+/** The binary + spawner a one-shot driver call shells out through. */
+interface ShellDeps {
+  readonly binary: string;
+  readonly prefix: ReadonlyArray<string>;
+  readonly exists: (binary: string) => Promise<boolean>;
+  readonly spawner: Spawner;
+}
+
+/** Accumulate everything written to `stream`; read it back with the returned getter. */
+function captureOutput(stream: NodeJS.ReadableStream | null | undefined): () => string {
+  let out = "";
+  stream?.on("data", (chunk: Buffer | string) => {
+    out += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+  });
+  return () => out;
+}
+
+async function startProcessImpl(
+  socketPath: string,
+  service: string,
+  deps: ShellDeps,
+): Promise<StartResult> {
+  await ensureBinary({ binary: deps.binary, exists: deps.exists });
+  const args = [...deps.prefix, ...buildProcessStartArgs(socketPath, service)];
+  return new Promise<StartResult>((resolve) => {
+    const child = deps.spawner(deps.binary, args, { stdio: ["ignore", "ignore", "pipe"] });
+    const stderr = captureOutput(child.stderr);
+    child.on("error", (err) => resolve({ ok: false, message: err.message }));
+    child.on("exit", (code) => {
+      if (code === 0 || code === null || ALREADY_RUNNING.test(stderr())) {
+        resolve({ ok: true });
+        return;
+      }
+      resolve({ ok: false, message: describeStartFailure(stderr(), deps.binary, code) });
+    });
+  });
+}
+
+/**
+ * process-compose logs a refusal as one colourised log line
+ * (`FTL failed to start process x error="no such process: x"`). Strip the
+ * ANSI escapes so the message reads cleanly in an error envelope.
+ */
+function describeStartFailure(stderr: string, binary: string, code: number): string {
+  // eslint-disable-next-line no-control-regex
+  const plain = stderr.replace(/\x1b\[[0-9;]*m/g, "").trim();
+  return plain === "" ? `${binary} process start exited with code ${code}` : plain;
+}
+
 async function reloadConfigImpl(
   inst: InstanceRef,
-  deps: {
-    readonly binary: string;
-    readonly prefix: ReadonlyArray<string>;
-    readonly exists: (binary: string) => Promise<boolean>;
-    readonly spawner: Spawner;
-    readonly timeoutMs: number;
-  },
+  deps: ShellDeps & { readonly timeoutMs: number },
 ): Promise<ReloadResult> {
   await ensureBinary({ binary: deps.binary, exists: deps.exists });
   return new Promise<ReloadResult>((resolve) => {
     const child = deps.spawner(deps.binary, [...deps.prefix, ...buildReloadConfigArgs(inst)], {
       stdio: ["ignore", "ignore", "pipe"],
     });
-    let stderr = "";
-    child.stderr?.on("data", (chunk: Buffer | string) => {
-      stderr += typeof chunk === "string" ? chunk : chunk.toString("utf8");
-    });
+    const stderr = captureOutput(child.stderr);
     const timer = setTimeout(() => {
       child.kill?.("SIGTERM");
       resolve({
@@ -544,7 +625,7 @@ async function reloadConfigImpl(
         resolve({ ok: true });
         return;
       }
-      const message = stderr.trim() || `${deps.binary} project update exited with code ${code}`;
+      const message = stderr().trim() || `${deps.binary} project update exited with code ${code}`;
       resolve({ ok: false, reason: "not_supported", message });
     });
   });

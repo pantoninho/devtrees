@@ -528,6 +528,32 @@ interface LsDoc {
 }
 
 /**
+ * Write `<root>/<name>.py`, a long-running process whose argv carries the
+ * scenario root (so `pidsMatching` finds exactly it), and return its path.
+ * With `exitIf`, it exits 4 at start whenever that file exists, so a
+ * restarted run dies straight away.
+ */
+function sleeper(root: string, name: string, exitIf?: string): string {
+  const path = join(root, `${name}.py`);
+  const guard =
+    exitIf === undefined ? "" : `if os.path.exists(${JSON.stringify(exitIf)}):\n    sys.exit(4)\n`;
+  writeFileSync(path, `import os, sys, time\n${guard}time.sleep(300)\n`);
+  return path;
+}
+
+/**
+ * HTTP status of `GET http://127.0.0.1:<port>/`, or 0 when nothing answers.
+ */
+async function httpStatus(port: number): Promise<number> {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(3000) });
+    return res.status;
+  } catch {
+    return 0;
+  }
+}
+
+/**
  * Poll `ls --json` until a given service row reports `health: "ready"`, or
  * until `timeoutMs` elapses. Returns the last-observed row (possibly
  * `undefined` if the instance never appeared) so the caller can assert.
@@ -953,10 +979,11 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
     expect(pidsMatching(holdB), "exactly one copy of the new command").toHaveLength(1);
   }, 120_000);
 
-  it("scenario 16: re-up after one of two services is killed fails with HEALTH_TIMEOUT naming it (#162, #177)", async () => {
+  it("scenario 16: re-up after one of two services is killed restarts it; its port answers again (#162, #178)", async () => {
     // #162's two-service shape: `keeper` keeps the instance alive after `toy`
     // is killed, so the re-up takes the already-running path. Before #177 it
-    // printed `is up.` and exited 0 over the corpse.
+    // printed `is up.` and exited 0 over the corpse; since #178 it restarts
+    // the dead service and waits for it to be healthy.
     const repo = buildSmokeRepo("dt-rpc16-", ["login"]);
     currentCtx = { pidNeedle: repo.root, root: repo.root };
     const wt = repo.worktrees.login!;
@@ -982,7 +1009,7 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
         "  keeper:",
         "    tier: isolated",
         "    namespace: test",
-        '    command: "sleep 300"',
+        `    command: "python3 ${sleeper(repo.root, "keeper")}"`,
         "",
       ].join("\n"),
     );
@@ -990,34 +1017,30 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
 
     const first = devtrees(wt, ["up", "-n", "test", "--json", "--wait-timeout", "60"]);
     expect(first.code, `first up failed: ${first.stderr} ${first.stdout}`).toBe(0);
+    const port = Number((first.doc as UpDoc).up.env.TOY_PORT);
+    expect(await httpStatus(port)).toBe(200);
 
     // Match on the server's own argv, not the bare root: process-compose's
     // argv carries the root too (its `-f` config path), and killing it would
     // take the whole instance down — not #162's shape.
     const toyNeedle = `--directory ${repo.root}`;
+    const keeperNeedle = join(repo.root, "keeper.py");
+    const keeperPids = pidsMatching(keeperNeedle);
+    expect(keeperPids.length, "keeper should be running").toBeGreaterThan(0);
     const toyPids = pidsMatching(toyNeedle);
     expect(toyPids.length, "toy should be running").toBeGreaterThan(0);
     reapPids(toyPids);
     expect(await waitForNoPids(toyNeedle, 5000)).toEqual([]);
+    expect(await httpStatus(port)).toBe(0);
 
-    const started = Date.now();
     const again = devtrees(wt, ["up", "-n", "test", "--json", "--wait-timeout", "60"]);
-    const elapsed = Date.now() - started;
-    expect(again.code, `re-up should fail: ${again.stdout}`).toBe(1);
-    const err = (again.doc as { error?: { code?: string; message?: string; details?: unknown } })
-      .error;
-    expect(err?.code).toBe("HEALTH_TIMEOUT");
-    expect(err?.message).toContain("toy");
-    expect(err?.message).toContain("devtrees down && devtrees up -n test");
-    expect(err?.details).toMatchObject({ dead_services: [{ name: "toy", exit_code: -1 }] });
-    // Fail-fast: a corpse is not waited on for the full 60s window.
-    expect(elapsed).toBeLessThan(30_000);
-
-    // Reported, not restarted; the surviving service is untouched.
-    const ls = devtrees(wt, ["ls", "--json"]).doc as LsDoc;
-    const rows = ls.ls.instances.find((i) => i.id === wtId(wt))?.services ?? [];
-    expect(rows.find((s) => s.name === "keeper")?.status).toBe("Running");
-    expect(pidsMatching(toyNeedle)).toEqual([]);
+    expect(again.code, `re-up should restart toy: ${again.stderr} ${again.stdout}`).toBe(0);
+    const doc = again.doc as UpDoc & { up: { restarted: string[] } };
+    expect(doc.up.restarted).toEqual(["toy"]);
+    expect(await httpStatus(port)).toBe(200);
+    expect(pidsMatching(toyNeedle).length, "toy is running again").toBeGreaterThan(0);
+    // Nothing was stopped: the surviving service is the same process.
+    expect(pidsMatching(keeperNeedle)).toEqual(keeperPids);
   }, 180_000);
 
   it("scenario 17: up -n one, then up -n one -n two fails with NAMESPACE_NOT_RUNNING (#170, #177)", async () => {
@@ -1061,6 +1084,90 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
     const bare = devtrees(wt, ["up", "--json", "--wait-timeout", "20"]);
     expect(bare.code, `bare re-up failed: ${bare.stderr} ${bare.stdout}`).toBe(0);
     expect((bare.doc as UpDoc).up.services.map((s) => s.name)).toEqual(["a"]);
+  }, 120_000);
+
+  it("scenario 18: a failed one-shot is restarted by the re-up; an exit-0 one-shot is not (#178)", async () => {
+    const repo = buildSmokeRepo("dt-rpc18-", ["login"]);
+    currentCtx = { pidNeedle: repo.root, root: repo.root };
+    const wt = repo.worktrees.login!;
+    const ran = join(repo.root, "flaky-ran");
+    writeFileSync(
+      join(wt, "devtrees.yaml"),
+      [
+        "services:",
+        "  keeper:",
+        "    tier: isolated",
+        `    command: "python3 ${sleeper(repo.root, "keeper")}"`,
+        // Exits 0 once: a finished one-shot, never restarted.
+        "  seed:",
+        "    tier: isolated",
+        '    command: "true"',
+        // Fails on its first run, succeeds on its second.
+        "  flaky:",
+        "    tier: isolated",
+        `    command: "sh -c 'test -f ${ran} || { touch ${ran}; exit 3; }'"`,
+        "",
+      ].join("\n"),
+    );
+    cleanupStack.push(() => devtrees(wt, ["down"]));
+
+    // The first up may pass (flaky read Running) or fail fast (flaky read
+    // dead); either way the instance is left running with flaky dead.
+    devtrees(wt, ["up", "--json", "--wait-timeout", "30"]);
+    expect(existsSync(ran), "flaky should have run once").toBe(true);
+
+    const again = devtrees(wt, ["up", "--json", "--wait-timeout", "30"]);
+    expect(again.code, `re-up should restart flaky: ${again.stderr} ${again.stdout}`).toBe(0);
+    expect((again.doc as { up: { restarted: string[] } }).up.restarted).toEqual(["flaky"]);
+
+    // Converged: both one-shots are done, nothing left to restart.
+    const third = devtrees(wt, ["up", "--json", "--wait-timeout", "30"]);
+    expect(third.code, `third up: ${third.stderr} ${third.stdout}`).toBe(0);
+    expect((third.doc as { up: { restarted: string[] } }).up.restarted).toEqual([]);
+  }, 120_000);
+
+  it("scenario 19: a restarted service that dies straight away fails fast with HEALTH_TIMEOUT (#178)", async () => {
+    // The restarted run exits before any poll can read it running, so only
+    // its new pid tells its corpse from the pre-restart one.
+    const repo = buildSmokeRepo("dt-rpc19-", ["login"]);
+    currentCtx = { pidNeedle: repo.root, root: repo.root };
+    const wt = repo.worktrees.login!;
+    const armed = join(repo.root, "crash-armed");
+    writeFileSync(
+      join(wt, "devtrees.yaml"),
+      [
+        "services:",
+        "  keeper:",
+        "    tier: isolated",
+        `    command: "python3 ${sleeper(repo.root, "keeper")}"`,
+        "  crasher:",
+        "    tier: isolated",
+        `    command: "python3 ${sleeper(repo.root, "crasher", armed)}"`,
+        "",
+      ].join("\n"),
+    );
+    cleanupStack.push(() => devtrees(wt, ["down"]));
+
+    const first = devtrees(wt, ["up", "--json", "--wait-timeout", "30"]);
+    expect(first.code, `first up failed: ${first.stderr} ${first.stdout}`).toBe(0);
+
+    writeFileSync(armed, "");
+    const crasherNeedle = join(repo.root, "crasher.py");
+    reapPids(pidsMatching(crasherNeedle));
+    expect(await waitForNoPids(crasherNeedle, 5000)).toEqual([]);
+
+    const started = Date.now();
+    const again = devtrees(wt, ["up", "--json", "--wait-timeout", "60"]);
+    const elapsed = Date.now() - started;
+    expect(again.code, `re-up should fail: ${again.stdout}`).toBe(1);
+    const err = (again.doc as { error?: { code?: string; message?: string; details?: unknown } })
+      .error;
+    expect(err?.code).toBe("HEALTH_TIMEOUT");
+    expect(err?.message).toContain("crasher (Completed, exit 4)");
+    expect(err?.message).toContain("died again");
+    expect(err?.details).toMatchObject({ dead_services: [{ name: "crasher", exit_code: 4 }] });
+    // Fail-fast: the restarted corpse is not waited on for the full window.
+    expect(elapsed).toBeLessThan(30_000);
   }, 120_000);
 
   /**

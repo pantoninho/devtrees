@@ -63,6 +63,7 @@ import {
   createWaitForSharedHealth,
   readStatusesWithin,
   sharedServiceDeadError,
+  type RestartedService,
   type WaitForHealth,
   type WaitForSharedHealth,
 } from "./health.js";
@@ -268,6 +269,29 @@ class NamespaceNotRunningError extends Error {
   ) {
     super(message);
     this.name = "NamespaceNotRunningError";
+  }
+}
+
+/**
+ * Thrown when `up` asks process-compose to restart a dead selected service
+ * on a running instance and the start request itself fails (ADR-0008, issue
+ * #178): process-compose refused or errored. Distinct from `HEALTH_TIMEOUT`,
+ * which is a service that started but never became healthy. Nothing is
+ * stopped; the instance keeps running and `details.remedy` is the `down` +
+ * `up` that restarts the whole stack.
+ */
+class ServiceStartFailedError extends Error {
+  readonly code = "SERVICE_START_FAILED" as const;
+  constructor(
+    message: string,
+    readonly details: {
+      readonly worktree_id: string;
+      readonly services: ReadonlyArray<{ readonly name: string; readonly message: string }>;
+      readonly remedy: string;
+    },
+  ) {
+    super(message);
+    this.name = "ServiceStartFailedError";
   }
 }
 
@@ -676,6 +700,12 @@ export interface UpResult {
    * stderr as `up` ran. Empty when nothing was dropped.
    */
   readonly droppedNamespaceEdges: ReadonlyArray<DroppedNamespaceEdge>;
+  /**
+   * Dead selected isolated services this `up` restarted on a running
+   * instance before its health wait (ADR-0008, issue #178), in declaration
+   * order. Always empty on a fresh start.
+   */
+  readonly restarted: ReadonlyArray<string>;
 }
 
 /**
@@ -970,8 +1000,10 @@ async function socketIsLive(
  *
  * Verifying a running instance (issue #177): selection read back from the
  * project, `NAMESPACE_NOT_RUNNING` for an unbooted `-n`, and the same health
- * wait as a fresh headless start, failing with `HEALTH_TIMEOUT` on a dead
- * selected service. Never attaches, never stops or restarts anything.
+ * wait as a fresh headless start. Dead selected isolated services are
+ * restarted first (#178; `SERVICE_START_FAILED` if process-compose refuses),
+ * and one that does not become healthy fails with `HEALTH_TIMEOUT`. Never
+ * attaches, never stops anything.
  *
  * Dead shared services (ADR-0008), on both paths: a shared instance found
  * already running is checked inside the lock right after
@@ -1261,7 +1293,12 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
       driver,
       verified.rows,
     );
-    return { ...result, services, droppedNamespaceEdges: verified.droppedNamespaceEdges };
+    return {
+      ...result,
+      services,
+      droppedNamespaceEdges: verified.droppedNamespaceEdges,
+      restarted: verified.restarted,
+    };
   }
 
   if (shouldAttachAfterUp(deps)) {
@@ -1278,7 +1315,12 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     // Snapshot the per-service rows after the human detaches so the post-TUI
     // summary line reflects the state at detach time. Best-effort (issue #29).
     const services = await collectIsolatedServices(stack, paths.socketPath, portFor, deps, driver);
-    return { ...result, services, droppedNamespaceEdges: outcome.droppedNamespaceEdges };
+    return {
+      ...result,
+      services,
+      droppedNamespaceEdges: outcome.droppedNamespaceEdges,
+      restarted: [],
+    };
   }
 
   // Headless paths (`--json` / `--no-attach`): no TUI to render progress, so the
@@ -1293,7 +1335,12 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
   // applies, issue #29).
   const services = await collectIsolatedServices(stack, paths.socketPath, portFor, deps, driver);
 
-  return { ...result, services, droppedNamespaceEdges: outcome.droppedNamespaceEdges };
+  return {
+    ...result,
+    services,
+    droppedNamespaceEdges: outcome.droppedNamespaceEdges,
+    restarted: [],
+  };
 }
 
 /**
@@ -2606,18 +2653,24 @@ async function reconcileRunning(args: {
  *     boot-time selection); `-n` is exact, and a requested namespace whose
  *     services are absent fails with `NAMESPACE_NOT_RUNNING` (#170) — they
  *     cannot be added to a running instance.
- *  2. **Health.** Wait on every selected isolated service with the same
+ *  2. **Restart.** Every dead selected isolated service (`classifyService`:
+ *     a crash, a kill, a non-zero exit; not an exit-0 one-shot, not one
+ *     process-compose is already `Restarting`) is started again over the
+ *     control socket (#162, #178). A start request process-compose refuses
+ *     fails with `SERVICE_START_FAILED`.
+ *  3. **Health.** Wait on every selected isolated service with the same
  *     machinery and `--wait-timeout` as a fresh headless start. A healthy
- *     instance passes on the first poll; a dead selected service fails with
- *     `HEALTH_TIMEOUT` naming it (#162).
+ *     instance passes on the first poll; a restarted service that never
+ *     becomes healthy, or dies again, fails with `HEALTH_TIMEOUT` naming it.
  *
  * Dead shared services are checked earlier, inside the lifecycle lock, on
- * both paths (`assertSharedServicesAlive`). Returns the rows the last poll
- * saw, so the envelope needs no extra read, and the `depends_on` edges the
+ * both paths (`assertSharedServicesAlive`), and are never restarted. Returns
+ * the rows the last poll saw, so the envelope needs no extra read, the
+ * names of the services it restarted, and the `depends_on` edges the
  * effective selection drops (#179), each already warned about.
  *
- * Never stops or restarts anything: a narrower `-n` than what is running only
- * narrows what is checked.
+ * Never stops anything, and restarts only selected services: a narrower `-n`
+ * than what is running only narrows what is checked and restarted.
  */
 async function verifyRunning(args: {
   readonly stack: ResolvedStack;
@@ -2629,6 +2682,7 @@ async function verifyRunning(args: {
 }): Promise<{
   readonly rows: ServiceStatus[] | undefined;
   readonly droppedNamespaceEdges: ReadonlyArray<DroppedNamespaceEdge>;
+  readonly restarted: string[];
 }> {
   const { stack, anchor, socketPath, deps, driver } = args;
   const isolated = stack.services.filter((s) => s.tier === "isolated");
@@ -2655,11 +2709,76 @@ async function verifyRunning(args: {
   // than the boot selection does not report edges to services still running.
   const nsEdges = warnDroppedNamespaceEdges(stack, selection.services, args.warn, present);
 
-  const finalRows = await waitForSelectedHealth(selection.services, socketPath, deps, driver, {
-    remedy: `devtrees down && ${formatUpCommand(stack.services, selection.namespaces)}`,
-    firstRead: rows,
+  const remedy = `devtrees down && ${formatUpCommand(stack.services, selection.namespaces)}`;
+  const restarted = await restartDeadServices({
+    rows,
+    names: selection.services.map((s) => s.name),
+    socketPath,
+    driver,
+    worktreeId: anchor.worktreeId,
+    remedy,
   });
-  return { rows: finalRows, droppedNamespaceEdges: nsEdges };
+  const lastRows = await waitForSelectedHealth(selection.services, socketPath, deps, driver, {
+    remedy,
+    // The first read predates the restarts, so it can only serve as the
+    // first poll when nothing was restarted.
+    ...(restarted.length === 0 ? { firstRead: rows } : { restarted }),
+  });
+  return {
+    rows: lastRows,
+    droppedNamespaceEdges: nsEdges,
+    restarted: restarted.map((r) => r.name),
+  };
+}
+
+/**
+ * Start every dead service among `names` again over the instance's control
+ * socket (ADR-0008, issue #178), in `names` order. `rows` is the read the
+ * dead verdicts come from; each restarted service carries the pid of the run
+ * that died, so the health wait can tell that stale row from the restarted
+ * run dying again (`createRestartTracker`).
+ *
+ * Every dead service is attempted even if an earlier one is refused; any
+ * refusal then fails with `SERVICE_START_FAILED` naming each refused
+ * service. Nothing is stopped.
+ */
+async function restartDeadServices(args: {
+  readonly rows: ReadonlyArray<ServiceStatus>;
+  readonly names: ReadonlyArray<string>;
+  readonly socketPath: string;
+  readonly driver: ReturnType<typeof createDriver>;
+  readonly worktreeId: string;
+  readonly remedy: string;
+}): Promise<RestartedService[]> {
+  const dead = findDeadServices(args.rows, args.names);
+  const pids = new Map(args.rows.map((r) => [r.name, r.pid]));
+  const restarted: RestartedService[] = [];
+  const failed: Array<{ name: string; message: string }> = [];
+  for (const { name } of dead) {
+    const outcome = await args.driver.startProcess(args.socketPath, name);
+    if (!outcome.ok) {
+      failed.push({ name, message: outcome.message });
+      continue;
+    }
+    const stalePid = pids.get(name);
+    restarted.push(stalePid === undefined ? { name } : { name, stalePid });
+  }
+  if (failed.length > 0) throw serviceStartFailedError(args.worktreeId, failed, args.remedy);
+  return restarted;
+}
+
+function serviceStartFailedError(
+  worktreeId: string,
+  failed: ReadonlyArray<{ readonly name: string; readonly message: string }>,
+  remedy: string,
+): ServiceStartFailedError {
+  const reasons = failed.map((f) => `${f.name} (${f.message})`).join(", ");
+  return new ServiceStartFailedError(
+    `devtrees up: could not restart dead service(s) in '${worktreeId}': ${reasons}. ` +
+      `process-compose refused the start request. Run \`${remedy}\` to restart the whole ` +
+      `stack. Nothing was stopped; the worktree instance is still running.`,
+    { worktree_id: worktreeId, services: failed, remedy },
+  );
 }
 
 /**
@@ -2806,6 +2925,8 @@ async function waitForSelectedHealth(
      * round-trip.
      */
     readonly firstRead?: ServiceStatus[];
+    /** Services the caller just restarted (issue #178); see `WaitForHealth`. */
+    readonly restarted?: ReadonlyArray<RestartedService>;
   },
 ): Promise<ServiceStatus[] | undefined> {
   const read = statusReader(deps, driver);
@@ -2829,6 +2950,7 @@ async function waitForSelectedHealth(
     probedServiceNames: probedNames(services),
     timeoutMs: deps.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS,
     remedy: opts.remedy,
+    ...(opts.restarted !== undefined ? { restarted: opts.restarted } : {}),
   });
   return lastRows;
 }

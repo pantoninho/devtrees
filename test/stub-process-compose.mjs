@@ -11,6 +11,9 @@
  *        socket as a liveness marker. Backgrounds itself and returns.
  *   down -U -u <socket>
  *        Signals the running instance to stop and removes the control socket.
+ *   process start <name> -U -u <socket>
+ *        Records <name> as restarted, so `process list` reports it running
+ *        again (issue #178). See the `process list` notes for the env knobs.
  *   version
  *        Prints a version (`$STUB_PC_VERSION`, default v1.122.0; `--short`
  *        prints it bare) so the presence and minimum-version probes work.
@@ -189,6 +192,11 @@ if (cmd === "up") {
       // ignore
     }
     try {
+      rmSync(`${socketPath}.started`, { force: true });
+    } catch {
+      // ignore
+    }
+    try {
       rmSync(socketPath, { force: true });
     } catch {
       // ignore
@@ -335,22 +343,50 @@ if (cmd === "up") {
     //                                   instance, shared or worktree.
     //   DEVTREES_STUB_DONE=a,b          the named services model a finished
     //                                   one-shot: "Completed", exit_code 0.
+    //
+    // `process start <name>` (issue #178) records the name in
+    // `<socket>.started`. A started name no longer reads dead: it reads as a
+    // fresh run (pid 2000), Running, with the usual readiness rules — so
+    // DEVTREES_STUB_NEVER_READY=1 models a restart that never becomes
+    // healthy. Except:
+    //
+    //   DEVTREES_STUB_DIES_AGAIN=a,b    the named services, once started,
+    //                                   read as the restarted run dying:
+    //                                   "Completed", exit_code 1, pid 2000.
+    //
+    // Dead rows carry pid 1000 — the run that died — so the restarted run is
+    // told apart by pid, as on the real binary.
     const namesFrom = (v) => new Set((v ?? "").split(",").filter((n) => n !== ""));
     const deadNames = namesFrom(process.env.DEVTREES_STUB_DEAD);
     const doneNames = namesFrom(process.env.DEVTREES_STUB_DONE);
+    const diesAgain = namesFrom(process.env.DEVTREES_STUB_DIES_AGAIN);
+    let started = new Set();
+    try {
+      started = new Set(JSON.parse(readFileSync(`${socketPath}.started`, "utf8")));
+    } catch {
+      started = new Set();
+    }
+    /** The row of a process modelled as stopped (dead, done, died again), else undefined. */
+    const stoppedRow = (name, proc) => {
+      const stopped = (exit_code, pid) => ({
+        name,
+        namespace: reportedNamespace(proc),
+        status: "Completed",
+        is_ready: "-",
+        exit_code,
+        pid,
+        is_running: false,
+      });
+      if (started.has(name)) return diesAgain.has(name) ? stopped(1, 2000) : undefined;
+      if (deadNames.has(name)) return stopped(-1, 1000);
+      if (doneNames.has(name)) return stopped(0, 1000);
+      return undefined;
+    };
     const procs = Object.entries(config.processes ?? {})
       .filter(([, proc]) => selectedByNamespace(proc, namespaces))
       .map(([name, proc]) => {
-        if (deadNames.has(name) || doneNames.has(name)) {
-          return {
-            name,
-            namespace: reportedNamespace(proc),
-            status: "Completed",
-            is_ready: "-",
-            exit_code: deadNames.has(name) ? -1 : 0,
-            is_running: false,
-          };
-        }
+        const stopped = stoppedRow(name, proc);
+        if (stopped !== undefined) return stopped;
         const probed = proc?.readiness_probe !== undefined;
         if (probed && process.env.DEVTREES_STUB_DEAD_PROBED === "1") {
           return {
@@ -371,6 +407,35 @@ if (cmd === "up") {
         };
       });
     process.stdout.write(JSON.stringify(procs));
+    process.exit(0);
+  }
+  if (sub === "start") {
+    // `process start <name> -U -u <socket>` (issue #178): bring a dead
+    // process back. The stub records the name so `process list` reports the
+    // restarted run (see above). DEVTREES_STUB_START_FAIL=a,b makes the
+    // named starts fail the way the real binary refuses one: a log line on
+    // stderr and exit 1.
+    const service = process.argv[4];
+    if (!existsSync(`${socketPath}.config`)) {
+      process.stderr.write(`stub-process-compose: no instance at ${socketPath}\n`);
+      process.exit(1);
+    }
+    const refused = (process.env.DEVTREES_STUB_START_FAIL ?? "").split(",");
+    if (refused.includes(service)) {
+      process.stderr.write(
+        `FTL failed to start process ${service} error="stub refused to start ${service}"\n`,
+      );
+      process.exit(1);
+    }
+    let started = [];
+    try {
+      started = JSON.parse(readFileSync(`${socketPath}.started`, "utf8"));
+    } catch {
+      started = [];
+    }
+    if (!started.includes(service)) started.push(service);
+    writeFileSync(`${socketPath}.started`, JSON.stringify(started));
+    process.stdout.write(`Process ${service} started\n`);
     process.exit(0);
   }
   process.stderr.write(`stub-process-compose: unknown subcommand 'process ${sub}'\n`);
@@ -451,6 +516,7 @@ if (cmd === "up") {
   rmSync(`${socketPath}.parent-pid`, { force: true });
   rmSync(`${socketPath}.config`, { force: true });
   rmSync(`${socketPath}.namespaces`, { force: true });
+  rmSync(`${socketPath}.started`, { force: true });
   rmSync(socketPath, { force: true });
   process.exit(0);
 } else {

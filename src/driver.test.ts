@@ -10,6 +10,7 @@ import {
   buildAttachArgs,
   buildLogsArgs,
   buildProcessListArgs,
+  buildProcessStartArgs,
   buildReloadConfigArgs,
   createDriver,
   mergeAsyncIterables,
@@ -136,6 +137,17 @@ describe("process-compose driver — parseServiceStatuses", () => {
     expect(parseServiceStatuses(stdout)).toEqual([
       { name: "web", status: "Completed", health: "not_ready", exitCode: -1 },
       { name: "api", status: "Completed", health: "not_ready" },
+    ]);
+  });
+
+  it("carries the pid of the row's latest run, when reported (#178)", () => {
+    const stdout = JSON.stringify([
+      { name: "toy", status: "Completed", is_ready: "-", exit_code: -1, pid: 4242 },
+      { name: "idle", status: "Pending", is_ready: "-", pid: 0 },
+    ]);
+    expect(parseServiceStatuses(stdout)).toEqual([
+      { name: "toy", status: "Completed", health: "unknown", exitCode: -1, pid: 4242 },
+      { name: "idle", status: "Pending", health: "unknown" },
     ]);
   });
 
@@ -336,6 +348,75 @@ describe("process-compose driver — getServiceStatuses", () => {
       "-o",
       "json",
     ]);
+  });
+});
+
+describe("process-compose driver — startProcess (#178)", () => {
+  const socket = "/anchor/devtrees/run/login.sock";
+
+  it("targets `process start <name>` over the instance's UDS", () => {
+    expect(buildProcessStartArgs(socket, "toy")).toEqual([
+      "process",
+      "start",
+      "toy",
+      "-U",
+      "-u",
+      socket,
+    ]);
+  });
+
+  /** A `process start` child that writes `stderr`, then exits with `code`. */
+  function spawnerWith(code: number, stderr = "", seen: string[][] = []) {
+    return (_b: string, args: ReadonlyArray<string>): SpawnedProcess => {
+      seen.push([...args]);
+      const emitter = new EventEmitter() as EventEmitter & SpawnedProcess;
+      Object.assign(emitter, { stderr: Readable.from(stderr === "" ? [] : [stderr]) });
+      setTimeout(() => emitter.emit("exit", code), 5);
+      return emitter;
+    };
+  }
+
+  it("returns {ok:true} on a clean exit, with the start argv", async () => {
+    const seen: string[][] = [];
+    const driver = createDriver({
+      exists: () => Promise.resolve(true),
+      spawner: spawnerWith(0, "", seen),
+    });
+    expect(await driver.startProcess(socket, "toy")).toEqual({ ok: true });
+    expect(seen).toEqual([buildProcessStartArgs(socket, "toy")]);
+  });
+
+  it("returns process-compose's refusal, stripped of colour codes, on a non-zero exit", async () => {
+    const driver = createDriver({
+      exists: () => Promise.resolve(true),
+      spawner: spawnerWith(
+        1,
+        '\u001b[90m26-10-12 15:15:31\u001b[0m \u001b[31mFTL\u001b[0m failed to start process nope error="no such process: nope"\n',
+      ),
+    });
+    expect(await driver.startProcess(socket, "nope")).toEqual({
+      ok: false,
+      message: '26-10-12 15:15:31 FTL failed to start process nope error="no such process: nope"',
+    });
+  });
+
+  it("names the exit code when process-compose says nothing", async () => {
+    const driver = createDriver({ exists: () => Promise.resolve(true), spawner: spawnerWith(2) });
+    expect(await driver.startProcess(socket, "toy")).toEqual({
+      ok: false,
+      message: "process-compose process start exited with code 2",
+    });
+  });
+
+  it("treats `already running` as ok: someone else restarted it first", async () => {
+    const driver = createDriver({
+      exists: () => Promise.resolve(true),
+      spawner: spawnerWith(
+        1,
+        'FTL failed to start process keeper error="process keeper is already running"',
+      ),
+    });
+    expect(await driver.startProcess(socket, "keeper")).toEqual({ ok: true });
   });
 });
 
