@@ -219,7 +219,7 @@ footer lists the subset that command can actually emit.
 | `NAMESPACE_NOT_RUNNING`     | `up -n` named a namespace the running instance was not booted with; `details.remedy` is the `down` + `up` that boots it. |
 | `SHARED_SERVICE_DEAD`       | A shared service in the running shared instance is dead; it is not restarted from a worktree, run `details.remedy` (`devtrees down --shared && devtrees up`). |
 | `SERVICE_START_FAILED`      | `up` tried to restart a dead service on the running instance and process-compose refused; `details.services` names each one, `details.remedy` is the `down` + `up` that restarts the stack. |
-| `CONFIG_DRIFT`              | Running config differs from devtrees.yaml and hot-reload failed; `details.reason` is `timeout`, `not_supported` or `error`. |
+| `CONFIG_DRIFT`              | Running config differs from devtrees.yaml and hot-reload failed; `details.reason` is `timeout`, `not_supported`, `error`, or `reload_pending` (an earlier timed-out reload is still waiting on `details.pids`; nothing was reloaded). |
 | `SHARED_DRIFT`              | This worktree's shared services diverge from the running shared instance; bring shared down and up again. |
 | `SHARED_START_FAILED`       | The lazy-started shared instance died before binding its control socket; `details.config_path` is the config to run by hand. |
 | `WORKTREE_START_FAILED`     | This worktree's instance died before binding its control socket; `details.config_path` is the config to run by hand. |
@@ -308,6 +308,12 @@ are. It never stops anything, and never attaches the TUI.
   stack stopped by a concurrent `down` starts nothing and fails with
   `INSTANCE_NOT_FOUND`; one that waits too long for the other fails with
   `LOCK_CONTENTION`. Either way, run `devtrees up` again.
+- A hot-reload whose changed service's old process never stops fails with
+  `CONFIG_DRIFT` (`details.reason: "timeout"`), and process-compose keeps
+  waiting on that process. Until it exits, `up` reloads nothing and fails
+  with `details.reason: "reload_pending"`, naming the service and the old
+  PID: a second reload would start an untracked copy. Kill the old process,
+  then run `devtrees up` again.
 - A dead shared service fails `up` with `SHARED_SERVICE_DEAD`; run
   `devtrees down --shared && devtrees up`.
 
@@ -326,7 +332,7 @@ Branch on `error.code`:
 | `SERVICE_START_FAILED`      | `up` tried to restart a dead service and process-compose refused. `details.services` carries each one with process-compose's message; read it, then run `details.remedy` (`devtrees down && devtrees up …`). |
 | `STALE_PORT_BLOCK`          | Foreign listeners hold this worktree's ports. `details.collisions[]` lists `{port_name, port, pid, command}`; kill the orphans and retry. |
 | `SHARED_DRIFT`              | This worktree's shared services diverge from the running shared instance. Follow the message: `devtrees down --shared && devtrees up`. |
-| `CONFIG_DRIFT`              | The running config differs from `devtrees.yaml` and hot-reload failed. Branch on `details.reason`: `not_supported`/`error` → `devtrees down && devtrees up`. `timeout` → a changed service's old process won't stop and `down` would hang too: do **not** re-run `up` (it starts an untracked second copy); kill that process, then run `devtrees up` again to resync. |
+| `CONFIG_DRIFT`              | The running config differs from `devtrees.yaml` and hot-reload failed. Branch on `details.reason`: `not_supported`/`error` → `devtrees down && devtrees up`. `timeout` → a changed service's old process won't stop and `down` would hang too: kill that process, then run `devtrees up` again to resync. `reload_pending` → that earlier reload is still waiting, so `up` reloaded nothing (another reload would start an untracked second copy): kill the old process (`details.pids`, for `details.services`), then run `devtrees up` again. |
 | `SERVICE_NOT_FOUND`         | You named a service that isn't in the instance. `details.valid_services` lists the real names; pick one. |
 | `NO_SERVICES_SELECTED`      | A bare `up` starts only services with no `namespace:`, and there are none. `details.namespaces` lists the namespaces; retry with `devtrees up -n <ns>`. |
 | `INSTANCE_NOT_FOUND`        | No instance is running for this worktree. Run `devtrees up` first.                            |

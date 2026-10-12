@@ -21,7 +21,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { Readable } from "node:stream";
 import type { SpawnOptions } from "node:child_process";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
@@ -60,6 +60,7 @@ import {
 } from "./paths.js";
 import { sharedStackHash, stackHash } from "./hash.js";
 import { readSharedState } from "./shared-state.js";
+import { readPendingReload, writePendingReload, type PendingReload } from "./reload-pending.js";
 import type { ResolvedStack, ServiceDependency } from "./stack.js";
 
 const cleanups: Array<() => void> = [];
@@ -3914,6 +3915,20 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     };
   }
 
+  /**
+   * `stubDeps` whose instance reports `web` running. The drift path reads the
+   * project before reloading (#191), and the stub spawner's empty `process
+   * list` would look like a reload still pending.
+   */
+  function liveStubDeps(opts: Parameters<typeof stubDeps>[0]): StubbedDeps {
+    return {
+      ...stubDeps(opts),
+      getServiceStatuses: async () => [
+        { name: "web", status: "Running", health: "ready", pid: 4242 },
+      ],
+    };
+  }
+
   it("writes the stack hash to the hash store after a successful first up", async () => {
     const track: StubSpawn = { invocations: [], touchSocket: false };
     const hashes = hashStore();
@@ -4001,7 +4016,7 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     const hashes = hashStore();
 
     // Seed the hash store with the OLD stack's hash so the second up sees drift.
-    const baseDeps = stubDeps({ stack: stackA, track });
+    const baseDeps = liveStubDeps({ stack: stackA, track });
     const reloadCalls: ControlRequest[] = [];
     const controlRequest = reloadAnswering(200, reloadCalls);
     const firstDeps: CommandDeps = {
@@ -4043,7 +4058,7 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     const track: StubSpawn = { invocations: [], touchSocket: true };
     const hashes = hashStore();
 
-    const baseDeps = stubDeps({ stack: stackA, track });
+    const baseDeps = liveStubDeps({ stack: stackA, track });
     const reloadCalls: ControlRequest[] = [];
     const controlRequest = reloadAnswering(200, reloadCalls);
     const firstDeps: CommandDeps = {
@@ -4083,7 +4098,7 @@ describe("runUp — idempotency + drift detection (#31)", () => {
   it("a namespace-only edit triggers the drift/reload path on the next up (#175)", async () => {
     const track: StubSpawn = { invocations: [], touchSocket: true };
     const hashes = hashStore();
-    const baseDeps = stubDeps({ stack: stackA, track });
+    const baseDeps = liveStubDeps({ stack: stackA, track });
     const reloadCalls: ControlRequest[] = [];
     const controlRequest = reloadAnswering(200, reloadCalls);
     const firstDeps: CommandDeps = {
@@ -4112,7 +4127,7 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     const track: StubSpawn = { invocations: [], touchSocket: true };
     const hashes = hashStore();
 
-    const baseDeps = stubDeps({ stack: stackA, track });
+    const baseDeps = liveStubDeps({ stack: stackA, track });
     // The reload route answers 404 → driver classifies as not_supported.
     const controlRequest = reloadAnswering(404);
     const firstDeps: CommandDeps = {
@@ -4148,7 +4163,7 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     const track: StubSpawn = { invocations: [], touchSocket: true };
     const hashes = hashStore();
 
-    const baseDeps = stubDeps({ stack: stackA, track });
+    const baseDeps = liveStubDeps({ stack: stackA, track });
     // process-compose refuses the reload → reloadConfig reports failure.
     const controlRequest = reloadAnswering(400);
     const firstDeps: CommandDeps = {
@@ -4181,7 +4196,7 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     // it, or SIGTERM ignored with no shutdown.timeout_seconds), `up` used to hang.
     const track: StubSpawn = { invocations: [], touchSocket: true };
     const hashes = hashStore();
-    const baseDeps = stubDeps({ stack: stackA, track });
+    const baseDeps = liveStubDeps({ stack: stackA, track });
     const aborted: boolean[] = [];
     const controlRequest: ControlRequester = ({ signal }) =>
       new Promise((_resolve, reject) => {
@@ -4211,7 +4226,7 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     expect(err.code).toBe("CONFIG_DRIFT");
     expect((err as Error & { details?: unknown }).details).toEqual({ reason: "timeout" });
     expect(err.message).toMatch(/did not finish within/);
-    expect(err.message).toMatch(/Do NOT re-run `devtrees up`/);
+    expect(err.message).toMatch(/refuses with `reload_pending`/);
     expect(err.message).toMatch(/shutdown\.command/);
     expect(aborted).toEqual([true]);
     expect(readFileSync(worktreeSpawn.configPath, "utf8")).toBe(configBefore);
@@ -4222,7 +4237,7 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     const track: StubSpawn = { invocations: [], touchSocket: true };
     const hashes = hashStore();
 
-    const baseDeps = stubDeps({ stack: stackA, track });
+    const baseDeps = liveStubDeps({ stack: stackA, track });
     const controlRequest = reloadAnswering(200);
     const firstDeps: CommandDeps = {
       ...baseDeps,
@@ -4247,7 +4262,7 @@ describe("runUp — idempotency + drift detection (#31)", () => {
   it("noop path does NOT call driver.reloadConfig (no process-compose churn when the config matches)", async () => {
     const track: StubSpawn = { invocations: [], touchSocket: true };
     const hashes = hashStore();
-    const baseDeps = stubDeps({ stack: stackA, track });
+    const baseDeps = liveStubDeps({ stack: stackA, track });
     const reloadCalls: ControlRequest[] = [];
     const controlRequest = reloadAnswering(200, reloadCalls);
     const deps: CommandDeps = {
@@ -4259,6 +4274,223 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     await runUp(deps);
     await runUp(deps);
     expect(reloadCalls).toHaveLength(0);
+  });
+});
+
+/**
+ * A reload whose old process never stops leaves process-compose applying it
+ * after `up` gave up; reloading again in that window starts an untracked
+ * second copy (#191). `up` refuses with `CONFIG_DRIFT` / `reload_pending`
+ * until the pending update has converged.
+ */
+describe("runUp — pending-reload guard (#191)", () => {
+  const row = (name: string, pid: number): ServiceStatus => ({
+    name,
+    status: "Running",
+    health: "ready",
+    pid,
+  });
+  type Svc = ReturnType<typeof isolated> & { namespace?: string | string[] };
+  const svc = (name: string, command: string, namespace?: string | string[]): Svc => ({
+    ...isolated(name, command),
+    ...(namespace !== undefined ? { namespace } : {}),
+  });
+  const stackA: ResolvedStack = {
+    services: [svc("web", "node a.js"), svc("api", "node api.js")],
+  };
+  const stackB: ResolvedStack = {
+    services: [svc("web", "node b.js"), svc("api", "node api.js")],
+  };
+
+  /**
+   * A live instance whose project (`rows`), live PIDs and reload behaviour
+   * the test drives. `reload: "hang"` never answers, like process-compose
+   * waiting on an old process that will not stop.
+   */
+  function fixture(stack: ResolvedStack = stackA, rows: ServiceStatus[] = []) {
+    const state = {
+      stack,
+      rows,
+      alive: new Set(rows.flatMap((r) => (r.pid !== undefined ? [r.pid] : []))),
+      reload: 200 as 200 | "hang",
+      reloads: 0,
+    };
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const base = stubDeps({ stack, track });
+    const controlRequest: ControlRequester = ({ signal }) => {
+      state.reloads++;
+      if (state.reload === 200) return Promise.resolve({ status: 200, body: "{}" });
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(new Error("aborted")));
+      });
+    };
+    const deps: CommandDeps = {
+      ...base,
+      readStack: () => state.stack,
+      driver: { ...base.driver, controlRequest, reloadTimeoutMs: 50 },
+      getServiceStatuses: async () => state.rows,
+      isProcessAlive: (pid) => state.alive.has(pid),
+    };
+    const where = (): { anchor: string; id: string } => {
+      const spawn = track.invocations.find((i) => !i.socketPath.endsWith("/shared.sock"));
+      if (spawn === undefined) throw new Error("expected a worktree spawn");
+      return { anchor: dirname(dirname(spawn.configPath)), id: base.expectedWorktreeId };
+    };
+    const marker = (): PendingReload | undefined => {
+      const { anchor, id } = where();
+      return readPendingReload(anchor, id);
+    };
+    return { state, deps, marker, where };
+  }
+
+  async function upError(deps: CommandDeps): Promise<Error & { code?: string; details?: unknown }> {
+    return runUp(deps).then(
+      () => {
+        throw new Error("expected runUp to reject");
+      },
+      (e: unknown) => e as Error & { code?: string; details?: unknown },
+    );
+  }
+
+  it("timeout -> retry refused -> recovery succeeds: the marker is set, holds, then clears", async () => {
+    const { state, deps, marker } = fixture(stackA, [row("web", 100), row("api", 200)]);
+    await runUp(deps);
+
+    state.stack = stackB;
+    state.reload = "hang";
+    const timedOut = await upError(deps);
+    expect(timedOut.details).toEqual({ reason: "timeout" });
+    expect(marker()).toEqual({ services: ["web"], oldRuns: [{ name: "web", pid: 100 }] });
+
+    // process-compose dropped `web` and is waiting for pid 100 to exit.
+    state.rows = [row("api", 200)];
+    const retry = await upError(deps);
+    expect(retry.code).toBe("CONFIG_DRIFT");
+    expect(retry.details).toEqual({ reason: "reload_pending", services: ["web"], pids: [100] });
+    expect(retry.message).toMatch(/kill 100/);
+    expect(state.reloads).toBe(1);
+
+    // The old process exited, but the pending update has not started the
+    // new one yet: still pending, now without a PID to kill.
+    state.alive.delete(100);
+    const between = await upError(deps);
+    expect(between.details).toEqual({ reason: "reload_pending", services: ["web"], pids: [] });
+    expect(state.reloads).toBe(1);
+
+    // The pending update finished: `up` resyncs and the marker is gone.
+    state.rows = [row("web", 101), row("api", 200)];
+    state.alive.add(101);
+    state.reload = 200;
+    await runUp(deps);
+    expect(state.reloads).toBe(2);
+    expect(marker()).toBeUndefined();
+  });
+
+  it("an unconverged marker refuses even when the config no longer drifts", async () => {
+    const { state, deps, marker } = fixture(stackA, [row("web", 100), row("api", 200)]);
+    await runUp(deps);
+    state.stack = stackB;
+    state.reload = "hang";
+    await upError(deps);
+    // Reverting devtrees.yaml does not stop process-compose applying stackB.
+    state.stack = stackA;
+    state.rows = [row("api", 200)];
+    const err = await upError(deps);
+    expect(err.details).toMatchObject({ reason: "reload_pending", services: ["web"] });
+    expect(marker()).toBeDefined();
+  });
+
+  it("down clears the marker", async () => {
+    const { state, deps, marker } = fixture(stackA, [row("web", 100), row("api", 200)]);
+    await runUp(deps);
+    state.stack = stackB;
+    state.reload = "hang";
+    await upError(deps);
+    expect(marker()).toBeDefined();
+    await runDown(deps);
+    expect(marker()).toBeUndefined();
+  });
+
+  it("a fresh start clears a marker left by an instance that is gone", async () => {
+    const { deps, marker, where } = fixture(stackA, [row("web", 100), row("api", 200)]);
+    await runUp(deps);
+    const { anchor, id } = where();
+    writePendingReload(anchor, id, { services: ["web"], oldRuns: [{ name: "web", pid: 100 }] });
+    // The instance died (stale socket): this `up` starts a new one.
+    await runUp({ ...deps, probeSocket: async () => "stale" as const });
+    expect(marker()).toBeUndefined();
+  });
+
+  it("no marker: a declared service absent from a booted namespace refuses (stateless fallback)", async () => {
+    const { state, deps } = fixture(stackA, [row("web", 100), row("api", 200)]);
+    await runUp(deps);
+    // A timeout from a build that wrote no marker: `web` is gone, `api`
+    // (same namespace) is still there.
+    state.rows = [row("api", 200)];
+    state.stack = stackB;
+    const err = await upError(deps);
+    expect(err.details).toEqual({ reason: "reload_pending", services: ["web"], pids: [] });
+    expect(err.message).toMatch(/devtrees down && devtrees up/);
+    expect(state.reloads).toBe(0);
+  });
+
+  it("no marker: an empty project on a live instance refuses", async () => {
+    const { state, deps } = fixture(stackA, [row("web", 100), row("api", 200)]);
+    await runUp(deps);
+    state.rows = [];
+    state.stack = stackB;
+    const err = await upError(deps);
+    expect(err.details).toMatchObject({ reason: "reload_pending" });
+    expect(state.reloads).toBe(0);
+  });
+
+  it("an unselected namespace's absent services do not trip the fallback", async () => {
+    const one: ResolvedStack = {
+      services: [svc("web", "node a.js", "one"), svc("worker", "node w.js", "two")],
+    };
+    const { state, deps } = fixture(one, [row("web", 100)]);
+    await runUp({ ...deps, namespaces: ["one"] });
+    state.stack = {
+      services: [svc("web", "node b.js", "one"), svc("worker", "node w.js", "two")],
+    };
+    await runUp({ ...deps, namespaces: ["one"] });
+    expect(state.reloads).toBe(1);
+  });
+
+  it("a list-valued namespace proves nothing about which namespace booted (#179)", async () => {
+    const stack: ResolvedStack = {
+      services: [
+        svc("db", "node db.js", ["one", "two"]),
+        svc("web", "node a.js", "one"),
+        svc("worker", "node w.js", "two"),
+      ],
+    };
+    // Booted `-n two`: `db` is present through `two`, `web` (only `one`) is
+    // legitimately absent.
+    const { state, deps } = fixture(stack, [row("db", 100), row("worker", 300)]);
+    await runUp({ ...deps, namespaces: ["two"] });
+    state.stack = {
+      services: [
+        svc("db", "node db.js", ["one", "two"]),
+        svc("web", "node a.js", "one"),
+        svc("worker", "node w2.js", "two"),
+      ],
+    };
+    await runUp(deps);
+    expect(state.reloads).toBe(1);
+  });
+
+  it("a namespace-narrowed up on a wider instance reloads normally", async () => {
+    const wide: ResolvedStack = {
+      services: [svc("web", "node a.js", "one"), svc("worker", "node w.js", "two")],
+    };
+    const { state, deps } = fixture(wide, [row("web", 100), row("worker", 300)]);
+    await runUp({ ...deps, namespaces: ["one", "two"] });
+    state.stack = {
+      services: [svc("web", "node b.js", "one"), svc("worker", "node w.js", "two")],
+    };
+    await runUp({ ...deps, namespaces: ["one"] });
+    expect(state.reloads).toBe(1);
   });
 });
 
