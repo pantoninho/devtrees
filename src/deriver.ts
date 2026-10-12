@@ -23,7 +23,7 @@
 
 import { join } from "node:path";
 import { SHARED_INSTANCE_ID, logsDir } from "./paths.js";
-import type { ResolvedStack, ServiceDependency, Tier } from "./stack.js";
+import type { Namespace, ResolvedStack, ServiceDependency, Tier } from "./stack.js";
 
 /** Env-var name devtrees injects the stable worktree id under. */
 const WORKTREE_ID_ENV = "DEVTREES_WORKTREE_ID";
@@ -73,8 +73,9 @@ export interface DerivedProcess {
    * verbatim from the resolved stack. `up -n <ns>` starts only the selected
    * namespaces; present only when the author declared one — a namespace-less
    * service derives without the key (process-compose's implicit `default`).
+   * A list stays a list (#179, process-compose v1.122.0+).
    */
-  readonly namespace?: string;
+  readonly namespace?: Namespace;
   /**
    * process-compose `log_location` (issue #136) — the **absolute** on-disk path
    * process-compose writes this process's logs to, so external tooling can tail
@@ -345,7 +346,7 @@ function buildTierProcesses(input: {
     readinessProbe?: Readonly<Record<string, unknown>>;
     livenessProbe?: Readonly<Record<string, unknown>>;
     availability?: Readonly<Record<string, unknown>>;
-    namespace?: string;
+    namespace?: Namespace;
     shutdown?: Readonly<Record<string, unknown>>;
     isDaemon?: boolean;
     launchTimeoutSeconds?: number;
@@ -389,7 +390,7 @@ type PassthroughSource = {
   readinessProbe?: Readonly<Record<string, unknown>>;
   livenessProbe?: Readonly<Record<string, unknown>>;
   availability?: Readonly<Record<string, unknown>>;
-  namespace?: string;
+  namespace?: Namespace;
   shutdown?: Readonly<Record<string, unknown>>;
   isDaemon?: boolean;
   launchTimeoutSeconds?: number;

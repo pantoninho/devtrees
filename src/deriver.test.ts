@@ -432,6 +432,31 @@ describe("config deriver — namespace passthrough (#128)", () => {
     expect(derived.config.processes.api?.namespace).toBe("local-backend");
   });
 
+  it("emits a list-valued namespace as a list, unchanged (#179)", () => {
+    const stack: ResolvedStack = {
+      services: [
+        {
+          name: "db",
+          tier: "isolated",
+          command: "postgres",
+          ports: [],
+          dependsOn: [],
+          environment: [],
+          namespace: ["backoffice", "backoffice-be"],
+        },
+      ],
+    };
+    const derived = deriveWorktreeConfig(stack, {
+      worktreeId: "login",
+      worktreeRoot: "/wt/login",
+      portFor: () => 20512,
+    });
+    expect(derived.config.processes.db?.namespace).toEqual(["backoffice", "backoffice-be"]);
+    expect(stringifyYaml(derived.config)).toMatch(
+      /namespace:\n\s+- backoffice\n\s+- backoffice-be/,
+    );
+  });
+
   it("omits the namespace key when the service didn't declare one", () => {
     const stack: ResolvedStack = {
       services: [

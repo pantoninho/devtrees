@@ -22,6 +22,7 @@ import {
   formatUp,
   formatDroppedEdgeWarning,
   formatUpDryRun,
+  formatDroppedNamespaceEdgeWarning,
   type ErrorCode,
   type LsInstanceRow,
   type LsServiceRow,
@@ -678,6 +679,52 @@ describe("output formatter — formatUpDryRun (#124)", () => {
       expect(result.stderr).toBe("");
       expect(() => JSON.parse(result.stdout)).not.toThrow();
     });
+  });
+});
+
+describe("output formatter — dropped cross-namespace depends_on edges (#179)", () => {
+  const edge = { from: "api", to: "db", toNamespaces: ["one", "three"] };
+  const dry: UpDryRunPayload = {
+    worktreeId: "login",
+    env: {},
+    config: { processes: {} } as UpDryRunPayload["config"],
+  };
+
+  it("names both services and the target's namespaces", () => {
+    const line = formatDroppedNamespaceEdgeWarning(edge);
+    expect(line).toContain("cross-namespace depends_on 'api' -> 'db'");
+    expect(line).toContain("[one, three]");
+  });
+
+  it("up --dry-run: human mode warns on stderr, stdout stays the document", () => {
+    const withEdge = formatUpDryRun({ ...dry, droppedNamespaceEdges: [edge] }, "human");
+    expect(withEdge.stderr).toContain(formatDroppedNamespaceEdgeWarning(edge));
+    expect(withEdge.stdout).toBe(formatUpDryRun(dry, "human").stdout);
+  });
+
+  it("up --dry-run: JSON carries dropped_namespace_edges, always present, stderr silent", () => {
+    const parse = (p: UpDryRunPayload) =>
+      JSON.parse(formatUpDryRun(p, "json").stdout) as {
+        up_dry_run: { dropped_namespace_edges: unknown };
+      };
+    expect(
+      parse({ ...dry, droppedNamespaceEdges: [edge] }).up_dry_run.dropped_namespace_edges,
+    ).toEqual([{ from: "api", to: "db", to_namespaces: ["one", "three"] }]);
+    expect(parse(dry).up_dry_run.dropped_namespace_edges).toEqual([]);
+    expect(formatUpDryRun({ ...dry, droppedNamespaceEdges: [edge] }, "json").stderr).toBe("");
+  });
+
+  it("up: JSON carries dropped_namespace_edges, always present; human output unchanged", () => {
+    const up: UpPayload = { worktreeId: "login", env: {}, sharedStarted: false };
+    const parse = (p: UpPayload) =>
+      JSON.parse(formatUp(p, "json").stdout) as { up: { dropped_namespace_edges: unknown } };
+    expect(parse({ ...up, droppedNamespaceEdges: [edge] }).up.dropped_namespace_edges).toEqual([
+      { from: "api", to: "db", to_namespaces: ["one", "three"] },
+    ]);
+    expect(parse(up).up.dropped_namespace_edges).toEqual([]);
+    expect(formatUp({ ...up, droppedNamespaceEdges: [edge] }, "human")).toEqual(
+      formatUp(up, "human"),
+    );
   });
 });
 

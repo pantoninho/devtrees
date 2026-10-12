@@ -21,6 +21,7 @@ import { Writable } from "node:stream";
 import { Cli, Command, Option, Builtins, type BaseContext } from "clipanion";
 import type { LogEvent } from "./driver.js";
 import type { DerivedConfig, DroppedEdge } from "./deriver.js";
+import type { DroppedNamespaceEdge } from "./selection.js";
 import { maybeInitHint } from "./init-hint.js";
 import {
   classifyError,
@@ -40,6 +41,7 @@ import {
   type LsServiceRow,
   type PrunedRow,
   type ReapWarningRow,
+  type UpDryRunPayload,
 } from "./output.js";
 
 /**
@@ -121,6 +123,8 @@ export interface ExecuteDeps {
     sharedStarted?: boolean;
     blockBase?: number;
     services?: ReadonlyArray<LsServiceRow>;
+    /** `depends_on` edges lost to namespace selection (#179). */
+    droppedNamespaceEdges?: ReadonlyArray<DroppedNamespaceEdge>;
   }>;
   /**
    * Dry-run derivation (#124): runs the full pipeline `up` would run and
@@ -141,6 +145,8 @@ export interface ExecuteDeps {
      * Optional so a test stub can omit it; absent is read as "none dropped".
      */
     droppedEdges?: ReadonlyArray<DroppedEdge>;
+    /** `depends_on` edges a fresh `up` would lose to namespace selection (#179). */
+    droppedNamespaceEdges?: ReadonlyArray<DroppedNamespaceEdge>;
     /**
      * The namespace selection a fresh `up` would apply (issue #176) and the
      * isolated services it starts. Optional so a test stub can omit them.
@@ -375,6 +381,9 @@ class UpCommand extends DevtreesCommand {
           sharedStarted: result.sharedStarted ?? false,
           ...(result.blockBase !== undefined ? { blockBase: result.blockBase } : {}),
           ...(result.services !== undefined ? { services: result.services } : {}),
+          ...(result.droppedNamespaceEdges !== undefined
+            ? { droppedNamespaceEdges: result.droppedNamespaceEdges }
+            : {}),
         },
         this.mode,
       );
@@ -441,29 +450,34 @@ class UpCommand extends DevtreesCommand {
   private async executeDryRun(): Promise<number> {
     if (!this.context.deps.upDryRun) return 0;
     const result = await this.context.deps.upDryRun(this.namespaceOptions());
-    const out = formatUpDryRun(
-      {
-        worktreeId: result.worktreeId,
-        env: result.env,
-        config: result.config,
-        ...(result.sharedEnv !== undefined ? { sharedEnv: result.sharedEnv } : {}),
-        ...(result.sharedConfig !== undefined ? { sharedConfig: result.sharedConfig } : {}),
-        droppedEdges: result.droppedEdges ?? [],
-        ...(result.namespaces !== undefined
-          ? {
-              selection: {
-                namespaces: result.namespaces,
-                services: result.selectedServices ?? [],
-              },
-            }
-          : {}),
-      },
-      this.mode,
-    );
+    const out = formatUpDryRun(dryRunPayload(result), this.mode);
     if (out.stdout) this.context.stdout.write(out.stdout);
     if (out.stderr) this.context.stderr.write(out.stderr);
     return 0;
   }
+}
+
+/** Map the injected `upDryRun` result onto the formatter's payload. */
+function dryRunPayload(
+  result: Awaited<ReturnType<NonNullable<ExecuteDeps["upDryRun"]>>>,
+): UpDryRunPayload {
+  return {
+    worktreeId: result.worktreeId,
+    env: result.env,
+    config: result.config,
+    ...(result.sharedEnv !== undefined ? { sharedEnv: result.sharedEnv } : {}),
+    ...(result.sharedConfig !== undefined ? { sharedConfig: result.sharedConfig } : {}),
+    droppedEdges: result.droppedEdges ?? [],
+    droppedNamespaceEdges: result.droppedNamespaceEdges ?? [],
+    ...(result.namespaces !== undefined
+      ? {
+          selection: {
+            namespaces: result.namespaces,
+            services: result.selectedServices ?? [],
+          },
+        }
+      : {}),
+  };
 }
 
 class DownCommand extends DevtreesCommand {

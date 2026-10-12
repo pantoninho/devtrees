@@ -66,16 +66,31 @@ function canonicalBase(s: ResolvedService): Record<string, unknown> {
 }
 
 /**
+ * Canonical `namespace` (#179). process-compose ignores the order of a
+ * list-valued namespace and treats a one-element list as that name (a
+ * reorder hot-reloads as "No processes were updated"), so neither may count
+ * as drift: a list hashes sorted, and `[a]` hashes as the bare string `a`.
+ * A plain string hashes exactly as it did before lists existed, so existing
+ * stacks see no spurious drift. The derived config still carries the list in
+ * written order.
+ */
+function canonicalNamespace(ns: ResolvedService["namespace"]): string | string[] | null {
+  if (ns === undefined) return null;
+  if (typeof ns === "string") return ns;
+  return ns.length === 1 ? (ns[0] as string) : [...ns].sort();
+}
+
+/**
  * Every field devtrees forwards to process-compose, so editing any of them on
  * a running instance registers as drift and hot-reloads (#175). Absent fields
  * hash as null; object blocks are key-sorted by `canonicalValue`. `namespace`
- * goes through `canonicalValue` too, so a list-valued namespace (planned in
- * #179) is hashed in authored order without this function changing again.
+ * goes through `canonicalNamespace`: list order is ignored, because
+ * process-compose ignores it.
  */
 function canonicalService(s: ResolvedService): unknown {
   return {
     ...canonicalBase(s),
-    namespace: canonicalValue(s.namespace ?? null),
+    namespace: canonicalNamespace(s.namespace),
     shutdown: canonicalValue(s.shutdown ?? null),
     isDaemon: s.isDaemon ?? null,
     launchTimeoutSeconds: s.launchTimeoutSeconds ?? null,

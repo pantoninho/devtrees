@@ -20,6 +20,7 @@
  */
 import { stringify as stringifyYaml } from "yaml";
 import type { DerivedConfig, DroppedEdge } from "./deriver.js";
+import type { DroppedNamespaceEdge } from "./selection.js";
 
 export const SCHEMA_VERSION = "1";
 
@@ -357,6 +358,12 @@ export interface UpPayload {
    * defaults a missing value to `[]` so the field is always present.
    */
   readonly services?: ReadonlyArray<LsServiceRow>;
+  /**
+   * `depends_on` edges dropped because their target is in no selected
+   * namespace (#179). Human mode does not repeat them — `up` warned on stderr
+   * as it ran; JSON mode always emits `dropped_namespace_edges` (possibly empty).
+   */
+  readonly droppedNamespaceEdges?: ReadonlyArray<DroppedNamespaceEdge>;
 }
 
 function formatUpHuman(payload: UpPayload): string {
@@ -385,6 +392,9 @@ export function formatUp(payload: UpPayload, mode: FormatMode): OutputResult {
       env: payload.env,
       services: (payload.services ?? []).map(lsServiceJson),
       shared_started: payload.sharedStarted,
+      // Always present, even empty (#179) — the `up_dry_run.dropped_edges`
+      // contract (#169): an empty list is the answer "nothing was dropped".
+      dropped_namespace_edges: (payload.droppedNamespaceEdges ?? []).map(droppedNamespaceEdgeJson),
     };
     if (payload.blockBase !== undefined) up.block_base = payload.blockBase;
     const doc = { schema_version: SCHEMA_VERSION, up };
@@ -481,6 +491,11 @@ export interface UpDryRunPayload {
    */
   readonly droppedEdges?: ReadonlyArray<DroppedEdge>;
   /**
+   * `depends_on` edges a fresh `up` would lose to namespace selection (#179).
+   * Defaults to empty, like `droppedEdges`.
+   */
+  readonly droppedNamespaceEdges?: ReadonlyArray<DroppedNamespaceEdge>;
+  /**
    * The namespace selection a fresh `up` would pass to process-compose and the
    * isolated services it starts (issue #176). Optional so a caller with no
    * selection to report can omit it; the real `runUpDryRun` always fills it.
@@ -517,6 +532,27 @@ export function formatDroppedEdgeWarning(edge: DroppedEdge): string {
   );
 }
 
+/**
+ * One human-readable line per `depends_on` edge process-compose drops because
+ * its target is in no selected namespace (ADR-0008, #179). Shared by `up`
+ * (which warns as it starts or verifies) and `up --dry-run`: one drop, one
+ * wording, as for cross-tier edges.
+ */
+export function formatDroppedNamespaceEdgeWarning(edge: DroppedNamespaceEdge): string {
+  const namespaces = edge.toNamespaces.join(", ");
+  return (
+    `devtrees: dropped cross-namespace depends_on '${edge.from}' -> '${edge.to}': ` +
+    `'${edge.to}' is in namespace(s) [${namespaces}], none of which is selected, so ` +
+    `process-compose starts '${edge.from}' without waiting for it. ` +
+    `Select one of [${namespaces}] with -n to start '${edge.to}' too.`
+  );
+}
+
+/** Snake_case row for a `dropped_namespace_edges[]` envelope entry (#179). */
+function droppedNamespaceEdgeJson(edge: DroppedNamespaceEdge): Record<string, unknown> {
+  return { from: edge.from, to: edge.to, to_namespaces: edge.toNamespaces };
+}
+
 /** Snake_case row for the `up_dry_run.dropped_edges[]` envelope entry. */
 function droppedEdgeJson(edge: DroppedEdge): Record<string, string> {
   return { from: edge.from, to: edge.to, from_tier: edge.fromTier, to_tier: edge.toTier };
@@ -526,21 +562,24 @@ function droppedEdgeJson(edge: DroppedEdge): Record<string, string> {
  * Render `devtrees up --dry-run` output.
  *
  *   - `json`: `{schema_version, up_dry_run: {worktree_id, env, config,
- *     dropped_edges, namespaces?, selected_services?, shared_env?,
- *     shared_config?}}` — one byte-clean document
+ *     dropped_edges, dropped_namespace_edges, namespaces?,
+ *     selected_services?, shared_env?, shared_config?}}` — one byte-clean document
  *     on stdout, the agent-readable preview of what `up` would run. `shared_*`
  *     keys are omitted when the stack has no shared services; `dropped_edges`
- *     is always present (possibly empty). Stderr stays untouched.
+ *     and `dropped_namespace_edges` (#179) are always present (possibly
+ *     empty). Stderr stays untouched.
  *   - `human`: the derived YAML document(s) — the worktree config, then the
  *     shared config (separated by a `---` document marker) when present. The
  *     same derived config `up` writes to disk; here it goes to stdout so a
  *     developer can eyeball it or pipe it into `process-compose -f -`. Any
  *     dropped cross-tier `depends_on` edge is reported on **stderr** (issue
  *     #168) so stdout stays byte-identical to the document alone; so is the
- *     namespace selection a fresh `up` would start (issue #176).
+ *     namespace selection a fresh `up` would start (issue #176), and each
+ *     `depends_on` edge that selection would drop (issue #179).
  */
 export function formatUpDryRun(payload: UpDryRunPayload, mode: FormatMode): OutputResult {
   const droppedEdges = payload.droppedEdges ?? [];
+  const nsEdges = payload.droppedNamespaceEdges ?? [];
   if (mode === "json") {
     const dry: Record<string, unknown> = {
       worktree_id: payload.worktreeId,
@@ -553,6 +592,8 @@ export function formatUpDryRun(payload: UpDryRunPayload, mode: FormatMode): Outp
       // reported drops. Same contract `prune.pruned[]` / `prune.warnings[]`
       // already offer.
       dropped_edges: droppedEdges.map(droppedEdgeJson),
+      // Same always-present contract for edges lost to namespace selection (#179).
+      dropped_namespace_edges: nsEdges.map(droppedNamespaceEdgeJson),
     };
     if (payload.selection !== undefined) {
       // What a fresh `up` with the same flags would start (issue #176): the
@@ -580,7 +621,10 @@ export function formatUpDryRun(payload: UpDryRunPayload, mode: FormatMode): Outp
   // `devtrees up --dry-run > stack.yaml` (or a pipe into `process-compose -f -`)
   // must not pick up prose.
   const selection = payload.selection !== undefined ? formatSelectionNotice(payload.selection) : "";
-  const stderr = selection + droppedEdges.map((e) => `${formatDroppedEdgeWarning(e)}\n`).join("");
+  const stderr =
+    selection +
+    droppedEdges.map((e) => `${formatDroppedEdgeWarning(e)}\n`).join("") +
+    nsEdges.map((e) => `${formatDroppedNamespaceEdgeWarning(e)}\n`).join("");
   return { stdout: body, stderr };
 }
 
