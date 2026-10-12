@@ -69,9 +69,12 @@ Namespaces are **opt-in** and selection is **exact**
 - `-n/--namespace` (repeatable) starts exactly the namespaces it names.
   `-n app` starts `app` and nothing else; it does **not** add `default`. To
   run both, write `devtrees up -n default -n app`.
-- If every service declares a namespace, a bare `up` has nothing to start and
-  fails with `NO_SERVICES_SELECTED`, listing the namespaces to pick from with
-  `-n`.
+- If the selection resolves to no services, `up` fails with
+  `NO_SERVICES_SELECTED`, listing the namespaces to pick from with `-n`. That is
+  a bare `up` when every service declares a namespace, and an `-n` that names
+  only namespaces with no services (`up -n nope`) — an empty instance is
+  useless, and process-compose exits after hot-reloading one (#203). Mixing a
+  real namespace with an empty one (`-n app -n nope`) still starts `app`.
 - A running stack keeps the namespaces it was booted with. A bare `up` on it
   checks exactly those; `-n` naming one it was not booted with fails with
   `NAMESPACE_NOT_RUNNING` (`devtrees down && devtrees up -n …` boots it).
@@ -224,7 +227,7 @@ footer lists the subset that command can actually emit.
 | `SHARED_DRIFT`              | This worktree's shared services diverge from the running shared instance; bring shared down and up again. |
 | `SHARED_START_FAILED`       | The lazy-started shared instance died before binding its control socket; `details.config_path` is the config to run by hand. |
 | `WORKTREE_START_FAILED`     | This worktree's instance died before binding its control socket; `details.config_path` is the config to run by hand. |
-| `NO_SERVICES_SELECTED`      | A bare `up` starts only the `default` namespace and it has no services; `details.namespaces` lists the namespaces to pass with `-n`. |
+| `NO_SERVICES_SELECTED`      | The selection has no services: a bare `up` starts only the `default` namespace and it has none, or `-n` names only namespaces with none. `details.namespaces` lists the namespaces to pass with `-n`. |
 | `SOCKET_PATH_TOO_LONG`      | The control socket path exceeds the platform's unix-socket limit; set `DEVTREES_RUNTIME_DIR` to a shorter directory. |
 | `STALE_PORT_BLOCK`          | Foreign listeners hold ports in this worktree's allocated block (likely orphans).   |
 | `LOCK_CONTENTION`           | Another devtrees process holds a devtrees lock (allocation registry or an instance's lifecycle lock). |
@@ -341,7 +344,7 @@ Branch on `error.code`:
 | `SHARED_DRIFT`              | This worktree's shared services diverge from the running shared instance. Follow the message: `devtrees down --shared && devtrees up`. |
 | `CONFIG_DRIFT`              | The running config differs from `devtrees.yaml` and hot-reload failed, or an earlier reload is still pending. Branch on `details.reason`: `not_supported`/`error` → `devtrees down && devtrees up`. `timeout` → a changed service's old process won't stop. process-compose no longer lists it, so `down` cannot force-kill it either and fails with `DOWN_TIMEOUT` after its budget: kill that process, then run `devtrees up` again to resync. `reload_pending` → that earlier reload is still waiting, so `up` reloaded nothing (another reload would start an untracked second copy): kill the old process (`details.pids`, for `details.services`), then run `devtrees up` again. Empty `details.pids` → the old process is gone and process-compose is still starting the new one: retry shortly; if it persists, follow the message's `devtrees down && devtrees up …`. |
 | `SERVICE_NOT_FOUND`         | You named a service that isn't in the instance. `details.valid_services` lists the real names; pick one. |
-| `NO_SERVICES_SELECTED`      | A bare `up` starts only services with no `namespace:`, and there are none. `details.namespaces` lists the namespaces; retry with `devtrees up -n <ns>`. |
+| `NO_SERVICES_SELECTED`      | The selection has no services: a bare `up` starts only services with no `namespace:` and there are none, or `-n` names only namespaces with none. `details.namespaces` lists the namespaces; retry with `devtrees up -n <ns>`. |
 | `INSTANCE_NOT_FOUND`        | No instance is running for this worktree. Run `devtrees up` first.                            |
 | `INSTANCE_UNRESPONSIVE`     | The instance may be running but its process-compose did not answer (busy or frozen). Nothing changed. **Retry** in a moment; if it persists, follow `details.remedy`. Do not delete the socket by hand. |
 | `DOWN_TIMEOUT`              | `down` could not finish: process-compose was still running after devtrees force-killed the stuck services (`details.stuck_services`). Nothing was removed. **Retry** `down` once; if it fails again, **surface it to the human** with `details.remedy`, which names the process-compose pid to stop by hand. |
