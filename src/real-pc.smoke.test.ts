@@ -1265,7 +1265,8 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
     expect(down.code, `down failed: ${down.stderr}`).toBe(0);
     const code = (again.doc as { error?: { code?: string } } | undefined)?.error?.code;
     // Up either ran before/after down (exit 0), found the instance gone under
-    // the lock, or gave up waiting for it — never a timeout on a dead instance.
+    // the lock or mid-health-wait (#205), or lost the lock race. HEALTH_TIMEOUT is
+    // deliberately absent: a dead instance must never read as a slow one.
     expect([undefined, "INSTANCE_NOT_FOUND", "LOCK_CONTENTION"]).toContain(code);
     expect(orphanedServices(repo.root)).toEqual([]);
   }, 120_000);
