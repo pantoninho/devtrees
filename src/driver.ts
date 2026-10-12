@@ -29,6 +29,59 @@ export class MissingProcessComposeError extends Error {
 }
 
 /**
+ * The oldest process-compose devtrees supports. v1.122.0 is the first release
+ * that accepts a list-valued `namespace` (issue #173), which namespace
+ * selection builds on.
+ */
+export const MIN_PROCESS_COMPOSE_VERSION = "1.122.0";
+
+const PROCESS_COMPOSE_UPGRADE_URL = "https://f1bonacc1.github.io/process-compose/installation/";
+
+/** Raised when the installed process-compose is older than the supported minimum. */
+export class ProcessComposeTooOldError extends Error {
+  readonly code = "PROCESS_COMPOSE_TOO_OLD" as const;
+  readonly details: {
+    readonly installed_version: string | null;
+    readonly minimum_version: string;
+    readonly upgrade_url: string;
+  };
+  constructor(installed: string | null) {
+    super(
+      // No `devtrees:` prefix — the CLI's human formatter adds one (output.ts).
+      `${
+        installed === null
+          ? "could not determine the installed process-compose version"
+          : `process-compose v${installed} is installed`
+      }, but devtrees requires v${MIN_PROCESS_COMPOSE_VERSION} or newer. ` +
+        `Upgrade process-compose (e.g. \`brew upgrade process-compose\`) and retry: ` +
+        PROCESS_COMPOSE_UPGRADE_URL,
+    );
+    this.name = "ProcessComposeTooOldError";
+    this.details = {
+      installed_version: installed,
+      minimum_version: MIN_PROCESS_COMPOSE_VERSION,
+      upgrade_url: PROCESS_COMPOSE_UPGRADE_URL,
+    };
+  }
+}
+
+/** Extract `major.minor.patch` from `process-compose version --short` output. */
+export function parseProcessComposeVersion(output: string): string | null {
+  const m = /v?(\d+)\.(\d+)\.(\d+)/.exec(output);
+  return m ? `${m[1]}.${m[2]}.${m[3]}` : null;
+}
+
+/** True when `version` (`major.minor.patch`) is at least `minimum`. */
+export function isAtLeastVersion(version: string, minimum: string): boolean {
+  const a = version.split(".").map(Number);
+  const b = minimum.split(".").map(Number);
+  for (let i = 0; i < 3; i++) {
+    if ((a[i] ?? 0) !== (b[i] ?? 0)) return (a[i] ?? 0) > (b[i] ?? 0);
+  }
+  return true;
+}
+
+/**
  * Start the instance's server detached, over its UDS, with the TUI disabled.
  *
  * `namespaces` is forwarded verbatim as process-compose's repeatable
@@ -272,6 +325,31 @@ export function createDriver(deps: DriverDeps = {}) {
         stdio: "ignore",
       });
       child.unref?.();
+    },
+    /**
+     * Fail with `ProcessComposeTooOldError` unless the installed process-compose
+     * is at least `MIN_PROCESS_COMPOSE_VERSION` (issue #173). One shell-out to
+     * `process-compose version --short`, which prints just the version tag.
+     */
+    async assertSupportedVersion(): Promise<void> {
+      await ensureBinary({ binary, exists });
+      const stdout = await new Promise<string>((resolve, reject) => {
+        const child = spawner(binary, [...prefix, "version", "--short"], {
+          stdio: ["ignore", "pipe", "ignore"],
+        });
+        let out = "";
+        child.stdout?.on("data", (chunk: Buffer | string) => {
+          out += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+        });
+        child.on("error", (err) => reject(err));
+        // An unparseable result (older build rejecting `--short`, odd output)
+        // is reported as an unknown version rather than a crash.
+        child.on("exit", () => resolve(out));
+      });
+      const installed = parseProcessComposeVersion(stdout);
+      if (installed === null || !isAtLeastVersion(installed, MIN_PROCESS_COMPOSE_VERSION)) {
+        throw new ProcessComposeTooOldError(installed);
+      }
     },
     /** Stop the running instance. */
     down(inst: InstanceRef): Promise<void> {

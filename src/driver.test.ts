@@ -3,6 +3,9 @@ import { EventEmitter } from "node:events";
 import { Readable } from "node:stream";
 import {
   MissingProcessComposeError,
+  ProcessComposeTooOldError,
+  isAtLeastVersion,
+  parseProcessComposeVersion,
   buildUpArgs,
   buildDownArgs,
   buildAttachArgs,
@@ -456,5 +459,74 @@ describe("process-compose driver — mergeAsyncIterables", () => {
       break;
     }
     expect(returned).toBe(2);
+  });
+});
+
+describe("process-compose minimum version (#173)", () => {
+  /** A spawner whose `version --short` child prints `stdout` then exits. */
+  function versionSpawner(stdout: string, seen: string[][] = []) {
+    return (_binary: string, args: ReadonlyArray<string>): SpawnedProcess => {
+      seen.push([...args]);
+      const out = Readable.from([stdout]);
+      const ee = new EventEmitter();
+      out.on("end", () => setImmediate(() => ee.emit("exit", 0)));
+      return Object.assign(ee, { stdout: out }) as unknown as SpawnedProcess;
+    };
+  }
+
+  it("parses the version tag from `version --short` and the full `version` block", () => {
+    expect(parseProcessComposeVersion("v1.122.0\n")).toBe("1.122.0");
+    expect(
+      parseProcessComposeVersion("Process Compose\nVersion:        v1.122.0\nCommit: abc\n"),
+    ).toBe("1.122.0");
+    expect(parseProcessComposeVersion("garbage")).toBeNull();
+  });
+
+  it("compares versions numerically, not lexically", () => {
+    expect(isAtLeastVersion("1.122.0", "1.122.0")).toBe(true);
+    expect(isAtLeastVersion("1.122.1", "1.122.0")).toBe(true);
+    expect(isAtLeastVersion("1.200.0", "1.122.0")).toBe(true);
+    expect(isAtLeastVersion("2.0.0", "1.122.0")).toBe(true);
+    expect(isAtLeastVersion("1.121.9", "1.122.0")).toBe(false);
+    expect(isAtLeastVersion("1.110.0", "1.122.0")).toBe(false);
+    expect(isAtLeastVersion("0.999.0", "1.122.0")).toBe(false);
+  });
+
+  it("passes for v1.122.0 with a single `version --short` shell-out", async () => {
+    const seen: string[][] = [];
+    const driver = createDriver({
+      exists: async () => true,
+      spawner: versionSpawner("v1.122.0\n", seen),
+    });
+    await expect(driver.assertSupportedVersion()).resolves.toBeUndefined();
+    expect(seen).toEqual([["version", "--short"]]);
+  });
+
+  it("rejects an older release with a typed error naming installed and minimum", async () => {
+    const driver = createDriver({
+      exists: async () => true,
+      spawner: versionSpawner("v1.110.0\n"),
+    });
+    const err = await driver.assertSupportedVersion().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ProcessComposeTooOldError);
+    const e = err as ProcessComposeTooOldError;
+    expect(e.code).toBe("PROCESS_COMPOSE_TOO_OLD");
+    expect(e.message).toContain("v1.110.0");
+    expect(e.message).toContain("v1.122.0");
+    expect(e.details).toMatchObject({ installed_version: "1.110.0", minimum_version: "1.122.0" });
+  });
+
+  it("treats unparseable output as an undeterminable version", async () => {
+    const driver = createDriver({ exists: async () => true, spawner: versionSpawner("???") });
+    const err = (await driver.assertSupportedVersion().catch((e: unknown) => e)) as Error;
+    expect(err).toBeInstanceOf(ProcessComposeTooOldError);
+    expect(err.message).toContain("could not determine");
+  });
+
+  it("reports a missing binary as MissingProcessComposeError, not a version failure", async () => {
+    const driver = createDriver({ exists: async () => false });
+    await expect(driver.assertSupportedVersion()).rejects.toBeInstanceOf(
+      MissingProcessComposeError,
+    );
   });
 });

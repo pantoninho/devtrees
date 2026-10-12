@@ -482,6 +482,12 @@ export interface CommandDeps {
   readonly allocator?: AllocatorOptions;
   readonly driver?: DriverDeps;
   /**
+   * Verify the installed process-compose meets the minimum version (issue
+   * #173). Default: one `process-compose version --short` shell-out through
+   * the driver. Injected so unit tests don't spawn the version probe.
+   */
+  readonly assertProcessComposeVersion?: () => Promise<void>;
+  /**
    * Read the resolved-stack hash previously stored for a worktree (issue #31).
    * Default: reads `<anchor>/devtrees/hashes.json`. Injected so noop / drift
    * branch tests can run without touching disk.
@@ -848,6 +854,13 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
   const { readStack, lock, sharedLock, isPortFree, portHolder, warn, readHash, writeHash } = seams;
 
   const stack = readStack(anchor.worktreeRoot);
+
+  // Refuse an unsupported process-compose before allocating ports or touching
+  // any state (issue #173): one cheap subprocess, and nothing to roll back.
+  await (
+    deps.assertProcessComposeVersion ?? (() => createDriver(deps.driver).assertSupportedVersion())
+  )();
+
   const options = resolveAllocatorOptions(stack, deps.allocator ?? DEFAULT_ALLOCATOR);
   const sharedNeeded = hasTier(stack, "shared");
 

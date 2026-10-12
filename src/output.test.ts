@@ -45,6 +45,10 @@ describe("output formatter — constants", () => {
     expect(ERROR_CODES).toContain("INSTANCE_NOT_FOUND");
   });
 
+  it("declares PROCESS_COMPOSE_TOO_OLD for the minimum-version pre-flight (#173)", () => {
+    expect(ERROR_CODES).toContain("PROCESS_COMPOSE_TOO_OLD");
+  });
+
   it("reserves STALE_PORT_BLOCK so #58 routes via classifyError's typed-code short-circuit", () => {
     expect(ERROR_CODES).toContain("STALE_PORT_BLOCK");
   });

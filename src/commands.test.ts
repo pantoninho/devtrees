@@ -42,7 +42,7 @@ import { withLifecycleLock } from "./registry.js";
 import { deriveWorktreeId } from "./anchor.js";
 import { deriveSharedConfig, deriveWorktreeConfig, type DerivedConfig } from "./deriver.js";
 import type { RegistrySnapshot } from "./allocator.js";
-import type { LogEvent, SpawnedProcess } from "./driver.js";
+import { ProcessComposeTooOldError, type LogEvent, type SpawnedProcess } from "./driver.js";
 import {
   SHARED_REGISTRY_KEY,
   SOCKET_PATH_MAX_BYTES,
@@ -257,6 +257,9 @@ function stubDeps(opts: {
     // real post-spawn socket poll (#91) would burn its full timeout in most
     // tests. Tests that care about the socket-wait override this field.
     waitForSocketFile: () => Promise.resolve(),
+    // The version probe (#173) would run through the stub spawner, which
+    // prints nothing; the check itself is covered in its own describe block.
+    assertProcessComposeVersion: () => Promise.resolve(),
     // Driver that records every spawn but doesn't actually run anything.
     driver: {
       exists: () => Promise.resolve(true),
@@ -302,6 +305,24 @@ describe("runUp — port injection", () => {
       services: [isolated("web", "node x.js", ["A_PORT", "B_PORT", "C_PORT"])],
     };
     await expect(runUp(stubDeps({ stack }))).rejects.toThrow(/block_size is 2/);
+  });
+});
+
+describe("runUp — minimum process-compose version (#173)", () => {
+  it("fails before allocating or spawning when the version probe rejects", async () => {
+    const stack: ResolvedStack = { services: [isolated("web", "node server.js", ["WEB_PORT"])] };
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    let probed = 0;
+    const deps = {
+      ...stubDeps({ stack, track }),
+      assertProcessComposeVersion: async () => {
+        probed += 1;
+        throw new ProcessComposeTooOldError("1.110.0");
+      },
+    };
+    await expect(runUp(deps)).rejects.toMatchObject({ code: "PROCESS_COMPOSE_TOO_OLD" });
+    expect(probed).toBe(1);
+    expect(track.invocations).toEqual([]);
   });
 });
 

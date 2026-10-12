@@ -290,6 +290,7 @@ class UpCommand extends DevtreesCommand {
     // and stops before any side effect, so it can only emit the allocation
     // subset of the codes below (#124).
     details: errorCodeFooter([
+      "PROCESS_COMPOSE_TOO_OLD",
       "STALE_PORT_BLOCK",
       "CONFIG_DRIFT",
       "SHARED_DRIFT",

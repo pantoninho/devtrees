@@ -31,6 +31,7 @@ export const SCHEMA_VERSION = "1";
  */
 export const ERROR_CODES = [
   "PROCESS_COMPOSE_NOT_FOUND",
+  "PROCESS_COMPOSE_TOO_OLD",
   "INSTANCE_NOT_FOUND",
   "SERVICE_NOT_FOUND",
   "HEALTH_TIMEOUT",
@@ -61,6 +62,8 @@ export type ErrorCode = (typeof ERROR_CODES)[number];
  */
 export const ERROR_CODE_DESCRIPTIONS: Readonly<Record<ErrorCode, string>> = {
   PROCESS_COMPOSE_NOT_FOUND: "The `process-compose` binary is not on PATH.",
+  PROCESS_COMPOSE_TOO_OLD:
+    "The installed `process-compose` is older than the minimum devtrees supports; `details` carries the installed and minimum versions.",
   INSTANCE_NOT_FOUND: "No worktree (or shared) instance is running for this anchor.",
   SERVICE_NOT_FOUND:
     "The named service does not exist in the target instance; `details.valid_services` lists the known ones.",
