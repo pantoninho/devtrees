@@ -742,6 +742,20 @@ describe("output formatter — dropped cross-namespace depends_on edges (#179)",
       formatUp(up, "human"),
     );
   });
+
+  it("up: JSON carries shared_config_changes, always present; human output unchanged (#185)", () => {
+    const up: UpPayload = { worktreeId: "login", env: {}, sharedStarted: false };
+    const change = { service: "pg", field: "shutdown" };
+    const parse = (p: UpPayload) =>
+      JSON.parse(formatUp(p, "json").stdout) as { up: { shared_config_changes: unknown } };
+    expect(parse({ ...up, sharedFieldChanges: [change] }).up.shared_config_changes).toEqual([
+      change,
+    ]);
+    expect(parse(up).up.shared_config_changes).toEqual([]);
+    expect(formatUp({ ...up, sharedFieldChanges: [change] }, "human")).toEqual(
+      formatUp(up, "human"),
+    );
+  });
 });
 
 /**
