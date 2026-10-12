@@ -167,18 +167,57 @@ const RELOAD_BASE_TIMEOUT_MS = 30_000;
  * process is stopped in turn, so the values add up, and a reload that is
  * merely slow is never cut short.
  */
-export function reloadTimeoutMs(config: {
+export function reloadTimeoutMs(config: ShutdownBudgetConfig): number {
+  return shutdownBudgetMs(config, RELOAD_BASE_TIMEOUT_MS);
+}
+
+/** The slice of a derived config the stop budgets read. */
+type ShutdownBudgetConfig = {
   readonly processes: Readonly<
     Record<string, { readonly shutdown?: Readonly<Record<string, unknown>> }>
   >;
-}): number {
-  let total = RELOAD_BASE_TIMEOUT_MS;
+};
+
+/** `baseMs` plus every explicit, positive `shutdown.timeout_seconds` in `config`. */
+function shutdownBudgetMs(config: ShutdownBudgetConfig, baseMs: number): number {
+  let total = baseMs;
   for (const proc of Object.values(config.processes)) {
     const seconds = proc.shutdown?.timeout_seconds;
     if (typeof seconds === "number" && seconds > 0) total += seconds * 1000;
   }
   return total;
 }
+
+/**
+ * Base budget for `process-compose down` (issue #190). The stop hangs on the
+ * same two shapes the reload does (see `RELOAD_BASE_TIMEOUT_MS`):
+ * process-compose waits with no timeout for a process that a
+ * `shutdown.command` did not stop, or that ignores SIGTERM and declares no
+ * `shutdown.timeout_seconds`. The budget turns that wait into a bounded
+ * escalation (`boundedDown` in src/bounded-down.ts).
+ */
+const DOWN_BASE_TIMEOUT_MS = 30_000;
+
+/**
+ * `down` budget for a derived config: `baseMs` (default
+ * `DOWN_BASE_TIMEOUT_MS`) plus every explicit `shutdown.timeout_seconds`,
+ * mirroring `reloadTimeoutMs`. A missing config gets the base alone.
+ */
+export function downTimeoutMs(
+  config: ShutdownBudgetConfig | undefined,
+  baseMs: number = DOWN_BASE_TIMEOUT_MS,
+): number {
+  return config === undefined ? baseMs : shutdownBudgetMs(config, baseMs);
+}
+
+/**
+ * Outcome of a bounded `down` call. `stopped` means `process-compose down`
+ * returned 0. `timeout` means it was still waiting when the budget ran out;
+ * the client was killed, but process-compose keeps shutting down server-side.
+ */
+export type DownOutcome =
+  | { readonly stopped: true }
+  | { readonly stopped: false; readonly reason: "timeout" };
 
 /**
  * List the running processes of an instance over its UDS, in JSON. devtrees
@@ -548,9 +587,19 @@ export function createDriver(deps: DriverDeps = {}) {
         throw new ProcessComposeTooOldError(installed);
       }
     },
-    /** Stop the running instance. */
-    down(inst: InstanceRef): Promise<void> {
-      return run(buildDownArgs(inst), { stdio: "inherit" });
+    /**
+     * Stop the running instance, bounded by `timeoutMs` (default
+     * `DOWN_BASE_TIMEOUT_MS`, issue #190). Rejects when `process-compose down`
+     * exits non-zero. When the budget runs out the client is killed and the
+     * call resolves `timeout`; the caller decides how to escalate.
+     */
+    async down(
+      inst: InstanceRef,
+      opts: { readonly timeoutMs?: number } = {},
+    ): Promise<DownOutcome> {
+      await ensureBinary({ binary, exists });
+      const timeoutMs = opts.timeoutMs ?? DOWN_BASE_TIMEOUT_MS;
+      return downImpl(inst, { binary, prefix, exists, spawner, timeoutMs });
     },
     /** Attach a TUI to the running instance. */
     attach(inst: InstanceRef): Promise<void> {
@@ -645,36 +694,62 @@ async function getServiceStatusesImpl(
   deps: ShellDeps & { readonly timeoutMs: number },
 ): Promise<ServiceStatus[]> {
   await ensureBinary({ binary: deps.binary, exists: deps.exists });
-  return new Promise<ServiceStatus[]>((resolve, reject) => {
-    const child = deps.spawner(deps.binary, [...deps.prefix, ...buildProcessListArgs(socketPath)], {
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-    const stdout = captureOutput(child.stdout);
-    // A wedged process-compose accepts the connection and never answers, so
-    // the client would wait forever. Kill it and fail the read.
+  const child = deps.spawner(deps.binary, [...deps.prefix, ...buildProcessListArgs(socketPath)], {
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  const stdout = captureOutput(child.stdout);
+  // A wedged process-compose accepts the connection and never answers, so
+  // the client would wait forever. Kill it and fail the read.
+  const exit = await waitForExitWithin(child, deps.timeoutMs);
+  if (exit.timedOut) {
+    throw new Error(
+      `${deps.binary} process list did not answer within ${formatSeconds(deps.timeoutMs)}`,
+    );
+  }
+  if (exit.code !== 0 && exit.code !== null) {
+    throw new Error(`${deps.binary} process list exited with code ${exit.code}`);
+  }
+  return parseServiceStatuses(stdout() || "[]");
+}
+
+async function downImpl(
+  inst: InstanceRef,
+  deps: ShellDeps & { readonly timeoutMs: number },
+): Promise<DownOutcome> {
+  const child = deps.spawner(deps.binary, [...deps.prefix, ...buildDownArgs(inst)], {
+    stdio: "inherit",
+  });
+  // process-compose's `down` client has no timeout of its own and blocks
+  // while the server waits on a process that never stops. Kill the client
+  // on expiry; the server's shutdown carries on without it.
+  const exit = await waitForExitWithin(child, deps.timeoutMs);
+  if (exit.timedOut) return { stopped: false, reason: "timeout" };
+  if (exit.code === 0 || exit.code === null) return { stopped: true };
+  throw new Error(`${deps.binary} down exited with code ${exit.code}`);
+}
+
+/**
+ * Wait for a one-shot client to exit, at most `timeoutMs`. On expiry the
+ * client is sent SIGTERM and `timedOut` is reported. Rejects on a spawn error.
+ */
+function waitForExitWithin(
+  child: SpawnedProcess,
+  timeoutMs: number,
+): Promise<
+  { readonly timedOut: true } | { readonly timedOut: false; readonly code: number | null }
+> {
+  return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       child.kill?.("SIGTERM");
-      reject(
-        new Error(
-          `${deps.binary} process list did not answer within ${formatSeconds(deps.timeoutMs)}`,
-        ),
-      );
-    }, deps.timeoutMs);
+      resolve({ timedOut: true });
+    }, timeoutMs);
     child.on("error", (err) => {
       clearTimeout(timer);
       reject(err);
     });
     child.on("exit", (code) => {
       clearTimeout(timer);
-      if (code !== 0 && code !== null) {
-        reject(new Error(`${deps.binary} process list exited with code ${code}`));
-        return;
-      }
-      try {
-        resolve(parseServiceStatuses(stdout() || "[]"));
-      } catch (err) {
-        reject(err as Error);
-      }
+      resolve({ timedOut: false, code });
     });
   });
 }
@@ -690,25 +765,21 @@ async function startProcessImpl(
 ): Promise<StartResult> {
   await ensureBinary({ binary: deps.binary, exists: deps.exists });
   const args = [...deps.prefix, ...buildProcessStartArgs(socketPath, service)];
-  return new Promise<StartResult>((resolve) => {
-    const child = deps.spawner(deps.binary, args, { stdio: ["ignore", "ignore", "pipe"] });
-    const stderr = captureOutput(child.stderr);
-    const timer = setTimeout(() => {
-      child.kill?.("SIGTERM");
-      resolve({
-        ok: false,
-        message: `${deps.binary} process start did not finish within ${Math.round(deps.timeoutMs / 1000)}s`,
-      });
-    }, deps.timeoutMs);
-    child.on("error", (err) => {
-      clearTimeout(timer);
-      resolve({ ok: false, message: err.message });
-    });
-    child.on("exit", (code) => {
-      clearTimeout(timer);
-      resolve(startOutcome(code, stderr(), deps.binary));
-    });
-  });
+  const child = deps.spawner(deps.binary, args, { stdio: ["ignore", "ignore", "pipe"] });
+  const stderr = captureOutput(child.stderr);
+  let exit: Awaited<ReturnType<typeof waitForExitWithin>>;
+  try {
+    exit = await waitForExitWithin(child, deps.timeoutMs);
+  } catch (err) {
+    return { ok: false, message: (err as Error).message };
+  }
+  if (exit.timedOut) {
+    return {
+      ok: false,
+      message: `${deps.binary} process start did not finish within ${Math.round(deps.timeoutMs / 1000)}s`,
+    };
+  }
+  return startOutcome(exit.code, stderr(), deps.binary);
 }
 
 /** Map a finished `process start` client to its `StartResult`. */

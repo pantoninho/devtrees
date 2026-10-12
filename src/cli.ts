@@ -42,6 +42,7 @@ import {
   type LsServiceRow,
   type PrunedRow,
   type ReapWarningRow,
+  type ForceKilledRow,
   type UnreclaimedRow,
   type UpDryRunPayload,
 } from "./output.js";
@@ -163,9 +164,12 @@ export interface ExecuteDeps {
     namespaces?: ReadonlyArray<string>;
     selectedServices?: ReadonlyArray<string>;
   }>;
-  down: (options: {
-    shared: boolean;
-  }) => Promise<{ worktreeId?: string; stopped?: boolean; warning?: ReapWarningRow } | void>;
+  down: (options: { shared: boolean }) => Promise<{
+    worktreeId?: string;
+    stopped?: boolean;
+    warning?: ReapWarningRow;
+    forceKilled?: ReadonlyArray<ForceKilledRow>;
+  } | void>;
   ls?: () => Promise<{ anchor: string; instances: ReadonlyArray<LsInstanceRow> }>;
   attach?: (options: { shared: boolean }) => Promise<void>;
   prune?: () => Promise<{
@@ -492,10 +496,14 @@ class DownCommand extends DevtreesCommand {
     // Both branches serialize on a lifecycle lock (the worktree's, #178, or the
     // shared one with `--shared`) → LOCK_CONTENTION. A socket whose liveness
     // stays unknown after the probe retries → INSTANCE_UNRESPONSIVE (#186).
+    // A stop that outlives its budget, and whose process-compose is still
+    // running after devtrees force-killed the stuck services → DOWN_TIMEOUT
+    // (#190).
     details: errorCodeFooter([
       "PROCESS_COMPOSE_NOT_FOUND",
       "LOCK_CONTENTION",
       "INSTANCE_UNRESPONSIVE",
+      "DOWN_TIMEOUT",
       "UNKNOWN",
     ]),
   });
@@ -514,12 +522,16 @@ class DownCommand extends DevtreesCommand {
       // "instance stopped" output; `runDown` reports `false` on the
       // idempotent no-op and the formatter renders the notice.
       const stopped = result.stopped ?? true;
+      // Issue #190: service processes devtrees had to SIGKILL to finish the
+      // stop — a stderr warning (human) / `down.force_killed` (JSON).
+      const forceKilled = result.forceKilled ?? [];
       const out = formatDown(
         this.shared
-          ? { shared: true, stopped }
+          ? { shared: true, stopped, forceKilled }
           : {
               worktreeId: result.worktreeId ?? "",
               stopped,
+              forceKilled,
               // Issue #148: a failed dead-supervisor reap surfaces as a stderr
               // warning (human) / `down.warning` (JSON) — not a silent stop.
               ...(result.warning !== undefined ? { warning: result.warning } : {}),
@@ -1014,6 +1026,18 @@ function entrypointIsTTY(): boolean {
   return Boolean(process.stdout.isTTY && process.stderr.isTTY);
 }
 
+/**
+ * Test seam for the bounded stop (issue #190): `DEVTREES_DOWN_BASE_TIMEOUT_MS`
+ * replaces the 30s base `down` budget so the real-process-compose smoke can
+ * exercise the escalation without sitting out the full budget. Not a user
+ * knob: an unset or malformed value keeps the default.
+ */
+function stopSeamsFromEnv(): { baseTimeoutMs?: number } {
+  const raw = process.env.DEVTREES_DOWN_BASE_TIMEOUT_MS;
+  const ms = raw === undefined ? Number.NaN : Number(raw);
+  return Number.isInteger(ms) && ms > 0 ? { baseTimeoutMs: ms } : {};
+}
+
 if (isEntrypoint(import.meta.url, process.argv[1])) {
   const { runUp, runUpDryRun, runDown, runEnv, runLs, runAttach, runPrune, runLogs, runInit } =
     await import("./commands.js");
@@ -1026,10 +1050,10 @@ if (isEntrypoint(import.meta.url, process.argv[1])) {
       }),
     upDryRun: (options) =>
       runUpDryRun(options?.namespaces !== undefined ? { namespaces: options.namespaces } : {}),
-    down: ({ shared }) => runDown({}, { shared }),
+    down: ({ shared }) => runDown({ stop: stopSeamsFromEnv() }, { shared }),
     ls: () => runLs(),
     attach: ({ shared }) => runAttach({}, { shared }),
-    prune: () => runPrune(),
+    prune: () => runPrune({ stop: stopSeamsFromEnv() }),
     env: () => runEnv(),
     logs: (opts) =>
       runLogs(

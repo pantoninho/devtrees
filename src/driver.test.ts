@@ -12,6 +12,7 @@ import {
   buildProcessListArgs,
   buildProcessStartArgs,
   createDriver,
+  downTimeoutMs,
   mergeAsyncIterables,
   parseServiceStatuses,
   RELOAD_CONFIG_ROUTE,
@@ -611,6 +612,76 @@ describe("process-compose driver — reloadConfig", () => {
         },
       }),
     ).toBe(80_000);
+  });
+});
+
+describe("process-compose driver — bounded down (#190)", () => {
+  const inst = { configPath: "/x.yaml", socketPath: "/x.sock" };
+
+  /** A `down` client that exits with `code` straight away. */
+  function spawnerExiting(code: number): () => SpawnedProcess {
+    return () => {
+      const emitter = new EventEmitter();
+      queueMicrotask(() => emitter.emit("exit", code));
+      return emitter as unknown as SpawnedProcess;
+    };
+  }
+
+  /** A `down` client that never returns (process-compose stuck on a process); records kills. */
+  function spawnerHanging(killed: Array<NodeJS.Signals | number | undefined>) {
+    return (): SpawnedProcess => {
+      const emitter = new EventEmitter();
+      (emitter as unknown as SpawnedProcess).kill = (signal) => {
+        killed.push(signal);
+        queueMicrotask(() => emitter.emit("exit", null));
+        return true;
+      };
+      return emitter as unknown as SpawnedProcess;
+    };
+  }
+
+  it("resolves stopped when process-compose down exits 0", async () => {
+    const driver = createDriver({
+      exists: () => Promise.resolve(true),
+      spawner: spawnerExiting(0),
+    });
+    expect(await driver.down(inst, { timeoutMs: 1000 })).toEqual({ stopped: true });
+  });
+
+  it("rejects when process-compose down exits non-zero", async () => {
+    const driver = createDriver({
+      exists: () => Promise.resolve(true),
+      spawner: spawnerExiting(3),
+    });
+    await expect(driver.down(inst, { timeoutMs: 1000 })).rejects.toThrow(/down exited with code 3/);
+  });
+
+  it("kills a down that outlives its budget and resolves timeout", async () => {
+    const killed: Array<NodeJS.Signals | number | undefined> = [];
+    const driver = createDriver({
+      exists: () => Promise.resolve(true),
+      spawner: spawnerHanging(killed),
+    });
+    expect(await driver.down(inst, { timeoutMs: 20 })).toEqual({
+      stopped: false,
+      reason: "timeout",
+    });
+    expect(killed).toEqual(["SIGTERM"]);
+  });
+
+  it("downTimeoutMs adds every explicit shutdown.timeout_seconds to the 30s base", () => {
+    expect(downTimeoutMs(undefined)).toBe(30_000);
+    expect(downTimeoutMs({ processes: { web: {} } })).toBe(30_000);
+    const config = {
+      processes: {
+        web: { shutdown: { timeout_seconds: 45 } },
+        api: { shutdown: { command: "echo bye" } },
+        db: { shutdown: { timeout_seconds: 5 } },
+        bad: { shutdown: { timeout_seconds: -1 } },
+      },
+    };
+    expect(downTimeoutMs(config)).toBe(80_000);
+    expect(downTimeoutMs(config, 1000)).toBe(51_000);
   });
 });
 

@@ -1951,7 +1951,8 @@ describe("runDown — worktree teardown holds the lifecycle lock (#178)", () => 
       },
     });
     expect(result.stopped).toBe(true);
-    expect(events).toEqual([`lock ${deps.expectedWorktreeId}`, "down", "unlock"]);
+    // The pre-stop snapshot (`process list`, #190) also runs under the lock.
+    expect(events).toEqual([`lock ${deps.expectedWorktreeId}`, "process", "down", "unlock"]);
   });
 
   it("a lock held by a concurrent up fails LOCK_CONTENTION and stops nothing", async () => {
@@ -5633,7 +5634,7 @@ describe("runDown — crash recovery: stale shared socket (#80)", () => {
     const result = await runDown(deps, { shared: true });
 
     // Idempotent no-op result, no `process-compose down` against the dead UDS.
-    expect(result).toEqual({ shared: true, stopped: false });
+    expect(result).toEqual({ shared: true, stopped: false, forceKilled: [] });
     expect(downSpawns).toHaveLength(0);
     // The orphaned socket file was unlinked, so the next up lazy-starts fresh.
     expect(existsSync(sharedPaths.socketPath)).toBe(false);
@@ -5662,7 +5663,7 @@ describe("runDown — crash recovery: stale shared socket (#80)", () => {
 
     const result = await runDown(deps, { shared: true });
 
-    expect(result).toEqual({ shared: true, stopped: true });
+    expect(result).toEqual({ shared: true, stopped: true, forceKilled: [] });
     expect(downSpawns).toHaveLength(1);
   });
 });
@@ -6313,5 +6314,253 @@ describe("runUp — per-worktree lifecycle lock (issue #91)", () => {
     };
 
     await expect(runUp(deps)).rejects.toMatchObject({ code: "LOCK_CONTENTION" });
+  });
+});
+
+/**
+ * Issue #190: `down` (worktree and `--shared`) and prune's orphan stop are
+ * bounded. process-compose never escalates on a `shutdown.command` that does
+ * not stop its process, so its `down` would block forever. On expiry devtrees
+ * SIGKILLs only the snapshot service processes still alive, reports them as
+ * `forceKilled`, and fails `DOWN_TIMEOUT` (state kept) if process-compose
+ * still does not exit.
+ */
+describe("bounded down — force-kill and DOWN_TIMEOUT (#190)", () => {
+  const PC_PID = 100;
+  const WEB_PID = 201;
+
+  /** A `process-compose down` client that never returns until killed. */
+  function hangingDown(): SpawnedProcess {
+    const emitter = new EventEmitter();
+    (emitter as unknown as SpawnedProcess).kill = () => {
+      queueMicrotask(() => emitter.emit("exit", null));
+      return true;
+    };
+    return emitter as unknown as SpawnedProcess;
+  }
+
+  /** A `process list -o json` child reporting `web` running as WEB_PID. */
+  function listing(): SpawnedProcess {
+    const emitter = new EventEmitter() as EventEmitter & { stdout: Readable };
+    const rows = [
+      { name: "web", status: "Running", is_ready: "-", pid: WEB_PID, is_running: true },
+    ];
+    emitter.stdout = Readable.from([JSON.stringify(rows)]);
+    emitter.stdout.on("end", () => queueMicrotask(() => emitter.emit("exit", 0)));
+    return emitter as unknown as SpawnedProcess;
+  }
+
+  /** A driver whose `down` hangs on a stuck `web`. */
+  function stuckDriver(): CommandDeps["driver"] {
+    return {
+      exists: () => Promise.resolve(true),
+      spawner: (_binary, args) => {
+        if (args[0] === "down") return hangingDown();
+        if (args[0] === "process") return listing();
+        return spawnedOk();
+      },
+    };
+  }
+
+  /**
+   * Stop seams over a fake process table: process-compose (PC_PID) bound to
+   * `socketPath`, `web` its child. `pcExits` decides whether process-compose
+   * exits once `web` is killed.
+   */
+  function stopSeams(socketPath: string, opts: { pcExits: boolean }) {
+    const kills: Array<[number, string]> = [];
+    const seams: NonNullable<CommandDeps["stop"]> = {
+      readProcessTable: async () => [
+        {
+          pid: PC_PID,
+          ppid: 1,
+          pgid: PC_PID,
+          command: `process-compose up -f x.yaml -U -u ${socketPath} -t=false`,
+        },
+        { pid: WEB_PID, ppid: PC_PID, pgid: WEB_PID, command: "bash -c tail -f hold" },
+      ],
+      kill: (target, signal) => {
+        kills.push([target, signal]);
+      },
+      isAlive: (pid) => pid === PC_PID && !opts.pcExits,
+      exists: () => true,
+      baseTimeoutMs: 20,
+      graceMs: 30,
+      pollMs: 5,
+    };
+    return { seams, kills };
+  }
+
+  const isolatedStack: ResolvedStack = {
+    services: [isolated("web", "tail -f hold", ["WEB_PORT"])],
+  };
+  const mixedStack: ResolvedStack = {
+    services: [
+      isolated("web", "tail -f hold", ["WEB_PORT"]),
+      shared("postgres", "postgres", ["DB_PORT"]),
+    ],
+  };
+
+  function anchorOf(deps: StubbedDeps): string {
+    return (deps.git!(["rev-parse", "--git-common-dir"]) as string).trim();
+  }
+
+  type Failure = Error & { code?: string; details?: Record<string, unknown> };
+
+  it("worktree down force-kills only the stuck service and reports it", async () => {
+    const deps = stubDeps({ stack: isolatedStack, track: { invocations: [], touchSocket: true } });
+    await runUp(deps);
+    const paths = instancePaths(anchorOf(deps), deps.expectedWorktreeId);
+    const { seams, kills } = stopSeams(paths.socketPath, { pcExits: true });
+    const result = await runDown({ ...deps, driver: stuckDriver(), stop: seams });
+    expect(result).toMatchObject({ shared: false, stopped: true });
+    expect(result.forceKilled).toEqual([{ service: "web", pid: WEB_PID }]);
+    // The service's process group, never process-compose itself.
+    expect(kills).toEqual([[-WEB_PID, "SIGKILL"]]);
+  });
+
+  it("worktree down fails DOWN_TIMEOUT and keeps the socket and config when process-compose never exits", async () => {
+    const deps = stubDeps({ stack: isolatedStack, track: { invocations: [], touchSocket: true } });
+    await runUp(deps);
+    const paths = instancePaths(anchorOf(deps), deps.expectedWorktreeId);
+    const { seams, kills } = stopSeams(paths.socketPath, { pcExits: false });
+    const err = (await runDown({ ...deps, driver: stuckDriver(), stop: seams }).catch(
+      (e: unknown) => e,
+    )) as Failure;
+    expect(err.code).toBe("DOWN_TIMEOUT");
+    expect(err.details).toMatchObject({
+      instance: deps.expectedWorktreeId,
+      socket_path: paths.socketPath,
+      process_compose_pid: PC_PID,
+      stuck_services: [{ service: "web", pid: WEB_PID }],
+      force_killed: [{ service: "web", pid: WEB_PID }],
+    });
+    expect(String(err.details?.remedy)).toContain(`kill ${PC_PID}`);
+    expect(String(err.details?.remedy)).toContain("`devtrees down`");
+    expect(classifyError(err).code).toBe("DOWN_TIMEOUT");
+    expect(kills).toEqual([[-WEB_PID, "SIGKILL"]]);
+    expect(existsSync(paths.socketPath)).toBe(true);
+    expect(existsSync(paths.configPath)).toBe(true);
+  });
+
+  it("the down budget is the base plus the derived config's shutdown.timeout_seconds", async () => {
+    const deps = stubDeps({ stack: isolatedStack, track: { invocations: [], touchSocket: true } });
+    await runUp(deps);
+    const paths = instancePaths(anchorOf(deps), deps.expectedWorktreeId);
+    writeFileSync(
+      paths.configPath,
+      stringifyYaml({ processes: { web: { command: "x", shutdown: { timeout_seconds: 1 } } } }),
+    );
+    const { seams } = stopSeams(paths.socketPath, { pcExits: false });
+    const err = (await runDown({ ...deps, driver: stuckDriver(), stop: seams }).catch(
+      (e: unknown) => e,
+    )) as Failure;
+    expect(err.details?.timeout_ms).toBe(1020);
+  });
+
+  it("down --shared reports force-killed services", async () => {
+    const deps = stubDeps({ stack: mixedStack, track: { invocations: [], touchSocket: true } });
+    await runUp(deps);
+    const paths = sharedInstancePaths(anchorOf(deps));
+    const { seams } = stopSeams(paths.socketPath, { pcExits: true });
+    const result = await runDown({ ...deps, driver: stuckDriver(), stop: seams }, { shared: true });
+    expect(result).toEqual({
+      shared: true,
+      stopped: true,
+      forceKilled: [{ service: "web", pid: WEB_PID }],
+    });
+    expect(existsSync(paths.configPath)).toBe(false);
+  });
+
+  it("down --shared fails DOWN_TIMEOUT and keeps the shared config", async () => {
+    const deps = stubDeps({ stack: mixedStack, track: { invocations: [], touchSocket: true } });
+    await runUp(deps);
+    const paths = sharedInstancePaths(anchorOf(deps));
+    const { seams } = stopSeams(paths.socketPath, { pcExits: false });
+    const err = (await runDown(
+      { ...deps, driver: stuckDriver(), stop: seams },
+      { shared: true },
+    ).catch((e: unknown) => e)) as Failure;
+    expect(err.code).toBe("DOWN_TIMEOUT");
+    expect(err.details?.instance).toBe("shared");
+    expect(String(err.details?.remedy)).toContain("`devtrees down --shared`");
+    expect(existsSync(paths.configPath)).toBe(true);
+    expect(existsSync(paths.socketPath)).toBe(true);
+  });
+
+  /** Prune inputs with only `login` live, so `removed` is an orphan. */
+  function pruneInputs(tmp: { anchor: string; worktreeRoot: string }, socketPath: string) {
+    return {
+      cwd: join(tmp.worktreeRoot, "login"),
+      git: (args: ReadonlyArray<string>): string => {
+        if (args[1] === "--git-common-dir") return tmp.anchor;
+        if (args[1] === "--show-toplevel") return join(tmp.worktreeRoot, "login");
+        if (args[1] === "--is-bare-repository") return "false";
+        if (args[0] === "worktree") return `worktree ${join(tmp.worktreeRoot, "login")}\nHEAD x\n`;
+        throw new Error(`unexpected git invocation: ${args.join(" ")}`);
+      },
+      discover: async () => [
+        {
+          id: "removed",
+          kind: "worktree" as const,
+          status: "running" as const,
+          socketPath,
+          ports: {},
+          blockBase: undefined,
+          services: [],
+        },
+      ],
+      driver: stuckDriver(),
+    };
+  }
+
+  it("prune reports a force-killed orphan stop on its pruned row", async () => {
+    const tmp = tmpAnchor();
+    mkdirSync(runDir(tmp.anchor), { recursive: true });
+    const orphan = instancePaths(tmp.anchor, "removed");
+    writeFileSync(orphan.socketPath, "");
+    const { seams } = stopSeams(orphan.socketPath, { pcExits: true });
+    const { runPrune } = await import("./commands.js");
+    const result = await runPrune({
+      ...pruneInputs(tmp, orphan.socketPath),
+      readRegistry: () => ({}),
+      withRegistryLock: async (_anchor, mutate) => mutate({}),
+      stop: seams,
+    });
+    expect(result.pruned).toEqual([
+      expect.objectContaining({ id: "removed", forceKilled: [{ service: "web", pid: WEB_PID }] }),
+    ]);
+    expect(result.unreclaimed).toEqual([]);
+  });
+
+  it("prune keeps a running orphan whose bounded down timed out, and reports it unreclaimed", async () => {
+    // Unlike an ordinary failed `down`, a DOWN_TIMEOUT proves process-compose
+    // is still running: unlinking its socket would hide a live supervisor.
+    const tmp = tmpAnchor();
+    mkdirSync(runDir(tmp.anchor), { recursive: true });
+    const orphan = instancePaths(tmp.anchor, "removed");
+    writeFileSync(orphan.socketPath, "");
+    writeFileSync(orphan.configPath, "processes: {}\n");
+    const registryRef = { snapshot: { removed: 20032 } as RegistrySnapshot };
+    const { seams } = stopSeams(orphan.socketPath, { pcExits: false });
+    const { runPrune } = await import("./commands.js");
+    const result = await runPrune({
+      ...pruneInputs(tmp, orphan.socketPath),
+      readRegistry: () => registryRef.snapshot,
+      withRegistryLock: async (_anchor, mutate) => {
+        registryRef.snapshot = await mutate(registryRef.snapshot);
+        return registryRef.snapshot;
+      },
+      stop: seams,
+    });
+    expect(result.pruned).toEqual([]);
+    expect(result.unreclaimed).toEqual([
+      expect.objectContaining({ id: "removed", socketPath: orphan.socketPath }),
+    ]);
+    expect(result.unreclaimed[0]?.message).toMatch(/did not stop within/);
+    expect(result.unreclaimed[0]?.message).toContain("`devtrees prune`");
+    expect(existsSync(orphan.socketPath)).toBe(true);
+    expect(existsSync(orphan.configPath)).toBe(true);
+    expect(registryRef.snapshot.removed).toBe(20032);
   });
 });

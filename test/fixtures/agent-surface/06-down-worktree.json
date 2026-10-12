@@ -2,6 +2,7 @@
   "schema_version": "1",
   "down": {
     "worktreeId": "<WT>",
-    "stopped": true
+    "stopped": true,
+    "force_killed": []
   }
 }

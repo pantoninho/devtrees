@@ -376,14 +376,17 @@ describe("built CLI e2e — argv→commands wiring over the stub process-compose
     // down --json: documented operation-output-only envelope; socket reaped.
     const down = devtrees(wt, ["down", "--json"]);
     expect(down.code, `down failed: ${down.stderr}`).toBe(0);
-    expect(down.doc).toEqual({ schema_version: "1", down: { worktreeId: id, stopped: true } });
+    expect(down.doc).toEqual({
+      schema_version: "1",
+      down: { worktreeId: id, stopped: true, force_killed: [] },
+    });
     expect(existsSync(sock)).toBe(false);
 
     const downShared = devtrees(wt, ["down", "--shared", "--json"]);
     expect(downShared.code, `down --shared failed: ${downShared.stderr}`).toBe(0);
     expect(downShared.doc).toEqual({
       schema_version: "1",
-      down: { shared: true, stopped: true },
+      down: { shared: true, stopped: true, force_killed: [] },
     });
   }, 60_000);
 

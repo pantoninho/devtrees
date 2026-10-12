@@ -1417,7 +1417,7 @@ describe("e2e — crash recovery: stale control sockets (#80)", () => {
     // Acceptance: an idempotent no-op — resolves cleanly and unlinks the
     // orphaned socket so the next up lazy-starts a fresh shared instance.
     const result = await runDown(deps as never, { shared: true });
-    expect(result).toEqual({ shared: true, stopped: false });
+    expect(result).toEqual({ shared: true, stopped: false, forceKilled: [] });
     expect(existsSync(socketPath)).toBe(false);
   }, 30000);
 });
