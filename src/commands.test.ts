@@ -1590,21 +1590,38 @@ describe("runUp — namespace selection (#128)", () => {
     expect(observed).toEqual(["web", "worker"]);
   });
 
-  it("`-n` naming a namespace with NO services is not an error today (ADR-0008 leaves it undecided)", async () => {
-    // Pins current behaviour so any later change (e.g. making this
-    // NO_SERVICES_SELECTED too) is a deliberate decision, not an accident.
+  it("`-n` naming only a namespace with NO services fails NO_SERVICES_SELECTED before any state is written (#203)", async () => {
+    const registryRef = { snapshot: {} as RegistrySnapshot };
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const deps = stubDeps({ stack: allNamespaced, track, registryRef });
+    const err = await runUp({ ...deps, namespaces: ["nope"] }).then(
+      () => undefined,
+      (e: unknown) => e as Error & { code?: string; details?: Record<string, unknown> },
+    );
+    expect(err?.code).toBe("NO_SERVICES_SELECTED");
+    expect(err?.details).toEqual({
+      worktree_id: deps.expectedWorktreeId,
+      selected_namespaces: ["nope"],
+      namespaces: ["app", "local-backend"],
+    });
+    expect(err?.message).toContain("-n nope");
+    expect(err?.message).toContain("Available namespaces: app, local-backend");
+    expect(err?.message).toContain("devtrees up -n app");
+    expect(track.invocations).toEqual([]);
+    expect(registryRef.snapshot).toEqual({});
+  });
+
+  it("`-n app -n nope` still starts: only an overall empty selection is an error (#203)", async () => {
     let observed: string[] | undefined;
     const track: StubSpawn = { invocations: [], touchSocket: false };
-    const result = await runUp({
+    await runUp({
       ...stubDeps({ stack: allNamespaced, track }),
-      namespaces: ["nope"],
+      namespaces: ["app", "nope"],
       waitForHealth: async ({ serviceNames }) => {
-        observed = [...serviceNames];
+        observed = [...serviceNames].sort();
       },
     });
-    expect(result.worktreeId).toBeDefined();
-    expect(observed).toEqual([]);
-    expect(track.invocations.length).toBeGreaterThan(0);
+    expect(observed).toEqual(["web", "worker"]);
   });
 
   it("a bare up on a RUNNING instance is not a fresh start: no NO_SERVICES_SELECTED, no spawn (#177's scope)", async () => {
@@ -2314,6 +2331,19 @@ describe("runUpDryRun — namespace selection preview (#176)", () => {
     await expect(runUpDryRun(deps)).rejects.toMatchObject({
       code: "NO_SERVICES_SELECTED",
       details: { namespaces: ["app"] },
+    });
+    expect(registryRef.snapshot).toEqual({});
+  });
+
+  it("`-n` naming only a namespace with no services fails NO_SERVICES_SELECTED in a dry run, registry untouched (#203)", async () => {
+    const registryRef = { snapshot: {} as RegistrySnapshot };
+    const deps = stubDeps({
+      stack: { services: [{ ...isolated("api", "node api.js", ["API_PORT"]), namespace: "app" }] },
+      registryRef,
+    });
+    await expect(runUpDryRun({ ...deps, namespaces: ["nope"] })).rejects.toMatchObject({
+      code: "NO_SERVICES_SELECTED",
+      details: { selected_namespaces: ["nope"], namespaces: ["app"] },
     });
     expect(registryRef.snapshot).toEqual({});
   });
@@ -4506,13 +4536,14 @@ describe("runUp — pending-reload guard (#191)", () => {
     expect(err.message).toContain("`devtrees down && devtrees up -n one -n two`");
   });
 
-  it("no marker: an instance booted on a namespace with no services reloads normally (#176)", async () => {
-    // `up -n nope` boots an empty project; that is not a pending reload.
+  it("an empty-selection instance can no longer exist: `-n nope` is refused before any boot or reload (#203)", async () => {
+    // process-compose exits after reloading an empty project, so `up -n nope`
+    // never boots one (it used to, #176).
     const { state, deps } = fixture(stackA, []);
-    await runUp({ ...deps, namespaces: ["nope"] });
-    state.stack = stackB;
-    await runUp({ ...deps, namespaces: ["nope"] });
-    expect(state.reloads).toBe(1);
+    await expect(upError({ ...deps, namespaces: ["nope"] })).resolves.toMatchObject({
+      code: "NO_SERVICES_SELECTED",
+    });
+    expect(state.reloads).toBe(0);
   });
 
   it("an instance booted through a list-valued namespace reloads normally (#179)", async () => {
@@ -4691,6 +4722,33 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
     ]);
     const line = warnings.find((w) => /cross-namespace/.test(w));
     expect(line).toContain("'web' -> 'api'");
+  });
+
+  it("#203: -n naming only a namespace with no services fails NO_SERVICES_SELECTED, not NAMESPACE_NOT_RUNNING", async () => {
+    const { deps, spawned, id } = liveInstance(twoNamespaces, { worktree: [running("a")] });
+    const err = await failure({ ...deps, namespaces: ["nope"] });
+    expect(err?.code).toBe("NO_SERVICES_SELECTED");
+    expect(err?.details).toEqual({
+      worktree_id: id,
+      selected_namespaces: ["nope"],
+      namespaces: ["one", "two"],
+    });
+    expect(spawned.filter((a) => a[0] !== "process")).toEqual([]);
+  });
+
+  it("#203: -n one -n nope on a running instance keeps today's behaviour for the real namespace", async () => {
+    const waited: string[][] = [];
+    const { deps } = liveInstance(
+      twoNamespaces,
+      { worktree: [running("a")] },
+      {
+        waitForHealth: async ({ serviceNames }) => {
+          waited.push([...serviceNames]);
+        },
+      },
+    );
+    await runUp({ ...deps, namespaces: ["one", "nope"] });
+    expect(waited).toEqual([["a"]]);
   });
 
   it("#170: -n naming a namespace the instance was not booted with fails with NAMESPACE_NOT_RUNNING", async () => {

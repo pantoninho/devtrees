@@ -264,13 +264,13 @@ class WorktreeStartFailedError extends Error {
 }
 
 /**
- * Thrown when a bare fresh `up` (no `-n`) selects zero services (issue #176,
- * ADR-0008). Namespaces are opt-in, so a bare fresh start selects only the
- * implicit `default` namespace; when every isolated service declares a named
- * namespace that selection is empty, and starting an empty instance and
- * reporting it healthy would be a lie. `details.namespaces` lists the
- * namespaces the stack declares so an agent can retry with `-n` without a
- * second round-trip.
+ * Thrown when an `up` selects zero isolated services (issues #176, #203,
+ * ADR-0008): a bare fresh `up` whose implicit `default` namespace is empty,
+ * or an explicit `-n` naming only namespaces with no services. Starting an
+ * empty instance and reporting it healthy would be a lie, and process-compose
+ * exits after hot-reloading an empty project (#203). `details.namespaces`
+ * lists the namespaces the stack declares so an agent can retry with `-n`
+ * without a second round-trip; `selected_namespaces` is what was asked for.
  */
 class NoServicesSelectedError extends Error {
   readonly code = "NO_SERVICES_SELECTED" as const;
@@ -279,11 +279,19 @@ class NoServicesSelectedError extends Error {
     readonly selected_namespaces: ReadonlyArray<string>;
     readonly namespaces: ReadonlyArray<string>;
   };
-  constructor(worktreeId: string, available: ReadonlyArray<string>) {
+  constructor(
+    worktreeId: string,
+    available: ReadonlyArray<string>,
+    selected: ReadonlyArray<string> = [DEFAULT_NAMESPACE],
+    explicit = false,
+  ) {
     const example = available[0] ?? "<ns>";
+    const why = explicit
+      ? `\`-n ${selected.join(", ")}\` names no namespace with services in this stack.`
+      : `A bare \`devtrees up\` starts only the \`${DEFAULT_NAMESPACE}\` namespace ` +
+        `(services with no \`namespace:\`), and this stack has none.`;
     super(
-      `devtrees up: no services selected (NO_SERVICES_SELECTED) for '${worktreeId}'. A bare \`devtrees up\` starts only ` +
-        `the \`${DEFAULT_NAMESPACE}\` namespace (services with no \`namespace:\`), and this stack has none. ` +
+      `devtrees up: no services selected (NO_SERVICES_SELECTED) for '${worktreeId}'. ${why} ` +
         `Available namespaces: ${available.join(", ")}. ` +
         `Name the ones to start with -n, e.g. \`devtrees up -n ${example}\` ` +
         `(repeat -n for several).`,
@@ -291,7 +299,7 @@ class NoServicesSelectedError extends Error {
     this.name = "NoServicesSelectedError";
     this.details = {
       worktree_id: worktreeId,
-      selected_namespaces: [DEFAULT_NAMESPACE],
+      selected_namespaces: selected,
       namespaces: available,
     };
   }
@@ -401,14 +409,15 @@ class InstanceUnresponsiveError extends Error {
  * The returned `namespaces` is never empty, so the worktree up-spawn always
  * passes `-n` and process-compose never falls back to "every namespace".
  *
- * Throws `NoServicesSelectedError` when a bare selection resolves to zero
- * isolated services. Only isolated services are counted: namespace selection
- * applies to this worktree's instance only (shared services cannot declare a
- * namespace, #130). An explicit `-n` naming an empty namespace is deliberately
- * NOT an error here — ADR-0008 left that case open.
+ * Throws `NoServicesSelectedError` when the selection resolves to zero
+ * isolated services — bare or explicit `-n` (#203: an empty instance is
+ * useless, and process-compose exits after reloading one). Only isolated
+ * services are counted: namespace selection applies to this worktree's
+ * instance only (shared services cannot declare a namespace, #130). A stack
+ * with no isolated services at all keeps starting (shared only).
  *
  * Not used on the running-instance path: what a bare `up` targets there is
- * #177's to define.
+ * #177's to define; `assertExplicitSelectionNotEmpty` covers explicit `-n`.
  */
 function resolveFreshSelection(
   stack: ResolvedStack,
@@ -419,10 +428,27 @@ function resolveFreshSelection(
   const namespaces = bare ? [DEFAULT_NAMESPACE] : requested;
   const isolated = stack.services.filter((s) => s.tier === "isolated");
   const services = isolated.filter((s) => namespaceSelected(s, namespaces));
-  if (bare && services.length === 0 && isolated.length > 0) {
-    throw new NoServicesSelectedError(worktreeId, declaredNamespaces(isolated));
+  if (services.length === 0 && isolated.length > 0) {
+    throw new NoServicesSelectedError(worktreeId, declaredNamespaces(isolated), namespaces, !bare);
   }
   return { namespaces, services };
+}
+
+/**
+ * Pure pre-check for an explicit `-n` (#203): fail `NO_SERVICES_SELECTED` when
+ * the namespaces select no isolated service in the stack, on a fresh and a
+ * running instance alike, before any port allocation or state write. On a
+ * running instance nothing is "missing" from such a selection, so this is
+ * not `NAMESPACE_NOT_RUNNING`. A bare `up` is not checked here: its target
+ * depends on whether the instance is running.
+ */
+function assertExplicitSelectionNotEmpty(
+  stack: ResolvedStack,
+  worktreeId: string,
+  requested: ReadonlyArray<string> | undefined,
+): void {
+  if (requested === undefined || requested.length === 0) return;
+  resolveFreshSelection(stack, worktreeId, requested);
 }
 
 /**
@@ -1220,6 +1246,10 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
 
   const stack = readStack(anchor.worktreeRoot);
 
+  // An explicit `-n` that selects nothing is an error whether or not the
+  // instance is running (#203); checked before any version probe or state.
+  assertExplicitSelectionNotEmpty(stack, anchor.worktreeId, deps.namespaces);
+
   // Refuse an unsupported process-compose before allocating ports or touching
   // any state (issue #173): one cheap subprocess, and nothing to roll back.
   await (
@@ -1640,7 +1670,7 @@ export async function runUpDryRun(deps: CommandDeps = {}): Promise<DryRunResult>
   const isPortFree = deps.isPortFree ?? defaultIsPortFree;
 
   const stack = readStack(anchor.worktreeRoot);
-  // Preview the fresh-start selection (issue #176): same namespaces, same
+  // Preview the fresh-start selection (issues #176, #203): same namespaces, same
   // NO_SERVICES_SELECTED failure a real fresh `up` would hit — checked before
   // the registry is touched, so a failing preview has no side effect at all.
   const selection = resolveFreshSelection(stack, anchor.worktreeId, deps.namespaces);

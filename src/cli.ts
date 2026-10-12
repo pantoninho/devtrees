@@ -316,7 +316,8 @@ class UpCommand extends DevtreesCommand {
     // and stops before any side effect, so it can only emit the allocation
     // subset of the codes below (#124), plus NO_SERVICES_SELECTED (#176).
     // NO_SERVICES_SELECTED: a bare fresh `up` whose `default` namespace has no
-    // services (namespaces are opt-in, ADR-0008).
+    // services, or an explicit `-n` naming only namespaces with none
+    // (namespaces are opt-in, ADR-0008; #203).
     details: errorCodeFooter([
       "PROCESS_COMPOSE_TOO_OLD",
       "STALE_PORT_BLOCK",
@@ -374,7 +375,7 @@ class UpCommand extends DevtreesCommand {
     description:
       "Start exactly the given process-compose namespace(s). Repeatable (`-n a -n b`); " +
       "`-n app` does not imply `default`. Omitted, a fresh `up` starts only the `default` " +
-      "namespace (services with no `namespace:`) and fails with NO_SERVICES_SELECTED if it has none. " +
+      "namespace (services with no `namespace:`) and fails with NO_SERVICES_SELECTED if it has none; `-n` naming only namespaces with no services fails the same way. " +
       "On a running instance, omitted checks the namespaces it was booted with (restarting dead services), and `-n` naming one " +
       "it was not booted with fails with NAMESPACE_NOT_RUNNING.",
   });

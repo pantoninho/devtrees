@@ -825,6 +825,25 @@ describe("built CLI e2e — argv→commands wiring over the stub process-compose
     expect(existsSync(sock)).toBe(false);
   }, 60_000);
 
+  it("`-n` naming only an empty namespace fails NO_SERVICES_SELECTED, real and dry-run (#203)", () => {
+    const { wt, sock } = setupAllNamespacedScenario("dt-bcns6-");
+
+    const json = devtrees(wt, ["up", "--json", "-n", "nope"]);
+    expect(json.code).not.toBe(0);
+    const err = (json.doc as ErrorDoc).error;
+    expect(err?.code).toBe("NO_SERVICES_SELECTED");
+    expect(err?.details?.namespaces).toEqual(["app", "local-backend"]);
+
+    const human = devtrees(wt, ["up", "--no-attach", "-n", "nope"]);
+    expect(human.code).not.toBe(0);
+    expect(human.stderr).toContain("NO_SERVICES_SELECTED");
+
+    const dry = devtrees(wt, ["up", "--dry-run", "--json", "-n", "nope"]);
+    expect(dry.code).not.toBe(0);
+    expect((dry.doc as ErrorDoc).error?.code).toBe("NO_SERVICES_SELECTED");
+    expect(existsSync(sock)).toBe(false);
+  }, 60_000);
+
   it("up --dry-run previews the same selection and the same NO_SERVICES_SELECTED failure (#176)", () => {
     const mixed = setupNamespaceScenario("dt-bcns4-");
     const dry = devtrees(mixed.wt, ["up", "--dry-run", "--json"]);
