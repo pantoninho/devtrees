@@ -25,7 +25,7 @@
  *
  * The marker also lets `down` finish (#206). process-compose no longer lists
  * the old runs, yet its `down` waits on them, so the bounded `down` kills
- * them along with its own snapshot once its budget runs out. To make that
+ * them before it stops the instance. To make that
  * safe against pid reuse, the marker records each old run's parent, process
  * group and command line, read from `ps` when the reload times out
  * (`identifyOldRuns`).
@@ -69,8 +69,8 @@ export interface OldRun {
   /**
    * Set by `identifyOldRuns` when the marker is written (#206). `null`: the
    * run could not be identified as a child of the instance's process-compose
-   * then (already gone, or `ps` failed), so `down` never kills it. Absent: a
-   * marker from a build before #206, see `pendingRunsToKill`.
+   * then (already gone, or `ps` failed). `down` kills a run only with a
+   * matching identity, so `null` or a missing one means never.
    */
   readonly identity?: OldRunIdentity | null;
 }
@@ -126,7 +126,12 @@ function markerFile(anchor: string, worktreeId: string): string {
   return join(stateDir(anchor), `${worktreeId}.reload-pending.json`);
 }
 
-/** Read the marker, or `undefined` when there is none (or it is unreadable). */
+/**
+ * Read the marker, or `undefined` when there is none (or it is unreadable).
+ * The `oldRuns` entries are not validated: every reader fails safe on a
+ * malformed one (a hand-edited `identity` never matches, so `down` does not
+ * kill on it).
+ */
 export function readPendingReload(anchor: string, worktreeId: string): PendingReload | undefined {
   const file = markerFile(anchor, worktreeId);
   if (!existsSync(file)) return undefined;

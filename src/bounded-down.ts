@@ -6,18 +6,25 @@
  * ignores SIGTERM and declares no `shutdown.timeout_seconds`. Its `down` then
  * waits forever, and so did `devtrees down` and prune's orphan stop.
  *
- * `boundedDown` stops an instance in three steps:
+ * `boundedDown` stops an instance in four steps:
+ *  0. If a hot-reload is still pending (#206), SIGKILL the old runs it is
+ *     waiting on first. process-compose no longer lists them, so only the
+ *     pending-reload marker knows them, and they are held to the same
+ *     identity checks as step 3 (see `pendingRunsToKill`). Then wait briefly
+ *     for process-compose to finish the pending update, which starts the new
+ *     copy of each service. Its `down` must see that copy: killing the old
+ *     run during the `down` instead lets the update start the new copy after
+ *     the shutdown order was fixed, and it outlives process-compose as an
+ *     orphan.
  *  1. Snapshot each service's pid (`process list`) and its process-table row
  *     (`ps`) before asking process-compose to stop.
  *  2. Run `process-compose down` within a budget (`downTimeoutMs`).
  *  3. On expiry, SIGKILL only the snapshot processes that are still alive
  *     and still the same process (same parent, process group and command
- *     line, so a reused pid is never hit). Add the old runs a pending
- *     hot-reload is still waiting on (#206): process-compose no longer lists
- *     them, so only the pending-reload marker knows them, and they are held
- *     to the same checks (see `pendingRunsToKill`). process-compose then
- *     sees them exit and finishes its own shutdown. If it still has not
- *     exited after a short grace period, fail with `DOWN_TIMEOUT`.
+ *     line, so a reused pid is never hit), plus any pending old run step 0
+ *     could not kill yet. process-compose then sees them exit and finishes
+ *     its own shutdown. If it still has not exited after a short grace
+ *     period, fail with `DOWN_TIMEOUT`.
  *
  * devtrees never kills the process-compose supervisor itself, nor a
  * `shutdown.command` it is running: killing the supervisor would skip the
@@ -29,7 +36,7 @@
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import type { DownOutcome, InstanceRef, ServiceStatus } from "./driver.js";
-import type { OldRun } from "./reload-pending.js";
+import type { OldRun, PendingReload } from "./reload-pending.js";
 
 /** One row of the process table, as `ps -o pid=,ppid=,pgid=,command=` prints it. */
 export interface ProcessRow {
@@ -160,18 +167,12 @@ export function stillRunning(
  * snapshot. process-compose dropped them from `process list` when the reload
  * timed out, so the snapshot cannot see them, yet its `down` waits on them.
  * A run qualifies only when it is alive in `table` as a direct child of this
- * instance's process-compose (`supervisorPid`), and:
- *  - with a recorded identity: its parent, process group and command line
- *    all still match, as `stillRunning` requires of the snapshot;
- *  - with `identity: null` (not identifiable when the marker was written):
- *    never;
- *  - with no identity at all (a marker written before #206): on the
- *    parentage alone, unless the snapshot shows the service back under
- *    another pid. A process with this parent is one this instance's
- *    process-compose started and is now being stopped, and process-compose
- *    re-adds a service only once its old run has exited, so a reused pid
- *    would have to be both a fresh child of this supervisor and not one of
- *    its listed services.
+ * instance's process-compose (`supervisorPid`) and its recorded identity
+ * (parent, process group and command line) still matches, as
+ * `stillRunning` requires of the snapshot. A run without an identity
+ * (`identity: null`, or a hand-edited or older marker) is never killed: on
+ * the pid alone it could be anything, including a running
+ * `shutdown.command`. `unverifiedRuns` names those instead.
  * Runs already in `snapshot` are left to it.
  */
 export function pendingRunsToKill(
@@ -183,24 +184,41 @@ export function pendingRunsToKill(
   if (supervisorPid === undefined) return [];
   const byPid = new Map(table.map((row) => [row.pid, row]));
   const listed = new Set(snapshot.map((proc) => proc.pid));
-  const relisted = new Set(snapshot.map((proc) => proc.service));
   const picked = new Set<number>();
   return runs.flatMap((run) => {
     const now = byPid.get(run.pid);
     if (now === undefined || now.ppid !== supervisorPid) return [];
     if (listed.has(run.pid) || picked.has(run.pid)) return [];
-    if (!sameIdentity(run, now, relisted)) return [];
+    if (!sameIdentity(run, now)) return [];
     picked.add(run.pid);
     return [{ service: run.name, ...now }];
   });
 }
 
-/** Does `now` still pass for `run`'s recorded identity (see `pendingRunsToKill`)? */
-function sameIdentity(run: OldRun, now: ProcessRow, relisted: ReadonlySet<string>): boolean {
+/**
+ * Does `now` still pass for `run`'s recorded identity? The marker is read
+ * unvalidated, so anything but a well-formed identity that matches field
+ * for field (none, `null`, a hand-edited value) fails safe: no kill.
+ */
+function sameIdentity(run: OldRun, now: ProcessRow): boolean {
   const id = run.identity;
-  if (id === null) return false;
-  if (id === undefined) return !relisted.has(run.name);
+  if (id === null || id === undefined || typeof id !== "object") return false;
   return id.ppid === now.ppid && id.pgid === now.pgid && id.command === now.command;
+}
+
+/**
+ * Pending old runs devtrees will not kill because it cannot verify them (no
+ * recorded identity) but whose pid is still in `table`, so the operator can
+ * check and kill them by hand.
+ */
+export function unverifiedRuns(
+  runs: ReadonlyArray<OldRun>,
+  table: ReadonlyArray<ProcessRow>,
+): ForceKilled[] {
+  const live = new Set(table.map((row) => row.pid));
+  return runs.flatMap((run) =>
+    run.identity == null && live.has(run.pid) ? [{ service: run.name, pid: run.pid }] : [],
+  );
 }
 
 /** True when `pid` names a live process (EPERM counts: it exists). */
@@ -240,7 +258,7 @@ export class DownTimeoutError extends Error {
         : `its process-compose (pid ${details.process_compose_pid})`;
     const stuck =
       details.stuck_services.length === 0
-        ? "No service process devtrees recorded was still running: process-compose may be waiting on a shutdown.command that does not exit, or on a process it no longer lists that devtrees could not identify (such as a service's old process after a CONFIG_DRIFT timeout recorded by an older devtrees, or one that `ps` could not read at the time)."
+        ? "No service process devtrees recorded was still running: process-compose may be waiting on a shutdown.command that does not exit, or on a service's old process from a timed-out hot-reload that devtrees could not verify, and so did not kill."
         : `Stuck: ${describeProcesses(details.stuck_services)}.`;
     const killed =
       details.force_killed.length === 0
@@ -285,11 +303,18 @@ export interface StopSeams {
   readonly graceMs?: number;
   /** Poll interval while waiting for process-compose to exit. Default: 100ms. */
   readonly pollMs?: number;
+  /**
+   * How long to wait, after killing a pending reload's old runs, for
+   * process-compose to finish that update before stopping. Default: 5s.
+   */
+  readonly settleMs?: number;
 }
 
 /** Default grace for process-compose to exit once its stuck services are killed. */
 const DOWN_GRACE_MS = 10_000;
 const DOWN_POLL_MS = 100;
+/** Default wait for a pending update to finish once its old runs are killed. */
+const PENDING_SETTLE_MS = 5_000;
 
 /** What `boundedDown` is stopping and how to describe it in a `DOWN_TIMEOUT`. */
 export interface StopTarget {
@@ -303,19 +328,21 @@ export interface StopTarget {
   /** The `details.remedy` a `DOWN_TIMEOUT` carries, given the supervisor pid if known. */
   readonly remedy: (processComposePid: number | undefined) => string;
   /**
-   * The old runs a pending hot-reload is still waiting on, from the
-   * instance's pending-reload marker (#206). Default: none.
+   * The instance's pending-reload marker (#206): the old runs a timed-out
+   * hot-reload is still waiting on, and the services it brings back.
+   * Default: none.
    */
-  readonly pendingOldRuns?: ReadonlyArray<OldRun>;
+  readonly pendingReload?: PendingReload;
 }
 
 /**
  * Stop an instance within its budget, force-killing only the service
  * processes that kept it from stopping, including a pending reload's old
- * runs (`target.pendingOldRuns`). Resolves with what was force-killed
- * (empty on a clean stop). Throws `DownTimeoutError` when process-compose is
- * still running after the escalation; rejects as `driver.down` does when
- * `process-compose down` itself fails.
+ * runs (`target.pendingReload`), which are killed before the stop. Resolves
+ * with what was force-killed (empty on a clean stop with nothing pending).
+ * Throws `DownTimeoutError` when process-compose is still running after the
+ * escalation; rejects as `driver.down` does when `process-compose down`
+ * itself fails.
  */
 export async function boundedDown(
   target: StopTarget,
@@ -323,6 +350,9 @@ export async function boundedDown(
   seams: StopSeams = {},
 ): Promise<{ readonly forceKilled: ReadonlyArray<ForceKilled> }> {
   const readTable = seams.readProcessTable ?? readProcessTable;
+  const kill = seams.kill ?? process.kill.bind(process);
+  const oldRuns = target.pendingReload?.oldRuns ?? [];
+  const preKilled = await killPendingRuns(target, driver, seams);
   const { snapshot, supervisorPid } = await snapshotInstance(
     target.inst.socketPath,
     driver,
@@ -330,15 +360,20 @@ export async function boundedDown(
   );
 
   const outcome = await driver.down(target.inst, { timeoutMs: target.timeoutMs });
-  if (outcome.stopped) return { forceKilled: [] };
+  if (outcome.stopped) return { forceKilled: preKilled };
 
   const table = await readTable();
   const pcPid = supervisorPid ?? findSupervisorPid(table, target.inst.socketPath);
+  // The pending runs again, as a backstop: one step 0 could not kill yet
+  // (its supervisor was not found then) still blocks the stop.
+  const preKilledPids = new Set(preKilled.map((k) => k.pid));
   const stuck = [
     ...stillRunning(snapshot, table),
-    ...pendingRunsToKill(target.pendingOldRuns ?? [], snapshot, table, pcPid),
+    ...pendingRunsToKill(oldRuns, snapshot, table, pcPid).filter(
+      (proc) => !preKilledPids.has(proc.pid),
+    ),
   ];
-  const forceKilled = killProcesses(stuck, seams.kill ?? process.kill.bind(process));
+  const forceKilled = [...preKilled, ...killProcesses(stuck, kill)];
   const exited = await waitForExit(target.inst.socketPath, pcPid, seams);
   if (exited) return { forceKilled };
   throw new DownTimeoutError(target.command, {
@@ -348,8 +383,72 @@ export async function boundedDown(
     process_compose_pid: pcPid ?? null,
     stuck_services: stuck.map(({ service, pid }) => ({ service, pid })),
     force_killed: forceKilled,
-    remedy: target.remedy(pcPid),
+    remedy: unverifiedRemedy(unverifiedRuns(oldRuns, table)) + target.remedy(pcPid),
   });
+}
+
+/** The remedy's lead-in naming pending old runs devtrees would not kill. */
+function unverifiedRemedy(runs: ReadonlyArray<ForceKilled>): string {
+  if (runs.length === 0) return "";
+  return (
+    `A timed-out hot-reload may still be waiting on ${describeProcesses(runs)}, ` +
+    "which devtrees could not verify as the service's old process and did not kill: " +
+    "check it with `ps` and kill it if it is. "
+  );
+}
+
+/**
+ * Step 0 (#206): SIGKILL the pending reload's old runs that still pass the
+ * identity checks, then wait for process-compose to finish the pending
+ * update, so the `down` that follows sees, and stops, each new copy. Waits
+ * at most `settleMs`; the stop proceeds either way.
+ */
+async function killPendingRuns(
+  target: StopTarget,
+  driver: StopDriver,
+  seams: StopSeams,
+): Promise<ForceKilled[]> {
+  const pending = target.pendingReload;
+  if (pending === undefined || pending.oldRuns.length === 0) return [];
+  const table = await (seams.readProcessTable ?? readProcessTable)();
+  const pcPid = findSupervisorPid(table, target.inst.socketPath);
+  const procs = pendingRunsToKill(pending.oldRuns, [], table, pcPid);
+  if (procs.length === 0) return [];
+  const killed = killProcesses(procs, seams.kill ?? process.kill.bind(process));
+  await waitForPendingUpdate(target.inst.socketPath, pending, killed, driver, seams);
+  return killed;
+}
+
+/**
+ * Wait until every killed old run is gone and every service the pending
+ * update brings back (`pending.services`) is listed again under a pid other
+ * than its killed one. A service absent from `pending.services` (removed or
+ * renamed by the reload) never comes back and is not waited on.
+ */
+async function waitForPendingUpdate(
+  socketPath: string,
+  pending: PendingReload,
+  killed: ReadonlyArray<ForceKilled>,
+  driver: StopDriver,
+  seams: StopSeams,
+): Promise<void> {
+  const isAlive = seams.isAlive ?? isPidAlive;
+  const oldPid = new Map(killed.map((k) => [k.service, k.pid]));
+  const settled = async (): Promise<boolean> => {
+    if (killed.some((k) => isAlive(k.pid))) return false;
+    const rows = await driver.getServiceStatuses(socketPath).catch(() => undefined);
+    if (rows === undefined) return false;
+    const listed = new Map(rows.map((r) => [r.name, r.pid]));
+    return pending.services.every(
+      (name) => listed.has(name) && listed.get(name) !== oldPid.get(name),
+    );
+  };
+  const deadline = Date.now() + (seams.settleMs ?? PENDING_SETTLE_MS);
+  const poll = seams.pollMs ?? DOWN_POLL_MS;
+  while (!(await settled())) {
+    if (Date.now() >= deadline) return;
+    await new Promise((r) => setTimeout(r, poll));
+  }
 }
 
 /**

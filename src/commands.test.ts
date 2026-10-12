@@ -4377,7 +4377,14 @@ describe("runUp — pending-reload guard (#191)", () => {
       driver: { ...base.driver, controlRequest, reloadTimeoutMs: 50 },
       getServiceStatuses: async () => state.rows,
       isProcessAlive: (pid) => state.alive.has(pid),
-      stop: { readProcessTable },
+      // Never the real `process.kill`: a SIGKILL drops the pid from the fake table.
+      stop: {
+        readProcessTable,
+        kill: (target) => void state.alive.delete(Math.abs(target)),
+        isAlive: (pid) => state.alive.has(pid),
+        settleMs: 20,
+        pollMs: 2,
+      },
     };
     const where = (): { anchor: string; id: string } => {
       const spawn = worktreeSpawn();
@@ -6506,7 +6513,7 @@ describe("bounded down — force-kill and DOWN_TIMEOUT (#190)", () => {
     expect(readPendingReload(anchorOf(deps), deps.expectedWorktreeId)).toBeUndefined();
   });
 
-  it("worktree down also force-kills a pending reload's unlisted old run, then clears the marker (#206)", async () => {
+  it("worktree down force-kills a pending reload's unlisted old run before stopping, then clears the marker (#206)", async () => {
     const deps = stubDeps({ stack: isolatedStack, track: { invocations: [], touchSocket: true } });
     await runUp(deps);
     const paths = instancePaths(anchorOf(deps), deps.expectedWorktreeId);
@@ -6514,19 +6521,20 @@ describe("bounded down — force-kill and DOWN_TIMEOUT (#190)", () => {
     const old = { pid: 77, ppid: PC_PID, pgid: 77, command: "bash -c sleep 300" };
     const { seams, kills } = stopSeams(paths.socketPath, { pcExits: true, extra: [old] });
     writePendingReload(anchorOf(deps), deps.expectedWorktreeId, {
-      services: ["api"],
+      services: [],
       oldRuns: [
         { name: "api", pid: 77, identity: { ppid: PC_PID, pgid: 77, command: old.command } },
       ],
     });
     const result = await runDown({ ...deps, driver: stuckDriver(), stop: seams });
     expect(result.forceKilled).toEqual([
-      { service: "web", pid: WEB_PID },
       { service: "api", pid: 77 },
+      { service: "web", pid: WEB_PID },
     ]);
+    // The old run first, before `process-compose down`; then the escalation.
     expect(kills).toEqual([
-      [-WEB_PID, "SIGKILL"],
       [-77, "SIGKILL"],
+      [-WEB_PID, "SIGKILL"],
     ]);
     expect(readPendingReload(anchorOf(deps), deps.expectedWorktreeId)).toBeUndefined();
   });
@@ -6646,6 +6654,39 @@ describe("bounded down — force-kill and DOWN_TIMEOUT (#190)", () => {
       expect.objectContaining({ id: "removed", forceKilled: [{ service: "web", pid: WEB_PID }] }),
     ]);
     expect(result.unreclaimed).toEqual([]);
+  });
+
+  it("prune forwards an orphan's pending-reload marker to its stop (#206)", async () => {
+    const tmp = tmpAnchor();
+    mkdirSync(runDir(tmp.anchor), { recursive: true });
+    const orphan = instancePaths(tmp.anchor, "removed");
+    writeFileSync(orphan.socketPath, "");
+    const old = { pid: 77, ppid: PC_PID, pgid: 77, command: "bash -c sleep 300" };
+    const { seams, kills } = stopSeams(orphan.socketPath, { pcExits: true, extra: [old] });
+    writePendingReload(tmp.anchor, "removed", {
+      services: [],
+      oldRuns: [
+        { name: "api", pid: 77, identity: { ppid: PC_PID, pgid: 77, command: old.command } },
+      ],
+    });
+    const { runPrune } = await import("./commands.js");
+    const result = await runPrune({
+      ...pruneInputs(tmp, orphan.socketPath),
+      readRegistry: () => ({}),
+      withRegistryLock: async (_anchor, mutate) => mutate({}),
+      stop: seams,
+    });
+    expect(kills[0]).toEqual([-77, "SIGKILL"]);
+    expect(result.pruned).toEqual([
+      expect.objectContaining({
+        id: "removed",
+        forceKilled: [
+          { service: "api", pid: 77 },
+          { service: "web", pid: WEB_PID },
+        ],
+      }),
+    ]);
+    expect(readPendingReload(tmp.anchor, "removed")).toBeUndefined();
   });
 
   it("prune keeps a running orphan whose bounded down timed out, and reports it unreclaimed", async () => {

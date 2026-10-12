@@ -318,13 +318,14 @@ are. It never stops anything, and never attaches the TUI.
   with `details.reason: "reload_pending"`, naming the service and the old
   PID: a second reload would start an untracked copy. Kill the old process,
   then run `devtrees up` again. `devtrees down` also works: it force-kills
-  that old process once its budget runs out.
+  that old process before it stops the stack.
 - `down` never hangs on a service that will not stop (a `shutdown.command`
   that leaves it running, or a process that ignores SIGTERM). After its
   budget (30s plus every `shutdown.timeout_seconds`) devtrees force-kills
-  that service, and the old process of a timed-out hot-reload, and `down`
-  names them (`force_killed` in the `--json` envelope). If process-compose
-  still does not exit, `down` fails with `DOWN_TIMEOUT`.
+  that service, and `down` names it (`force_killed` in the `--json`
+  envelope). The old process of a timed-out hot-reload is force-killed up
+  front and named the same way. If process-compose still does not exit,
+  `down` fails with `DOWN_TIMEOUT`.
 - A dead shared service fails `up` with `SHARED_SERVICE_DEAD`; run
   `devtrees down --shared && devtrees up`.
 
@@ -343,7 +344,7 @@ Branch on `error.code`:
 | `SERVICE_START_FAILED`      | `up` tried to restart a dead service and process-compose refused. `details.services` carries each one with process-compose's message; read it, then run `details.remedy` (`devtrees down && devtrees up …`). |
 | `STALE_PORT_BLOCK`          | Foreign listeners hold this worktree's ports. `details.collisions[]` lists `{port_name, port, pid, command}`; kill the orphans and retry. |
 | `SHARED_DRIFT`              | This worktree's shared services diverge from the running shared instance. Follow the message: `devtrees down --shared && devtrees up`. |
-| `CONFIG_DRIFT`              | The running config differs from `devtrees.yaml` and hot-reload failed, or an earlier reload is still pending. Branch on `details.reason`: `not_supported`/`error` → `devtrees down && devtrees up`. `timeout` → a changed service's old process won't stop: kill that process, then run `devtrees up` again to resync. Or run `devtrees down && devtrees up`: `down` force-kills that old process after its budget and lists it in `force_killed`. `reload_pending` → that earlier reload is still waiting, so `up` reloaded nothing (another reload would start an untracked second copy): kill the old process (`details.pids`, for `details.services`), then run `devtrees up` again. Empty `details.pids` → the old process is gone and process-compose is still starting the new one: retry shortly; if it persists, follow the message's `devtrees down && devtrees up …`. |
+| `CONFIG_DRIFT`              | The running config differs from `devtrees.yaml` and hot-reload failed, or an earlier reload is still pending. Branch on `details.reason`: `not_supported`/`error` → `devtrees down && devtrees up`. `timeout` → a changed service's old process won't stop: kill that process, then run `devtrees up` again to resync. Or run `devtrees down && devtrees up`: `down` force-kills that old process first and lists it in `force_killed`. `reload_pending` → that earlier reload is still waiting, so `up` reloaded nothing (another reload would start an untracked second copy): kill the old process (`details.pids`, for `details.services`), then run `devtrees up` again. Empty `details.pids` → the old process is gone and process-compose is still starting the new one: retry shortly; if it persists, follow the message's `devtrees down && devtrees up …`. |
 | `SERVICE_NOT_FOUND`         | You named a service that isn't in the instance. `details.valid_services` lists the real names; pick one. |
 | `NO_SERVICES_SELECTED`      | The selection has no services: a bare `up` starts only services with no `namespace:` and there are none, or `-n` names only namespaces with none. `details.namespaces` lists the namespaces; retry with `devtrees up -n <ns>`. |
 | `INSTANCE_NOT_FOUND`        | No instance is running for this worktree. Run `devtrees up` first.                            |

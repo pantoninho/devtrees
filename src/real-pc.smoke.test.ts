@@ -193,14 +193,14 @@ function writeLogLocationStack(worktreeRoot: string, opts: { marker: string }): 
  */
 function writeReloadStack(
   worktreeRoot: string,
-  opts: { readonly hold: string; readonly shutdownCommand?: string },
+  opts: { readonly hold: string; readonly shutdownCommand?: string; readonly command?: string },
 ): void {
   writeFileSync(opts.hold, "");
   const yaml = [
     "services:",
     "  web:",
     "    tier: isolated",
-    `    command: "tail -f ${opts.hold}"`,
+    `    command: "${opts.command ?? `tail -f ${opts.hold}`}"`,
     "    ports: [WEB_PORT]",
     ...(opts.shutdownCommand ? ["    shutdown:", `      command: "${opts.shutdownCommand}"`] : []),
     "",
@@ -1504,7 +1504,14 @@ describe.skipIf(!ENABLED)("real-pc smoke — down after a timed-out reload (#206
     const oldPids = pidsMatching(holdA);
 
     // The #188 hang shape: the edited service's old process never stops.
-    writeReloadStack(wt, { hold: holdB, shutdownCommand: "echo bye" });
+    // The new command logs each start, so a copy started by the pending
+    // update is seen even if it is gone again by the time we look.
+    const starts = join(repo.root, "newstarts");
+    writeReloadStack(wt, {
+      hold: holdB,
+      shutdownCommand: "echo bye",
+      command: `sh -c 'echo started >> ${starts}; exec tail -f ${holdB}'`,
+    });
     const reload = up(wt);
     const reloadErr = (
       reload.doc as { error?: { code?: string; details?: { reason?: string } } } | undefined
@@ -1534,6 +1541,13 @@ describe.skipIf(!ENABLED)("real-pc smoke — down after a timed-out reload (#206
     expect(elapsed).toBeLessThan(30_000);
     expect(await waitForNoPids(repo.root, 10_000), "nothing should survive down").toEqual([]);
     expect(orphanedServices(repo.root)).toEqual([]);
+    // The old run is killed before the stop, so the pending update's new copy
+    // (if it started) is stopped by `down` too, never left behind with PPID 1.
+    expect(pidsMatching(holdB), "no copy of the new command survives").toEqual([]);
+    expect(
+      orphanedServices(repo.root).filter((line) => line.includes(holdB)),
+      "no PPID-1 copy of the new command",
+    ).toEqual([]);
     expect(readPendingReload(anchor, wtId(wt)), "down clears the marker").toBeUndefined();
     expect(existsSync(instancePaths(anchor, wtId(wt)).socketPath)).toBe(false);
   }, 120_000);

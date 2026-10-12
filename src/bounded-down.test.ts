@@ -12,6 +12,7 @@ import {
   parseProcessTable,
   pendingRunsToKill,
   snapshotServiceProcesses,
+  unverifiedRuns,
   stillRunning,
   type ProcessRow,
   type StopDriver,
@@ -152,22 +153,20 @@ describe("pendingRunsToKill (#206)", () => {
     expect(pendingRunsToKill([OLD_RUN], [], [PC, OLD], undefined)).toEqual([]);
   });
 
-  it("never kills a run the marker could not identify when it was written", () => {
-    const unknown: OldRun = { name: "web", pid: 301, identity: null };
-    expect(pendingRunsToKill([unknown], [], [PC, OLD], 100)).toEqual([]);
+  it("never kills a run without a verified identity: null, missing (older marker) or malformed", () => {
+    // On the pid alone it could be anything, even a running shutdown.command.
+    for (const identity of [null, undefined, "x", { ppid: 100 }]) {
+      const run = { name: "web", pid: 301, identity } as unknown as OldRun;
+      expect(pendingRunsToKill([run], [], [PC, OLD], 100)).toEqual([]);
+    }
   });
 
-  it("a marker from before #206 (no identity) kills on parentage alone", () => {
+  it("unverifiedRuns names the unverified runs whose pid is still alive, for the remedy", () => {
     const legacy: OldRun = { name: "web", pid: 301 };
-    expect(pendingRunsToKill([legacy], [], [PC, OLD], 100)).toEqual([{ service: "web", ...OLD }]);
-    // ...but never a pid that is not a direct child of this supervisor.
-    expect(pendingRunsToKill([legacy], [], [PC, { ...OLD, ppid: 1 }], 100)).toEqual([]);
-  });
-
-  it("a legacy run is spared once the snapshot shows its service back under another pid", () => {
-    const legacy: OldRun = { name: "web", pid: 301 };
-    const back = [{ service: "web", ...WEB }];
-    expect(pendingRunsToKill([legacy], back, [PC, WEB, OLD], 100)).toEqual([]);
+    const gone: OldRun = { name: "api", pid: 999, identity: null };
+    expect(unverifiedRuns([legacy, gone, OLD_RUN], [PC, OLD])).toEqual([
+      { service: "web", pid: 301 },
+    ]);
   });
 
   it("leaves a pid the snapshot already covers to it, and lists each pid once", () => {
@@ -279,46 +278,6 @@ describe("boundedDown", () => {
     expect(w.kills).toEqual([]);
   });
 
-  it("on timeout also SIGKILLs a pending reload's unlisted old run, by process group (#206)", async () => {
-    const w = world({
-      statuses: [status("api", 202)],
-      tables: [
-        [PC, API, OLD],
-        [PC, API, OLD],
-      ],
-      outcome: { stopped: false, reason: "timeout" },
-    });
-    const result = await boundedDown({ ...target, pendingOldRuns: [OLD_RUN] }, w.driver, w.seams);
-    expect(result).toEqual({
-      forceKilled: [
-        { service: "api", pid: 202 },
-        { service: "web", pid: 301 },
-      ],
-    });
-    expect(w.kills).toEqual([
-      [-202, "SIGKILL"],
-      [-301, "SIGKILL"],
-    ]);
-  });
-
-  it("never kills a pending reload's old pid once it is reused (#206)", async () => {
-    const w = world({
-      statuses: [],
-      tables: [[PC, { ...OLD, command: "vim notes" }]],
-      outcome: { stopped: false, reason: "timeout" },
-    });
-    const result = await boundedDown({ ...target, pendingOldRuns: [OLD_RUN] }, w.driver, w.seams);
-    expect(result).toEqual({ forceKilled: [] });
-    expect(w.kills).toEqual([]);
-  });
-
-  it("a clean stop never touches a pending reload's old run", async () => {
-    const w = world({ statuses: [], tables: [[PC, OLD]], outcome: { stopped: true } });
-    const result = await boundedDown({ ...target, pendingOldRuns: [OLD_RUN] }, w.driver, w.seams);
-    expect(result).toEqual({ forceKilled: [] });
-    expect(w.kills).toEqual([]);
-  });
-
   it("leaves a process that exited between the read and the kill out of force_killed", async () => {
     const w = world({
       statuses: [status("web", 201)],
@@ -395,5 +354,99 @@ describe("boundedDown", () => {
       down: () => Promise.reject(new Error("process-compose down exited with code 1")),
     };
     await expect(boundedDown(target, driver, w.seams)).rejects.toThrow(/exited with code 1/);
+  });
+});
+
+describe("boundedDown with a pending reload (#206)", () => {
+  /** The new `web` copy process-compose starts once the old run is gone. */
+  const NEW: ProcessRow = { pid: 401, ppid: 100, pgid: 401, command: "bash -c tail -f hold-b" };
+  const PENDING = { services: ["web"], oldRuns: [OLD_RUN] };
+
+  /**
+   * A live instance whose pending update finishes once the old run dies:
+   * from then on `web` is listed again as NEW. `oldSurvives` keeps the old
+   * run alive and unlisted (a kill that does not take).
+   */
+  function pendingWorld(opts: { outcome: DownOutcome; pcExits?: boolean; oldSurvives?: boolean }) {
+    const events: string[] = [];
+    let oldAlive = true;
+    const driver: StopDriver = {
+      getServiceStatuses: async () =>
+        oldAlive ? [status("api", 202)] : [status("web", 401), status("api", 202)],
+      down: async () => {
+        events.push("down");
+        return opts.outcome;
+      },
+    };
+    const seams = {
+      readProcessTable: async () => [PC, API, ...(oldAlive ? [OLD] : [NEW])],
+      kill: (target: number) => {
+        events.push(`kill ${target}`);
+        if (target === -301 && !opts.oldSurvives) oldAlive = false;
+      },
+      isAlive: (pid: number) => (pid === 301 ? oldAlive : pid === 100 && !opts.pcExits),
+      exists: () => false,
+      graceMs: 30,
+      pollMs: 2,
+      settleMs: 50,
+    };
+    return { driver, seams, events };
+  }
+
+  it("kills the old run before the stop, waits for the new copy, and reports it", async () => {
+    const w = pendingWorld({ outcome: { stopped: true } });
+    const result = await boundedDown({ ...target, pendingReload: PENDING }, w.driver, w.seams);
+    expect(result).toEqual({ forceKilled: [{ service: "web", pid: 301 }] });
+    // Before `process-compose down`, by process group.
+    expect(w.events).toEqual(["kill -301", "down"]);
+  });
+
+  it("the stop's own escalation then covers the new copy", async () => {
+    const w = pendingWorld({ outcome: { stopped: false, reason: "timeout" }, pcExits: true });
+    const result = await boundedDown({ ...target, pendingReload: PENDING }, w.driver, w.seams);
+    expect(result.forceKilled).toEqual([
+      { service: "web", pid: 301 },
+      { service: "web", pid: 401 },
+      { service: "api", pid: 202 },
+    ]);
+  });
+
+  it("never kills a pending old pid once it is reused", async () => {
+    const w = pendingWorld({ outcome: { stopped: true } });
+    const reused = {
+      ...w.seams,
+      readProcessTable: async () => [PC, { ...OLD, command: "vim notes" }],
+    };
+    const result = await boundedDown({ ...target, pendingReload: PENDING }, w.driver, reused);
+    expect(result).toEqual({ forceKilled: [] });
+    expect(w.events).toEqual(["down"]);
+  });
+
+  it("gives up waiting after settleMs and stops anyway", async () => {
+    const w = pendingWorld({ outcome: { stopped: true }, oldSurvives: true });
+    const result = await boundedDown({ ...target, pendingReload: PENDING }, w.driver, w.seams);
+    expect(result).toEqual({ forceKilled: [{ service: "web", pid: 301 }] });
+    expect(w.events).toEqual(["kill -301", "down"]);
+  });
+
+  it("does not wait on a service the reload removed", async () => {
+    const w = pendingWorld({ outcome: { stopped: true } });
+    const removed = { services: [], oldRuns: [OLD_RUN] };
+    const slow = { ...w.seams, settleMs: 60_000 };
+    const result = await boundedDown({ ...target, pendingReload: removed }, w.driver, slow);
+    expect(result.forceKilled).toEqual([{ service: "web", pid: 301 }]);
+  });
+
+  it("names an unverified old run in the DOWN_TIMEOUT remedy instead of killing it", async () => {
+    const w = pendingWorld({ outcome: { stopped: false, reason: "timeout" } });
+    const legacy = { services: ["web"], oldRuns: [{ name: "web", pid: 301 }] };
+    const err = (await boundedDown({ ...target, pendingReload: legacy }, w.driver, w.seams).catch(
+      (e: unknown) => e,
+    )) as DownTimeoutError;
+    expect(err.code).toBe("DOWN_TIMEOUT");
+    expect(err.details.force_killed).toEqual([{ service: "api", pid: 202 }]);
+    expect(err.details.remedy).toMatch(/waiting on web \(pid 301\)/);
+    expect(err.message).toContain("web (pid 301)");
+    expect(w.events).not.toContain("kill -301");
   });
 });
