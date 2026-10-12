@@ -506,4 +506,66 @@ describe("health — readStatusesWithin (running-instance selection read, #177)"
       message: expect.stringContaining("ECONNREFUSED"),
     });
   });
+
+  it("never outlives its budget when a read hangs: each read is bounded by the time left (#192)", async () => {
+    const budgets: number[] = [];
+    const source: ServiceStatusSource = {
+      getServiceStatuses: (_path, opts) =>
+        new Promise((_resolve, reject) => {
+          budgets.push(opts?.timeoutMs ?? -1);
+          setTimeout(() => reject(new Error("process list did not answer")), opts?.timeoutMs);
+        }),
+    };
+    const started = Date.now();
+    await expect(readStatusesWithin(source, "/s", 60, { pollMs: 5 })).rejects.toMatchObject({
+      code: "HEALTH_TIMEOUT",
+      message: expect.stringContaining("did not answer"),
+    });
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(budgets[0]).toBeLessThanOrEqual(60);
+    expect(budgets.every((b) => b >= 1 && b <= 5000)).toBe(true);
+  });
+
+  it("tells the caller once that reads are failing and being retried (#192)", async () => {
+    const notices: string[] = [];
+    const source = sourceFromQueue([new Error("busy"), new Error("busy"), [row("web", "Running")]]);
+    await readStatusesWithin(source, "/s", 1000, { pollMs: 1, notify: (m) => notices.push(m) });
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatch(/service status failed \(busy\); retrying for up to 1s/);
+  });
+
+  it("stays quiet when the first read succeeds", async () => {
+    const notices: string[] = [];
+    await readStatusesWithin(sourceFromQueue([[row("web", "Running")]]), "/s", 1000, {
+      notify: (m) => notices.push(m),
+    });
+    expect(notices).toEqual([]);
+  });
+});
+
+describe("health — a wedged instance cannot outlive --wait-timeout (#192)", () => {
+  it("the worktree wait fails within its timeout, passing each read the time left, and notifies once", async () => {
+    const budgets: number[] = [];
+    const notices: string[] = [];
+    const source: ServiceStatusSource = {
+      getServiceStatuses: (_path, opts) =>
+        new Promise((_resolve, reject) => {
+          budgets.push(opts?.timeoutMs ?? -1);
+          setTimeout(() => reject(new Error("process list did not answer")), opts?.timeoutMs);
+        }),
+    };
+    const wait = createWaitForHealth(source, { pollMs: 5, notify: (m) => notices.push(m) });
+    const started = Date.now();
+    await expect(
+      wait({
+        socketPath: "/s",
+        serviceNames: ["web"],
+        probedServiceNames: [],
+        timeoutMs: 60,
+      }),
+    ).rejects.toMatchObject({ code: "HEALTH_TIMEOUT" });
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(budgets.every((b) => b >= 1 && b <= 60)).toBe(true);
+    expect(notices).toHaveLength(1);
+  });
 });

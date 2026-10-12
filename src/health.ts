@@ -13,7 +13,7 @@
  * the event loop.
  */
 
-import type { ServiceStatus } from "./driver.js";
+import { READ_TIMEOUT_MS, type ServiceStatus } from "./driver.js";
 import {
   classifyService,
   deadServicesDetails,
@@ -28,7 +28,15 @@ import {
  * canned source and `createDriver(...)` satisfies it as-is.
  */
 export interface ServiceStatusSource {
-  getServiceStatuses(socketPath: string): Promise<ServiceStatus[]>;
+  /**
+   * `opts.timeoutMs` bounds this one read: a read still pending then is
+   * killed and rejects. Waits pass what is left of their budget (capped by
+   * the driver), so a wedged instance cannot outlive the wait.
+   */
+  getServiceStatuses(
+    socketPath: string,
+    opts?: { readonly timeoutMs?: number },
+  ): Promise<ServiceStatus[]>;
 }
 
 /**
@@ -107,31 +115,34 @@ class HealthTimeoutError extends Error {
 
 /**
  * One successful read of an instance's per-service state, retrying failed
- * reads (a busy or briefly unreachable socket). `timeoutMs` bounds the
- * retrying only: it is checked between attempts, so no new attempt starts
- * after the deadline, but a single read that hangs (a `process list` that
- * never returns) has no timeout of its own and is waited on until it
- * settles. `up` on a running instance needs this read to know what was
- * booted (ADR-0008), and must never report success without it. When the
- * deadline passes after a failed read it throws `HEALTH_TIMEOUT`, leaving
- * the instance running like any other wait failure.
+ * reads (a busy or briefly unreachable socket). `timeoutMs` bounds the whole
+ * call: each read gets at most what is left of the budget (and never more
+ * than the driver's read cap), so a `process list` that never returns is
+ * killed at the deadline instead of waited on. Total time stays within
+ * `timeoutMs` plus one poll delay. `up` on a running instance needs this read
+ * to know what was booted (ADR-0008), and must never report success without
+ * it. When the deadline passes after a failed read it throws `HEALTH_TIMEOUT`,
+ * leaving the instance running like any other wait failure. The first failed
+ * read is reported once through `tuning.notify`.
  */
 export async function readStatusesWithin(
   source: ServiceStatusSource,
   socketPath: string,
   timeoutMs: number,
-  tuning: Pick<PollerTuning, "pollMs"> = {},
+  tuning: Pick<PollerTuning, "pollMs" | "notify"> = {},
 ): Promise<ServiceStatus[]> {
   const pollMs = tuning.pollMs ?? HEALTH_POLL_MS;
   const deadline = Date.now() + timeoutMs;
+  const notifyFailure = createFailureNotifier(tuning.notify, timeoutMs);
   let lastError: unknown;
   do {
     try {
-      return await source.getServiceStatuses(socketPath);
+      return await source.getServiceStatuses(socketPath, { timeoutMs: readBudget(deadline) });
     } catch (err) {
       lastError = err;
+      notifyFailure(err);
     }
-    await sleep(pollMs);
+    await sleep(Math.min(pollMs, Math.max(0, deadline - Date.now())));
   } while (Date.now() < deadline);
   const reason = lastError instanceof Error ? ` (${lastError.message})` : "";
   throw new HealthTimeoutError(
@@ -139,6 +150,32 @@ export async function readStatusesWithin(
       `The worktree instance is still running — inspect it with \`devtrees ls --json\`, ` +
       `or restart it with \`devtrees down\` and \`devtrees up\`.`,
   );
+}
+
+/** One read's budget: what is left until `deadline`, capped at the driver's read cap. */
+function readBudget(deadline: number): number {
+  return Math.max(1, Math.min(READ_TIMEOUT_MS, deadline - Date.now()));
+}
+
+/**
+ * A once-only notice that status reads are failing and being retried, so a
+ * wait that can run for the whole `--wait-timeout` is not silent. Goes to the
+ * caller's `notify` (stderr, like every other `up` warning); a no-op without one.
+ */
+function createFailureNotifier(
+  notify: ((message: string) => void) | undefined,
+  timeoutMs: number,
+): (err: unknown) => void {
+  let told = false;
+  return (err) => {
+    if (told || notify === undefined) return;
+    told = true;
+    const why = err instanceof Error ? ` (${err.message})` : "";
+    notify(
+      `devtrees: reading the instance's service status failed${why}; ` +
+        `retrying for up to ${Math.round(timeoutMs / 1000)}s...`,
+    );
+  };
 }
 
 /**
@@ -166,6 +203,8 @@ export interface PollerTuning {
   readonly pollMs?: number;
   /** Shared-wait deadline. Default: 30s. The worktree wait takes its deadline per call. */
   readonly timeoutMs?: number;
+  /** Told once when status reads start failing and being retried. Default: silent. */
+  readonly notify?: (message: string) => void;
 }
 
 /** One poll's verdict over the named services. */
@@ -177,6 +216,8 @@ interface PollVerdict {
   readonly pending: ReadonlyArray<string>;
   /** The rows the poll read; empty when the read failed. */
   readonly rows: ReadonlyArray<ServiceStatus>;
+  /** Why the read failed, when it did. */
+  readonly readError?: unknown;
 }
 
 /**
@@ -184,8 +225,9 @@ interface PollVerdict {
  * report whether every named service is healthy, and which are dead. Probed
  * services (those in `probedServiceNames`) require `health === "ready"`; the
  * rest gate on process state (`HEALTHY_STATES`). A failed read (socket not
- * reachable yet — the instance is still starting) is "not ready, keep
- * polling", never an error.
+ * reachable yet — the instance is still starting, or wedged and the read timed
+ * out) is "not ready, keep polling", never an error; the verdict carries the
+ * cause in `readError`.
  *
  * A dead service is never healthy, whatever its status string: a crashed
  * `Completed` (non-zero exit) would otherwise pass the status gate the same
@@ -196,12 +238,13 @@ async function poll(
   socketPath: string,
   serviceNames: ReadonlyArray<string>,
   probedServiceNames: ReadonlyArray<string>,
+  deadline: number,
 ): Promise<PollVerdict> {
   let statuses: ServiceStatus[];
   try {
-    statuses = await source.getServiceStatuses(socketPath);
-  } catch {
-    return { healthy: false, dead: [], pending: serviceNames, rows: [] };
+    statuses = await source.getServiceStatuses(socketPath, { timeoutMs: readBudget(deadline) });
+  } catch (readError) {
+    return { healthy: false, dead: [], pending: serviceNames, rows: [], readError };
   }
   const dead = findDeadServices(statuses, serviceNames);
   const deadNames = new Set(dead.map((d) => d.name));
@@ -276,10 +319,18 @@ export function createWaitForSharedHealth(
   return async ({ socketPath, sharedServiceNames, probedServiceNames }) => {
     if (sharedServiceNames.length === 0) return;
     const deadline = Date.now() + timeoutMs;
+    const notifyFailure = createFailureNotifier(tuning.notify, timeoutMs);
     let lastDead: ReadonlyArray<DeadService> = [];
     while (Date.now() < deadline) {
-      const verdict = await poll(source, socketPath, sharedServiceNames, probedServiceNames);
+      const verdict = await poll(
+        source,
+        socketPath,
+        sharedServiceNames,
+        probedServiceNames,
+        deadline,
+      );
       if (verdict.healthy) return;
+      if (verdict.readError !== undefined) notifyFailure(verdict.readError);
       // Same two-consecutive-reads rule as the worktree wait: a shared service
       // that died (e.g. right after this `up` lazy-started it) will not come
       // back by waiting, and it is reported, never restarted (ADR-0008).
@@ -325,11 +376,13 @@ export function createWaitForHealth(
     const countable = createRestartTracker(args.restarted ?? []);
     const dying = deadServicesErrorFor(args);
     const deadline = Date.now() + timeoutMs;
+    const notifyFailure = createFailureNotifier(tuning.notify, timeoutMs);
     let lastDead: ReadonlyArray<DeadService> = [];
     let last: PollVerdict | undefined;
     while (Date.now() < deadline) {
-      last = await poll(source, socketPath, serviceNames, probedServiceNames);
+      last = await poll(source, socketPath, serviceNames, probedServiceNames, deadline);
       if (last.healthy) return;
+      if (last.readError !== undefined) notifyFailure(last.readError);
       const dead = countable(last);
       if (dead.length > 0 && sameDead(dead, lastDead)) throw dying(dead);
       lastDead = dead;

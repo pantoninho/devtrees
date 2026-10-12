@@ -4804,6 +4804,44 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
     await expect(runUp(deps)).rejects.toMatchObject({ code: "HEALTH_TIMEOUT" });
   });
 
+  it("#192: a status read that keeps failing prints one retry notice through warn", async () => {
+    const stack: ResolvedStack = { services: [isolated("web", "node a.js")] };
+    const warnings: string[] = [];
+    const { deps } = liveInstance(
+      stack,
+      { worktree: [] },
+      {
+        waitTimeoutMs: 300,
+        warn: (m) => warnings.push(m),
+        getServiceStatuses: async () => {
+          throw new Error("process list did not answer within 5s");
+        },
+      },
+    );
+    await expect(runUp(deps)).rejects.toMatchObject({ code: "HEALTH_TIMEOUT" });
+    const notices = warnings.filter((w) => /service status failed/.test(w));
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain("did not answer within 5s");
+  });
+
+  it("#192: a status read that hangs is cut off at the wait budget, not waited on forever", async () => {
+    const stack: ResolvedStack = { services: [isolated("web", "node a.js")] };
+    const { deps } = liveInstance(
+      stack,
+      { worktree: [] },
+      {
+        waitTimeoutMs: 150,
+        getServiceStatuses: (_socket, opts) =>
+          new Promise((_resolve, reject) => {
+            setTimeout(() => reject(new Error("wedged")), opts?.timeoutMs);
+          }),
+      },
+    );
+    const started = Date.now();
+    await expect(runUp(deps)).rejects.toMatchObject({ code: "HEALTH_TIMEOUT" });
+    expect(Date.now() - started).toBeLessThan(1500);
+  });
+
   it("a healthy re-up reads the instance once: the selection read is the health poll and the envelope", async () => {
     const stack: ResolvedStack = { services: [isolated("web", "node a.js", ["WEB_PORT"])] };
     const { deps, statusReads, wtSocket } = liveInstance(stack, { worktree: [running("web")] });

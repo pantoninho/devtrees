@@ -44,6 +44,7 @@ import { loadStack, type ResolvedService, type ResolvedStack, type Tier } from "
 import {
   createDriver,
   mergeAsyncIterables,
+  READ_TIMEOUT_MS,
   reloadTimeoutMs,
   type DriverDeps,
   type LogEvent,
@@ -612,7 +613,10 @@ export interface CommandDeps {
    * envelope. Default: shells out to the driver's `getServiceStatuses` (same
    * primitive `ls --json` uses, issue #29). Injected so tests stub it.
    */
-  readonly getServiceStatuses?: (socketPath: string) => Promise<ServiceStatus[]>;
+  readonly getServiceStatuses?: (
+    socketPath: string,
+    opts?: { readonly timeoutMs?: number },
+  ) => Promise<ServiceStatus[]>;
   /** Is a concrete port free to bind? Default: probes a real TCP bind. */
   readonly isPortFree?: (port: number) => boolean | Promise<boolean>;
   /**
@@ -1244,7 +1248,10 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
       warn(formatHealthWaitNotice(sharedNames));
       const wait =
         deps.waitForSharedHealth ??
-        createWaitForSharedHealth({ getServiceStatuses: statusReader(deps, driver) });
+        createWaitForSharedHealth(
+          { getServiceStatuses: statusReader(deps, driver) },
+          { notify: warn },
+        );
       await wait({
         anchor: anchor.anchor,
         socketPath: sharedPaths.socketPath,
@@ -1346,7 +1353,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
   // Headless paths (`--json` / `--no-attach`): no TUI to render progress, so the
   // silent health-wait is what turns "up returned" into "the stack is serving
   // traffic" (PRD #26, ADR-0005), and HEALTH_TIMEOUT surfaces a stuck start.
-  await waitForWorktreeHealth(stack, outcome, paths.socketPath, deps, driver);
+  await waitForWorktreeHealth(stack, outcome, paths.socketPath, deps, driver, warn);
 
   // After the health-wait, snapshot the per-service runtime rows so the
   // issue-#30 `up --json` envelope can publish them without a follow-up
@@ -2726,6 +2733,7 @@ async function verifyRunning(args: {
     { getServiceStatuses: statusReader(deps, driver) },
     socketPath,
     timeoutMs,
+    { notify: args.warn },
   );
   const present = new Set(rows.map((r) => r.name));
   const selection = resolveRunningSelection(isolated, present, deps.namespaces);
@@ -2750,6 +2758,7 @@ async function verifyRunning(args: {
   // Outside the lifecycle lock, like the fresh path's wait.
   const lastRows = await waitForSelectedHealth(selection.services, socketPath, deps, driver, {
     remedy,
+    warn: args.warn,
     ...(restarted.length === 0 ? { firstRead } : { restarted }),
   });
   return {
@@ -2786,6 +2795,7 @@ async function restartDeadServices(args: {
   readonly deps: CommandDeps;
   readonly driver: ReturnType<typeof createDriver>;
   readonly remedy: string;
+  readonly warn: (message: string) => void;
 }): Promise<{ restarted: RestartedService[]; firstRead: ServiceStatus[] }> {
   if (findDeadServices(args.rows, args.names).length === 0) {
     return { restarted: [], firstRead: args.rows };
@@ -2799,6 +2809,7 @@ async function restartDeadServices(args: {
       { getServiceStatuses: statusReader(args.deps, args.driver) },
       args.socketPath,
       Math.min(args.deps.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS, RESTART_READ_TIMEOUT_MS),
+      { notify: args.warn },
     );
     const dead = findDeadServices(fresh, args.names).map((d) => d.name);
     const restarted = await startServices({
@@ -2811,7 +2822,7 @@ async function restartDeadServices(args: {
 }
 
 /** Budget for the re-read `restartDeadServices` makes under the lock. */
-const RESTART_READ_TIMEOUT_MS = 5000;
+const RESTART_READ_TIMEOUT_MS = READ_TIMEOUT_MS;
 
 /**
  * Start `names` over the instance's control socket, in the order given (the
@@ -2979,13 +2990,20 @@ async function waitForWorktreeHealth(
   },
   socketPath: string,
   deps: CommandDeps,
-  driver: { getServiceStatuses(socketPath: string): Promise<ServiceStatus[]> },
+  driver: {
+    getServiceStatuses(
+      socketPath: string,
+      opts?: { readonly timeoutMs?: number },
+    ): Promise<ServiceStatus[]>;
+  },
+  warn: (message: string) => void,
 ): Promise<void> {
   // `isolated` is the fresh selection (`resolveFreshSelection`): the isolated
   // tier intersected with the selected namespaces (issue #128) — `default`
   // alone on a bare `up` (#176).
   await waitForSelectedHealth(fresh.selected, socketPath, deps, driver, {
     remedy: `devtrees down && ${formatUpCommand(stack.services, fresh.namespaces)}`,
+    warn,
   });
 }
 
@@ -3000,9 +3018,16 @@ async function waitForSelectedHealth(
   services: ReadonlyArray<ResolvedService>,
   socketPath: string,
   deps: CommandDeps,
-  driver: { getServiceStatuses(socketPath: string): Promise<ServiceStatus[]> },
+  driver: {
+    getServiceStatuses(
+      socketPath: string,
+      opts?: { readonly timeoutMs?: number },
+    ): Promise<ServiceStatus[]>;
+  },
   opts: {
     readonly remedy: string;
+    /** Told once when status reads start failing and being retried. */
+    readonly warn?: (message: string) => void;
     /**
      * Rows the caller just read from this instance. Served as the first poll
      * so an already-healthy running instance costs no extra process-compose
@@ -3018,16 +3043,20 @@ async function waitForSelectedHealth(
   // The rows the wait last saw — on success, the poll that passed — so the
   // caller can build its envelope without another process-compose round-trip.
   let lastRows = opts.firstRead;
-  const getServiceStatuses = async (path: string): Promise<ServiceStatus[]> => {
+  const getServiceStatuses = async (
+    path: string,
+    readOpts?: { readonly timeoutMs?: number },
+  ): Promise<ServiceStatus[]> => {
     if (primed !== undefined) {
       const rows = primed;
       primed = undefined;
       return rows;
     }
-    lastRows = await read(path);
+    lastRows = await read(path, readOpts);
     return lastRows;
   };
-  const wait = deps.waitForHealth ?? createWaitForHealth({ getServiceStatuses });
+  const wait =
+    deps.waitForHealth ?? createWaitForHealth({ getServiceStatuses }, { notify: opts.warn });
   await wait({
     socketPath,
     serviceNames: services.map((s) => s.name),
@@ -3042,9 +3071,17 @@ async function waitForSelectedHealth(
 /** The per-service status read: the injected seam, else the driver. */
 function statusReader(
   deps: CommandDeps,
-  driver: { getServiceStatuses(socketPath: string): Promise<ServiceStatus[]> },
-): (socketPath: string) => Promise<ServiceStatus[]> {
-  return deps.getServiceStatuses ?? ((socketPath) => driver.getServiceStatuses(socketPath));
+  driver: {
+    getServiceStatuses(
+      socketPath: string,
+      opts?: { readonly timeoutMs?: number },
+    ): Promise<ServiceStatus[]>;
+  },
+): (socketPath: string, opts?: { readonly timeoutMs?: number }) => Promise<ServiceStatus[]> {
+  return (
+    deps.getServiceStatuses ??
+    ((socketPath, readOpts) => driver.getServiceStatuses(socketPath, readOpts))
+  );
 }
 
 /**
