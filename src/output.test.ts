@@ -951,7 +951,24 @@ describe("output formatter — formatPrune", () => {
     const json = formatPrune([], "json", [], kept);
     expect(json.stderr).toBe("");
     const parsed = JSON.parse(json.stdout) as { prune: { unreclaimed: unknown[] } };
-    expect(parsed.prune.unreclaimed).toEqual(kept);
+    expect(parsed.prune.unreclaimed).toEqual([{ ...kept[0], force_killed: [] }]);
+  });
+
+  it("carries force_killed on an unreclaimed orphan whose stop timed out (#190)", () => {
+    const kept = [
+      {
+        id: "removed",
+        kind: "worktree" as const,
+        worktreePath: "/gone/removed",
+        socketPath: "/run/removed.sock",
+        message: "DOWN_TIMEOUT",
+        forceKilled: [{ service: "web", pid: 4242 }],
+      },
+    ];
+    const parsed = JSON.parse(formatPrune([], "json", [], kept).stdout) as {
+      prune: { unreclaimed: Array<Record<string, unknown>> };
+    };
+    expect(parsed.prune.unreclaimed[0]?.force_killed).toEqual([{ service: "web", pid: 4242 }]);
   });
 });
 

@@ -329,6 +329,8 @@ export interface UnreclaimedRow {
   readonly worktreePath: string;
   readonly socketPath: string;
   readonly message: string;
+  /** Service processes devtrees SIGKILLed before the stop timed out (#190). */
+  readonly forceKilled?: ReadonlyArray<ForceKilledRow>;
 }
 
 function formatUnreclaimedStderr(u: UnreclaimedRow): string {
@@ -407,6 +409,7 @@ export function formatPrune(
           worktreePath: u.worktreePath,
           socketPath: u.socketPath,
           message: u.message,
+          force_killed: forceKilledJson(u.forceKilled),
         })),
       },
     };

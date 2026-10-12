@@ -64,6 +64,21 @@ describe("findSupervisorPid", () => {
     expect(findSupervisorPid([client, other], SOCK)).toBeUndefined();
   });
 
+  it("matches a socket path containing spaces, at the end of argv or mid-argv", () => {
+    const spaced = "/Users/me/My Repo/.git/devtrees/run/login-1234.sock";
+    const atEnd = { ...PC, command: `process-compose up -f /a b.yaml -U -u ${spaced}` };
+    const mid = {
+      ...PC,
+      pid: 102,
+      command: `process-compose up -U --unix-socket ${spaced} -t=false`,
+    };
+    expect(findSupervisorPid([atEnd], spaced)).toBe(100);
+    expect(findSupervisorPid([mid], spaced)).toBe(102);
+    // A path that merely starts with the socket path is another socket.
+    const longer = { ...PC, command: `process-compose up -U -u ${spaced}.bak` };
+    expect(findSupervisorPid([longer], spaced)).toBeUndefined();
+  });
+
   it("refuses to guess between two matches", () => {
     expect(findSupervisorPid([PC, { ...PC, pid: 101 }], SOCK)).toBeUndefined();
   });
@@ -263,7 +278,7 @@ describe("boundedDown", () => {
     expect(err?.code).toBe("DOWN_TIMEOUT");
     expect(err?.details.process_compose_pid).toBe(100);
     expect(err?.details.stuck_services).toEqual([]);
-    expect(err?.message).toMatch(/shutdown\.command may be what hangs/);
+    expect(err?.message).toMatch(/No service process devtrees recorded was still running/);
     expect(w.kills).toEqual([]);
   });
 

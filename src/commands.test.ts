@@ -6559,6 +6559,7 @@ describe("bounded down — force-kill and DOWN_TIMEOUT (#190)", () => {
     ]);
     expect(result.unreclaimed[0]?.message).toMatch(/did not stop within/);
     expect(result.unreclaimed[0]?.message).toContain("`devtrees prune`");
+    expect(result.unreclaimed[0]?.forceKilled).toEqual([{ service: "web", pid: WEB_PID }]);
     expect(existsSync(orphan.socketPath)).toBe(true);
     expect(existsSync(orphan.configPath)).toBe(true);
     expect(registryRef.snapshot.removed).toBe(20032);

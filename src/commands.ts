@@ -135,7 +135,8 @@ export type { WaitForHealth, WaitForSharedHealth } from "./health.js";
  *
  * `details.reason` lets an agent branch without parsing the message:
  * `timeout` means process-compose is still waiting for a changed service's
- * old process to exit (`down` would block too). `not_supported` / `error`
+ * old process to exit (`down` fails with `DOWN_TIMEOUT`: the old process is
+ * no longer listed, so it is not force-killed). `not_supported` / `error`
  * mean the reload was refused and the instance is untouched.
  * `reload_pending` (#191) means `up` did not reload at all: an earlier
  * reload is still waiting on an old process, and a second one would start an
@@ -2391,6 +2392,8 @@ export interface UnreclaimedOrphan {
   readonly socketPath: string;
   /** Why the graceful `process-compose down` failed. */
   readonly message: string;
+  /** Service processes devtrees SIGKILLed before the stop timed out (#190). */
+  readonly forceKilled?: ReadonlyArray<ForceKilled>;
 }
 
 /**
@@ -2487,6 +2490,7 @@ export async function runPrune(deps: PruneDeps = {}): Promise<PruneResult> {
         worktreePath: reported[i]?.worktreePath ?? "",
         socketPath: orphan.socketPath,
         message: outcome.downFailure,
+        forceKilled: outcome.forceKilled,
       });
     }
   }
@@ -2994,7 +2998,8 @@ const RELOAD_FAILED_REMEDIATION =
 
 /**
  * A timed-out reload means process-compose is still waiting for an old process
- * to exit, and `down` would wait on the same process. Killing that process
+ * to exit, and `down` would wait on the same process until its budget runs
+ * out, then fail with `DOWN_TIMEOUT`. Killing that process
  * unblocks process-compose, which then finishes applying the new config. A
  * second reload before then would start a new copy next to the old process,
  * and the pending update would later start another one, orphaning the first
@@ -3002,7 +3007,8 @@ const RELOAD_FAILED_REMEDIATION =
  */
 const RELOAD_TIMEOUT_REMEDIATION =
   ". The instance is still running, but process-compose stays blocked until the old " +
-  "process exits, and `devtrees down` would block on it too. Kill the service's old process " +
+  "process exits, and `devtrees down` cannot force-kill it either (process-compose no " +
+  "longer lists it), so it fails with `DOWN_TIMEOUT` after its budget. Kill the service's old process " +
   "to let the reload finish, then run `devtrees up` again to resync the on-disk config and " +
   "stored hash; until that process has exited, `devtrees up` refuses with " +
   "`reload_pending` instead of reloading again (a second reload would start an untracked " +

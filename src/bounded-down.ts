@@ -81,19 +81,33 @@ function readProcessTable(): Promise<ProcessRow[]> {
  * The pid of the process-compose server bound to `socketPath`: the process
  * whose argv is an `up` with `-u <socketPath>` (how devtrees starts every
  * instance). `undefined` when none, or more than one, matches.
+ *
+ * The socket path is matched against the raw command line, not a
+ * whitespace split, because a path may contain spaces (the legacy
+ * `<anchor>/devtrees/run` dir, a `DEVTREES_RUNTIME_DIR` override).
  */
 export function findSupervisorPid(
   table: ReadonlyArray<ProcessRow>,
   socketPath: string,
 ): number | undefined {
-  const matches = table.filter((row) => {
-    const argv = row.command.split(/\s+/);
-    if (!argv.includes("up")) return false;
-    return argv.some(
-      (token, i) => (token === "-u" || token === "--unix-socket") && argv[i + 1] === socketPath,
-    );
-  });
+  const matches = table.filter(
+    (row) => row.command.split(/\s+/).includes("up") && namesSocket(row.command, socketPath),
+  );
   return matches.length === 1 ? matches[0]?.pid : undefined;
+}
+
+/** Does `command` pass `socketPath` as its `-u`/`--unix-socket` value? */
+function namesSocket(command: string, socketPath: string): boolean {
+  for (const flag of [" -u ", " --unix-socket "]) {
+    const needle = `${flag}${socketPath}`;
+    let at = command.indexOf(needle);
+    while (at !== -1) {
+      const after = command[at + needle.length];
+      if (after === undefined || after === " ") return true;
+      at = command.indexOf(needle, at + 1);
+    }
+  }
+  return false;
 }
 
 /**
@@ -174,7 +188,7 @@ export class DownTimeoutError extends Error {
         : `its process-compose (pid ${details.process_compose_pid})`;
     const stuck =
       details.stuck_services.length === 0
-        ? "No service process was still running, so a shutdown.command may be what hangs."
+        ? "No service process devtrees recorded was still running: process-compose may be waiting on a shutdown.command, or on a process it no longer lists (such as a service's old process after a CONFIG_DRIFT timeout)."
         : `Stuck: ${describeProcesses(details.stuck_services)}.`;
     const killed =
       details.force_killed.length === 0

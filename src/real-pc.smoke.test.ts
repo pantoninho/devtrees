@@ -982,7 +982,8 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
     const wt = repo.worktrees.login!;
     const [holdA, holdB] = [join(repo.root, "hold-a"), join(repo.root, "hold-b")];
     writeReloadStack(wt, { hold: holdA, shutdownCommand: "echo bye" });
-    // `devtrees down` would block on the same never-stopping process, so tear
+    // `devtrees down` cannot force-kill the old process (process-compose no
+    // longer lists it) and would fail DOWN_TIMEOUT after its budget, so tear
     // down by killing everything this scenario spawned.
     cleanupStack.push(() => reapPids(pidsMatching(repo.root)));
 
