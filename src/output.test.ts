@@ -68,6 +68,10 @@ describe("output formatter — constants", () => {
     expect(ERROR_CODES).toContain("SHARED_START_FAILED");
     expect(ERROR_CODES).toContain("WORKTREE_START_FAILED");
   });
+
+  it("declares NO_SERVICES_SELECTED so a bare up with nothing in `default` fails loudly (#176)", () => {
+    expect(ERROR_CODES).toContain("NO_SERVICES_SELECTED");
+  });
 });
 
 describe("output formatter — classifyError", () => {

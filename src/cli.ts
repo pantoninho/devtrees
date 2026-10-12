@@ -107,7 +107,7 @@ export interface UpOptions {
   /**
    * process-compose namespaces to start (`-n/--namespace`, issue #128),
    * repeatable and forwarded verbatim. Omitted when no `-n` flag is given, so
-   * `runUp`'s default (all namespaces) applies.
+   * `runUp`'s default applies (a fresh start selects only `default`, #176).
    */
   readonly namespaces?: ReadonlyArray<string>;
 }
@@ -130,7 +130,7 @@ export interface ExecuteDeps {
    * carries the allocated worktree ports (and injected shared ports) a sibling
    * reads off the `--json` envelope (#125).
    */
-  upDryRun?: () => Promise<{
+  upDryRun?: (options?: { readonly namespaces?: ReadonlyArray<string> }) => Promise<{
     worktreeId: string;
     env: Record<string, string>;
     config: DerivedConfig;
@@ -141,6 +141,12 @@ export interface ExecuteDeps {
      * Optional so a test stub can omit it; absent is read as "none dropped".
      */
     droppedEdges?: ReadonlyArray<DroppedEdge>;
+    /**
+     * The namespace selection a fresh `up` would apply (issue #176) and the
+     * isolated services it starts. Optional so a test stub can omit them.
+     */
+    namespaces?: ReadonlyArray<string>;
+    selectedServices?: ReadonlyArray<string>;
   }>;
   down: (options: {
     shared: boolean;
@@ -288,7 +294,9 @@ class UpCommand extends DevtreesCommand {
     // `--dry-run` runs only the derivation pipeline (load devtrees.yaml →
     // CONFIG_INVALID; allocate ports under the registry lock → LOCK_CONTENTION)
     // and stops before any side effect, so it can only emit the allocation
-    // subset of the codes below (#124).
+    // subset of the codes below (#124), plus NO_SERVICES_SELECTED (#176).
+    // NO_SERVICES_SELECTED: a bare fresh `up` whose `default` namespace has no
+    // services (namespaces are opt-in, ADR-0008).
     details: errorCodeFooter([
       "PROCESS_COMPOSE_TOO_OLD",
       "STALE_PORT_BLOCK",
@@ -296,6 +304,7 @@ class UpCommand extends DevtreesCommand {
       "SHARED_DRIFT",
       "SHARED_START_FAILED",
       "WORKTREE_START_FAILED",
+      "NO_SERVICES_SELECTED",
       "SOCKET_PATH_TOO_LONG",
       "CONFIG_INVALID",
       "LOCK_CONTENTION",
@@ -305,7 +314,9 @@ class UpCommand extends DevtreesCommand {
       "UNKNOWN",
     ]),
     examples: [
-      ["Bring up the stack", "devtrees up"],
+      ["Bring up the stack (the `default` namespace only)", "devtrees up"],
+      ["Bring up only the `app` namespace", "devtrees up -n app"],
+      ["Bring up `default` plus the `app` namespace", "devtrees up -n default -n app"],
       ["Bring up + emit JSON envelope", "devtrees up --json"],
       ["Bring up with a 30s health-wait window", "devtrees up --wait-timeout 30"],
       ["Preview the derived config(s) + env without side effects", "devtrees up --dry-run --json"],
@@ -329,13 +340,16 @@ class UpCommand extends DevtreesCommand {
   });
   // process-compose `-n/--namespace` (issue #128): a repeatable string-array
   // selecting which namespace subset to start. Repeat the flag to pass more
-  // than one (`-n a -n b`); omitted starts every namespace (the default). The
+  // than one (`-n a -n b`). Namespaces are opt-in (issue #176, ADR-0008):
+  // omitted, a fresh `up` starts only the `default` namespace (services with
+  // no `namespace:`); `-n` is exact and never implies `default`. The
   // selection also narrows the health-wait's expected set so `up -n default`
   // never waits on a probed service in an excluded namespace.
   namespaces = Option.Array("--namespace,-n", {
     description:
-      "Start only the given process-compose namespace(s). Repeatable (`-n a -n b`); " +
-      "omitted starts all namespaces (the default).",
+      "Start exactly the given process-compose namespace(s). Repeatable (`-n a -n b`); " +
+      "`-n app` does not imply `default`. Omitted, a fresh `up` starts only the `default` " +
+      "namespace (services with no `namespace:`) and fails with NO_SERVICES_SELECTED if it has none.",
   });
   dryRun = Option.Boolean("--dry-run", false, {
     description:
@@ -369,7 +383,7 @@ class UpCommand extends DevtreesCommand {
 
   /**
    * Collect the parsed `up` flags into `UpOptions`, omitting each absent one so
-   * `runUp`'s own defaults apply (TTY-based attach, 120s wait, all namespaces).
+   * `runUp`'s own defaults apply (TTY-based attach, 120s wait, `default` namespace only).
    * Extracted from `execute` so the dispatch body stays a flat sequence and its
    * cyclomatic complexity doesn't grow per optional flag.
    *
@@ -386,10 +400,15 @@ class UpCommand extends DevtreesCommand {
       ...(this.waitTimeout !== undefined
         ? { waitTimeoutMs: parseWaitTimeoutSecondsToMs(this.waitTimeout) }
         : {}),
-      ...(this.namespaces !== undefined && this.namespaces.length > 0
-        ? { namespaces: this.namespaces }
-        : {}),
+      ...this.namespaceOptions(),
     };
+  }
+
+  /** The `-n` values as an options fragment; empty when none were given. */
+  private namespaceOptions(): { namespaces?: ReadonlyArray<string> } {
+    return this.namespaces !== undefined && this.namespaces.length > 0
+      ? { namespaces: this.namespaces }
+      : {};
   }
 
   /**
@@ -417,7 +436,7 @@ class UpCommand extends DevtreesCommand {
    */
   private async executeDryRun(): Promise<number> {
     if (!this.context.deps.upDryRun) return 0;
-    const result = await this.context.deps.upDryRun();
+    const result = await this.context.deps.upDryRun(this.namespaceOptions());
     const out = formatUpDryRun(
       {
         worktreeId: result.worktreeId,
@@ -426,6 +445,14 @@ class UpCommand extends DevtreesCommand {
         ...(result.sharedEnv !== undefined ? { sharedEnv: result.sharedEnv } : {}),
         ...(result.sharedConfig !== undefined ? { sharedConfig: result.sharedConfig } : {}),
         droppedEdges: result.droppedEdges ?? [],
+        ...(result.namespaces !== undefined
+          ? {
+              selection: {
+                namespaces: result.namespaces,
+                services: result.selectedServices ?? [],
+              },
+            }
+          : {}),
       },
       this.mode,
     );
@@ -960,7 +987,8 @@ if (isEntrypoint(import.meta.url, process.argv[1])) {
         ...(options?.waitTimeoutMs !== undefined ? { waitTimeoutMs: options.waitTimeoutMs } : {}),
         ...(options?.namespaces !== undefined ? { namespaces: options.namespaces } : {}),
       }),
-    upDryRun: () => runUpDryRun(),
+    upDryRun: (options) =>
+      runUpDryRun(options?.namespaces !== undefined ? { namespaces: options.namespaces } : {}),
     down: ({ shared }) => runDown({}, { shared }),
     ls: () => runLs(),
     attach: ({ shared }) => runAttach({}, { shared }),

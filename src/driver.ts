@@ -87,7 +87,8 @@ export function isAtLeastVersion(version: string, minimum: string): boolean {
  * `namespaces` is forwarded verbatim as process-compose's repeatable
  * `-n/--namespace` flag (a `stringArray`) — one `-n <ns>` token per value
  * (issue #128). Empty / omitted means no flag, which is process-compose's
- * "run all namespaces" default (unchanged behaviour for existing stacks).
+ * "run all namespaces" default. `runUp` never relies on that: a bare fresh
+ * `up` resolves to `-n default` first (namespaces are opt-in, #176).
  */
 export function buildUpArgs(inst: InstanceRef, namespaces: ReadonlyArray<string> = []): string[] {
   const args = ["up", "-f", inst.configPath, "-U", "-u", inst.socketPath, "-t=false"];
@@ -316,7 +317,8 @@ export function createDriver(deps: DriverDeps = {}) {
     /**
      * Start the instance's server in the background. `namespaces` (issue #128)
      * is forwarded verbatim as process-compose's repeatable `-n` flag; empty
-     * means all namespaces (the unchanged default).
+     * means process-compose's all-namespaces default, which `runUp` never
+     * passes on a fresh start (#176).
      */
     async up(inst: InstanceRef, namespaces: ReadonlyArray<string> = []): Promise<void> {
       await ensureBinary({ binary, exists });

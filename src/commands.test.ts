@@ -1400,29 +1400,124 @@ describe("runUp — namespace selection (#128)", () => {
     expect(observed).toEqual({ serviceNames: ["api"], probedServiceNames: ["api"] });
   });
 
-  it("with no namespaces requested, the full isolated set is expected (unchanged default)", async () => {
+  /** Capture the worktree up-spawn's argv alongside the stub spawner. */
+  function capturingUpArgs(base: ReturnType<typeof stubDeps>) {
+    const inner = base.driver?.spawner;
+    if (inner === undefined) throw new Error("expected stub spawner");
+    const captured: { args?: ReadonlyArray<string> } = {};
+    const driver = {
+      ...base.driver,
+      spawner: ((binary, args, options) => {
+        if (args[0] === "up") captured.args = args;
+        return inner(binary, args, options);
+      }) as typeof inner,
+    };
+    return { captured, driver };
+  }
+
+  it("a bare fresh up selects only `default`: spawns with `-n default` and waits only on default services (#176)", async () => {
     let observed: string[] | undefined;
     const track: StubSpawn = { invocations: [], touchSocket: false };
     const baseDeps = stubDeps({ stack: mixedNamespaces, track });
-    const inner = baseDeps.driver?.spawner;
-    if (inner === undefined) throw new Error("expected stub spawner");
-    let upArgs: ReadonlyArray<string> | undefined;
+    const { captured, driver } = capturingUpArgs(baseDeps);
     const deps: CommandDeps = {
       ...baseDeps,
+      driver,
       waitForHealth: async ({ serviceNames }) => {
         observed = [...serviceNames].sort();
       },
-      driver: {
-        ...baseDeps.driver,
-        spawner: (binary, args, options) => {
-          if (args[0] === "up") upArgs = args;
-          return inner(binary, args, options);
-        },
-      },
     };
     await runUp(deps);
-    expect(observed).toEqual(["api", "web"]);
-    expect(upArgs?.includes("-n")).toBe(false);
+    // Namespaces are opt-in (ADR-0008): the excluded local-backend api is
+    // neither started nor waited on.
+    expect(observed).toEqual(["web"]);
+    const args = captured.args ?? [];
+    expect(args.filter((a) => a === "-n")).toHaveLength(1);
+    expect(args.join(" ")).toContain("-n default");
+  });
+
+  it("`-n <ns>` stays exact: it never adds `default` on top (#176)", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const baseDeps = stubDeps({ stack: mixedNamespaces, track });
+    const { captured, driver } = capturingUpArgs(baseDeps);
+    await runUp({
+      ...baseDeps,
+      driver,
+      namespaces: ["local-backend"],
+      waitForHealth: async () => {},
+    });
+    const args = captured.args ?? [];
+    expect(args.filter((a) => a === "-n")).toHaveLength(1);
+    expect(args.join(" ")).toContain("-n local-backend");
+    expect(args).not.toContain("default");
+  });
+
+  /** Every isolated service in a named namespace — nothing in `default`. */
+  const allNamespaced: ResolvedStack = {
+    services: [
+      { ...isolated("web", "node web.js", ["WEB_PORT"]), namespace: "app" },
+      { ...isolated("api", "node api.js", ["API_PORT"]), namespace: "local-backend" },
+      { ...isolated("worker", "node worker.js", []), namespace: "app" },
+    ],
+  };
+
+  it("a bare fresh up with no `default` services fails NO_SERVICES_SELECTED before any spawn (#176)", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const deps = stubDeps({ stack: allNamespaced, track });
+    const err = await runUp(deps).then(
+      () => undefined,
+      (e: unknown) => e as Error & { code?: string; details?: Record<string, unknown> },
+    );
+    expect(err?.code).toBe("NO_SERVICES_SELECTED");
+    expect(err?.details).toEqual({
+      worktree_id: deps.expectedWorktreeId,
+      selected_namespaces: ["default"],
+      namespaces: ["app", "local-backend"],
+    });
+    expect(err?.message).toContain("Available namespaces: app, local-backend");
+    expect(err?.message).toContain("devtrees up -n app");
+    expect(track.invocations).toEqual([]);
+  });
+
+  it("`-n` naming a namespace with services still starts on the all-namespaced stack (#176)", async () => {
+    let observed: string[] | undefined;
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    await runUp({
+      ...stubDeps({ stack: allNamespaced, track }),
+      namespaces: ["app"],
+      waitForHealth: async ({ serviceNames }) => {
+        observed = [...serviceNames].sort();
+      },
+    });
+    expect(observed).toEqual(["web", "worker"]);
+  });
+
+  it("`-n` naming a namespace with NO services is not an error today (ADR-0008 leaves it undecided)", async () => {
+    // Pins current behaviour so any later change (e.g. making this
+    // NO_SERVICES_SELECTED too) is a deliberate decision, not an accident.
+    let observed: string[] | undefined;
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const result = await runUp({
+      ...stubDeps({ stack: allNamespaced, track }),
+      namespaces: ["nope"],
+      waitForHealth: async ({ serviceNames }) => {
+        observed = [...serviceNames];
+      },
+    });
+    expect(result.worktreeId).toBeDefined();
+    expect(observed).toEqual([]);
+    expect(track.invocations.length).toBeGreaterThan(0);
+  });
+
+  it("a bare up on a RUNNING instance is not a fresh start: no NO_SERVICES_SELECTED, no spawn (#177's scope)", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const baseDeps = stubDeps({ stack: allNamespaced, track });
+    await runUp({ ...baseDeps, namespaces: ["app"], waitForHealth: async () => {} });
+    const spawnsAfterBoot = track.invocations.length;
+    // Bare re-up against the live instance takes the reconcile path unchanged.
+    const result = await runUp({ ...baseDeps, probeSocket: async () => "running" as const });
+    expect(result.worktreeId).toBe(baseDeps.expectedWorktreeId);
+    expect(track.invocations).toHaveLength(spawnsAfterBoot);
   });
 });
 
@@ -2009,6 +2104,45 @@ describe("runDown — dead-supervisor reap of out-of-band resources (#148)", () 
       expect(result.warning?.orphanId).toBe(deps.expectedWorktreeId);
       expect(result.warning?.failures[0]?.reason).toBe("timeout");
     }
+  });
+});
+
+describe("runUpDryRun — namespace selection preview (#176)", () => {
+  const mixed: ResolvedStack = {
+    services: [
+      isolated("web", "node web.js", ["WEB_PORT"]),
+      { ...isolated("api", "node api.js", ["API_PORT"]), namespace: "local-backend" },
+    ],
+  };
+
+  it("a bare dry run previews the `default`-only selection", async () => {
+    const result = await runUpDryRun(stubDeps({ stack: mixed }));
+    expect(result.namespaces).toEqual(["default"]);
+    expect(result.selectedServices).toEqual(["web"]);
+    // The derived config still carries every service; `-n` filters at launch.
+    expect(Object.keys(result.config.processes).sort()).toEqual(["api", "web"]);
+  });
+
+  it("`-n` is previewed verbatim and exactly", async () => {
+    const result = await runUpDryRun({
+      ...stubDeps({ stack: mixed }),
+      namespaces: ["local-backend"],
+    });
+    expect(result.namespaces).toEqual(["local-backend"]);
+    expect(result.selectedServices).toEqual(["api"]);
+  });
+
+  it("a bare dry run of an all-namespaced stack fails NO_SERVICES_SELECTED without touching the registry", async () => {
+    const registryRef = { snapshot: {} as RegistrySnapshot };
+    const deps = stubDeps({
+      stack: { services: [{ ...isolated("api", "node api.js", ["API_PORT"]), namespace: "app" }] },
+      registryRef,
+    });
+    await expect(runUpDryRun(deps)).rejects.toMatchObject({
+      code: "NO_SERVICES_SELECTED",
+      details: { namespaces: ["app"] },
+    });
+    expect(registryRef.snapshot).toEqual({});
   });
 });
 
