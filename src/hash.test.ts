@@ -340,3 +340,36 @@ describe("sharedStackHash vs forwarded fields (#175)", () => {
     expect(sharedStackHash(a)).toBe(sharedStackHash(b));
   });
 });
+
+describe("shared services' #183 fields vs stackHash (#185)", () => {
+  const edits = {
+    shutdown: { shutdown: { command: "x" } },
+    isDaemon: { isDaemon: true },
+    launchTimeoutSeconds: { launchTimeoutSeconds: 9 },
+    logLocation: { logLocation: "pg.log" },
+    logConfiguration: { logConfiguration: { rotation: { max_size_mb: 1 } } },
+  } as const;
+
+  for (const [field, edit] of Object.entries(edits)) {
+    it(`editing a shared service's ${field} leaves stackHash unchanged`, () => {
+      const base = svc("pg", "postgres", ["DB_PORT"], "shared");
+      const a: ResolvedStack = { services: [base, svc("web", "node x.js")] };
+      const b: ResolvedStack = { services: [{ ...base, ...edit }, svc("web", "node x.js")] };
+      expect(stackHash(b)).toBe(stackHash(a));
+    });
+
+    it(`editing an isolated service's ${field} still changes stackHash`, () => {
+      const base = svc("web", "node x.js");
+      const a: ResolvedStack = { services: [base] };
+      const b: ResolvedStack = { services: [{ ...base, ...edit }] };
+      expect(stackHash(b)).not.toBe(stackHash(a));
+    });
+  }
+
+  it("still covers what a shared service had hashed before #183", () => {
+    const base = svc("pg", "postgres", ["DB_PORT"], "shared");
+    const a: ResolvedStack = { services: [base] };
+    expect(stackHash({ services: [{ ...base, command: "postgres -x" }] })).not.toBe(stackHash(a));
+    expect(stackHash({ services: [{ ...base, namespace: "db" }] })).not.toBe(stackHash(a));
+  });
+});

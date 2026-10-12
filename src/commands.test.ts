@@ -5421,6 +5421,68 @@ describe("runUp / runEnv — shared port map persistence & drift (#83)", () => {
     });
   });
 
+  describe("shared-only field edits (#185)", () => {
+    const withShutdown = (cmd: string): ResolvedStack => ({
+      services: [
+        { ...shared("postgres", "postgres -D ./pgdata", ["DB_PORT"]), shutdown: { command: cmd } },
+        isolated("web", "node server.js", ["WEB_PORT"]),
+      ],
+    });
+
+    it("an edit to a shared service's shutdown warns, does not reload, and does not drift", async () => {
+      const fixture = multiWorktreeFixture("dt-shared-field-");
+      const before = withShutdown("pg_ctl stop");
+      const after = withShutdown("pg_ctl stop -m fast");
+      expect(stackHash(after)).toBe(stackHash(before));
+
+      await runUp(worktreeDeps(fixture, before, "login"));
+      const track: StubSpawn = { invocations: [], touchSocket: true };
+      const warnings: string[] = [];
+      const result = await runUp({
+        ...worktreeDeps(fixture, after, "login", track),
+        warn: (m) => warnings.push(m),
+      });
+
+      expect(result.sharedFieldChanges).toEqual([{ service: "postgres", field: "shutdown" }]);
+      const line = warnings.find((w) => w.includes("shared service 'postgres'"));
+      expect(line).toMatch(/'shutdown'/);
+      expect(line).toMatch(/devtrees down --shared && devtrees up/);
+      // No worktree hot-reload: nothing was spawned for the unchanged instance.
+      expect(track.invocations).toEqual([]);
+    });
+
+    it("an unchanged stack reports no shared field changes", async () => {
+      const fixture = multiWorktreeFixture("dt-shared-field-same-");
+      const stack = withShutdown("pg_ctl stop");
+      await runUp(worktreeDeps(fixture, stack, "login"));
+      const warnings: string[] = [];
+      const result = await runUp({
+        ...worktreeDeps(fixture, stack, "billing"),
+        warn: (m) => warnings.push(m),
+      });
+      expect(result.sharedFieldChanges).toEqual([]);
+      expect(warnings.filter((w) => w.includes("shared service"))).toEqual([]);
+    });
+
+    it("an older shared-state.json without the record loads and does not warn", async () => {
+      const fixture = multiWorktreeFixture("dt-shared-field-old-");
+      const before = withShutdown("pg_ctl stop");
+      await runUp(worktreeDeps(fixture, before, "login"));
+      // Rewrite the state as a pre-#185 devtrees would have: no `extended`.
+      const state = readSharedState(fixture.sharedAnchor);
+      if (state === undefined) throw new Error("expected shared state");
+      writeFileSync(
+        join(fixture.sharedAnchor, "devtrees", "shared-state.json"),
+        JSON.stringify({ hash: state.hash, ports: state.ports }),
+        "utf8",
+      );
+      const result = await runUp({
+        ...worktreeDeps(fixture, withShutdown("pg_ctl stop -m fast"), "billing"),
+      });
+      expect(result.sharedFieldChanges).toEqual([]);
+    });
+  });
+
   it("falls back to positional offsets when shared is running but no state was persisted (pre-#83 instance)", async () => {
     const fixture = multiWorktreeFixture("dt-legacy-");
     // Simulate a shared instance started by an older devtrees: socket on

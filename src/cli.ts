@@ -22,6 +22,7 @@ import { Cli, Command, Option, Builtins, type BaseContext } from "clipanion";
 import type { LogEvent } from "./driver.js";
 import type { DerivedConfig, DroppedEdge } from "./deriver.js";
 import type { DroppedNamespaceEdge } from "./selection.js";
+import type { SharedFieldChange } from "./shared-state.js";
 import { maybeInitHint } from "./init-hint.js";
 import {
   classifyError,
@@ -125,6 +126,8 @@ export interface ExecuteDeps {
     services?: ReadonlyArray<LsServiceRow>;
     /** `depends_on` edges lost to namespace selection (#179). */
     droppedNamespaceEdges?: ReadonlyArray<DroppedNamespaceEdge>;
+    /** Shared fields edited since shared started (#185). */
+    sharedFieldChanges?: ReadonlyArray<SharedFieldChange>;
     restarted?: ReadonlyArray<string>;
   }>;
   /**

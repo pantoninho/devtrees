@@ -88,6 +88,21 @@ function canonicalNamespace(ns: ResolvedService["namespace"]): string | string[]
  * process-compose ignores it.
  */
 function canonicalService(s: ResolvedService): unknown {
+  if (s.tier === "shared") {
+    // A shared service's five #183 fields land in the shared instance's
+    // config, not this worktree's, so editing them must not hot-reload the
+    // worktree (#185). They stay as constant nulls (not omitted) so a shared
+    // service that never sets them hashes exactly as it did after #183.
+    return {
+      ...canonicalBase(s),
+      namespace: canonicalNamespace(s.namespace),
+      shutdown: null,
+      isDaemon: null,
+      launchTimeoutSeconds: null,
+      logLocation: null,
+      logConfiguration: null,
+    };
+  }
   return {
     ...canonicalBase(s),
     namespace: canonicalNamespace(s.namespace),
@@ -146,4 +161,28 @@ export function sharedStackHash(stack: ResolvedStack): string {
     .sort((a, b) => a.name.localeCompare(b.name))
     .map(canonicalBase);
   return createHash("sha256").update(JSON.stringify({ services })).digest("hex");
+}
+
+/**
+ * The five process-compose fields `sharedStackHash` deliberately leaves out
+ * (#183), per shared service, keyed by service name with `devtrees.yaml`
+ * field names. Absent fields are null, blocks key-sorted, so two equal
+ * configs serialize identically. Persisted at shared start so a later `up` can
+ * warn that an edit won't apply until shared restarts (#185).
+ */
+export function sharedExtendedFields(
+  stack: ResolvedStack,
+): Record<string, Record<string, unknown>> {
+  const out: Record<string, Record<string, unknown>> = {};
+  for (const s of stack.services) {
+    if (s.tier !== "shared") continue;
+    out[s.name] = {
+      shutdown: canonicalValue(s.shutdown ?? null),
+      is_daemon: s.isDaemon ?? null,
+      launch_timeout_seconds: s.launchTimeoutSeconds ?? null,
+      log_location: s.logLocation ?? null,
+      log_configuration: canonicalValue(s.logConfiguration ?? null),
+    };
+  }
+  return out;
 }

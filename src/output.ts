@@ -21,6 +21,7 @@
 import { stringify as stringifyYaml } from "yaml";
 import type { DerivedConfig, DroppedEdge } from "./deriver.js";
 import type { DroppedNamespaceEdge } from "./selection.js";
+import type { SharedFieldChange } from "./shared-state.js";
 
 export const SCHEMA_VERSION = "1";
 
@@ -368,6 +369,12 @@ export interface UpPayload {
    */
   readonly droppedNamespaceEdges?: ReadonlyArray<DroppedNamespaceEdge>;
   /**
+   * Shared-service fields edited since the running shared instance started
+   * (#185). Human mode does not repeat them — `up` warned on stderr as it ran;
+   * JSON mode always emits `shared_config_changes` (possibly empty).
+   */
+  readonly sharedFieldChanges?: ReadonlyArray<SharedFieldChange>;
+  /**
    * Dead services this `up` restarted on a running instance (issue #178).
    * Optional like `services`; JSON mode defaults a missing value to `[]`.
    */
@@ -408,6 +415,8 @@ export function formatUp(payload: UpPayload, mode: FormatMode): OutputResult {
       // Always present, even empty (#179) — the `up_dry_run.dropped_edges`
       // contract (#169): an empty list is the answer "nothing was dropped".
       dropped_namespace_edges: (payload.droppedNamespaceEdges ?? []).map(droppedNamespaceEdgeJson),
+      // Always present, even empty (#185), same contract.
+      shared_config_changes: (payload.sharedFieldChanges ?? []).map(sharedFieldChangeJson),
       restarted: payload.restarted ?? [],
     };
     if (payload.blockBase !== undefined) up.block_base = payload.blockBase;
@@ -560,6 +569,24 @@ export function formatDroppedNamespaceEdgeWarning(edge: DroppedNamespaceEdge): s
     `process-compose starts '${edge.from}' without waiting for it. ` +
     `Select one of [${namespaces}] with -n to start '${edge.to}' too.`
   );
+}
+
+/**
+ * One warning line per shared-service field edited since the running shared
+ * instance started (#185). Shared has no hot-reload, so the edit sits unapplied
+ * until shared is restarted.
+ */
+export function formatSharedFieldChangeWarning(change: SharedFieldChange): string {
+  return (
+    `devtrees: shared service '${change.service}' changed '${change.field}' since the shared ` +
+    `instance started; the change won't apply until ` +
+    `\`devtrees down --shared && devtrees up\`.`
+  );
+}
+
+/** Snake_case row for a `shared_config_changes[]` envelope entry (#185). */
+function sharedFieldChangeJson(change: SharedFieldChange): Record<string, string> {
+  return { service: change.service, field: change.field };
 }
 
 /** Snake_case row for a `dropped_namespace_edges[]` envelope entry (#179). */

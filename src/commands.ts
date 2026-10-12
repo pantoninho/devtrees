@@ -37,7 +37,11 @@ import {
   logsDir,
   sharedInstancePaths,
 } from "./paths.js";
-import { formatDroppedEdgeWarning, formatDroppedNamespaceEdgeWarning } from "./output.js";
+import {
+  formatDroppedEdgeWarning,
+  formatDroppedNamespaceEdgeWarning,
+  formatSharedFieldChangeWarning,
+} from "./output.js";
 import { findDeadReservations, findOrphans, parseWorktreeIds } from "./prune.js";
 import { reapShutdownHooks, type ReapDeps, type ReapOutcome } from "./reaper.js";
 import { loadStack, type ResolvedService, type ResolvedStack, type Tier } from "./stack.js";
@@ -53,12 +57,18 @@ import {
 } from "./driver.js";
 import { readRegistry, withLifecycleLock, withRegistryLock, withSharedLock } from "./registry.js";
 import { defaultIsPortFree, defaultPortHolder, type PortHolderReport } from "./port-probe.js";
-import { sharedStackHash, stackHash } from "./hash.js";
+import { sharedExtendedFields, sharedStackHash, stackHash } from "./hash.js";
 import {
   readStoredHash as defaultReadStoredHash,
   writeStoredHash as defaultWriteStoredHash,
 } from "./hashes.js";
-import { readSharedState, writeSharedState, type SharedState } from "./shared-state.js";
+import {
+  readSharedState,
+  sharedFieldChanges,
+  writeSharedState,
+  type SharedFieldChange,
+  type SharedState,
+} from "./shared-state.js";
 import {
   createWaitForHealth,
   createWaitForSharedHealth,
@@ -725,6 +735,14 @@ export interface UpResult {
    */
   readonly droppedNamespaceEdges: ReadonlyArray<DroppedNamespaceEdge>;
   /**
+   * Shared-service fields (shutdown, is_daemon, ...) edited since the running
+   * shared instance started (#185). They do not apply until
+   * `devtrees down --shared && devtrees up`; each was warned about on stderr.
+   * Empty when nothing changed, shared was just started, or its state
+   * predates the record.
+   */
+  readonly sharedFieldChanges: ReadonlyArray<SharedFieldChange>;
+  /**
    * Dead selected isolated services this `up` restarted on a running
    * instance before its health wait (ADR-0008, issue #178), in declaration
    * order. Always empty on a fresh start.
@@ -1162,6 +1180,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     // semantic divergence fails with SHARED_DRIFT before anything is derived
     // or spawned for this worktree.
     let sharedStarted = false;
+    let sharedChanges: ReadonlyArray<SharedFieldChange> = [];
     let effectiveSharedPortFor = sharedPortFor;
     if (sharedNeeded) {
       const ensured = await ensureSharedStarted(
@@ -1170,9 +1189,10 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
         anchor.worktreeId,
         sharedPortFor,
         sharedLock,
-        { driver, probe: seams.probe, socketTimeoutMs: deps.sharedSocketTimeoutMs },
+        { driver, probe: seams.probe, socketTimeoutMs: deps.sharedSocketTimeoutMs, warn },
       );
       sharedStarted = ensured.started;
+      sharedChanges = ensured.fieldChanges;
       if (ensured.ports !== undefined) {
         const ports = ensured.ports;
         effectiveSharedPortFor = (name) => ports[name];
@@ -1215,7 +1235,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     // Either way the instance is then verified outside the lock (ADR-0008).
     if (freshSelection === undefined) {
       await reconcileRunning({ stack, anchor, paths, derived, inst, driver, readHash, writeHash });
-      return { kind: "running", env: derived.env, sharedStarted } as const;
+      return { kind: "running", env: derived.env, sharedStarted, sharedChanges } as const;
     }
 
     // Same-tier edges the fresh selection leaves dangling (ADR-0008, #179):
@@ -1285,6 +1305,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
       kind: "started",
       env: derived.env,
       sharedStarted,
+      sharedChanges,
       selected: freshSelection.services,
       namespaces: freshSelection.namespaces,
       droppedNamespaceEdges: nsEdges,
@@ -1296,6 +1317,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     socketPath: paths.socketPath,
     env: outcome.env,
     sharedStarted: outcome.sharedStarted,
+    sharedFieldChanges: outcome.sharedChanges,
     blockBase,
   } as const;
 
@@ -1566,6 +1588,8 @@ export async function runAttach(
  */
 interface EnsuredShared {
   readonly started: boolean;
+  /** Extended shared fields edited since the running instance started (#185). */
+  readonly fieldChanges: ReadonlyArray<SharedFieldChange>;
   readonly ports?: Readonly<Record<string, number>>;
 }
 
@@ -1601,6 +1625,8 @@ async function ensureSharedStarted(
     probe: (socketPath: string) => Promise<InstanceStatus>;
     /** Socket-bind wait window for the lazy start (issue #92). Default: 3s. */
     socketTimeoutMs?: number;
+    /** Sink for the shared-field-change warnings (#185). */
+    warn: (message: string) => void;
   },
 ): Promise<EnsuredShared> {
   return await sharedLock(anchor, async () => {
@@ -1609,9 +1635,11 @@ async function ensureSharedStarted(
       const state = readSharedState(anchor);
       // Legacy fallback: a pre-#83 shared instance left no persisted map.
       // Positional computation is all we have — same behaviour as before.
-      if (state === undefined) return { started: false };
+      if (state === undefined) return { started: false, fieldChanges: [] };
       assertSharedSubsetMatches(stack, state, worktreeId);
-      return { started: false, ports: state.ports };
+      const fieldChanges = sharedFieldChanges(state, sharedExtendedFields(stack));
+      for (const change of fieldChanges) deps.warn(formatSharedFieldChangeWarning(change));
+      return { started: false, ports: state.ports, fieldChanges };
     }
 
     // Same bind-site guard the worktree instance gets (issue #156) — the
@@ -1650,8 +1678,12 @@ async function ensureSharedStarted(
     // started with so every subsequent `up`/`env` — on any branch — injects
     // these numbers, not its own positional recomputation (issue #83).
     const ports = collectSharedPorts(stack, sharedPortFor);
-    writeSharedState(anchor, { hash: sharedStackHash(stack), ports });
-    return { started: true, ports };
+    writeSharedState(anchor, {
+      hash: sharedStackHash(stack),
+      ports,
+      extended: sharedExtendedFields(stack),
+    });
+    return { started: true, ports, fieldChanges: [] };
   });
 }
 

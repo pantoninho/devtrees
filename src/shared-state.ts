@@ -32,6 +32,43 @@ export interface SharedState {
   readonly hash: string;
   /** Named port env var → the concrete number the shared instance bound. */
   readonly ports: Readonly<Record<string, number>>;
+  /**
+   * Per shared service, the process-compose fields `hash` does not cover
+   * (`sharedExtendedFields`, #185). Optional: state files written before #185
+   * lack it, and then no change can be detected.
+   */
+  readonly extended?: Readonly<Record<string, Readonly<Record<string, unknown>>>>;
+}
+
+/** One extended field of a shared service that changed since shared started. */
+export interface SharedFieldChange {
+  readonly service: string;
+  readonly field: string;
+}
+
+/**
+ * Fields of `current` that differ from what the running shared instance
+ * recorded. Empty when the state predates #185 (nothing to compare). Services
+ * or fields missing on either side are skipped: add/remove is `SHARED_DRIFT`'s
+ * business, not this warning's.
+ */
+export function sharedFieldChanges(
+  state: SharedState,
+  current: Readonly<Record<string, Readonly<Record<string, unknown>>>>,
+): SharedFieldChange[] {
+  if (state.extended === undefined) return [];
+  const changes: SharedFieldChange[] = [];
+  for (const [service, fields] of Object.entries(current)) {
+    const recorded = state.extended[service];
+    if (recorded === undefined) continue;
+    for (const [field, value] of Object.entries(fields)) {
+      if (!(field in recorded)) continue;
+      if (JSON.stringify(recorded[field]) !== JSON.stringify(value)) {
+        changes.push({ service, field });
+      }
+    }
+  }
+  return changes;
 }
 
 function sharedStateFile(anchor: string): string {
@@ -41,13 +78,32 @@ function sharedStateFile(anchor: string): string {
 /** Narrow an unknown parse result to a `SharedState`, or `undefined`. */
 function asSharedState(parsed: unknown): SharedState | undefined {
   if (parsed === null || typeof parsed !== "object") return undefined;
-  const { hash, ports } = parsed as { hash?: unknown; ports?: unknown };
+  const { hash, ports, extended } = parsed as {
+    hash?: unknown;
+    ports?: unknown;
+    extended?: unknown;
+  };
   if (typeof hash !== "string") return undefined;
-  if (ports === null || typeof ports !== "object" || Array.isArray(ports)) return undefined;
-  for (const value of Object.values(ports)) {
-    if (typeof value !== "number") return undefined;
+  if (!isPlainObject(ports) || !Object.values(ports).every((v) => typeof v === "number")) {
+    return undefined;
   }
-  return { hash, ports: ports as Readonly<Record<string, number>> };
+  const parsedExtended = asExtended(extended);
+  return {
+    hash,
+    ports: ports as Readonly<Record<string, number>>,
+    ...(parsedExtended !== undefined ? { extended: parsedExtended } : {}),
+  };
+}
+
+const isPlainObject = (v: unknown): v is Record<string, unknown> =>
+  v !== null && typeof v === "object" && !Array.isArray(v);
+
+/** A malformed `extended` is dropped, not fatal: it only feeds a warning. */
+function asExtended(value: unknown): SharedState["extended"] {
+  if (!isPlainObject(value)) return undefined;
+  return Object.values(value).every(isPlainObject)
+    ? (value as NonNullable<SharedState["extended"]>)
+    : undefined;
 }
 
 /**
