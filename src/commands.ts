@@ -77,7 +77,7 @@ import {
   type DroppedNamespaceEdge,
   type NamespaceNotRunning,
 } from "./selection.js";
-import { findDeadServices } from "./service-state.js";
+import { dependencyOrder, findDeadServices } from "./service-state.js";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -292,6 +292,26 @@ class ServiceStartFailedError extends Error {
   ) {
     super(message);
     this.name = "ServiceStartFailedError";
+  }
+}
+
+/**
+ * Thrown when `up` was about to restart dead services on a running instance
+ * and found, under the lifecycle lock, that the instance had stopped (issue
+ * #178): a concurrent `devtrees down` got there first. Nothing is started, so
+ * no process is left behind outside a supervisor. `INSTANCE_NOT_FOUND`
+ * because that is the state `up` found: no instance for this worktree is
+ * running any more, and the next `up` starts a fresh one.
+ */
+class InstanceGoneError extends Error {
+  readonly code = "INSTANCE_NOT_FOUND" as const;
+  constructor(readonly details: { readonly worktree_id: string }) {
+    super(
+      `devtrees up: '${details.worktree_id}' stopped while this \`up\` was checking it ` +
+        `(most likely a concurrent \`devtrees down\`). Nothing was started. Run ` +
+        `\`devtrees up\` to start it again.`,
+    );
+    this.name = "InstanceGoneError";
   }
 }
 
@@ -1852,16 +1872,24 @@ export async function runDown(
   // (#80 — a stale socket file is unlinked by the gate itself) and skip the
   // driver when no live instance answers; the caller renders the no-op notice
   // from `stopped: false` and still exits 0.
+  //
+  // The probe and the stop run under the worktree's lifecycle lock (#178),
+  // the same lock `up` holds while it spawns or restarts services: an `up`
+  // restarting dead services must never `process start` on a supervisor this
+  // `down` is shutting down (the restarted process would outlive it,
+  // orphaned). A contended lock waits ~10s, then fails LOCK_CONTENTION.
   const paths = instancePaths(anchor.anchor, anchor.worktreeId);
-  const live = await socketIsLive(paths.socketPath, resolveProbe(deps));
-  if (live) {
+  const lifecycleLock = deps.withLifecycleLock ?? defaultWithLifecycleLock;
+  const live = await lifecycleLock(anchor.anchor, anchor.worktreeId, async () => {
+    if (!(await socketIsLive(paths.socketPath, resolveProbe(deps)))) return false;
     // Live supervisor: a graceful `process-compose down` fires each process's
     // `shutdown.command` from its `working_dir` (the worktree, which is present
     // on the normal `down` path). devtrees must NOT also run the hook directly
     // here — that would double-run it (acceptance #4: no regression).
     await driver.down({ configPath: paths.configPath, socketPath: paths.socketPath });
-    return { shared: false, worktreeId: anchor.worktreeId, stopped: true };
-  }
+    return true;
+  });
+  if (live) return { shared: false, worktreeId: anchor.worktreeId, stopped: true };
 
   // Dead-supervisor `down` path (issue #148): the socket probed stale (a
   // SIGKILLed/rebooted supervisor), so no process-compose remains to launch the
@@ -2656,8 +2684,11 @@ async function reconcileRunning(args: {
  *  2. **Restart.** Every dead selected isolated service (`classifyService`:
  *     a crash, a kill, a non-zero exit; not an exit-0 one-shot, not one
  *     process-compose is already `Restarting`) is started again over the
- *     control socket (#162, #178). A start request process-compose refuses
- *     fails with `SERVICE_START_FAILED`.
+ *     control socket (#162, #178), in `depends_on` order, under the
+ *     lifecycle lock so a concurrent `down` cannot race it
+ *     (`restartDeadServices`). A start request process-compose refuses fails
+ *     with `SERVICE_START_FAILED`; an instance that stopped meanwhile fails
+ *     with `INSTANCE_NOT_FOUND`.
  *  3. **Health.** Wait on every selected isolated service with the same
  *     machinery and `--wait-timeout` as a fresh headless start. A healthy
  *     instance passes on the first poll; a restarted service that never
@@ -2710,19 +2741,16 @@ async function verifyRunning(args: {
   const nsEdges = warnDroppedNamespaceEdges(stack, selection.services, args.warn, present);
 
   const remedy = `devtrees down && ${formatUpCommand(stack.services, selection.namespaces)}`;
-  const restarted = await restartDeadServices({
+  const { restarted, firstRead } = await restartDeadServices({
+    ...args,
     rows,
     names: selection.services.map((s) => s.name),
-    socketPath,
-    driver,
-    worktreeId: anchor.worktreeId,
     remedy,
   });
+  // Outside the lifecycle lock, like the fresh path's wait.
   const lastRows = await waitForSelectedHealth(selection.services, socketPath, deps, driver, {
     remedy,
-    // The first read predates the restarts, so it can only serve as the
-    // first poll when nothing was restarted.
-    ...(restarted.length === 0 ? { firstRead: rows } : { restarted }),
+    ...(restarted.length === 0 ? { firstRead } : { restarted }),
   });
   return {
     rows: lastRows,
@@ -2732,38 +2760,92 @@ async function verifyRunning(args: {
 }
 
 /**
- * Start every dead service among `names` again over the instance's control
- * socket (ADR-0008, issue #178), in `names` order. `rows` is the read the
- * dead verdicts come from; each restarted service carries the pid of the run
- * that died, so the health wait can tell that stale row from the restarted
- * run dying again (`createRestartTracker`).
+ * Restart every dead service among `names` (ADR-0008, issue #178), under the
+ * worktree's lifecycle lock. `rows` is the unlocked read `verifyRunning`
+ * already made: when it shows nothing dead, no lock is taken and nothing is
+ * started.
  *
- * Every dead service is attempted even if an earlier one is refused; any
- * refusal then fails with `SERVICE_START_FAILED` naming each refused
- * service. Nothing is stopped.
+ * Otherwise, inside the lock — the one `up`'s spawn and `down` hold — the
+ * socket is probed again and the rows re-read, and only the services dead in
+ * that fresh read are started. The lock is what keeps a concurrent `down`
+ * from racing the restart: without it, `up` read the services `down` had just
+ * SIGTERM'd as dead and started them on a supervisor that was shutting down,
+ * leaving them orphaned. Under the lock either `down` has finished (the
+ * socket is gone: `InstanceGoneError`, nothing started) or it has not begun.
+ *
+ * Returns the services started (each with the pid of the run that died, so
+ * the health wait can tell that stale row from the restarted run dying again)
+ * and the rows to serve as the wait's first poll when nothing was started.
  */
 async function restartDeadServices(args: {
+  readonly stack: ResolvedStack;
+  readonly anchor: { readonly anchor: string; readonly worktreeId: string };
+  readonly rows: ServiceStatus[];
+  readonly names: ReadonlyArray<string>;
+  readonly socketPath: string;
+  readonly deps: CommandDeps;
+  readonly driver: ReturnType<typeof createDriver>;
+  readonly remedy: string;
+}): Promise<{ restarted: RestartedService[]; firstRead: ServiceStatus[] }> {
+  if (findDeadServices(args.rows, args.names).length === 0) {
+    return { restarted: [], firstRead: args.rows };
+  }
+  const { lifecycleLock } = resolveLifecycleSeams(args.deps);
+  return lifecycleLock(args.anchor.anchor, args.anchor.worktreeId, async () => {
+    if (!(await socketIsLive(args.socketPath, resolveProbe(args.deps)))) {
+      throw new InstanceGoneError({ worktree_id: args.anchor.worktreeId });
+    }
+    const fresh = await readStatusesWithin(
+      { getServiceStatuses: statusReader(args.deps, args.driver) },
+      args.socketPath,
+      Math.min(args.deps.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS, RESTART_READ_TIMEOUT_MS),
+    );
+    const dead = findDeadServices(fresh, args.names).map((d) => d.name);
+    const restarted = await startServices({
+      ...args,
+      rows: fresh,
+      names: dependencyOrder(args.stack.services, dead),
+    });
+    return { restarted, firstRead: fresh };
+  });
+}
+
+/** Budget for the re-read `restartDeadServices` makes under the lock. */
+const RESTART_READ_TIMEOUT_MS = 5000;
+
+/**
+ * Start `names` over the instance's control socket, in the order given (the
+ * caller orders them by `depends_on`: `process start` ignores it). Every
+ * service is attempted even if an earlier one is refused; any refusal then
+ * fails with `SERVICE_START_FAILED` naming each refused service. A service
+ * process-compose reports as already running was started by someone else
+ * (another `up`, its restart policy), so it is not in the result. Nothing is
+ * stopped.
+ */
+async function startServices(args: {
+  readonly anchor: { readonly worktreeId: string };
   readonly rows: ReadonlyArray<ServiceStatus>;
   readonly names: ReadonlyArray<string>;
   readonly socketPath: string;
   readonly driver: ReturnType<typeof createDriver>;
-  readonly worktreeId: string;
   readonly remedy: string;
 }): Promise<RestartedService[]> {
-  const dead = findDeadServices(args.rows, args.names);
   const pids = new Map(args.rows.map((r) => [r.name, r.pid]));
   const restarted: RestartedService[] = [];
   const failed: Array<{ name: string; message: string }> = [];
-  for (const { name } of dead) {
+  for (const name of args.names) {
     const outcome = await args.driver.startProcess(args.socketPath, name);
     if (!outcome.ok) {
       failed.push({ name, message: outcome.message });
       continue;
     }
+    if (outcome.alreadyRunning) continue;
     const stalePid = pids.get(name);
     restarted.push(stalePid === undefined ? { name } : { name, stalePid });
   }
-  if (failed.length > 0) throw serviceStartFailedError(args.worktreeId, failed, args.remedy);
+  if (failed.length > 0) {
+    throw serviceStartFailedError(args.anchor.worktreeId, failed, args.remedy);
+  }
   return restarted;
 }
 
@@ -2852,11 +2934,13 @@ const defaultWithRegistryLock: WithRegistryLock = (anchor, mutate) =>
 const defaultWithSharedLock: WithSharedLock = (anchor, fn) => withSharedLock(anchor, fn);
 
 /**
- * Wait budget for the per-worktree lifecycle lock (issue #91). The holder's
- * window covers a process spawn plus a ≤3s socket-observable wait (and, with
- * shared services, possibly the shared instance's own spawn and health wait),
- * so the registry lock's default ~1s budget would mislabel an ordinary
- * concurrent `up` as contention. ~10s comfortably covers the spawn window
+ * Wait budget for the per-worktree lifecycle lock (issue #91), for `up` and
+ * the worktree `down` alike (#178). The holder's window covers a process
+ * spawn plus a ≤3s socket-observable wait (and, with shared services,
+ * possibly the shared instance's own spawn and health wait), an `up`'s
+ * restart of dead services (each `process start` bounded at 10s), or a
+ * `down`'s graceful stop, so the registry lock's default ~1s budget would
+ * mislabel an ordinary concurrent `up` or `down` as contention. ~10s comfortably covers the spawn window
  * while still bounding the wait on a genuinely stuck holder — beyond it the
  * caller sees LOCK_CONTENTION ("retry later"), never a half-dead socket.
  */

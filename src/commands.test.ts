@@ -1882,6 +1882,80 @@ describe("runDown — shared lifecycle is decoupled from worktree lifecycle", ()
  * `{shared: false, worktreeId: "<id>"}` (discriminated union). Pre- and
  * post-teardown state belongs to `ls --json`, not this envelope.
  */
+/**
+ * The worktree `down` runs under the per-worktree lifecycle lock (#178), so
+ * an `up` restarting dead services cannot `process start` on a supervisor
+ * that is shutting down.
+ */
+describe("runDown — worktree teardown holds the lifecycle lock (#178)", () => {
+  const stack: ResolvedStack = { services: [isolated("web", "node server.js", ["WEB_PORT"])] };
+
+  it("probes and stops the instance inside the worktree's lifecycle lock", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const deps = stubDeps({ stack, track });
+    await runUp(deps);
+    const events: string[] = [];
+    const spawner = deps.driver?.spawner;
+    if (spawner === undefined) throw new Error("expected spawner");
+    const result = await runDown({
+      ...deps,
+      withLifecycleLock: async (_a, instanceId, fn) => {
+        events.push(`lock ${instanceId}`);
+        const out = await fn();
+        events.push("unlock");
+        return out;
+      },
+      driver: {
+        ...deps.driver,
+        spawner: (b, args, o) => {
+          events.push(args[0] ?? "");
+          return spawner(b, args, o);
+        },
+      },
+    });
+    expect(result.stopped).toBe(true);
+    expect(events).toEqual([`lock ${deps.expectedWorktreeId}`, "down", "unlock"]);
+  });
+
+  it("a lock held by a concurrent up fails LOCK_CONTENTION and stops nothing", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const deps = stubDeps({ stack, track });
+    await runUp(deps);
+    const anchor = (deps.git!(["rev-parse", "--git-common-dir"]) as string).trim();
+    const downs: string[][] = [];
+    const spawner = deps.driver?.spawner;
+    if (spawner === undefined) throw new Error("expected spawner");
+    let release: () => void = () => {};
+    const held = new Promise<void>((r) => (release = r));
+    let acquired: () => void = () => {};
+    const isHeld = new Promise<void>((r) => (acquired = r));
+    const holder = withLifecycleLock(anchor, deps.expectedWorktreeId, async () => {
+      acquired();
+      await held;
+    });
+    await isHeld;
+    const err = await runDown({
+      ...deps,
+      withLifecycleLock: (a, i, fn) =>
+        withLifecycleLock(a, i, fn, { retries: 3, retryDelayMs: 10 }),
+      driver: {
+        ...deps.driver,
+        spawner: (b, args, o) => {
+          if (args[0] === "down") downs.push([...args]);
+          return spawner(b, args, o);
+        },
+      },
+    }).then(
+      () => undefined,
+      (e: unknown) => e as Error & { code?: string },
+    );
+    release();
+    await holder;
+    expect(err?.code).toBe("LOCK_CONTENTION");
+    expect(downs).toEqual([]);
+  });
+});
+
 describe("runDown — operation-output result (#48)", () => {
   const mixedStack: ResolvedStack = {
     services: [
@@ -4160,7 +4234,15 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
       },
       ...extra,
     };
-    return { deps, spawned, statusReads, wtSocket, sharedSocket, id: base.expectedWorktreeId };
+    return {
+      deps,
+      spawned,
+      statusReads,
+      wtSocket,
+      sharedSocket,
+      id: base.expectedWorktreeId,
+      anchor: tmp.anchor,
+    };
   }
 
   async function failure(deps: CommandDeps) {
@@ -4535,7 +4617,106 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
           },
         },
       });
-      expect(result.restarted).toEqual(["toy"]);
+      // Someone else started it: not reported as restarted by this `up`.
+      expect(result.restarted).toEqual([]);
+      expect(starts(spawned)).toHaveLength(1);
+    });
+
+    it("dead services are started in depends_on order, not declaration order", async () => {
+      const stack: ResolvedStack = {
+        services: [
+          { ...isolated("web", "w"), dependsOn: [{ name: "api" }] },
+          { ...isolated("api", "a"), dependsOn: [{ name: "db" }, { name: "keeper" }] },
+          isolated("db", "d"),
+          isolated("keeper", "k"),
+        ],
+      };
+      const { deps, spawned } = liveInstance(stack, { worktree: [] });
+      const result = await runUp({
+        ...deps,
+        getServiceStatuses: reads(
+          spawned,
+          [killed("web"), killed("api"), killed("db"), running("keeper")],
+          [[running("web"), running("api"), running("db"), running("keeper")]],
+        ),
+      });
+      expect(starts(spawned).map((a) => a[2])).toEqual(["db", "api", "web"]);
+      expect(result.restarted).toEqual(["db", "api", "web"]);
+    });
+
+    it("a `down` holding the lifecycle lock: up starts nothing and fails LOCK_CONTENTION", async () => {
+      const { deps, spawned, anchor, id } = liveInstance(
+        toyStack,
+        { worktree: [killed("toy"), running("keeper")] },
+        {
+          namespaces: ["test"],
+          // Up's own spawn-window lock passes; the restart's lock is held by
+          // the "down" below and only retried briefly.
+          withLifecycleLock: (a, i, fn) =>
+            withLifecycleLock(a, i, fn, { retries: 3, retryDelayMs: 10 }),
+        },
+      );
+      let release: () => void = () => {};
+      const held = new Promise<void>((r) => (release = r));
+      let down: Promise<void> | undefined;
+      const err = await failure({
+        ...deps,
+        // The first read runs after up's spawn-window lock is released: a
+        // `down` takes the lifecycle lock right then, before up's restart.
+        getServiceStatuses: async () => {
+          if (down === undefined) {
+            let acquired: () => void = () => {};
+            const isHeld = new Promise<void>((r) => (acquired = r));
+            down = withLifecycleLock(anchor, id, async () => {
+              acquired();
+              await held;
+            });
+            await isHeld;
+          }
+          return [killed("toy"), running("keeper")];
+        },
+      });
+      release();
+      await down;
+      expect(err?.code).toBe("LOCK_CONTENTION");
+      expect(starts(spawned)).toEqual([]);
+    });
+
+    it("an instance that stopped between the read and the lock: nothing started, INSTANCE_NOT_FOUND", async () => {
+      let probes = 0;
+      const { deps, spawned, id } = liveInstance(
+        toyStack,
+        { worktree: [killed("toy"), running("keeper")] },
+        {
+          namespaces: ["test"],
+          // Live for up's own spawn-window gate, gone by the restart's re-probe
+          // (a concurrent `down` finished in between).
+          probeSocket: async () => (++probes === 1 ? "running" : "stale"),
+        },
+      );
+      const err = await failure(deps);
+      expect(err?.code).toBe("INSTANCE_NOT_FOUND");
+      expect(err?.message).toContain("Nothing was started");
+      expect(err?.details).toEqual({ worktree_id: id });
+      expect(starts(spawned)).toEqual([]);
+    });
+
+    it("re-reads under the lock: a service no longer dead there is not started", async () => {
+      let readsSoFar = 0;
+      const { deps, spawned } = liveInstance(
+        toyStack,
+        { worktree: [] },
+        {
+          namespaces: ["test"],
+          getServiceStatuses: async () =>
+            ++readsSoFar === 1
+              ? [killed("toy"), running("keeper")]
+              : [running("toy"), running("keeper")],
+        },
+      );
+      const result = await runUp(deps);
+      expect(starts(spawned)).toEqual([]);
+      expect(result.restarted).toEqual([]);
     });
   });
 

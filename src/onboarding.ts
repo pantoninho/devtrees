@@ -76,11 +76,16 @@ are. It never stops anything, and never attaches the TUI.
   fails with \`NAMESPACE_NOT_RUNNING\`. Boot with it: \`devtrees down && devtrees
   up -n …\` (the message names the exact command).
 - A dead selected service (crashed, killed, or exited non-zero) is started
-  again, and \`up\` names it (\`restarted\` in the \`--json\` envelope). If it does
-  not become healthy, or dies again, \`up\` fails with \`HEALTH_TIMEOUT\` naming
-  it; if process-compose refuses to start it, with \`SERVICE_START_FAILED\`.
-  The stack is left running either way. A one-shot that exited 0 counts as
-  done and is not rerun.
+  again, and \`up\` names it (\`restarted\` in the \`--json\` envelope). Several
+  dead services are started in \`depends_on\` order, without waiting between
+  them. If one does not become healthy, or dies again, \`up\` fails with
+  \`HEALTH_TIMEOUT\` naming it; if process-compose refuses to start it, with
+  \`SERVICE_START_FAILED\`. The stack is left running either way. A one-shot
+  that exited 0 counts as done and is not rerun.
+- \`up\` and \`down\` on the same worktree take turns. An \`up\` that finds the
+  stack stopped by a concurrent \`down\` starts nothing and fails with
+  \`INSTANCE_NOT_FOUND\`; one that waits too long for the other fails with
+  \`LOCK_CONTENTION\`. Either way, run \`devtrees up\` again.
 - A dead shared service fails \`up\` with \`SHARED_SERVICE_DEAD\`; run
   \`devtrees down --shared && devtrees up\`.
 

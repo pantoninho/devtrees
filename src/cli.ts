@@ -319,6 +319,7 @@ class UpCommand extends DevtreesCommand {
       "NAMESPACE_NOT_RUNNING",
       "SHARED_SERVICE_DEAD",
       "SERVICE_START_FAILED",
+      "INSTANCE_NOT_FOUND",
       "PROCESS_COMPOSE_NOT_FOUND",
       "INVALID_ARGS",
       "UNKNOWN",
@@ -477,7 +478,8 @@ class DownCommand extends DevtreesCommand {
   static override paths = [["down"]];
   static override usage = Command.Usage({
     description: "Stop this worktree's stack (`--shared` tears down the shared instance).",
-    // `--shared` serializes on the shared lifecycle lock → LOCK_CONTENTION.
+    // Both branches serialize on a lifecycle lock (the worktree's, #178, or the
+    // shared one with `--shared`) → LOCK_CONTENTION.
     details: errorCodeFooter(["PROCESS_COMPOSE_NOT_FOUND", "LOCK_CONTENTION", "UNKNOWN"]),
   });
 

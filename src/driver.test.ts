@@ -382,7 +382,7 @@ describe("process-compose driver — startProcess (#178)", () => {
       exists: () => Promise.resolve(true),
       spawner: spawnerWith(0, "", seen),
     });
-    expect(await driver.startProcess(socket, "toy")).toEqual({ ok: true });
+    expect(await driver.startProcess(socket, "toy")).toEqual({ ok: true, alreadyRunning: false });
     expect(seen).toEqual([buildProcessStartArgs(socket, "toy")]);
   });
 
@@ -408,7 +408,7 @@ describe("process-compose driver — startProcess (#178)", () => {
     });
   });
 
-  it("treats `already running` as ok: someone else restarted it first", async () => {
+  it("treats `already running` as ok, flagged: someone else started it first", async () => {
     const driver = createDriver({
       exists: () => Promise.resolve(true),
       spawner: spawnerWith(
@@ -416,7 +416,32 @@ describe("process-compose driver — startProcess (#178)", () => {
         'FTL failed to start process keeper error="process keeper is already running"',
       ),
     });
-    expect(await driver.startProcess(socket, "keeper")).toEqual({ ok: true });
+    expect(await driver.startProcess(socket, "keeper")).toEqual({
+      ok: true,
+      alreadyRunning: true,
+    });
+  });
+
+  it("kills a start that does not answer within its budget and reports it as a failure", async () => {
+    const killed: Array<NodeJS.Signals | number | undefined> = [];
+    const driver = createDriver({
+      exists: () => Promise.resolve(true),
+      startTimeoutMs: 20,
+      spawner: (): SpawnedProcess => {
+        const emitter = new EventEmitter() as EventEmitter & SpawnedProcess;
+        emitter.kill = (signal) => {
+          killed.push(signal);
+          queueMicrotask(() => emitter.emit("exit", null));
+          return true;
+        };
+        return emitter;
+      },
+    });
+    expect(await driver.startProcess(socket, "toy")).toEqual({
+      ok: false,
+      message: "process-compose process start did not finish within 0s",
+    });
+    expect(killed).toEqual(["SIGTERM"]);
   });
 });
 

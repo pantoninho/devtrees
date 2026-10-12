@@ -188,11 +188,23 @@ export function buildProcessStartArgs(socketPath: string, service: string): stri
 }
 
 /**
- * Outcome of a `startProcess` call. `ok:false` carries process-compose's own
- * complaint (its stderr, or the exit code) for the `SERVICE_START_FAILED`
- * envelope.
+ * Outcome of a `startProcess` call. `ok:true` with `alreadyRunning` means
+ * process-compose refused only because the process was already running, so
+ * this call started nothing. `ok:false` carries process-compose's own
+ * complaint (its stderr, the exit code, or the timeout) for the
+ * `SERVICE_START_FAILED` envelope.
  */
-type StartResult = { readonly ok: true } | { readonly ok: false; readonly message: string };
+type StartResult =
+  | { readonly ok: true; readonly alreadyRunning: boolean }
+  | { readonly ok: false; readonly message: string };
+
+/**
+ * Budget for one `process start` call. On v1.122.0 it returns as soon as the
+ * process is spawned, well under a second. `up` holds the worktree's
+ * lifecycle lock while it restarts services, so a client that hangs must not
+ * hold that lock for long.
+ */
+const START_TIMEOUT_MS = 10_000;
 
 /**
  * process-compose's refusal to start a process that is already running. Not a
@@ -386,6 +398,8 @@ export interface DriverDeps {
    * over the per-call `timeoutMs`.
    */
   readonly reloadTimeoutMs?: number;
+  /** Fixed `startProcess` budget in milliseconds, for tests. Default: 10s. */
+  readonly startTimeoutMs?: number;
 }
 
 async function ensureBinary(deps: Required<Pick<DriverDeps, "binary" | "exists">>): Promise<void> {
@@ -506,11 +520,20 @@ export function createDriver(deps: DriverDeps = {}) {
     /**
      * Start one process of the running instance at `socketPath`
      * (`process-compose process start <name>`, issue #178). Resolves
-     * `ok:false` with process-compose's message when it refuses or errors;
-     * a refusal because the process is already running counts as `ok`.
+     * `ok:false` with process-compose's message when it refuses or errors,
+     * or when it does not answer within the start budget (the client is then
+     * killed). A refusal because the process is already running is `ok`,
+     * flagged `alreadyRunning`.
      */
     startProcess(socketPath: string, service: string): Promise<StartResult> {
-      return startProcessImpl(socketPath, service, { binary, prefix, exists, spawner });
+      const timeoutMs = deps.startTimeoutMs ?? START_TIMEOUT_MS;
+      return startProcessImpl(socketPath, service, {
+        binary,
+        prefix,
+        exists,
+        spawner,
+        timeoutMs,
+      });
     },
     /**
      * Stream a service's logs from the instance at `socketPath` as an async
@@ -566,22 +589,36 @@ function captureOutput(stream: NodeJS.ReadableStream | null | undefined): () => 
 async function startProcessImpl(
   socketPath: string,
   service: string,
-  deps: ShellDeps,
+  deps: ShellDeps & { readonly timeoutMs: number },
 ): Promise<StartResult> {
   await ensureBinary({ binary: deps.binary, exists: deps.exists });
   const args = [...deps.prefix, ...buildProcessStartArgs(socketPath, service)];
   return new Promise<StartResult>((resolve) => {
     const child = deps.spawner(deps.binary, args, { stdio: ["ignore", "ignore", "pipe"] });
     const stderr = captureOutput(child.stderr);
-    child.on("error", (err) => resolve({ ok: false, message: err.message }));
+    const timer = setTimeout(() => {
+      child.kill?.("SIGTERM");
+      resolve({
+        ok: false,
+        message: `${deps.binary} process start did not finish within ${Math.round(deps.timeoutMs / 1000)}s`,
+      });
+    }, deps.timeoutMs);
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      resolve({ ok: false, message: err.message });
+    });
     child.on("exit", (code) => {
-      if (code === 0 || code === null || ALREADY_RUNNING.test(stderr())) {
-        resolve({ ok: true });
-        return;
-      }
-      resolve({ ok: false, message: describeStartFailure(stderr(), deps.binary, code) });
+      clearTimeout(timer);
+      resolve(startOutcome(code, stderr(), deps.binary));
     });
   });
+}
+
+/** Map a finished `process start` client to its `StartResult`. */
+function startOutcome(code: number | null, stderr: string, binary: string): StartResult {
+  if (code === 0 || code === null) return { ok: true, alreadyRunning: false };
+  if (ALREADY_RUNNING.test(stderr)) return { ok: true, alreadyRunning: true };
+  return { ok: false, message: describeStartFailure(stderr, binary, code) };
 }
 
 /**

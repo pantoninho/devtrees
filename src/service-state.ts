@@ -90,3 +90,33 @@ export function deadServicesDetails(
       : { name: d.name, status: d.status, exit_code: d.exitCode },
   );
 }
+
+/**
+ * `names` reordered so each service comes after the services among `names`
+ * it `depends_on` (issue #178): `process-compose process start` ignores
+ * `depends_on`, so `up` starts dead services in dependency order itself.
+ * Dependencies outside `names` are ignored (they are not being started), and
+ * otherwise the order of `names` is kept. A cycle cannot be ordered; its
+ * members keep their relative order.
+ */
+export function dependencyOrder(
+  services: ReadonlyArray<{
+    readonly name: string;
+    readonly dependsOn: ReadonlyArray<{ readonly name: string }>;
+  }>,
+  names: ReadonlyArray<string>,
+): string[] {
+  const wanted = new Set(names);
+  const deps = new Map(services.map((s) => [s.name, s.dependsOn.map((d) => d.name)]));
+  const ordered: string[] = [];
+  const visiting = new Set<string>();
+  const visit = (name: string): void => {
+    if (ordered.includes(name) || visiting.has(name)) return;
+    visiting.add(name);
+    for (const dep of deps.get(name) ?? []) if (wanted.has(dep)) visit(dep);
+    visiting.delete(name);
+    ordered.push(name);
+  };
+  for (const name of names) visit(name);
+  return ordered;
+}

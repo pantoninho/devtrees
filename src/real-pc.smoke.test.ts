@@ -26,7 +26,7 @@
  *     read README "Smoke testing against real process-compose".
  */
 import { afterEach, beforeAll, describe, expect, it } from "vite-plus/test";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { join } from "node:path";
@@ -539,6 +539,39 @@ function sleeper(root: string, name: string, exitIf?: string): string {
     exitIf === undefined ? "" : `if os.path.exists(${JSON.stringify(exitIf)}):\n    sys.exit(4)\n`;
   writeFileSync(path, `import os, sys, time\n${guard}time.sleep(300)\n`);
   return path;
+}
+
+/** `devtrees(...)`, but asynchronous: resolves once the CLI exits. */
+function devtreesAsync(cwd: string, args: ReadonlyArray<string>): Promise<CliResult> {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [CLI, ...args], { cwd });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (c: Buffer) => (stdout += c.toString("utf8")));
+    child.stderr.on("data", (c: Buffer) => (stderr += c.toString("utf8")));
+    child.on("exit", (code) => {
+      let doc: unknown;
+      try {
+        doc = JSON.parse(stdout);
+      } catch {
+        doc = undefined;
+      }
+      resolve({ code: code ?? -1, stdout, stderr, doc });
+    });
+  });
+}
+
+/**
+ * Service processes under `root` that were reparented to PID 1: orphans no
+ * supervisor will stop. process-compose itself is excluded — devtrees starts
+ * it detached, so its parent is always 1.
+ */
+function orphanedServices(root: string): string[] {
+  const out = spawnSync("ps", ["-A", "-o", "pid=,ppid=,args="], { encoding: "utf8" });
+  return out.stdout
+    .split("\n")
+    .filter((line) => line.includes(root) && !line.includes("process-compose"))
+    .filter((line) => line.trim().split(/\s+/)[1] === "1");
 }
 
 /**
@@ -1168,6 +1201,56 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
     expect(err?.details).toMatchObject({ dead_services: [{ name: "crasher", exit_code: 4 }] });
     // Fail-fast: the restarted corpse is not waited on for the full window.
     expect(elapsed).toBeLessThan(30_000);
+  }, 120_000);
+
+  it("scenario 20: a down racing an up that restarts a dead service leaves no orphan (#178)", async () => {
+    // `slowstop` ignores SIGTERM, so `down` holds the instance for ~3s before
+    // process-compose SIGKILLs it. `up` starts first (victim is dead, so it
+    // will restart it) and `down` follows. Whichever takes the lifecycle lock
+    // first, no service process may outlive its supervisor, and `up` must not
+    // report HEALTH_TIMEOUT on an instance that is gone.
+    const repo = buildSmokeRepo("dt-rpc20-", ["login"]);
+    currentCtx = { pidNeedle: repo.root, root: repo.root };
+    const wt = repo.worktrees.login!;
+    const slowstop = join(repo.root, "slowstop.py");
+    writeFileSync(
+      slowstop,
+      "import signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(300)\n",
+    );
+    writeFileSync(
+      join(wt, "devtrees.yaml"),
+      [
+        "services:",
+        "  victim:",
+        "    tier: isolated",
+        `    command: "python3 ${sleeper(repo.root, "victim")}"`,
+        "  slowstop:",
+        "    tier: isolated",
+        `    command: "python3 ${slowstop}"`,
+        "    shutdown:",
+        "      timeout_seconds: 3",
+        "",
+      ].join("\n"),
+    );
+    cleanupStack.push(() => devtrees(wt, ["down"]));
+
+    const first = devtrees(wt, ["up", "--json", "--wait-timeout", "30"]);
+    expect(first.code, `first up failed: ${first.stderr} ${first.stdout}`).toBe(0);
+    const victim = join(repo.root, "victim.py");
+    reapPids(pidsMatching(victim));
+    expect(await waitForNoPids(victim, 5000)).toEqual([]);
+
+    const upRun = devtreesAsync(wt, ["up", "--json", "--wait-timeout", "30"]);
+    await new Promise((r) => setTimeout(r, 600));
+    const down = await devtreesAsync(wt, ["down"]);
+    const again = await upRun;
+
+    expect(down.code, `down failed: ${down.stderr}`).toBe(0);
+    const code = (again.doc as { error?: { code?: string } } | undefined)?.error?.code;
+    // Up either ran before/after down (exit 0), found the instance gone under
+    // the lock, or gave up waiting for it — never a timeout on a dead instance.
+    expect([undefined, "INSTANCE_NOT_FOUND", "LOCK_CONTENTION"]).toContain(code);
+    expect(orphanedServices(repo.root)).toEqual([]);
   }, 120_000);
 
   /**
