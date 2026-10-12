@@ -297,6 +297,44 @@ describe("process-compose driver — getServiceStatuses", () => {
     };
   }
 
+  /** A `process list` child that never answers (a SIGSTOPped process-compose); records kills. */
+  function spawnerWedged(killed: Array<NodeJS.Signals | number | undefined>) {
+    return (): SpawnedProcess => {
+      const emitter = new EventEmitter() as EventEmitter & { stdout: Readable };
+      emitter.stdout = new Readable({ read() {} });
+      (emitter as unknown as SpawnedProcess).kill = (signal) => {
+        killed.push(signal);
+        queueMicrotask(() => emitter.emit("exit", null));
+        return true;
+      };
+      return emitter as unknown as SpawnedProcess;
+    };
+  }
+
+  it("kills a `process list` that never answers at the read cap and rejects (#192)", async () => {
+    const killed: Array<NodeJS.Signals | number | undefined> = [];
+    const driver = createDriver({
+      exists: () => Promise.resolve(true),
+      readTimeoutMs: 20,
+      spawner: spawnerWedged(killed),
+    });
+    await expect(driver.getServiceStatuses("/s")).rejects.toThrow(/did not answer within 20ms/);
+    expect(killed).toEqual(["SIGTERM"]);
+  });
+
+  it("a per-call timeout below the cap wins over a larger cap (#192)", async () => {
+    const killed: Array<NodeJS.Signals | number | undefined> = [];
+    const driver = createDriver({
+      exists: () => Promise.resolve(true),
+      readTimeoutMs: 60_000,
+      spawner: spawnerWedged(killed),
+    });
+    const started = Date.now();
+    await expect(driver.getServiceStatuses("/s", { timeoutMs: 15 })).rejects.toThrow(/15ms/);
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(killed).toEqual(["SIGTERM"]);
+  });
+
   it("returns ServiceStatus[] parsed from the binary's stdout", async () => {
     const stdout = JSON.stringify([
       { name: "web", status: "Running", is_ready: "Ready" },

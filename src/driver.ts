@@ -207,6 +207,14 @@ type StartResult =
 const START_TIMEOUT_MS = 10_000;
 
 /**
+ * Cap on one `process list` read. A healthy instance answers in tens of
+ * milliseconds; a wedged one (SIGSTOP, deadlock) never does, and the client
+ * has no timeout of its own. Health waits pass a smaller per-call value when
+ * their remaining budget is below the cap.
+ */
+export const READ_TIMEOUT_MS = 5_000;
+
+/**
  * process-compose's refusal to start a process that is already running. Not a
  * failure for `up`: another `up`, or the process's own restart policy, got
  * there first, and the health wait judges the result like any other run.
@@ -398,6 +406,8 @@ export interface DriverDeps {
    * over the per-call `timeoutMs`.
    */
   readonly reloadTimeoutMs?: number;
+  /** Cap on one `getServiceStatuses` read in milliseconds, for tests. Default: 5s. */
+  readonly readTimeoutMs?: number;
   /** Fixed `startProcess` budget in milliseconds, for tests. Default: 10s. */
   readonly startTimeoutMs?: number;
 }
@@ -493,29 +503,13 @@ export function createDriver(deps: DriverDeps = {}) {
      * `ServiceStatus[]`. Stays lock-free — this is a read against the
      * instance, never the allocation registry.
      */
-    async getServiceStatuses(socketPath: string): Promise<ServiceStatus[]> {
-      await ensureBinary({ binary, exists });
-      return new Promise<ServiceStatus[]>((resolve, reject) => {
-        const child = spawner(binary, [...prefix, ...buildProcessListArgs(socketPath)], {
-          stdio: ["ignore", "pipe", "ignore"],
-        });
-        let stdout = "";
-        child.stdout?.on("data", (chunk: Buffer | string) => {
-          stdout += typeof chunk === "string" ? chunk : chunk.toString("utf8");
-        });
-        child.on("error", (err) => reject(err));
-        child.on("exit", (code) => {
-          if (code !== 0 && code !== null) {
-            reject(new Error(`${binary} process list exited with code ${code}`));
-            return;
-          }
-          try {
-            resolve(parseServiceStatuses(stdout || "[]"));
-          } catch (err) {
-            reject(err as Error);
-          }
-        });
-      });
+    async getServiceStatuses(
+      socketPath: string,
+      opts: { readonly timeoutMs?: number } = {},
+    ): Promise<ServiceStatus[]> {
+      const cap = deps.readTimeoutMs ?? READ_TIMEOUT_MS;
+      const timeoutMs = Math.max(1, Math.min(opts.timeoutMs ?? cap, cap));
+      return getServiceStatusesImpl(socketPath, { binary, prefix, exists, spawner, timeoutMs });
     },
     /**
      * Start one process of the running instance at `socketPath`
@@ -584,6 +578,49 @@ function captureOutput(stream: NodeJS.ReadableStream | null | undefined): () => 
     out += typeof chunk === "string" ? chunk : chunk.toString("utf8");
   });
   return () => out;
+}
+
+async function getServiceStatusesImpl(
+  socketPath: string,
+  deps: ShellDeps & { readonly timeoutMs: number },
+): Promise<ServiceStatus[]> {
+  await ensureBinary({ binary: deps.binary, exists: deps.exists });
+  return new Promise<ServiceStatus[]>((resolve, reject) => {
+    const child = deps.spawner(deps.binary, [...deps.prefix, ...buildProcessListArgs(socketPath)], {
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const stdout = captureOutput(child.stdout);
+    // A wedged process-compose accepts the connection and never answers, so
+    // the client would wait forever. Kill it and fail the read.
+    const timer = setTimeout(() => {
+      child.kill?.("SIGTERM");
+      reject(
+        new Error(
+          `${deps.binary} process list did not answer within ${formatSeconds(deps.timeoutMs)}`,
+        ),
+      );
+    }, deps.timeoutMs);
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      if (code !== 0 && code !== null) {
+        reject(new Error(`${deps.binary} process list exited with code ${code}`));
+        return;
+      }
+      try {
+        resolve(parseServiceStatuses(stdout() || "[]"));
+      } catch (err) {
+        reject(err as Error);
+      }
+    });
+  });
+}
+
+function formatSeconds(ms: number): string {
+  return ms >= 1000 ? `${Math.round(ms / 1000)}s` : `${ms}ms`;
 }
 
 async function startProcessImpl(
