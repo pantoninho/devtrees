@@ -998,6 +998,23 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
     expect(doc?.error?.message).toMatch(/did not finish within/);
     expect(elapsed).toBeLessThan(50_000);
 
+    // An immediate retry must not reload again (#191): process-compose would
+    // start a second copy now and a third when the old process exits,
+    // orphaning one. It refuses, naming the stuck service, and starts nothing.
+    const retry = up(wt);
+    expect(retry.code, `retry should be refused: ${retry.stderr}`).not.toBe(0);
+    const retryErr = (
+      retry.doc as
+        | { error?: { code?: string; details?: { reason?: string; services?: string[] } } }
+        | undefined
+    )?.error;
+    expect(retryErr?.code).toBe("CONFIG_DRIFT");
+    expect(retryErr?.details?.reason).toBe("reload_pending");
+    expect(retryErr?.details?.services).toEqual(["web"]);
+    await new Promise((r) => setTimeout(r, 2_000));
+    expect(pidsMatching(holdA), "the old process is still the only copy").toHaveLength(1);
+    expect(pidsMatching(holdB), "the refused retry started no new copy").toEqual([]);
+
     // The documented remediation: killing the old process lets process-compose
     // finish the pending update and start the new command.
     reapPids(pidsMatching(holdA));

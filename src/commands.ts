@@ -90,9 +90,21 @@ import {
   formatUpCommand,
   namespaceSelected,
   resolveRunningSelection,
+  serviceNamespaces,
   type DroppedNamespaceEdge,
   type NamespaceNotRunning,
 } from "./selection.js";
+import {
+  clearPendingReload,
+  isProcessAlive,
+  planPendingReload,
+  readPendingReload,
+  stuckFromMarker,
+  provenNamespaces,
+  writePendingReload,
+  type PendingReload,
+  type StuckReload,
+} from "./reload-pending.js";
 import { dependencyOrder, findDeadServices } from "./service-state.js";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -117,14 +129,25 @@ export type { WaitForHealth, WaitForSharedHealth } from "./health.js";
  * `timeout` means process-compose is still waiting for a changed service's
  * old process to exit (`down` would block too). `not_supported` / `error`
  * mean the reload was refused and the instance is untouched.
+ * `reload_pending` (#191) means `up` did not reload at all: an earlier
+ * reload is still waiting on an old process, and a second one would start an
+ * untracked copy of the service. `details.services` names the stuck services
+ * and `details.pids` the old processes to kill (empty when the old process
+ * has exited but the service is not back yet). It can fire with no drift: reverting devtrees.yaml
+ * does not stop process-compose applying the pending config.
  */
+type ConfigDriftDetails =
+  | { readonly reason: "timeout" | "not_supported" | "error" }
+  | {
+      readonly reason: "reload_pending";
+      readonly services: ReadonlyArray<string>;
+      readonly pids: ReadonlyArray<number>;
+    };
+
 class ConfigDriftError extends Error {
   readonly code = "CONFIG_DRIFT";
-  readonly details: { readonly reason: "timeout" | "not_supported" | "error" };
-  constructor(
-    message: string,
-    details: { readonly reason: "timeout" | "not_supported" | "error" },
-  ) {
+  readonly details: ConfigDriftDetails;
+  constructor(message: string, details: ConfigDriftDetails) {
     super(message);
     this.name = "ConfigDriftError";
     this.details = details;
@@ -742,6 +765,13 @@ export interface CommandDeps {
    * itself. Default: the real `reapShutdownHooks`; injected for tests.
    */
   readonly reap?: Reaper;
+  /**
+   * Is a PID still alive? Used by `up` to tell whether an old process a
+   * timed-out reload is waiting on has exited (issue #191). Default: signal
+   * 0. Injected so tests can drive the pending-reload guard without real
+   * processes.
+   */
+  readonly isProcessAlive?: (pid: number) => boolean;
 }
 
 export interface UpResult {
@@ -1341,7 +1371,17 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     //   - drift  -> attempt hot-reload via the driver; map failure to CONFIG_DRIFT.
     // Either way the instance is then verified outside the lock (ADR-0008).
     if (freshSelection === undefined) {
-      await reconcileRunning({ stack, anchor, paths, derived, inst, driver, readHash, writeHash });
+      await reconcileRunning({
+        stack,
+        anchor,
+        paths,
+        derived,
+        inst,
+        driver,
+        deps,
+        readHash,
+        writeHash,
+      });
       return { kind: "running", env: derived.env, sharedStarted, sharedChanges } as const;
     }
 
@@ -1362,6 +1402,8 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     // isolated services land in this instance, so scope dir creation to them.
     ensureLogsDir(stack, logsDir(anchor.anchor, anchor.worktreeId), "isolated");
     writeFileSync(paths.configPath, stringifyYaml(derived.config), "utf8");
+    // A pending-reload marker (#191) describes an instance that is gone now.
+    clearPendingReload(anchor.anchor, anchor.worktreeId);
 
     // Shared-health wait: gate the worktree start on the shared services'
     // readiness probes whenever this worktree drops a cross-tier `depends_on`
@@ -2043,17 +2085,21 @@ export async function runDown(
     // Unknown liveness (#186) throws INSTANCE_UNRESPONSIVE out of the lock:
     // neither "nothing running" nor the dead-supervisor reap below may run
     // against an instance that might still be live.
-    const live = await socketIsLive(paths.socketPath, resolveProbe(deps), {
+    const wasLive = await socketIsLive(paths.socketPath, resolveProbe(deps), {
       command: "down",
       instance: anchor.worktreeId,
     });
-    if (!live) return false;
     // Live supervisor: a graceful `process-compose down` fires each process's
     // `shutdown.command` from its `working_dir` (the worktree, which is present
     // on the normal `down` path). devtrees must NOT also run the hook directly
     // here — that would double-run it (acceptance #4: no regression).
-    await driver.down({ configPath: paths.configPath, socketPath: paths.socketPath });
-    return true;
+    if (wasLive) {
+      await driver.down({ configPath: paths.configPath, socketPath: paths.socketPath });
+    }
+    // The instance is gone either way, and with it any reload still pending
+    // in it (#191). Not reached when the stop throws.
+    clearPendingReload(anchor.anchor, anchor.worktreeId);
+    return wasLive;
   });
   if (live) return { shared: false, worktreeId: anchor.worktreeId, stopped: true };
 
@@ -2412,6 +2458,7 @@ async function reapAndCleanupOrphan(
   // but stale/failed orphans need explicit cleanup) and the derived config.
   rmSync(socketPath, { force: true });
   rmSync(paths.configPath, { force: true });
+  clearPendingReload(anchor, orphan.id);
   return warning === undefined ? {} : { warning };
 }
 
@@ -2826,26 +2873,30 @@ const RELOAD_FAILED_REMEDIATION =
  * A timed-out reload means process-compose is still waiting for an old process
  * to exit, and `down` would wait on the same process. Killing that process
  * unblocks process-compose, which then finishes applying the new config. A
- * retried `up` before then is unsafe: process-compose has already dropped the
- * old process from its list, so a second reload starts a new copy
- * next to it, and the pending update later starts another one, leaving the
- * first copy orphaned.
+ * second reload before then would start a new copy next to the old process,
+ * and the pending update would later start another one, orphaning the first
+ * copy; `up` therefore refuses with `reload_pending` until then (#191).
  */
 const RELOAD_TIMEOUT_REMEDIATION =
   ". The instance is still running, but process-compose stays blocked until the old " +
-  "process exits, and `devtrees down` would block on it too. Do NOT re-run `devtrees up` " +
-  "until that process has exited: process-compose would start a second, untracked copy of " +
-  "the service. Kill the service's old process to let the reload finish, then run " +
-  "`devtrees up` again to resync the on-disk config and stored hash. To prevent this, give " +
-  "the service a `shutdown.command` that really stops the process; `shutdown.timeout_seconds` " +
-  "does not help when a `shutdown.command` exits 0 without stopping it (it only bounds the " +
-  "command itself, and only the plain SIGTERM path escalates to SIGKILL after it).";
+  "process exits, and `devtrees down` would block on it too. Kill the service's old process " +
+  "to let the reload finish, then run `devtrees up` again to resync the on-disk config and " +
+  "stored hash; until that process has exited, `devtrees up` refuses with " +
+  "`reload_pending` instead of reloading again (a second reload would start an untracked " +
+  "copy of the service). To prevent this, give the service a `shutdown.command` that really " +
+  "stops the process; `shutdown.timeout_seconds` does not help when a `shutdown.command` " +
+  "exits 0 without stopping it (it only bounds the command itself, and only the plain " +
+  "SIGTERM path escalates to SIGKILL after it).";
 
 /**
  * Config drift step for a `runUp` whose worktree instance is already
  * running. Runs inside the lifecycle lock; `verifyRunning` checks the
- * instance afterwards. Two outcomes:
+ * instance afterwards. Outcomes:
  *
+ *  - **Reload pending** (#191) -> a previous reload is still waiting on an
+ *    old process (`assertNoPendingReload`): throw `ConfigDriftError` with
+ *    `reason: "reload_pending"` before touching anything. Checked whenever a
+ *    marker exists, and on every drift.
  *  - **Matching hash** -> noop: skip `driver.up`, the reload and the
  *    registry write.
  *  - **Drift** -> write the new derived config and call `driver.reloadConfig`.
@@ -2853,7 +2904,9 @@ const RELOAD_TIMEOUT_REMEDIATION =
  *    failure, restore the previous on-disk config (issue #92 — the file must
  *    keep matching the still-running instance, `ls` reads ports from it) and
  *    throw `ConfigDriftError` so the CLI emits the `CONFIG_DRIFT` envelope
- *    and the instance keeps running (ADR-0005).
+ *    and the instance keeps running (ADR-0005). A timeout also persists the
+ *    pending-reload marker, from the `process list` snapshot taken before
+ *    the reload.
  */
 async function reconcileRunning(args: {
   readonly stack: ResolvedStack;
@@ -2865,13 +2918,15 @@ async function reconcileRunning(args: {
   readonly derived: ReturnType<typeof deriveWorktreeConfig>;
   readonly inst: { readonly configPath: string; readonly socketPath: string };
   readonly driver: ReturnType<typeof createDriver>;
+  readonly deps: CommandDeps;
   readonly readHash: (anchor: string, id: string) => string | undefined;
   readonly writeHash: (anchor: string, id: string, hash: string) => void;
 }): Promise<void> {
-  const { stack, anchor, paths, derived, inst, driver } = args;
-  const currentHash = stackHash(stack);
-  const storedHash = args.readHash(anchor.anchor, anchor.worktreeId);
-  if (storedHash === currentHash) return;
+  const { anchor, paths } = args;
+  const currentHash = stackHash(args.stack);
+  const drift = args.readHash(anchor.anchor, anchor.worktreeId) !== currentHash;
+  const marker = readPendingReload(anchor.anchor, anchor.worktreeId);
+  if (!drift && marker === undefined) return;
   // The on-disk derived config must always describe the *running* instance
   // (issue #92) — `ls` reads its ports from this file. `driver.reloadConfig`
   // re-reads the config from disk, so the new one has to be written before
@@ -2882,20 +2937,168 @@ async function reconcileRunning(args: {
   const previousConfig = existsSync(paths.configPath)
     ? readFileSync(paths.configPath, "utf8")
     : undefined;
-  writeFileSync(paths.configPath, stringifyYaml(derived.config), "utf8");
-  const reload = await driver.reloadConfig(inst, { timeoutMs: reloadTimeoutMs(derived.config) });
-  if (!reload.ok) {
-    if (previousConfig === undefined) rmSync(paths.configPath, { force: true });
-    else writeFileSync(paths.configPath, previousConfig, "utf8");
-    throw new ConfigDriftError(
-      `devtrees up: config drift detected for '${anchor.worktreeId}' and the running ` +
-        `process-compose could not hot-reload the new config` +
-        (reload.message ? ` (${reload.message})` : "") +
-        (reload.reason === "timeout" ? RELOAD_TIMEOUT_REMEDIATION : RELOAD_FAILED_REMEDIATION),
-      { reason: reload.reason },
-    );
-  }
+  // One bounded read; it doubles as the pre-reload snapshot the marker's old
+  // PIDs come from. A failed read is `undefined`, not evidence of anything.
+  const rows = await statusReader(args.deps, args.driver)(paths.socketPath, {
+    timeoutMs: READ_TIMEOUT_MS,
+  }).catch(() => undefined);
+  assertNoPendingReload({
+    anchor,
+    marker,
+    rows,
+    previous: derivedProcesses(previousConfig),
+    isolated: args.stack.services.filter((s) => s.tier === "isolated"),
+    requested: args.deps.namespaces ?? [],
+    isAlive: args.deps.isProcessAlive ?? isProcessAlive,
+  });
+  if (!drift) return;
+  await applyReload({ ...args, previousConfig, rows });
   args.writeHash(anchor.anchor, anchor.worktreeId, currentHash);
+}
+
+/**
+ * Write the new derived config and hot-reload it. On failure, restore the
+ * previous config (#92), persist the pending-reload marker if it timed out
+ * (#191), and throw `ConfigDriftError`.
+ */
+async function applyReload(args: {
+  readonly anchor: { readonly anchor: string; readonly worktreeId: string };
+  readonly paths: { readonly configPath: string };
+  readonly derived: ReturnType<typeof deriveWorktreeConfig>;
+  readonly inst: { readonly configPath: string; readonly socketPath: string };
+  readonly driver: ReturnType<typeof createDriver>;
+  readonly previousConfig: string | undefined;
+  readonly rows: ServiceStatus[] | undefined;
+  readonly writeHash: (anchor: string, id: string, hash: string) => void;
+}): Promise<void> {
+  const { anchor, paths, derived, previousConfig } = args;
+  const nextConfig = stringifyYaml(derived.config);
+  writeFileSync(paths.configPath, nextConfig, "utf8");
+  const reload = await args.driver.reloadConfig(args.inst, {
+    timeoutMs: reloadTimeoutMs(derived.config),
+  });
+  if (reload.ok) return;
+  if (previousConfig === undefined) rmSync(paths.configPath, { force: true });
+  else writeFileSync(paths.configPath, previousConfig, "utf8");
+  if (reload.reason === "timeout") {
+    // Both sides read back from YAML, so the per-service diff compares like
+    // with like.
+    const marker = planPendingReload(
+      derivedProcesses(previousConfig),
+      derivedProcesses(nextConfig) ?? {},
+      args.rows,
+    );
+    writePendingReload(anchor.anchor, anchor.worktreeId, marker);
+    // process-compose will end up running the NEW config, while the restored
+    // on-disk config and the stored hash still describe the old one. Forget
+    // the hash so the first `up` after the reload converges sees drift and
+    // re-applies whatever devtrees.yaml says then: a no-op if it still holds
+    // the new config, a restart if it was reverted meanwhile.
+    args.writeHash(anchor.anchor, anchor.worktreeId, RELOAD_TIMED_OUT_HASH);
+  }
+  throw new ConfigDriftError(
+    `devtrees up: config drift detected for '${anchor.worktreeId}' and the running ` +
+      `process-compose could not hot-reload the new config` +
+      (reload.message ? ` (${reload.message})` : "") +
+      (reload.reason === "timeout" ? RELOAD_TIMEOUT_REMEDIATION : RELOAD_FAILED_REMEDIATION),
+    { reason: reload.reason },
+  );
+}
+
+type DerivedProcessMap = Readonly<Record<string, Readonly<Record<string, unknown>>>>;
+
+/** The `processes` map of a derived config's YAML, or `undefined` if unreadable. */
+function derivedProcesses(yaml: string | undefined): DerivedProcessMap | undefined {
+  if (yaml === undefined) return undefined;
+  try {
+    const processes = (parseYaml(yaml) as { processes?: unknown } | null)?.processes;
+    return processes !== null && typeof processes === "object"
+      ? (processes as DerivedProcessMap)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Stored-hash sentinel written when a reload times out (#191). It never
+ * equals a real stack hash, so the next `up` always takes the drift path.
+ */
+const RELOAD_TIMED_OUT_HASH = "reload-timed-out";
+
+/**
+ * Refuse to reload while a previous reload is still pending (#191; see
+ * src/reload-pending.ts). The marker is checked whenever there is one, and
+ * cleared once a successful read shows it converged; a failed read leaves it
+ * in place, with only the old PIDs as evidence.
+ */
+function assertNoPendingReload(args: {
+  readonly anchor: { readonly anchor: string; readonly worktreeId: string };
+  readonly marker: PendingReload | undefined;
+  readonly rows: ServiceStatus[] | undefined;
+  readonly previous: DerivedProcessMap | undefined;
+  readonly isolated: ReadonlyArray<ResolvedService>;
+  readonly requested: ReadonlyArray<string>;
+  readonly isAlive: (pid: number) => boolean;
+}): void {
+  const { anchor, marker, rows } = args;
+  if (marker === undefined) return;
+  const stuck = stuckFromMarker(marker, rows, args.isAlive);
+  if (stuck !== undefined) {
+    throw reloadPendingError(anchor.worktreeId, stuck, pendingRemedyUp({ ...args, stuck }));
+  }
+  if (rows !== undefined) clearPendingReload(anchor.anchor, anchor.worktreeId);
+}
+
+/**
+ * The `down` + `up` that reboots the instance with the namespaces it runs:
+ * the ones this `up` asked for, those the project proves booted (a narrower
+ * `-n` must not drop the rest), and the stuck services' own when they have
+ * exactly one (they were running before the reload).
+ */
+function pendingRemedyUp(args: {
+  readonly rows: ServiceStatus[] | undefined;
+  readonly previous: DerivedProcessMap | undefined;
+  readonly isolated: ReadonlyArray<ResolvedService>;
+  readonly requested: ReadonlyArray<string>;
+  readonly stuck: StuckReload;
+}): string {
+  const proven =
+    args.previous !== undefined && args.rows !== undefined
+      ? provenNamespaces(args.previous, args.rows)
+      : [];
+  const stuckOwn = args.isolated
+    .filter((s) => args.stuck.services.includes(s.name))
+    .map((s) => serviceNamespaces(s))
+    .flatMap((ns) => (ns.length === 1 ? ns : []));
+  const namespaces = [...new Set([...args.requested, ...proven, ...stuckOwn])].sort();
+  return `devtrees down && ${formatUpCommand(args.isolated, namespaces)}`;
+}
+
+function reloadPendingError(
+  worktreeId: string,
+  stuck: StuckReload,
+  rebootCommand: string,
+): ConfigDriftError {
+  const names = stuck.services.map((s) => `'${s}'`).join(", ");
+  const pids = stuck.pids.join(" ");
+  const [waitingOn, remedy] =
+    stuck.pids.length > 0
+      ? [
+          `its old process (pid ${stuck.pids.join(", ")}) has not exited`,
+          `Kill the old process (\`kill ${pids}\`), then run \`devtrees up\` again.`,
+        ]
+      : [
+          `its old process has exited, but process-compose has not brought it back yet`,
+          `Wait a moment for process-compose to start the new one, then run ` +
+            `\`devtrees up\` again. If this persists, run \`${rebootCommand}\`.`,
+        ];
+  return new ConfigDriftError(
+    `devtrees up: a previous hot-reload of '${worktreeId}' is still pending for ${names}: ` +
+      `${waitingOn}. Reloading again now would make process-compose start a second, ` +
+      `untracked copy, so nothing was reloaded and the instance is unchanged. ${remedy}`,
+    { reason: "reload_pending", services: stuck.services, pids: stuck.pids },
+  );
 }
 
 /**

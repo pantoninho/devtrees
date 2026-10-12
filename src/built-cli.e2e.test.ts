@@ -1224,3 +1224,87 @@ describe("built CLI e2e — list-valued namespaces and dropped cross-namespace e
     expect((r.doc as NsEdgeDoc).error?.message).toContain("namespace list is empty");
   }, 30_000);
 });
+
+describe("built CLI e2e — hot-reload over the control socket (#194, #191)", () => {
+  interface ReloadErrorDoc {
+    readonly error?: { readonly code?: string; readonly details?: Record<string, unknown> };
+  }
+
+  /** `web` and `api` in the default namespace; `extra` lines are appended. */
+  function reloadStack(extra: ReadonlyArray<string> = []): string {
+    return [
+      "services:",
+      "  web:",
+      "    tier: isolated",
+      '    command: "sleep 300"',
+      "    ports: [WEB_PORT]",
+      "  api:",
+      "    tier: isolated",
+      '    command: "sleep 301"',
+      ...extra,
+      "",
+    ].join("\n");
+  }
+
+  const names = (wt: string, id: string): string[] | undefined =>
+    (devtrees(wt, ["ls", "--json"]).doc as LsDoc).ls.instances
+      .find((i) => i.id === id)
+      ?.services.map((s) => s.name)
+      .sort();
+
+  it("a drifted up reloads through POST /project/configuration and the project picks up the new service", () => {
+    const { wt, id, stateDir } = setupRepoWithStack("dt-bcr1-", reloadStack());
+    expect(devtrees(wt, ["up", "--json", "--wait-timeout", "10"]).code).toBe(0);
+    expect(names(wt, id)).toEqual(["api", "web"]);
+
+    writeFileSync(
+      join(wt, "devtrees.yaml"),
+      reloadStack(["  worker:", "    tier: isolated", '    command: "sleep 302"']),
+    );
+    const reload = devtrees(wt, ["up", "--json", "--wait-timeout", "10"]);
+    expect(reload.code, `drifted up failed: ${reload.stderr} ${reload.stdout}`).toBe(0);
+    // The stub's reload handler re-read the derived config: `process list`
+    // now reports the added service, and the on-disk config carries it.
+    expect(names(wt, id)).toEqual(["api", "web", "worker"]);
+    expect(readFileSync(join(stateDir, `${id}.yaml`), "utf8")).toContain("sleep 302");
+    // The new hash was stored: the next up is a noop that still exits 0.
+    expect(devtrees(wt, ["up", "--json", "--wait-timeout", "10"]).code).toBe(0);
+  }, 60_000);
+
+  it("a pending reload refuses with CONFIG_DRIFT reload_pending, then reloads once it converged (#191)", () => {
+    const { wt, id, stateDir } = setupRepoWithStack("dt-bcr2-", reloadStack());
+    expect(devtrees(wt, ["up", "--json", "--wait-timeout", "10"]).code).toBe(0);
+    // What a timed-out reload leaves behind; this test process stands in for
+    // the old `web` process that will not exit.
+    const marker = join(stateDir, `${id}.reload-pending.json`);
+    writeFileSync(
+      marker,
+      JSON.stringify({ services: ["web"], oldRuns: [{ name: "web", pid: process.pid }] }),
+    );
+    writeFileSync(join(wt, "devtrees.yaml"), reloadStack().replace("sleep 300", "sleep 303"));
+    const configBefore = readFileSync(join(stateDir, `${id}.yaml`), "utf8");
+
+    const refused = devtrees(wt, ["up", "--json", "--wait-timeout", "10"]);
+    expect(refused.code).toBe(1);
+    expect((refused.doc as ReloadErrorDoc).error).toMatchObject({
+      code: "CONFIG_DRIFT",
+      details: { reason: "reload_pending", services: ["web"], pids: [process.pid] },
+    });
+    // Nothing was reloaded.
+    expect(readFileSync(join(stateDir, `${id}.yaml`), "utf8")).toBe(configBefore);
+
+    const human = devtrees(wt, ["up", "--no-attach"]);
+    expect(human.code).toBe(1);
+    expect(human.stderr).toContain(`kill ${process.pid}`);
+
+    // The old process is gone and `web` is in the project: the reload runs.
+    writeFileSync(
+      marker,
+      JSON.stringify({ services: ["web"], oldRuns: [{ name: "web", pid: 2 ** 22 + 12345 }] }),
+    );
+    const resync = devtrees(wt, ["up", "--json", "--wait-timeout", "10"]);
+    expect(resync.code, `resync failed: ${resync.stderr} ${resync.stdout}`).toBe(0);
+    expect(existsSync(marker)).toBe(false);
+    expect(readFileSync(join(stateDir, `${id}.yaml`), "utf8")).toContain("sleep 303");
+  }, 60_000);
+});

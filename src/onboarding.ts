@@ -86,6 +86,12 @@ are. It never stops anything, and never attaches the TUI.
   stack stopped by a concurrent \`down\` starts nothing and fails with
   \`INSTANCE_NOT_FOUND\`; one that waits too long for the other fails with
   \`LOCK_CONTENTION\`. Either way, run \`devtrees up\` again.
+- A hot-reload whose changed service's old process never stops fails with
+  \`CONFIG_DRIFT\` (\`details.reason: "timeout"\`), and process-compose keeps
+  waiting on that process. Until it exits, \`up\` reloads nothing and fails
+  with \`details.reason: "reload_pending"\`, naming the service and the old
+  PID: a second reload would start an untracked copy. Kill the old process,
+  then run \`devtrees up\` again.
 - A dead shared service fails \`up\` with \`SHARED_SERVICE_DEAD\`; run
   \`devtrees down --shared && devtrees up\`.
 
@@ -104,7 +110,7 @@ Branch on \`error.code\`:
 | \`SERVICE_START_FAILED\`      | \`up\` tried to restart a dead service and process-compose refused. \`details.services\` carries each one with process-compose's message; read it, then run \`details.remedy\` (\`devtrees down && devtrees up …\`). |
 | \`STALE_PORT_BLOCK\`          | Foreign listeners hold this worktree's ports. \`details.collisions[]\` lists \`{port_name, port, pid, command}\`; kill the orphans and retry. |
 | \`SHARED_DRIFT\`              | This worktree's shared services diverge from the running shared instance. Follow the message: \`devtrees down --shared && devtrees up\`. |
-| \`CONFIG_DRIFT\`              | The running config differs from \`devtrees.yaml\` and hot-reload failed. Branch on \`details.reason\`: \`not_supported\`/\`error\` → \`devtrees down && devtrees up\`. \`timeout\` → a changed service's old process won't stop and \`down\` would hang too: do **not** re-run \`up\` (it starts an untracked second copy); kill that process, then run \`devtrees up\` again to resync. |
+| \`CONFIG_DRIFT\`              | The running config differs from \`devtrees.yaml\` and hot-reload failed, or an earlier reload is still pending. Branch on \`details.reason\`: \`not_supported\`/\`error\` → \`devtrees down && devtrees up\`. \`timeout\` → a changed service's old process won't stop and \`down\` would hang too: kill that process, then run \`devtrees up\` again to resync. \`reload_pending\` → that earlier reload is still waiting, so \`up\` reloaded nothing (another reload would start an untracked second copy): kill the old process (\`details.pids\`, for \`details.services\`), then run \`devtrees up\` again. Empty \`details.pids\` → the old process is gone and process-compose is still starting the new one: retry shortly; if it persists, follow the message's \`devtrees down && devtrees up …\`. |
 | \`SERVICE_NOT_FOUND\`         | You named a service that isn't in the instance. \`details.valid_services\` lists the real names; pick one. |
 | \`NO_SERVICES_SELECTED\`      | A bare \`up\` starts only services with no \`namespace:\`, and there are none. \`details.namespaces\` lists the namespaces; retry with \`devtrees up -n <ns>\`. |
 | \`INSTANCE_NOT_FOUND\`        | No instance is running for this worktree. Run \`devtrees up\` first.                            |

@@ -29,7 +29,7 @@ export const DEFAULT_NAMESPACE = "default";
  * `default`. A list-valued `namespace:` (ADR-0008, #179) contributes every
  * entry, so membership checks read "selected if ANY of its namespaces is".
  */
-function serviceNamespaces(service: Pick<ResolvedService, "namespace">): string[] {
+export function serviceNamespaces(service: Pick<ResolvedService, "namespace">): string[] {
   const ns = service.namespace;
   if (ns === undefined) return [DEFAULT_NAMESPACE];
   return typeof ns === "string" ? [ns] : [...ns];
