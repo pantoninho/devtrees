@@ -133,12 +133,14 @@ describe("devtrees CLI", () => {
         "HEALTH_TIMEOUT",
         "NAMESPACE_NOT_RUNNING",
         "SHARED_SERVICE_DEAD",
+        "SERVICE_START_FAILED",
+        "INSTANCE_NOT_FOUND",
         "PROCESS_COMPOSE_NOT_FOUND",
         "INVALID_ARGS",
         "UNKNOWN",
       ],
     ],
-    // `down --shared` serializes on the shared lifecycle lock → LOCK_CONTENTION.
+    // `down` serializes on a lifecycle lock (worktree or shared) → LOCK_CONTENTION.
     ["down", ["PROCESS_COMPOSE_NOT_FOUND", "LOCK_CONTENTION", "UNKNOWN"]],
     ["ls", ["UNKNOWN"]],
     ["attach", ["INSTANCE_NOT_FOUND", "PROCESS_COMPOSE_NOT_FOUND", "UNKNOWN"]],
@@ -161,6 +163,7 @@ describe("devtrees CLI", () => {
     "HEALTH_TIMEOUT",
     "NAMESPACE_NOT_RUNNING",
     "SHARED_SERVICE_DEAD",
+    "SERVICE_START_FAILED",
     "CONFIG_DRIFT",
     "SHARED_DRIFT",
     "SHARED_START_FAILED",

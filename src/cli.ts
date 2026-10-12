@@ -125,6 +125,7 @@ export interface ExecuteDeps {
     services?: ReadonlyArray<LsServiceRow>;
     /** `depends_on` edges lost to namespace selection (#179). */
     droppedNamespaceEdges?: ReadonlyArray<DroppedNamespaceEdge>;
+    restarted?: ReadonlyArray<string>;
   }>;
   /**
    * Dry-run derivation (#124): runs the full pipeline `up` would run and
@@ -317,6 +318,8 @@ class UpCommand extends DevtreesCommand {
       "HEALTH_TIMEOUT",
       "NAMESPACE_NOT_RUNNING",
       "SHARED_SERVICE_DEAD",
+      "SERVICE_START_FAILED",
+      "INSTANCE_NOT_FOUND",
       "PROCESS_COMPOSE_NOT_FOUND",
       "INVALID_ARGS",
       "UNKNOWN",
@@ -358,7 +361,7 @@ class UpCommand extends DevtreesCommand {
       "Start exactly the given process-compose namespace(s). Repeatable (`-n a -n b`); " +
       "`-n app` does not imply `default`. Omitted, a fresh `up` starts only the `default` " +
       "namespace (services with no `namespace:`) and fails with NO_SERVICES_SELECTED if it has none. " +
-      "On a running instance, omitted checks the namespaces it was booted with, and `-n` naming one " +
+      "On a running instance, omitted checks the namespaces it was booted with (restarting dead services), and `-n` naming one " +
       "it was not booted with fails with NAMESPACE_NOT_RUNNING.",
   });
   dryRun = Option.Boolean("--dry-run", false, {
@@ -374,19 +377,10 @@ class UpCommand extends DevtreesCommand {
     return this.dispatch(async () => {
       if (this.dryRun) return this.executeDryRun();
       const result = await this.context.deps.up(this.buildUpOptions());
-      const out = formatUp(
-        {
-          worktreeId: result.worktreeId,
-          env: result.env,
-          sharedStarted: result.sharedStarted ?? false,
-          ...(result.blockBase !== undefined ? { blockBase: result.blockBase } : {}),
-          ...(result.services !== undefined ? { services: result.services } : {}),
-          ...(result.droppedNamespaceEdges !== undefined
-            ? { droppedNamespaceEdges: result.droppedNamespaceEdges }
-            : {}),
-        },
-        this.mode,
-      );
+      // The optional fields (`blockBase`, `services`, `droppedNamespaceEdges`,
+      // `restarted`) pass through
+      // as-is; `formatUp` defaults whichever a caller left out.
+      const out = formatUp({ ...result, sharedStarted: result.sharedStarted ?? false }, this.mode);
       if (out.stdout) this.context.stdout.write(out.stdout);
       if (out.stderr) this.context.stderr.write(out.stderr);
       this.emitInitHint();
@@ -484,7 +478,8 @@ class DownCommand extends DevtreesCommand {
   static override paths = [["down"]];
   static override usage = Command.Usage({
     description: "Stop this worktree's stack (`--shared` tears down the shared instance).",
-    // `--shared` serializes on the shared lifecycle lock → LOCK_CONTENTION.
+    // Both branches serialize on a lifecycle lock (the worktree's, #178, or the
+    // shared one with `--shared`) → LOCK_CONTENTION.
     details: errorCodeFooter(["PROCESS_COMPOSE_NOT_FOUND", "LOCK_CONTENTION", "UNKNOWN"]),
   });
 

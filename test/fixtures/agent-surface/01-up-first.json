@@ -19,6 +19,7 @@
     ],
     "shared_started": true,
     "dropped_namespace_edges": [],
+    "restarted": [],
     "block_base": 0
   }
 }

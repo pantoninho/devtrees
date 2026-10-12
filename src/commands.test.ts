@@ -130,6 +130,23 @@ function spawnedOk(): SpawnedProcess {
   };
 }
 
+/**
+ * A `process-compose process start` child that refuses: writes `stderr` the
+ * way the real binary logs a refusal, then exits 1 (issue #178).
+ */
+function refusedStart(stderr: string): SpawnedProcess {
+  const exitHandlers: Array<(code: number | null) => void> = [];
+  setTimeout(() => {
+    for (const h of exitHandlers) h(1);
+  }, 5);
+  return {
+    on(event: "error" | "exit", cb: (arg: never) => void): void {
+      if (event === "exit") exitHandlers.push(cb as (code: number | null) => void);
+    },
+    stderr: Readable.from([stderr]),
+  };
+}
+
 /** Find the shared-instance up-spawn in a tracker, asserting it happened. */
 function findSharedSpawn(track: StubSpawn): UpInvocation {
   const spawn = track.invocations.find((i) => i.socketPath.endsWith("/shared.sock"));
@@ -1865,6 +1882,80 @@ describe("runDown — shared lifecycle is decoupled from worktree lifecycle", ()
  * `{shared: false, worktreeId: "<id>"}` (discriminated union). Pre- and
  * post-teardown state belongs to `ls --json`, not this envelope.
  */
+/**
+ * The worktree `down` runs under the per-worktree lifecycle lock (#178), so
+ * an `up` restarting dead services cannot `process start` on a supervisor
+ * that is shutting down.
+ */
+describe("runDown — worktree teardown holds the lifecycle lock (#178)", () => {
+  const stack: ResolvedStack = { services: [isolated("web", "node server.js", ["WEB_PORT"])] };
+
+  it("probes and stops the instance inside the worktree's lifecycle lock", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const deps = stubDeps({ stack, track });
+    await runUp(deps);
+    const events: string[] = [];
+    const spawner = deps.driver?.spawner;
+    if (spawner === undefined) throw new Error("expected spawner");
+    const result = await runDown({
+      ...deps,
+      withLifecycleLock: async (_a, instanceId, fn) => {
+        events.push(`lock ${instanceId}`);
+        const out = await fn();
+        events.push("unlock");
+        return out;
+      },
+      driver: {
+        ...deps.driver,
+        spawner: (b, args, o) => {
+          events.push(args[0] ?? "");
+          return spawner(b, args, o);
+        },
+      },
+    });
+    expect(result.stopped).toBe(true);
+    expect(events).toEqual([`lock ${deps.expectedWorktreeId}`, "down", "unlock"]);
+  });
+
+  it("a lock held by a concurrent up fails LOCK_CONTENTION and stops nothing", async () => {
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const deps = stubDeps({ stack, track });
+    await runUp(deps);
+    const anchor = (deps.git!(["rev-parse", "--git-common-dir"]) as string).trim();
+    const downs: string[][] = [];
+    const spawner = deps.driver?.spawner;
+    if (spawner === undefined) throw new Error("expected spawner");
+    let release: () => void = () => {};
+    const held = new Promise<void>((r) => (release = r));
+    let acquired: () => void = () => {};
+    const isHeld = new Promise<void>((r) => (acquired = r));
+    const holder = withLifecycleLock(anchor, deps.expectedWorktreeId, async () => {
+      acquired();
+      await held;
+    });
+    await isHeld;
+    const err = await runDown({
+      ...deps,
+      withLifecycleLock: (a, i, fn) =>
+        withLifecycleLock(a, i, fn, { retries: 3, retryDelayMs: 10 }),
+      driver: {
+        ...deps.driver,
+        spawner: (b, args, o) => {
+          if (args[0] === "down") downs.push([...args]);
+          return spawner(b, args, o);
+        },
+      },
+    }).then(
+      () => undefined,
+      (e: unknown) => e as Error & { code?: string },
+    );
+    release();
+    await holder;
+    expect(err?.code).toBe("LOCK_CONTENTION");
+    expect(downs).toEqual([]);
+  });
+});
+
 describe("runDown — operation-output result (#48)", () => {
   const mixedStack: ResolvedStack = {
     services: [
@@ -4082,9 +4173,9 @@ describe("runUp — idempotency + drift detection (#31)", () => {
  * `runUp` on an already-running instance verifies it (ADR-0008, issue #177)
  * instead of printing `is up.` because the socket answers: the selection is
  * read back from the project, an unbooted `-n` fails with
- * NAMESPACE_NOT_RUNNING (#170), a dead selected service fails with
- * HEALTH_TIMEOUT (#162), a dead shared service with SHARED_SERVICE_DEAD, and
- * nothing is ever stopped or started.
+ * NAMESPACE_NOT_RUNNING (#170), a dead selected isolated service is
+ * restarted and waited on (#162, #178), a dead shared service fails with
+ * SHARED_SERVICE_DEAD, and nothing is ever stopped.
  */
 describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
   const running = (name: string): ServiceStatus => ({ name, status: "Running", health: "unknown" });
@@ -4143,7 +4234,15 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
       },
       ...extra,
     };
-    return { deps, spawned, statusReads, wtSocket, sharedSocket, id: base.expectedWorktreeId };
+    return {
+      deps,
+      spawned,
+      statusReads,
+      wtSocket,
+      sharedSocket,
+      id: base.expectedWorktreeId,
+      anchor: tmp.anchor,
+    };
   }
 
   async function failure(deps: CommandDeps) {
@@ -4256,34 +4355,369 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
       },
     );
     await expect(runUp(deps)).resolves.toBeDefined();
-    // Only `one` is checked — `b` being dead in `two` is not this call's business.
+    // Only `one` is checked — `b` being dead in `two` is not this call's
+    // business, so it is not restarted either (#178).
     expect(waited).toEqual([["a"]]);
     expect(spawned.filter((a) => a[0] !== "process")).toEqual([]);
+    expect(spawned.filter((a) => a[1] === "start")).toEqual([]);
   });
 
-  it("#162: a killed service (Completed, exit -1) fails up with HEALTH_TIMEOUT naming it, fast", async () => {
-    const stack: ResolvedStack = {
+  describe("restarting dead isolated services (#178)", () => {
+    const toyStack: ResolvedStack = {
       services: [
         { ...isolated("toy", "python3 -m http.server", ["TOY_PORT"]), namespace: "test" },
         { ...isolated("keeper", "sleep 100000"), namespace: "test" },
       ],
     };
-    const { deps, spawned } = liveInstance(
-      stack,
-      { worktree: [killed("toy"), running("keeper")] },
-      { namespaces: ["test"], waitTimeoutMs: 60_000 },
-    );
-    const started = Date.now();
-    const err = await failure(deps);
-    expect(Date.now() - started).toBeLessThan(10_000);
-    expect(err?.code).toBe("HEALTH_TIMEOUT");
-    expect(err?.message).toContain("toy (Completed, exit -1)");
-    expect(err?.message).toContain("devtrees down && devtrees up -n test");
-    expect(err?.details).toMatchObject({
-      dead_services: [{ name: "toy", status: "Completed", exit_code: -1 }],
+    const killedWithPid = (name: string, pid: number, exitCode = -1): ServiceStatus => ({
+      ...killed(name),
+      exitCode,
+      pid,
     });
-    // Reported, not restarted: no process-compose call other than reads.
-    expect(spawned.filter((a) => a[0] !== "process")).toEqual([]);
+    const starts = (spawned: string[][]) =>
+      spawned.filter((a) => a[0] === "process" && a[1] === "start");
+
+    /**
+     * Status reads that serve `before` until a `process start` has been
+     * spawned, then each entry of `after` in turn (the last one repeats;
+     * `before` again when `after` is empty).
+     */
+    function reads(
+      spawned: string[][],
+      before: ServiceStatus[],
+      after: ServiceStatus[][],
+    ): (socketPath: string) => Promise<ServiceStatus[]> {
+      let i = 0;
+      return async () => {
+        if (starts(spawned).length === 0) return before;
+        const rows = after[Math.min(i, after.length - 1)] ?? before;
+        i += 1;
+        return rows;
+      };
+    }
+
+    it("#162: a killed service is started again over the control socket, then up succeeds", async () => {
+      const { deps, spawned, wtSocket } = liveInstance(
+        toyStack,
+        { worktree: [] },
+        { namespaces: ["test"], waitTimeoutMs: 10_000 },
+      );
+      const result = await runUp({
+        ...deps,
+        getServiceStatuses: reads(
+          spawned,
+          [killedWithPid("toy", 41), running("keeper")],
+          [[running("toy"), running("keeper")]],
+        ),
+      });
+      expect(starts(spawned)).toEqual([["process", "start", "toy", "-U", "-u", wtSocket]]);
+      expect(result.restarted).toEqual(["toy"]);
+      // Never stops anything: no `down`, no `up`, no reload.
+      expect(spawned.filter((a) => a[0] !== "process")).toEqual([]);
+    });
+
+    it("the stale pre-restart row read right after `process start` does not fail-fast", async () => {
+      // Same pid as before the restart: still the old corpse, not a new death.
+      const stale = [killedWithPid("toy", 41), running("keeper")];
+      const { deps, spawned } = liveInstance(
+        toyStack,
+        { worktree: [] },
+        { namespaces: ["test"], waitTimeoutMs: 10_000 },
+      );
+      const result = await runUp({
+        ...deps,
+        getServiceStatuses: reads(spawned, stale, [
+          stale,
+          stale,
+          stale,
+          [running("toy"), running("keeper")],
+        ]),
+      });
+      expect(result.restarted).toEqual(["toy"]);
+    });
+
+    it("a restarted service that dies again (new pid) fails fast with HEALTH_TIMEOUT naming it", async () => {
+      const { deps, spawned } = liveInstance(
+        toyStack,
+        { worktree: [] },
+        { namespaces: ["test"], waitTimeoutMs: 60_000 },
+      );
+      const started = Date.now();
+      const err = await failure({
+        ...deps,
+        getServiceStatuses: reads(
+          spawned,
+          [killedWithPid("toy", 41), running("keeper")],
+          [[killedWithPid("toy", 77, 1), running("keeper")]],
+        ),
+      });
+      expect(Date.now() - started).toBeLessThan(10_000);
+      expect(err?.code).toBe("HEALTH_TIMEOUT");
+      expect(err?.message).toContain("toy (Completed, exit 1)");
+      expect(err?.message).toContain("restarted toy, and it died again");
+      expect(err?.message).toContain("devtrees down && devtrees up -n test");
+      expect(err?.details).toMatchObject({
+        dead_services: [{ name: "toy", status: "Completed", exit_code: 1 }],
+      });
+      expect(starts(spawned)).toHaveLength(1);
+    });
+
+    it("a restarted service that dies again after being read running fails fast too", async () => {
+      const { deps, spawned } = liveInstance(
+        toyStack,
+        { worktree: [] },
+        { namespaces: ["test"], waitTimeoutMs: 60_000 },
+      );
+      const started = Date.now();
+      const err = await failure({
+        ...deps,
+        getServiceStatuses: reads(
+          spawned,
+          [killed("toy"), running("keeper")],
+          [[{ name: "toy", status: "Running", health: "not_ready" }], [killed("toy")]],
+        ),
+      });
+      expect(Date.now() - started).toBeLessThan(10_000);
+      expect(err?.code).toBe("HEALTH_TIMEOUT");
+      expect(err?.message).toContain("died again");
+    });
+
+    it("without pids, a restarted service never read alive is reported dead at the deadline, not before", async () => {
+      const { deps, spawned } = liveInstance(
+        toyStack,
+        { worktree: [] },
+        { namespaces: ["test"], waitTimeoutMs: 600 },
+      );
+      const started = Date.now();
+      const err = await failure({
+        ...deps,
+        getServiceStatuses: reads(spawned, [killed("toy"), running("keeper")], []),
+      });
+      expect(Date.now() - started).toBeGreaterThanOrEqual(550);
+      expect(err?.code).toBe("HEALTH_TIMEOUT");
+      expect(err?.details).toMatchObject({ dead_services: [{ name: "toy", exit_code: -1 }] });
+    });
+
+    it("a restarted probed service that never becomes ready fails HEALTH_TIMEOUT naming only it", async () => {
+      const stack: ResolvedStack = {
+        services: [
+          { ...isolated("toy", "x", ["TOY_PORT"]), readinessProbe: { exec: { command: "x" } } },
+          isolated("keeper", "sleep 100000"),
+        ],
+      };
+      const { deps, spawned } = liveInstance(stack, { worktree: [] }, { waitTimeoutMs: 400 });
+      const err = await failure({
+        ...deps,
+        getServiceStatuses: reads(
+          spawned,
+          [killed("toy"), running("keeper")],
+          [[{ name: "toy", status: "Running", health: "not_ready" }, running("keeper")]],
+        ),
+      });
+      expect(err?.code).toBe("HEALTH_TIMEOUT");
+      expect(err?.message).toContain("healthy [toy] after 400ms");
+      expect(starts(spawned)).toHaveLength(1);
+    });
+
+    it("a failing one-shot (non-zero exit) is restarted; an exit-0 one-shot is not", async () => {
+      const stack: ResolvedStack = {
+        services: [isolated("seed", "x"), isolated("migrate", "true"), isolated("web", "y")],
+      };
+      const done: ServiceStatus = {
+        name: "migrate",
+        status: "Completed",
+        health: "unknown",
+        exitCode: 0,
+      };
+      const seedDone: ServiceStatus = { ...done, name: "seed" };
+      const { deps, spawned } = liveInstance(stack, { worktree: [] });
+      const result = await runUp({
+        ...deps,
+        getServiceStatuses: reads(
+          spawned,
+          [killedWithPid("seed", 5, 3), done, running("web")],
+          [[seedDone, done, running("web")]],
+        ),
+      });
+      expect(starts(spawned).map((a) => a[2])).toEqual(["seed"]);
+      expect(result.restarted).toEqual(["seed"]);
+    });
+
+    it("a service process-compose is already Restarting is left to its restart policy", async () => {
+      const { deps, spawned } = liveInstance(
+        toyStack,
+        {
+          worktree: [
+            { name: "toy", status: "Restarting", health: "unknown", exitCode: -1 },
+            running("keeper"),
+          ],
+        },
+        { namespaces: ["test"], waitForHealth: async () => {} },
+      );
+      const result = await runUp(deps);
+      expect(starts(spawned)).toEqual([]);
+      expect(result.restarted).toEqual([]);
+    });
+
+    it("a refused start fails with SERVICE_START_FAILED naming the service and the down + up remedy", async () => {
+      const { deps, spawned, id } = liveInstance(
+        toyStack,
+        { worktree: [killed("toy"), running("keeper")] },
+        { namespaces: ["test"] },
+      );
+      const recording = deps.driver?.spawner;
+      if (recording === undefined) throw new Error("expected spawner");
+      const err = await failure({
+        ...deps,
+        driver: {
+          ...deps.driver,
+          spawner: (binary, args, options) => {
+            if (args[0] === "process" && args[1] === "start") {
+              spawned.push([...args]);
+              return refusedStart('FTL failed to start process toy error="no such process"');
+            }
+            return recording(binary, args, options);
+          },
+        },
+      });
+      expect(err?.code).toBe("SERVICE_START_FAILED");
+      expect(err?.message).toContain("toy");
+      expect(err?.message).toContain("devtrees down && devtrees up -n test");
+      expect(err?.details).toEqual({
+        worktree_id: id,
+        services: [
+          { name: "toy", message: 'FTL failed to start process toy error="no such process"' },
+        ],
+        remedy: "devtrees down && devtrees up -n test",
+      });
+      expect(spawned.filter((a) => a[0] !== "process")).toEqual([]);
+    });
+
+    it("process-compose refusing because the service is already running is not a failure", async () => {
+      const { deps, spawned } = liveInstance(toyStack, { worktree: [] }, { namespaces: ["test"] });
+      const recording = deps.driver?.spawner;
+      if (recording === undefined) throw new Error("expected spawner");
+      const result = await runUp({
+        ...deps,
+        getServiceStatuses: reads(
+          spawned,
+          [killed("toy"), running("keeper")],
+          [[running("toy"), running("keeper")]],
+        ),
+        driver: {
+          ...deps.driver,
+          spawner: (binary, args, options) => {
+            if (args[0] === "process" && args[1] === "start") {
+              spawned.push([...args]);
+              return refusedStart(
+                "FTL failed to start process toy: process toy is already running",
+              );
+            }
+            return recording(binary, args, options);
+          },
+        },
+      });
+      // Someone else started it: not reported as restarted by this `up`.
+      expect(result.restarted).toEqual([]);
+      expect(starts(spawned)).toHaveLength(1);
+    });
+
+    it("dead services are started in depends_on order, not declaration order", async () => {
+      const stack: ResolvedStack = {
+        services: [
+          { ...isolated("web", "w"), dependsOn: [{ name: "api" }] },
+          { ...isolated("api", "a"), dependsOn: [{ name: "db" }, { name: "keeper" }] },
+          isolated("db", "d"),
+          isolated("keeper", "k"),
+        ],
+      };
+      const { deps, spawned } = liveInstance(stack, { worktree: [] });
+      const result = await runUp({
+        ...deps,
+        getServiceStatuses: reads(
+          spawned,
+          [killed("web"), killed("api"), killed("db"), running("keeper")],
+          [[running("web"), running("api"), running("db"), running("keeper")]],
+        ),
+      });
+      expect(starts(spawned).map((a) => a[2])).toEqual(["db", "api", "web"]);
+      expect(result.restarted).toEqual(["db", "api", "web"]);
+    });
+
+    it("a `down` holding the lifecycle lock: up starts nothing and fails LOCK_CONTENTION", async () => {
+      const { deps, spawned, anchor, id } = liveInstance(
+        toyStack,
+        { worktree: [killed("toy"), running("keeper")] },
+        {
+          namespaces: ["test"],
+          // Up's own spawn-window lock passes; the restart's lock is held by
+          // the "down" below and only retried briefly.
+          withLifecycleLock: (a, i, fn) =>
+            withLifecycleLock(a, i, fn, { retries: 3, retryDelayMs: 10 }),
+        },
+      );
+      let release: () => void = () => {};
+      const held = new Promise<void>((r) => (release = r));
+      let down: Promise<void> | undefined;
+      const err = await failure({
+        ...deps,
+        // The first read runs after up's spawn-window lock is released: a
+        // `down` takes the lifecycle lock right then, before up's restart.
+        getServiceStatuses: async () => {
+          if (down === undefined) {
+            let acquired: () => void = () => {};
+            const isHeld = new Promise<void>((r) => (acquired = r));
+            down = withLifecycleLock(anchor, id, async () => {
+              acquired();
+              await held;
+            });
+            await isHeld;
+          }
+          return [killed("toy"), running("keeper")];
+        },
+      });
+      release();
+      await down;
+      expect(err?.code).toBe("LOCK_CONTENTION");
+      expect(starts(spawned)).toEqual([]);
+    });
+
+    it("an instance that stopped between the read and the lock: nothing started, INSTANCE_NOT_FOUND", async () => {
+      let probes = 0;
+      const { deps, spawned, id } = liveInstance(
+        toyStack,
+        { worktree: [killed("toy"), running("keeper")] },
+        {
+          namespaces: ["test"],
+          // Live for up's own spawn-window gate, gone by the restart's re-probe
+          // (a concurrent `down` finished in between).
+          probeSocket: async () => (++probes === 1 ? "running" : "stale"),
+        },
+      );
+      const err = await failure(deps);
+      expect(err?.code).toBe("INSTANCE_NOT_FOUND");
+      expect(err?.message).toContain("Nothing was started");
+      expect(err?.details).toEqual({ worktree_id: id });
+      expect(starts(spawned)).toEqual([]);
+    });
+
+    it("re-reads under the lock: a service no longer dead there is not started", async () => {
+      let readsSoFar = 0;
+      const { deps, spawned } = liveInstance(
+        toyStack,
+        { worktree: [] },
+        {
+          namespaces: ["test"],
+          getServiceStatuses: async () =>
+            ++readsSoFar === 1
+              ? [killed("toy"), running("keeper")]
+              : [running("toy"), running("keeper")],
+        },
+      );
+      const result = await runUp(deps);
+      expect(starts(spawned)).toEqual([]);
+      expect(result.restarted).toEqual([]);
+    });
   });
 
   it("a completed exit-0 one-shot does not fail up", async () => {
@@ -4328,7 +4762,9 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
       dead_services: [{ name: "db", status: "Completed", exit_code: -1 }],
       remedy: "devtrees down --shared && devtrees up",
     });
+    // Reported, never restarted (ADR-0008).
     expect(spawned.filter((a) => a[0] !== "process")).toEqual([]);
+    expect(spawned.filter((a) => a[1] === "start")).toEqual([]);
   });
 
   it("a FRESH up against an already-running shared instance with a dead service fails SHARED_SERVICE_DEAD before spawning", async () => {

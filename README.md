@@ -192,9 +192,10 @@ footer lists the subset that command can actually emit.
 | `PROCESS_COMPOSE_TOO_OLD`   | The installed `process-compose` is older than v1.122.0; `details` has `installed_version`, `minimum_version`, `upgrade_url`. |
 | `INSTANCE_NOT_FOUND`        | No worktree (or shared) instance is running for this anchor.                        |
 | `SERVICE_NOT_FOUND`         | The named service does not exist in the target instance; `details.valid_services` lists the known ones. |
-| `HEALTH_TIMEOUT`            | Stack started but services did not report healthy before the wait window expired, or a selected service is dead (`details.dead_services`). |
+| `HEALTH_TIMEOUT`            | Stack started but services did not report healthy before the wait window expired, or a selected service is dead, including one `up` restarted (`details.dead_services`). |
 | `NAMESPACE_NOT_RUNNING`     | `up -n` named a namespace the running instance was not booted with; `details.remedy` is the `down` + `up` that boots it. |
 | `SHARED_SERVICE_DEAD`       | A shared service in the running shared instance is dead; it is not restarted from a worktree, run `details.remedy` (`devtrees down --shared && devtrees up`). |
+| `SERVICE_START_FAILED`      | `up` tried to restart a dead service on the running instance and process-compose refused; `details.services` names each one, `details.remedy` is the `down` + `up` that restarts the stack. |
 | `CONFIG_DRIFT`              | Running config differs from devtrees.yaml and hot-reload failed; `details.reason` is `timeout`, `not_supported` or `error`. |
 | `SHARED_DRIFT`              | This worktree's shared services diverge from the running shared instance; bring shared down and up again. |
 | `SHARED_START_FAILED`       | The lazy-started shared instance died before binding its control socket; `details.config_path` is the config to run by hand. |
@@ -262,19 +263,28 @@ devtrees down
 ```
 
 `devtrees up` is safe to call defensively before every test run. On a stack
-that is already running it hot-reloads changed config, then **verifies** the
-stack rather than trusting it: it waits (up to `--wait-timeout`) for every
+that is already running it hot-reloads changed config, **restarts** any
+selected service that has died, then waits (up to `--wait-timeout`) for every
 selected service to be healthy and exits 0 only then — immediately when all
-are. It never stops or restarts anything, and never attaches the TUI.
+are. It never stops anything, and never attaches the TUI.
 
 - A bare `up` checks the namespaces the stack was booted with. `-n` checks
-  exactly the namespaces it names; a narrower `-n` leaves the rest running.
+  exactly the namespaces it names; a narrower `-n` leaves the rest running
+  and restarts nothing outside it.
 - `-n` cannot add a namespace the running stack was not booted with: `up`
   fails with `NAMESPACE_NOT_RUNNING`. Boot with it: `devtrees down && devtrees
   up -n …` (the message names the exact command).
-- A dead selected service (crashed, killed, or exited non-zero) fails `up`
-  with `HEALTH_TIMEOUT`, naming it and the `devtrees down && devtrees up …`
-  that brings it back. A one-shot that exited 0 counts as done.
+- A dead selected service (crashed, killed, or exited non-zero) is started
+  again, and `up` names it (`restarted` in the `--json` envelope). Several
+  dead services are started in `depends_on` order, without waiting between
+  them. If one does not become healthy, or dies again, `up` fails with
+  `HEALTH_TIMEOUT` naming it; if process-compose refuses to start it, with
+  `SERVICE_START_FAILED`. The stack is left running either way. A one-shot
+  that exited 0 counts as done and is not rerun.
+- `up` and `down` on the same worktree take turns. An `up` that finds the
+  stack stopped by a concurrent `down` starts nothing and fails with
+  `INSTANCE_NOT_FOUND`; one that waits too long for the other fails with
+  `LOCK_CONTENTION`. Either way, run `devtrees up` again.
 - A dead shared service fails `up` with `SHARED_SERVICE_DEAD`; run
   `devtrees down --shared && devtrees up`.
 
@@ -287,9 +297,10 @@ Branch on `error.code`:
 | Code                        | What it means and what to do                                                                 |
 | --------------------------- | -------------------------------------------------------------------------------------------- |
 | `LOCK_CONTENTION`           | Another devtrees process holds a lock. Wait briefly and **retry** `up`/`down`.               |
-| `HEALTH_TIMEOUT`            | A service never reported ready, or a selected service is dead (`details.dead_services`). The stack is **left running** — read `devtrees logs <service> --tail=N` to see why, then retry or follow the message (`devtrees down && devtrees up …`). |
+| `HEALTH_TIMEOUT`            | A service never reported ready, or is still dead after `up` restarted it (`details.dead_services`). The stack is **left running** — read `devtrees logs <service> --tail=N` to see why, then retry or follow the message (`devtrees down && devtrees up …`). |
 | `NAMESPACE_NOT_RUNNING`     | You asked `-n` for a namespace the running stack was not booted with. Run `details.remedy` (`devtrees down && devtrees up -n …`). |
 | `SHARED_SERVICE_DEAD`       | A shared service is dead. devtrees will not restart it from one worktree; run `devtrees down --shared && devtrees up`. |
+| `SERVICE_START_FAILED`      | `up` tried to restart a dead service and process-compose refused. `details.services` carries each one with process-compose's message; read it, then run `details.remedy` (`devtrees down && devtrees up …`). |
 | `STALE_PORT_BLOCK`          | Foreign listeners hold this worktree's ports. `details.collisions[]` lists `{port_name, port, pid, command}`; kill the orphans and retry. |
 | `SHARED_DRIFT`              | This worktree's shared services diverge from the running shared instance. Follow the message: `devtrees down --shared && devtrees up`. |
 | `CONFIG_DRIFT`              | The running config differs from `devtrees.yaml` and hot-reload failed. Branch on `details.reason`: `not_supported`/`error` → `devtrees down && devtrees up`. `timeout` → a changed service's old process won't stop and `down` would hang too: do **not** re-run `up` (it starts an untracked second copy); kill that process, then run `devtrees up` again to resync. |

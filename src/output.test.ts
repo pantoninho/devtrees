@@ -508,8 +508,24 @@ describe("output formatter — formatUp", () => {
       } as UpPayload,
       "json",
     );
-    const parsed = JSON.parse(result.stdout) as { up: { services: unknown[] } };
+    const parsed = JSON.parse(result.stdout) as {
+      up: { services: unknown[]; restarted: unknown[] };
+    };
     expect(parsed.up.services).toEqual([]);
+    expect(parsed.up.restarted).toEqual([]);
+  });
+
+  it("reports the dead services this up restarted (#178), in both modes", () => {
+    const withRestart: UpPayload = { ...payload, restarted: ["toy", "seed"] };
+    const json = JSON.parse(formatUp(withRestart, "json").stdout) as {
+      up: { restarted: string[] };
+    };
+    expect(json.up.restarted).toEqual(["toy", "seed"]);
+    const human = formatUp(withRestart, "human").stdout;
+    expect(human).toContain("devtrees up: restarted dead service(s): toy, seed.\n");
+    expect(human).toContain("'login' is up");
+    // Nothing restarted: no note.
+    expect(formatUp(payload, "human").stdout).not.toContain("restarted");
   });
 
   it("JSON output ends with a single trailing newline (line-friendly for shell consumers)", () => {

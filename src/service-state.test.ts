@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vite-plus/test";
-import { classifyService, describeDeadServices, findDeadServices } from "./service-state.js";
+import {
+  classifyService,
+  dependencyOrder,
+  describeDeadServices,
+  findDeadServices,
+} from "./service-state.js";
 import type { ServiceStatus } from "./driver.js";
 
 const row = (name: string, status: string, exitCode?: number): ServiceStatus =>
@@ -66,5 +71,32 @@ describe("findDeadServices", () => {
         { name: "api", status: "Error" },
       ]),
     ).toBe("toy (Completed, exit -1), api (Error)");
+  });
+});
+
+describe("dependencyOrder — restart order (#178)", () => {
+  const svc = (name: string, ...deps: string[]) => ({
+    name,
+    dependsOn: deps.map((d) => ({ name: d })),
+  });
+  const services = [
+    svc("web", "api"),
+    svc("api", "db", "cache"),
+    svc("db"),
+    svc("cache"),
+    svc("x"),
+  ];
+
+  it("puts each service after the services it depends on", () => {
+    expect(dependencyOrder(services, ["web", "api", "db"])).toEqual(["db", "api", "web"]);
+  });
+
+  it("ignores dependencies that are not being started, and keeps the given order otherwise", () => {
+    expect(dependencyOrder(services, ["x", "web", "db"])).toEqual(["x", "web", "db"]);
+  });
+
+  it("does not loop on a cycle", () => {
+    const cyclic = [svc("a", "b"), svc("b", "a")];
+    expect(dependencyOrder(cyclic, ["a", "b"])).toEqual(["b", "a"]);
   });
 });

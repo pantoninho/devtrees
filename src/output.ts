@@ -38,6 +38,7 @@ export const ERROR_CODES = [
   "HEALTH_TIMEOUT",
   "NAMESPACE_NOT_RUNNING",
   "SHARED_SERVICE_DEAD",
+  "SERVICE_START_FAILED",
   "CONFIG_DRIFT",
   "SHARED_DRIFT",
   "SHARED_START_FAILED",
@@ -72,11 +73,13 @@ export const ERROR_CODE_DESCRIPTIONS: Readonly<Record<ErrorCode, string>> = {
   SERVICE_NOT_FOUND:
     "The named service does not exist in the target instance; `details.valid_services` lists the known ones.",
   HEALTH_TIMEOUT:
-    "Stack started but services did not report healthy before the wait window expired, or a selected service is dead (`details.dead_services`).",
+    "Stack started but services did not report healthy before the wait window expired, or a selected service is dead, including one `up` restarted (`details.dead_services`).",
   NAMESPACE_NOT_RUNNING:
     "`up -n` named a namespace the running instance was not booted with; `details.remedy` is the `down` + `up` that boots it.",
   SHARED_SERVICE_DEAD:
     "A shared service in the running shared instance is dead; it is not restarted from a worktree, run `details.remedy` (`devtrees down --shared && devtrees up`).",
+  SERVICE_START_FAILED:
+    "`up` tried to restart a dead service on the running instance and process-compose refused; `details.services` names each one, `details.remedy` is the `down` + `up` that restarts the stack.",
   CONFIG_DRIFT:
     "Running config differs from devtrees.yaml and hot-reload failed; `details.reason` is `timeout`, `not_supported` or `error`.",
   SHARED_DRIFT:
@@ -364,6 +367,11 @@ export interface UpPayload {
    * as it ran; JSON mode always emits `dropped_namespace_edges` (possibly empty).
    */
   readonly droppedNamespaceEdges?: ReadonlyArray<DroppedNamespaceEdge>;
+  /**
+   * Dead services this `up` restarted on a running instance (issue #178).
+   * Optional like `services`; JSON mode defaults a missing value to `[]`.
+   */
+  readonly restarted?: ReadonlyArray<string>;
 }
 
 function formatUpHuman(payload: UpPayload): string {
@@ -371,7 +379,12 @@ function formatUpHuman(payload: UpPayload): string {
     .map(([k, v]) => `  ${k}=${v}`)
     .join("\n");
   const sharedNote = payload.sharedStarted ? "devtrees up: shared instance started.\n" : "";
-  return `${sharedNote}devtrees up: '${payload.worktreeId}' is up.\n${ports}\n`;
+  const restarted = payload.restarted ?? [];
+  const restartNote =
+    restarted.length > 0
+      ? `devtrees up: restarted dead service(s): ${restarted.join(", ")}.\n`
+      : "";
+  return `${sharedNote}${restartNote}devtrees up: '${payload.worktreeId}' is up.\n${ports}\n`;
 }
 
 /**
@@ -395,6 +408,7 @@ export function formatUp(payload: UpPayload, mode: FormatMode): OutputResult {
       // Always present, even empty (#179) — the `up_dry_run.dropped_edges`
       // contract (#169): an empty list is the answer "nothing was dropped".
       dropped_namespace_edges: (payload.droppedNamespaceEdges ?? []).map(droppedNamespaceEdgeJson),
+      restarted: payload.restarted ?? [],
     };
     if (payload.blockBase !== undefined) up.block_base = payload.blockBase;
     const doc = { schema_version: SCHEMA_VERSION, up };
