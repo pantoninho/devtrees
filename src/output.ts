@@ -35,6 +35,8 @@ export const ERROR_CODES = [
   "INSTANCE_NOT_FOUND",
   "SERVICE_NOT_FOUND",
   "HEALTH_TIMEOUT",
+  "NAMESPACE_NOT_RUNNING",
+  "SHARED_SERVICE_DEAD",
   "CONFIG_DRIFT",
   "SHARED_DRIFT",
   "SHARED_START_FAILED",
@@ -69,7 +71,11 @@ export const ERROR_CODE_DESCRIPTIONS: Readonly<Record<ErrorCode, string>> = {
   SERVICE_NOT_FOUND:
     "The named service does not exist in the target instance; `details.valid_services` lists the known ones.",
   HEALTH_TIMEOUT:
-    "Stack started but services did not report healthy before the wait window expired.",
+    "Stack started but services did not report healthy before the wait window expired, or a selected service is dead (`details.dead_services`).",
+  NAMESPACE_NOT_RUNNING:
+    "`up -n` named a namespace the running instance was not booted with; `details.remedy` is the `down` + `up` that boots it.",
+  SHARED_SERVICE_DEAD:
+    "A shared service in the running shared instance is dead; it is not restarted from a worktree, run `details.remedy` (`devtrees down --shared && devtrees up`).",
   CONFIG_DRIFT:
     "Running config differs from devtrees.yaml and hot-reload failed; `details.reason` is `timeout`, `not_supported` or `error`.",
   SHARED_DRIFT:

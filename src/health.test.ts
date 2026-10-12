@@ -235,6 +235,112 @@ describe("health — createWaitForHealth (worktree instance gate)", () => {
   });
 });
 
+describe("health — createWaitForHealth fails fast on a dead service (ADR-0008, #177)", () => {
+  const dead = (name: string, exitCode: number): ServiceStatus => ({
+    name,
+    status: "Completed",
+    health: "unknown",
+    exitCode,
+  });
+
+  it("a killed unprobed service (Completed, exit -1) fails with HEALTH_TIMEOUT long before the deadline, naming it and the remedy", async () => {
+    // #162: health is `unknown` for an unprobed service, so only the exit
+    // code tells the corpse apart from a finished one-shot.
+    const source = sourceFromQueue([[dead("toy", -1), row("keeper", "Running")]]);
+    const wait = createWaitForHealth(source, { pollMs: 1 });
+    const started = Date.now();
+    const err = await wait({
+      socketPath: "/run/x.sock",
+      serviceNames: ["toy", "keeper"],
+      probedServiceNames: [],
+      timeoutMs: 60_000,
+      remedy: "devtrees down && devtrees up -n test",
+    }).then(
+      () => undefined,
+      (e: unknown) => e as Error & { code?: string; details?: Record<string, unknown> },
+    );
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(err?.code).toBe("HEALTH_TIMEOUT");
+    expect(err?.message).toContain("toy (Completed, exit -1)");
+    expect(err?.message).toContain("devtrees down && devtrees up -n test");
+    expect(err?.message).not.toContain("keeper");
+    expect(err?.details).toEqual({
+      dead_services: [{ name: "toy", status: "Completed", exit_code: -1 }],
+      remedy: "devtrees down && devtrees up -n test",
+    });
+  });
+
+  it("Failed and Error count as dead too", async () => {
+    const source = sourceFromQueue([[row("a", "Failed"), row("b", "Error")]]);
+    const wait = createWaitForHealth(source, { pollMs: 1 });
+    await expect(
+      wait({
+        socketPath: "/s",
+        serviceNames: ["a", "b"],
+        probedServiceNames: [],
+        timeoutMs: 60_000,
+      }),
+    ).rejects.toMatchObject({
+      code: "HEALTH_TIMEOUT",
+      message: expect.stringContaining("a (Failed), b (Error)"),
+    });
+  });
+
+  it("a Completed exit-0 one-shot is done, not dead", async () => {
+    const source = sourceFromQueue([[dead("migrate", 0), row("web", "Running")]]);
+    const wait = createWaitForHealth(source, { pollMs: 1 });
+    await expect(
+      wait({
+        socketPath: "/s",
+        serviceNames: ["migrate", "web"],
+        probedServiceNames: [],
+        timeoutMs: 1000,
+      }),
+    ).resolves.toBeUndefined();
+  });
+
+  it("a single dead read that recovers (crash → Restarting) does not fail the wait", async () => {
+    // The instant between a crash and process-compose flipping a restartable
+    // process to Restarting must not be read as final: fail-fast needs the
+    // same dead set on two consecutive polls.
+    const source = sourceFromQueue([
+      [dead("web", 1)],
+      [row("web", "Restarting")],
+      [row("web", "Running")],
+    ]);
+    const wait = createWaitForHealth(source, { pollMs: 1 });
+    await expect(
+      wait({ socketPath: "/s", serviceNames: ["web"], probedServiceNames: [], timeoutMs: 1000 }),
+    ).resolves.toBeUndefined();
+  });
+
+  it("a dead service that is not waited on does not fail the wait", async () => {
+    const source = sourceFromQueue([[dead("other", -1), row("web", "Running")]]);
+    const wait = createWaitForHealth(source, { pollMs: 1 });
+    await expect(
+      wait({ socketPath: "/s", serviceNames: ["web"], probedServiceNames: [], timeoutMs: 1000 }),
+    ).resolves.toBeUndefined();
+  });
+
+  it("a probed service whose process died is dead, not merely not-ready", async () => {
+    const source = sourceFromQueue([
+      [{ name: "web", status: "Completed", health: "not_ready", exitCode: -1 }],
+    ]);
+    const wait = createWaitForHealth(source, { pollMs: 1 });
+    await expect(
+      wait({
+        socketPath: "/s",
+        serviceNames: ["web"],
+        probedServiceNames: ["web"],
+        timeoutMs: 60_000,
+      }),
+    ).rejects.toMatchObject({
+      code: "HEALTH_TIMEOUT",
+      details: { dead_services: [{ name: "web" }] },
+    });
+  });
+});
+
 describe("health — createWaitForSharedHealth (cross-tier gate)", () => {
   it("resolves once every shared service is healthy", async () => {
     const source = sourceFromQueue([[row("db", "Pending")], [row("db", "Running")]]);

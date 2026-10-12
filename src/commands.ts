@@ -64,6 +64,15 @@ import {
   type WaitForHealth,
   type WaitForSharedHealth,
 } from "./health.js";
+import {
+  DEFAULT_NAMESPACE,
+  declaredNamespaces,
+  formatUpCommand,
+  namespaceSelected,
+  resolveRunningSelection,
+  type NamespaceNotRunning,
+} from "./selection.js";
+import { deadServicesDetails, describeDeadServices, findDeadServices } from "./service-state.js";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -236,6 +245,29 @@ class NoServicesSelectedError extends Error {
 }
 
 /**
+ * Thrown when `up -n` on a running instance names a namespace the instance
+ * was not booted with (ADR-0008, issue #170). process-compose omits
+ * `-n`-excluded services from the project and cannot add them at runtime, so
+ * the only honest answer is to fail, name what is missing, and say how to
+ * boot with it. Nothing is started or stopped; the instance keeps running.
+ */
+class NamespaceNotRunningError extends Error {
+  readonly code = "NAMESPACE_NOT_RUNNING" as const;
+  constructor(
+    message: string,
+    readonly details: {
+      readonly worktree_id: string;
+      readonly namespaces: ReadonlyArray<string>;
+      readonly services: ReadonlyArray<string>;
+      readonly remedy: string;
+    },
+  ) {
+    super(message);
+    this.name = "NamespaceNotRunningError";
+  }
+}
+
+/**
  * The namespace selection a **fresh** start applies (issue #176, ADR-0008).
  * Namespaces are opt-in: with no `-n`, only the implicit `default` namespace
  * starts; `-n` is exact and forwarded verbatim (it never implies `default`).
@@ -266,9 +298,27 @@ function resolveFreshSelection(
   return { namespaces, services };
 }
 
-/** Distinct namespaces the given services declare, sorted, `default` included when used. */
-function declaredNamespaces(services: ReadonlyArray<ResolvedService>): string[] {
-  return [...new Set(services.map((s) => s.namespace ?? DEFAULT_NAMESPACE))].sort();
+/**
+ * Thrown when `up` on a running instance finds a dead shared service
+ * (ADR-0008). Shared services are reported, never restarted: the shared
+ * instance serves every worktree, so a worktree's `up` must not bounce it.
+ * A code of its own, not `HEALTH_TIMEOUT`, because the remedy tears down a
+ * different instance (`devtrees down --shared`) — the same reason
+ * `WORKTREE_START_FAILED` was split from `SHARED_START_FAILED` (ADR-0005):
+ * agents branch on `error.code`, not on prose.
+ */
+class SharedServiceDeadError extends Error {
+  readonly code = "SHARED_SERVICE_DEAD" as const;
+  constructor(
+    message: string,
+    readonly details: {
+      readonly dead_services: ReadonlyArray<{ name: string; status: string; exit_code?: number }>;
+      readonly remedy: string;
+    },
+  ) {
+    super(message);
+    this.name = "SharedServiceDeadError";
+  }
 }
 
 /**
@@ -915,14 +965,20 @@ async function socketIsLive(
  *  - **First up** (socket absent): allocate ports, write derived config,
  *    `driver.up`, health-wait, persist the stack-hash, return envelope.
  *  - **Already up, unchanged config** (socket present, stored hash matches):
- *    noop — skip `driver.up`, skip registry write, just re-emit the state
- *    envelope an agent would see from a fresh `up`.
+ *    skip `driver.up` and the registry write, then verify the instance
+ *    (`verifyRunning`, ADR-0008) before re-emitting the state envelope.
  *  - **Already up, drifted config** (socket present, stored hash differs):
  *    write the new derived config, call `driver.reloadConfig`. On success,
- *    update the stored hash and return the new envelope; on failure
+ *    update the stored hash and verify the instance; on failure
  *    (`not_supported` or otherwise), restore the previous on-disk config
  *    (issue #92) and throw `ConfigDriftError` (code `CONFIG_DRIFT`), leaving
  *    the instance running unchanged.
+ *
+ * Verifying a running instance (issue #177): selection read back from the
+ * project, `NAMESPACE_NOT_RUNNING` for an unbooted `-n`, `SHARED_SERVICE_DEAD`
+ * for a dead shared service, and the same health wait as a fresh headless
+ * start, failing with `HEALTH_TIMEOUT` on a dead selected service. Never
+ * attaches, never stops or restarts anything.
  *
  * Pre-flight stale-port-block check (issue #58): when the worktree's
  * control socket is absent (first up — not the idempotent re-up path),
@@ -1087,24 +1143,12 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     // by a live listener (probed above, #80 — file existence alone is not
     // enough), the instance is up. Compare the current resolved-stack hash to
     // the one stored from the previous successful `up`:
-    //   - match  -> noop, re-emit the envelope (no driver.up, no registry write)
+    //   - match  -> noop (no driver.up, no registry write)
     //   - drift  -> attempt hot-reload via the driver; map failure to CONFIG_DRIFT.
+    // Either way the instance is then verified outside the lock (ADR-0008).
     if (freshSelection === undefined) {
-      const result = await reconcileRunning({
-        stack,
-        anchor,
-        paths,
-        blockBase,
-        portFor,
-        derived,
-        inst,
-        driver,
-        readHash,
-        writeHash,
-        sharedStarted,
-        deps,
-      });
-      return { kind: "reconciled", result } as const;
+      await reconcileRunning({ stack, anchor, paths, derived, inst, driver, readHash, writeHash });
+      return { kind: "running", env: derived.env, sharedStarted } as const;
     }
 
     // The run dir now lives outside the git dir (issue #156), so the anchor
@@ -1163,10 +1207,9 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
       env: derived.env,
       sharedStarted,
       selected: freshSelection.services,
+      namespaces: freshSelection.namespaces,
     } as const;
   });
-
-  if (outcome.kind === "reconciled") return outcome.result;
 
   const result = {
     worktreeId: anchor.worktreeId,
@@ -1175,6 +1218,23 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     sharedStarted: outcome.sharedStarted,
     blockBase,
   } as const;
+
+  if (outcome.kind === "running") {
+    // Already-running instance (ADR-0008): verify it instead of trusting that
+    // it exists. Runs AFTER the lifecycle lock is released, like the fresh
+    // path's health wait, so a slow wait never shows up as LOCK_CONTENTION to
+    // a concurrent `up`. Headless always — this path never attaches a TTY.
+    await verifyRunning({
+      stack,
+      anchor,
+      socketPath: paths.socketPath,
+      deps,
+      driver,
+      sharedStarted: outcome.sharedStarted,
+    });
+    const services = await collectIsolatedServices(stack, paths.socketPath, portFor, deps, driver);
+    return { ...result, services };
+  }
 
   if (shouldAttachAfterUp(deps)) {
     // Attach path (#132): the server is already started detached, and
@@ -1196,7 +1256,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
   // Headless paths (`--json` / `--no-attach`): no TUI to render progress, so the
   // silent health-wait is what turns "up returned" into "the stack is serving
   // traffic" (PRD #26, ADR-0005), and HEALTH_TIMEOUT surfaces a stuck start.
-  await waitForWorktreeHealth(outcome.selected, paths.socketPath, deps, driver);
+  await waitForWorktreeHealth(stack, outcome, paths.socketPath, deps, driver);
 
   // After the health-wait, snapshot the per-service runtime rows so the
   // issue-#30 `up --json` envelope can publish them without a follow-up
@@ -2449,14 +2509,14 @@ const RELOAD_TIMEOUT_REMEDIATION =
   "command itself, and only the plain SIGTERM path escalates to SIGKILL after it).";
 
 /**
- * Idempotency / drift dispatch for a `runUp` whose worktree instance is
- * already running. Two outcomes:
+ * Config drift step for a `runUp` whose worktree instance is already
+ * running. Runs inside the lifecycle lock; `verifyRunning` checks the
+ * instance afterwards. Two outcomes:
  *
- *  - **Matching hash** -> noop: skip `driver.up` and the registry write, just
- *    re-collect per-service runtime rows and return the same envelope shape
- *    a fresh `up` would (issue-#30 contract).
+ *  - **Matching hash** -> noop: skip `driver.up`, the reload and the
+ *    registry write.
  *  - **Drift** -> write the new derived config and call `driver.reloadConfig`.
- *    On success, persist the new hash and return the new envelope; on any
+ *    On success, persist the new hash; on any
  *    failure, restore the previous on-disk config (issue #92 — the file must
  *    keep matching the still-running instance, `ls` reads ports from it) and
  *    throw `ConfigDriftError` so the CLI emits the `CONFIG_DRIFT` envelope
@@ -2469,66 +2529,149 @@ async function reconcileRunning(args: {
     readonly configPath: string;
     readonly socketPath: string;
   };
-  readonly blockBase: number;
-  readonly portFor: (name: string) => number | undefined;
   readonly derived: ReturnType<typeof deriveWorktreeConfig>;
   readonly inst: { readonly configPath: string; readonly socketPath: string };
   readonly driver: ReturnType<typeof createDriver>;
   readonly readHash: (anchor: string, id: string) => string | undefined;
   readonly writeHash: (anchor: string, id: string, hash: string) => void;
-  /**
-   * Whether THIS call lazy-started the shared instance (issue #56). The
-   * shared liveness check runs before this dispatch in `runUp`, so the
-   * envelope returned from the idempotency branch must surface the same
-   * value a fresh-start envelope would.
-   */
-  readonly sharedStarted: boolean;
-  readonly deps: CommandDeps;
-}): Promise<UpResult> {
-  const { stack, anchor, paths, blockBase, portFor, derived, inst, driver } = args;
+}): Promise<void> {
+  const { stack, anchor, paths, derived, inst, driver } = args;
   const currentHash = stackHash(stack);
   const storedHash = args.readHash(anchor.anchor, anchor.worktreeId);
-  if (storedHash !== currentHash) {
-    // The on-disk derived config must always describe the *running* instance
-    // (issue #92) — `ls` reads its ports from this file. `driver.reloadConfig`
-    // re-reads the config from disk, so the new one has to be written before
-    // the attempt; snapshot the old bytes first and restore them on failure
-    // so a failed reload never leaves the file describing config the instance
-    // is not running.
-    mkdirSync(dirname(paths.configPath), { recursive: true });
-    const previousConfig = existsSync(paths.configPath)
-      ? readFileSync(paths.configPath, "utf8")
-      : undefined;
-    writeFileSync(paths.configPath, stringifyYaml(derived.config), "utf8");
-    const reload = await driver.reloadConfig(inst, { timeoutMs: reloadTimeoutMs(derived.config) });
-    if (!reload.ok) {
-      if (previousConfig === undefined) rmSync(paths.configPath, { force: true });
-      else writeFileSync(paths.configPath, previousConfig, "utf8");
-      throw new ConfigDriftError(
-        `devtrees up: config drift detected for '${anchor.worktreeId}' and the running ` +
-          `process-compose could not hot-reload the new config` +
-          (reload.message ? ` (${reload.message})` : "") +
-          (reload.reason === "timeout" ? RELOAD_TIMEOUT_REMEDIATION : RELOAD_FAILED_REMEDIATION),
-        { reason: reload.reason },
-      );
-    }
-    args.writeHash(anchor.anchor, anchor.worktreeId, currentHash);
+  if (storedHash === currentHash) return;
+  // The on-disk derived config must always describe the *running* instance
+  // (issue #92) — `ls` reads its ports from this file. `driver.reloadConfig`
+  // re-reads the config from disk, so the new one has to be written before
+  // the attempt; snapshot the old bytes first and restore them on failure
+  // so a failed reload never leaves the file describing config the instance
+  // is not running.
+  mkdirSync(dirname(paths.configPath), { recursive: true });
+  const previousConfig = existsSync(paths.configPath)
+    ? readFileSync(paths.configPath, "utf8")
+    : undefined;
+  writeFileSync(paths.configPath, stringifyYaml(derived.config), "utf8");
+  const reload = await driver.reloadConfig(inst, { timeoutMs: reloadTimeoutMs(derived.config) });
+  if (!reload.ok) {
+    if (previousConfig === undefined) rmSync(paths.configPath, { force: true });
+    else writeFileSync(paths.configPath, previousConfig, "utf8");
+    throw new ConfigDriftError(
+      `devtrees up: config drift detected for '${anchor.worktreeId}' and the running ` +
+        `process-compose could not hot-reload the new config` +
+        (reload.message ? ` (${reload.message})` : "") +
+        (reload.reason === "timeout" ? RELOAD_TIMEOUT_REMEDIATION : RELOAD_FAILED_REMEDIATION),
+      { reason: reload.reason },
+    );
   }
-  const services = await collectIsolatedServices(
-    stack,
-    paths.socketPath,
-    portFor,
-    args.deps,
-    driver,
+  args.writeHash(anchor.anchor, anchor.worktreeId, currentHash);
+}
+
+/**
+ * Verify an already-running worktree instance against what this `up` asked
+ * for (ADR-0008, issue #177). `up` never reports success on the strength of
+ * the instance merely existing:
+ *
+ *  1. **Selection.** Read the project back from process-compose. A bare `up`
+ *     targets the namespaces whose declared services are all present (the
+ *     boot-time selection); `-n` is exact, and a requested namespace whose
+ *     services are absent fails with `NAMESPACE_NOT_RUNNING` (#170) — they
+ *     cannot be added to a running instance.
+ *  2. **Shared tier.** A dead shared service fails with `SHARED_SERVICE_DEAD`
+ *     and the `devtrees down --shared && devtrees up` remedy. Reported, never
+ *     restarted. Skipped when this very call just started shared.
+ *  3. **Health.** Wait on every selected isolated service with the same
+ *     machinery and `--wait-timeout` as a fresh headless start. A healthy
+ *     instance passes on the first poll; a dead selected service fails with
+ *     `HEALTH_TIMEOUT` naming it (#162).
+ *
+ * Never stops or restarts anything: a narrower `-n` than what is running only
+ * narrows what is checked.
+ */
+async function verifyRunning(args: {
+  readonly stack: ResolvedStack;
+  readonly anchor: { readonly anchor: string; readonly worktreeId: string };
+  readonly socketPath: string;
+  readonly deps: CommandDeps;
+  readonly driver: ReturnType<typeof createDriver>;
+  readonly sharedStarted: boolean;
+}): Promise<void> {
+  const { stack, anchor, socketPath, deps, driver } = args;
+  const fetch = statusReader(deps, driver);
+  const isolated = stack.services.filter((s) => s.tier === "isolated");
+
+  // A failed read leaves nothing to resolve the boot-time selection against;
+  // fall back to the requested one and let the health wait (which keeps
+  // polling through read failures) decide.
+  const rows = await fetch(socketPath).catch(() => undefined);
+  const selection =
+    rows === undefined
+      ? {
+          namespaces: deps.namespaces ?? [],
+          services: isolated.filter((s) =>
+            namespaceSelected(s, deps.namespaces?.length ? deps.namespaces : [DEFAULT_NAMESPACE]),
+          ),
+          notRunning: [],
+        }
+      : resolveRunningSelection(isolated, new Set(rows.map((r) => r.name)), deps.namespaces);
+
+  if (selection.notRunning.length > 0) {
+    throw namespaceNotRunningError(anchor.worktreeId, selection.notRunning, deps.namespaces ?? []);
+  }
+
+  if (!args.sharedStarted && hasTier(stack, "shared")) {
+    await assertSharedServicesAlive(stack, sharedInstancePaths(anchor.anchor).socketPath, fetch);
+  }
+
+  await waitForSelectedHealth(selection.services, socketPath, deps, driver, {
+    remedy: `devtrees down && ${formatUpCommand(stack.services, selection.namespaces)}`,
+    firstRead: rows,
+  });
+}
+
+function namespaceNotRunningError(
+  worktreeId: string,
+  notRunning: ReadonlyArray<NamespaceNotRunning>,
+  requested: ReadonlyArray<string>,
+): NamespaceNotRunningError {
+  const namespaces = notRunning.map((n) => n.namespace);
+  const services = notRunning.flatMap((n) => n.missingServices);
+  const flags = [...new Set(requested)].map((ns) => `-n ${ns}`).join(" ");
+  const remedy = `devtrees down && devtrees up ${flags}`;
+  const quoted = namespaces.map((ns) => `'${ns}'`).join(", ");
+  const one = namespaces.length === 1;
+  return new NamespaceNotRunningError(
+    `devtrees up: namespace${one ? "" : "s"} ${quoted} ${one ? "is" : "are"} not running in ` +
+      `'${worktreeId}' (not started: ${services.join(", ")}). A running instance keeps the ` +
+      `namespaces it was booted with and cannot add more. Run \`${remedy}\` to boot with ` +
+      `them. Nothing was started or stopped.`,
+    { worktree_id: worktreeId, namespaces, services, remedy },
   );
-  return {
-    worktreeId: anchor.worktreeId,
-    socketPath: paths.socketPath,
-    env: derived.env,
-    sharedStarted: args.sharedStarted,
-    blockBase,
-    services,
-  };
+}
+
+/**
+ * Fail with `SHARED_SERVICE_DEAD` when a declared shared service is dead in
+ * the running shared instance (ADR-0008). One read, no wait: shared services
+ * are reported, not restarted or waited on. Every declared shared service is
+ * checked — the shared instance is booted without `-n`, so namespace
+ * selection does not narrow it. A failed read is not evidence of a dead
+ * service, so it passes.
+ */
+async function assertSharedServicesAlive(
+  stack: ResolvedStack,
+  sharedSocketPath: string,
+  fetch: (socketPath: string) => Promise<ServiceStatus[]>,
+): Promise<void> {
+  const rows = await fetch(sharedSocketPath).catch(() => undefined);
+  if (rows === undefined) return;
+  const names = stack.services.filter((s) => s.tier === "shared").map((s) => s.name);
+  const dead = findDeadServices(rows, names);
+  if (dead.length === 0) return;
+  const remedy = "devtrees down --shared && devtrees up";
+  throw new SharedServiceDeadError(
+    `devtrees up: shared service(s) not running: ${describeDeadServices(dead)}. devtrees ` +
+      `does not restart shared services from a worktree's \`up\` — every worktree uses ` +
+      `them. Run \`${remedy}\` to bring the shared instance back.`,
+    { dead_services: deadServicesDetails(dead), remedy },
+  );
 }
 
 // --- default I/O implementations -------------------------------------------
@@ -2571,48 +2714,77 @@ function defaultIsTTY(): boolean {
 }
 
 /**
- * Worktree-instance health gate: poll until every isolated service reports a
- * healthy state, or throw `HealthTimeoutError` (code: HEALTH_TIMEOUT) so the
- * caller exits non-zero. The stack is left running on failure — the explicit
- * ADR-0005 choice so the agent can inspect logs after the timeout.
+ * Worktree-instance health gate on a fresh start: wait on the isolated
+ * services process-compose actually started — the isolated tier intersected
+ * with the selected namespaces (issue #128). Without the namespace narrowing,
+ * `up -n default` would wait on a probed service in an excluded namespace
+ * process-compose never started and HEALTH_TIMEOUT (the critical #108
+ * interaction).
  */
 async function waitForWorktreeHealth(
-  isolated: ReadonlyArray<ResolvedService>,
+  stack: ResolvedStack,
+  fresh: {
+    readonly selected: ReadonlyArray<ResolvedService>;
+    readonly namespaces: ReadonlyArray<string>;
+  },
   socketPath: string,
   deps: CommandDeps,
   driver: { getServiceStatuses(socketPath: string): Promise<ServiceStatus[]> },
 ): Promise<void> {
-  const wait = deps.waitForHealth ?? createWaitForHealth(driver);
   // `isolated` is the fresh selection (`resolveFreshSelection`): the isolated
   // tier intersected with the selected namespaces (issue #128) — `default`
-  // alone on a bare `up` (#176). Without the namespace narrowing, `up -n
-  // default` would wait on a probed service in an excluded namespace
-  // process-compose never started and HEALTH_TIMEOUT (the #108 interaction).
-  await wait({
-    socketPath,
-    serviceNames: isolated.map((s) => s.name),
-    probedServiceNames: probedNames(isolated),
-    timeoutMs: deps.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS,
+  // alone on a bare `up` (#176).
+  await waitForSelectedHealth(fresh.selected, socketPath, deps, driver, {
+    remedy: `devtrees down && ${formatUpCommand(stack.services, fresh.namespaces)}`,
   });
 }
 
 /**
- * Process-compose's `default` namespace — where a service with no explicit
- * `namespace:` lands. `-n default` therefore selects exactly the unlabelled
- * services (issue #128).
+ * The one health wait both `up` paths share: poll until every service in
+ * `services` reports a healthy state, or throw `HealthTimeoutError` (code:
+ * HEALTH_TIMEOUT) — on the deadline, or early when a selected service is dead
+ * (ADR-0008). The stack is left running on failure — the explicit ADR-0005
+ * choice so the agent can inspect logs after the timeout.
  */
-const DEFAULT_NAMESPACE = "default";
+async function waitForSelectedHealth(
+  services: ReadonlyArray<ResolvedService>,
+  socketPath: string,
+  deps: CommandDeps,
+  driver: { getServiceStatuses(socketPath: string): Promise<ServiceStatus[]> },
+  opts: {
+    readonly remedy: string;
+    /**
+     * Rows the caller just read from this instance. Served as the first poll
+     * so an already-healthy running instance costs no extra process-compose
+     * round-trip.
+     */
+    readonly firstRead?: ServiceStatus[];
+  },
+): Promise<void> {
+  const read = statusReader(deps, driver);
+  let primed = opts.firstRead;
+  const getServiceStatuses = (path: string): Promise<ServiceStatus[]> => {
+    if (primed === undefined) return read(path);
+    const rows = primed;
+    primed = undefined;
+    return Promise.resolve(rows);
+  };
+  const wait = deps.waitForHealth ?? createWaitForHealth({ getServiceStatuses });
+  await wait({
+    socketPath,
+    serviceNames: services.map((s) => s.name),
+    probedServiceNames: probedNames(services),
+    timeoutMs: deps.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS,
+    remedy: opts.remedy,
+  });
+}
 
-/**
- * Is this service part of the selected namespace set (issue #128)? A service
- * is selected iff its namespace — the implicit `default` when unlabelled — is
- * among the selected values. This mirrors what process-compose's `-n`
- * actually starts, so the health-wait expects exactly the running set. The
- * caller resolves a bare `up` to `["default"]` first (`resolveFreshSelection`,
- * #176), so there is no "empty means all" case here.
- */
-function namespaceSelected(service: ResolvedService, namespaces: ReadonlyArray<string>): boolean {
-  return namespaces.includes(service.namespace ?? DEFAULT_NAMESPACE);
+/** The per-service status read: the injected seam, else the driver. */
+function statusReader(
+  deps: CommandDeps,
+  driver: { getServiceStatuses(socketPath: string): Promise<ServiceStatus[]> },
+): (socketPath: string) => Promise<ServiceStatus[]> {
+  return deps.getServiceStatuses ?? ((socketPath) => driver.getServiceStatuses(socketPath));
 }
 
 /**

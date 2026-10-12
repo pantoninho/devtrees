@@ -42,7 +42,7 @@ import { withLifecycleLock } from "./registry.js";
 import { deriveWorktreeId } from "./anchor.js";
 import { deriveSharedConfig, deriveWorktreeConfig, type DerivedConfig } from "./deriver.js";
 import type { RegistrySnapshot } from "./allocator.js";
-import type { LogEvent, SpawnedProcess } from "./driver.js";
+import type { LogEvent, ServiceStatus, SpawnedProcess } from "./driver.js";
 import {
   SHARED_REGISTRY_KEY,
   SOCKET_PATH_MAX_BYTES,
@@ -50,7 +50,7 @@ import {
   runDir,
   sharedInstancePaths,
 } from "./paths.js";
-import { sharedStackHash } from "./hash.js";
+import { sharedStackHash, stackHash } from "./hash.js";
 import { readSharedState } from "./shared-state.js";
 import type { ResolvedStack, ServiceDependency } from "./stack.js";
 
@@ -4016,6 +4016,235 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     await runUp(deps);
     await runUp(deps);
     expect(reloadCount).toBe(0);
+  });
+});
+
+/**
+ * `runUp` on an already-running instance verifies it (ADR-0008, issue #177)
+ * instead of printing `is up.` because the socket answers: the selection is
+ * read back from the project, an unbooted `-n` fails with
+ * NAMESPACE_NOT_RUNNING (#170), a dead selected service fails with
+ * HEALTH_TIMEOUT (#162), a dead shared service with SHARED_SERVICE_DEAD, and
+ * nothing is ever stopped or started.
+ */
+describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
+  const running = (name: string): ServiceStatus => ({ name, status: "Running", health: "unknown" });
+  const killed = (name: string): ServiceStatus => ({
+    name,
+    status: "Completed",
+    health: "unknown",
+    exitCode: -1,
+  });
+
+  /**
+   * Fake a live worktree instance (and a live shared one when the stack has
+   * shared services) whose stored hash matches, so `runUp` takes the
+   * already-running path with no reload. `rows` is what process-compose
+   * reports per socket. The real health wait runs (no `waitForHealth` stub).
+   */
+  function liveInstance(
+    stack: ResolvedStack,
+    rows: { worktree: ServiceStatus[]; shared?: ServiceStatus[] },
+    extra: Partial<CommandDeps> = {},
+  ) {
+    const tmp = tmpAnchor();
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const spawned: string[][] = [];
+    const base = stubDeps({
+      stack,
+      track,
+      anchorOverride: tmp.anchor,
+      worktreeRootOverride: tmp.worktreeRoot,
+    });
+    const inner = base.driver?.spawner;
+    if (inner === undefined) throw new Error("expected stub spawner");
+    const wtSocket = instancePaths(tmp.anchor, base.expectedWorktreeId).socketPath;
+    const sharedSocket = sharedInstancePaths(tmp.anchor).socketPath;
+    mkdirSync(runDir(tmp.anchor), { recursive: true });
+    writeFileSync(wtSocket, "");
+    if (rows.shared !== undefined) writeFileSync(sharedSocket, "");
+    const statusReads: string[] = [];
+    const deps: CommandDeps = {
+      ...base,
+      waitForHealth: undefined,
+      readStoredHash: () => stackHash(stack),
+      writeStoredHash: () => {},
+      getServiceStatuses: async (socketPath) => {
+        statusReads.push(socketPath);
+        if (socketPath === wtSocket) return rows.worktree;
+        if (socketPath === sharedSocket) return rows.shared ?? [];
+        throw new Error(`unexpected socket ${socketPath}`);
+      },
+      driver: {
+        ...base.driver,
+        spawner: (binary, args, options) => {
+          spawned.push([...args]);
+          return inner(binary, args, options);
+        },
+      },
+      ...extra,
+    };
+    return { deps, spawned, statusReads, wtSocket, sharedSocket, id: base.expectedWorktreeId };
+  }
+
+  async function failure(deps: CommandDeps) {
+    return runUp(deps).then(
+      () => undefined,
+      (e: unknown) => e as Error & { code?: string; details?: Record<string, unknown> },
+    );
+  }
+
+  const twoNamespaces: ResolvedStack = {
+    services: [
+      { ...isolated("a", "sleep 100000"), namespace: "one" },
+      { ...isolated("b", "python3 -m http.server", ["B_PORT"]), namespace: "two" },
+    ],
+  };
+
+  it("#170: -n naming a namespace the instance was not booted with fails with NAMESPACE_NOT_RUNNING", async () => {
+    const { deps, spawned, id } = liveInstance(twoNamespaces, { worktree: [running("a")] });
+    const err = await failure({ ...deps, namespaces: ["one", "two"] });
+    expect(err?.code).toBe("NAMESPACE_NOT_RUNNING");
+    expect(err?.message).toContain("'two'");
+    expect(err?.message).toContain("devtrees down && devtrees up -n one -n two");
+    expect(err?.details).toEqual({
+      worktree_id: id,
+      namespaces: ["two"],
+      services: ["b"],
+      remedy: "devtrees down && devtrees up -n one -n two",
+    });
+    // Nothing was started, stopped or reloaded.
+    expect(spawned.filter((a) => a[0] !== "process")).toEqual([]);
+  });
+
+  it("bare up on an instance booted with -n one targets `one` only", async () => {
+    const waited: string[][] = [];
+    const { deps } = liveInstance(
+      twoNamespaces,
+      { worktree: [running("a")] },
+      {
+        waitForHealth: async ({ serviceNames }) => {
+          waited.push([...serviceNames]);
+        },
+      },
+    );
+    const result = await runUp(deps);
+    expect(waited).toEqual([["a"]]);
+    expect(result.services.map((s) => s.name)).toEqual(["a"]);
+  });
+
+  it("a narrower -n than what runs leaves the rest alone and does not fail", async () => {
+    const waited: string[][] = [];
+    const { deps, spawned } = liveInstance(
+      twoNamespaces,
+      { worktree: [running("a"), killed("b")] },
+      {
+        namespaces: ["one"],
+        waitForHealth: async ({ serviceNames }) => {
+          waited.push([...serviceNames]);
+        },
+      },
+    );
+    await expect(runUp(deps)).resolves.toBeDefined();
+    // Only `one` is checked — `b` being dead in `two` is not this call's business.
+    expect(waited).toEqual([["a"]]);
+    expect(spawned.filter((a) => a[0] !== "process")).toEqual([]);
+  });
+
+  it("#162: a killed service (Completed, exit -1) fails up with HEALTH_TIMEOUT naming it, fast", async () => {
+    const stack: ResolvedStack = {
+      services: [
+        { ...isolated("toy", "python3 -m http.server", ["TOY_PORT"]), namespace: "test" },
+        { ...isolated("keeper", "sleep 100000"), namespace: "test" },
+      ],
+    };
+    const { deps, spawned } = liveInstance(
+      stack,
+      { worktree: [killed("toy"), running("keeper")] },
+      { namespaces: ["test"], waitTimeoutMs: 60_000 },
+    );
+    const started = Date.now();
+    const err = await failure(deps);
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(err?.code).toBe("HEALTH_TIMEOUT");
+    expect(err?.message).toContain("toy (Completed, exit -1)");
+    expect(err?.message).toContain("devtrees down && devtrees up -n test");
+    expect(err?.details).toMatchObject({
+      dead_services: [{ name: "toy", status: "Completed", exit_code: -1 }],
+    });
+    // Reported, not restarted: no process-compose call other than reads.
+    expect(spawned.filter((a) => a[0] !== "process")).toEqual([]);
+  });
+
+  it("a healthy running instance passes on the first status check", async () => {
+    const stack: ResolvedStack = { services: [isolated("web", "node a.js", ["WEB_PORT"])] };
+    const { deps, statusReads } = liveInstance(stack, {
+      worktree: [{ name: "web", status: "Running", health: "unknown" }],
+    });
+    const result = await runUp(deps);
+    expect(result.services.map((s) => s.name)).toEqual(["web"]);
+    // selection read + one health poll + envelope rows: no polling loop.
+    expect(statusReads.length).toBeLessThanOrEqual(3);
+  });
+
+  it("a completed exit-0 one-shot does not fail up", async () => {
+    const stack: ResolvedStack = {
+      services: [isolated("migrate", "true"), isolated("web", "node a.js")],
+    };
+    const { deps } = liveInstance(stack, {
+      worktree: [
+        { name: "migrate", status: "Completed", health: "unknown", exitCode: 0 },
+        running("web"),
+      ],
+    });
+    await expect(runUp(deps)).resolves.toBeDefined();
+  });
+
+  it("a probed service that is still coming up is waited on with --wait-timeout", async () => {
+    const stack: ResolvedStack = {
+      services: [{ ...isolated("web", "node a.js"), readinessProbe: { exec: { command: "x" } } }],
+    };
+    const { deps } = liveInstance(
+      stack,
+      { worktree: [{ name: "web", status: "Running", health: "not_ready" }] },
+      { waitTimeoutMs: 300 },
+    );
+    const err = await failure(deps);
+    expect(err?.code).toBe("HEALTH_TIMEOUT");
+    expect(err?.message).toContain("after 300ms");
+  });
+
+  it("a dead shared service fails up with SHARED_SERVICE_DEAD and the down --shared remedy", async () => {
+    const stack: ResolvedStack = {
+      services: [shared("db", "postgres", ["DB_PORT"]), isolated("web", "node a.js")],
+    };
+    const { deps, spawned } = liveInstance(stack, {
+      worktree: [running("web")],
+      shared: [killed("db")],
+    });
+    const err = await failure(deps);
+    expect(err?.code).toBe("SHARED_SERVICE_DEAD");
+    expect(err?.message).toContain("db (Completed, exit -1)");
+    expect(err?.details).toEqual({
+      dead_services: [{ name: "db", status: "Completed", exit_code: -1 }],
+      remedy: "devtrees down --shared && devtrees up",
+    });
+    expect(spawned.filter((a) => a[0] !== "process")).toEqual([]);
+  });
+
+  it("a live shared tier does not fail up", async () => {
+    const stack: ResolvedStack = {
+      services: [shared("db", "postgres", ["DB_PORT"]), isolated("web", "node a.js")],
+    };
+    const { deps } = liveInstance(stack, { worktree: [running("web")], shared: [running("db")] });
+    await expect(runUp(deps)).resolves.toBeDefined();
+  });
+
+  it("never attaches on the running path, even when a TTY is present", async () => {
+    const stack: ResolvedStack = { services: [isolated("web", "node a.js")] };
+    const { deps, spawned } = liveInstance(stack, { worktree: [running("web")] }, { attach: true });
+    await runUp(deps);
+    expect(spawned.some((a) => a[0] === "attach")).toBe(false);
   });
 });
 

@@ -860,3 +860,141 @@ describe("built CLI e2e — argv→commands wiring over the stub process-compose
     expect(names).toEqual(["api"]);
   }, 60_000);
 });
+
+/**
+ * `up` on an already-running instance (ADR-0008, issue #177), through
+ * `dist/cli.mjs` and the stub. Each scenario boots once, then re-runs `up`
+ * against the live instance. `DEVTREES_STUB_DEAD` / `DEVTREES_STUB_DONE` make
+ * the stub's `process list` report named services as killed (`Completed`,
+ * exit -1) or as a finished one-shot (`Completed`, exit 0).
+ */
+describe("built CLI e2e — up verifies a running instance (#177)", () => {
+  interface VerifyErrorDoc {
+    readonly error?: {
+      readonly code?: string;
+      readonly message?: string;
+      readonly details?: Record<string, unknown>;
+    };
+  }
+
+  /** #170's stack: `a` in `one`, `b` in `two`. */
+  function twoNamespaceScenario(prefix: string): Scenario {
+    return setupRepoWithStack(
+      prefix,
+      [
+        "services:",
+        "  a:",
+        "    tier: isolated",
+        "    namespace: one",
+        '    command: "sleep 300"',
+        "  b:",
+        "    tier: isolated",
+        "    namespace: two",
+        '    command: "sleep 300"',
+        "    ports: [B_PORT]",
+        "",
+      ].join("\n"),
+    );
+  }
+
+  it("#170: up -n one, then up -n one -n two fails with NAMESPACE_NOT_RUNNING naming `two`", () => {
+    const { wt, id } = twoNamespaceScenario("dt-bcv1-");
+    const first = devtrees(wt, ["up", "-n", "one", "--json", "--wait-timeout", "10"]);
+    expect(first.code, `first up failed: ${first.stderr} ${first.stdout}`).toBe(0);
+
+    const json = devtrees(wt, ["up", "-n", "one", "-n", "two", "--json", "--wait-timeout", "10"]);
+    expect(json.code).toBe(1);
+    const err = (json.doc as VerifyErrorDoc).error;
+    expect(err?.code).toBe("NAMESPACE_NOT_RUNNING");
+    expect(err?.details).toEqual({
+      worktree_id: id,
+      namespaces: ["two"],
+      services: ["b"],
+      remedy: "devtrees down && devtrees up -n one -n two",
+    });
+
+    const human = devtrees(wt, ["up", "-n", "one", "-n", "two", "--no-attach"]);
+    expect(human.code).toBe(1);
+    expect(human.stderr).toContain("'two'");
+    expect(human.stderr).toContain("devtrees down && devtrees up -n one -n two");
+    expect(human.stdout).not.toContain("is up");
+
+    // Nothing was stopped: `a` is still the running set.
+    const ls = devtrees(wt, ["ls", "--json"]).doc as LsDoc;
+    const names = ls.ls.instances.find((i) => i.id === id)?.services.map((s) => s.name);
+    expect(names).toEqual(["a"]);
+  }, 60_000);
+
+  it("bare up on an instance booted with -n one targets `one` only and exits 0", () => {
+    const { wt } = twoNamespaceScenario("dt-bcv2-");
+    expect(devtrees(wt, ["up", "-n", "one", "--json", "--wait-timeout", "10"]).code).toBe(0);
+    const again = devtrees(wt, ["up", "--json", "--wait-timeout", "10"]);
+    expect(again.code, `bare re-up failed: ${again.stderr} ${again.stdout}`).toBe(0);
+    expect((again.doc as UpDoc).up.services.map((s) => s.name)).toEqual(["a"]);
+  }, 60_000);
+
+  it("a narrower -n leaves the other namespace running and does not fail", () => {
+    const { wt, id } = twoNamespaceScenario("dt-bcv3-");
+    expect(devtrees(wt, ["up", "-n", "one", "-n", "two", "--json"]).code).toBe(0);
+    const narrow = devtrees(wt, ["up", "-n", "one", "--json", "--wait-timeout", "10"]);
+    expect(narrow.code, `narrow re-up failed: ${narrow.stderr} ${narrow.stdout}`).toBe(0);
+    const names = (devtrees(wt, ["ls", "--json"]).doc as LsDoc).ls.instances
+      .find((i) => i.id === id)
+      ?.services.map((s) => s.name)
+      .sort();
+    expect(names).toEqual(["a", "b"]);
+  }, 60_000);
+
+  it("#162: a killed service makes the re-up fail with HEALTH_TIMEOUT naming it, without waiting out the timeout", () => {
+    const { wt } = setupScenario("dt-bcv4-", { webProbe: false });
+    expect(devtrees(wt, ["up", "--json", "--wait-timeout", "10"]).code).toBe(0);
+
+    const started = Date.now();
+    const r = devtrees(wt, ["up", "--json", "--wait-timeout", "60"], {
+      env: { DEVTREES_STUB_DEAD: "web" },
+    });
+    expect(Date.now() - started).toBeLessThan(20_000);
+    expect(r.code).toBe(1);
+    const err = (r.doc as VerifyErrorDoc).error;
+    expect(err?.code).toBe("HEALTH_TIMEOUT");
+    expect(err?.message).toContain("web (Completed, exit -1)");
+    expect(err?.message).toContain("devtrees down && devtrees up");
+    expect(err?.details).toMatchObject({
+      dead_services: [{ name: "web", status: "Completed", exit_code: -1 }],
+    });
+  }, 90_000);
+
+  it("a healthy running instance re-ups with exit 0 quickly", () => {
+    const { wt } = setupScenario("dt-bcv5-");
+    expect(devtrees(wt, ["up", "--json", "--wait-timeout", "30"]).code).toBe(0);
+    const started = Date.now();
+    const r = devtrees(wt, ["up", "--json", "--wait-timeout", "30"]);
+    expect(r.code, `re-up failed: ${r.stderr} ${r.stdout}`).toBe(0);
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect((r.doc as UpDoc).up.services.find((s) => s.name === "web")?.health).toBe("ready");
+  }, 90_000);
+
+  it("a finished exit-0 one-shot does not fail the re-up", () => {
+    const { wt } = setupScenario("dt-bcv6-", { webProbe: false });
+    expect(devtrees(wt, ["up", "--json", "--wait-timeout", "10"]).code).toBe(0);
+    const r = devtrees(wt, ["up", "--json", "--wait-timeout", "10"], {
+      env: { DEVTREES_STUB_DONE: "web" },
+    });
+    expect(r.code, `re-up failed: ${r.stderr} ${r.stdout}`).toBe(0);
+  }, 60_000);
+
+  it("a dead shared service fails the re-up with SHARED_SERVICE_DEAD and the down --shared remedy", () => {
+    const { wt } = setupScenario("dt-bcv7-", { webProbe: false });
+    expect(devtrees(wt, ["up", "--json", "--wait-timeout", "10"]).code).toBe(0);
+    const r = devtrees(wt, ["up", "--json", "--wait-timeout", "10"], {
+      env: { DEVTREES_STUB_DEAD: "db" },
+    });
+    expect(r.code).toBe(1);
+    const err = (r.doc as VerifyErrorDoc).error;
+    expect(err?.code).toBe("SHARED_SERVICE_DEAD");
+    expect(err?.details).toEqual({
+      dead_services: [{ name: "db", status: "Completed", exit_code: -1 }],
+      remedy: "devtrees down --shared && devtrees up",
+    });
+  }, 60_000);
+});

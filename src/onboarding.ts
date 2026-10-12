@@ -63,10 +63,22 @@ devtrees logs <service> --tail=200
 devtrees down
 \`\`\`
 
-\`devtrees up\` is idempotent: calling it when the stack is already running
-reconciles config (hot-reloading on change) instead of erroring, so it's safe
-to call defensively before every test run rather than tracking whether the
-stack is up.
+\`devtrees up\` is safe to call defensively before every test run. On a stack
+that is already running it hot-reloads changed config, then **verifies** the
+stack rather than trusting it: it waits (up to \`--wait-timeout\`) for every
+selected service to be healthy and exits 0 only then — immediately when all
+are. It never stops or restarts anything, and never attaches the TUI.
+
+- A bare \`up\` checks the namespaces the stack was booted with. \`-n\` checks
+  exactly the namespaces it names; a narrower \`-n\` leaves the rest running.
+- \`-n\` cannot add a namespace the running stack was not booted with: \`up\`
+  fails with \`NAMESPACE_NOT_RUNNING\`. Boot with it: \`devtrees down && devtrees
+  up -n …\` (the message names the exact command).
+- A dead selected service (crashed, killed, or exited non-zero) fails \`up\`
+  with \`HEALTH_TIMEOUT\`, naming it and the \`devtrees down && devtrees up …\`
+  that brings it back. A one-shot that exited 0 counts as done.
+- A dead shared service fails \`up\` with \`SHARED_SERVICE_DEAD\`; run
+  \`devtrees down --shared && devtrees up\`.
 
 ### Handling failures
 
@@ -77,7 +89,9 @@ Branch on \`error.code\`:
 | Code                        | What it means and what to do                                                                 |
 | --------------------------- | -------------------------------------------------------------------------------------------- |
 | \`LOCK_CONTENTION\`           | Another devtrees process holds a lock. Wait briefly and **retry** \`up\`/\`down\`.               |
-| \`HEALTH_TIMEOUT\`            | A service never reported ready. The stack is **left running** — read \`devtrees logs <service> --tail=N\` to see why, then retry or \`down\`. |
+| \`HEALTH_TIMEOUT\`            | A service never reported ready, or a selected service is dead (\`details.dead_services\`). The stack is **left running** — read \`devtrees logs <service> --tail=N\` to see why, then retry or follow the message (\`devtrees down && devtrees up …\`). |
+| \`NAMESPACE_NOT_RUNNING\`     | You asked \`-n\` for a namespace the running stack was not booted with. Run \`details.remedy\` (\`devtrees down && devtrees up -n …\`). |
+| \`SHARED_SERVICE_DEAD\`       | A shared service is dead. devtrees will not restart it from one worktree; run \`devtrees down --shared && devtrees up\`. |
 | \`STALE_PORT_BLOCK\`          | Foreign listeners hold this worktree's ports. \`details.collisions[]\` lists \`{port_name, port, pid, command}\`; kill the orphans and retry. |
 | \`SHARED_DRIFT\`              | This worktree's shared services diverge from the running shared instance. Follow the message: \`devtrees down --shared && devtrees up\`. |
 | \`CONFIG_DRIFT\`              | The running config differs from \`devtrees.yaml\` and hot-reload failed. Branch on \`details.reason\`: \`not_supported\`/\`error\` → \`devtrees down && devtrees up\`. \`timeout\` → a changed service's old process won't stop and \`down\` would hang too: do **not** re-run \`up\` (it starts an untracked second copy); kill that process, then run \`devtrees up\` again to resync. |
