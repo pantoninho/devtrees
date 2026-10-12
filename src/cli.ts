@@ -42,6 +42,7 @@ import {
   type LsServiceRow,
   type PrunedRow,
   type ReapWarningRow,
+  type UnreclaimedRow,
   type UpDryRunPayload,
 } from "./output.js";
 
@@ -167,6 +168,7 @@ export interface ExecuteDeps {
     anchor: string;
     pruned: ReadonlyArray<PrunedRow>;
     warnings?: ReadonlyArray<ReapWarningRow>;
+    unreclaimed?: ReadonlyArray<UnreclaimedRow>;
   }>;
   env?: () => Promise<{ worktreeId: string; env: Record<string, string> }>;
   logs?: (options: LogsCliOptions) => Promise<{
@@ -323,6 +325,7 @@ class UpCommand extends DevtreesCommand {
       "SHARED_SERVICE_DEAD",
       "SERVICE_START_FAILED",
       "INSTANCE_NOT_FOUND",
+      "INSTANCE_UNRESPONSIVE",
       "PROCESS_COMPOSE_NOT_FOUND",
       "INVALID_ARGS",
       "UNKNOWN",
@@ -482,8 +485,14 @@ class DownCommand extends DevtreesCommand {
   static override usage = Command.Usage({
     description: "Stop this worktree's stack (`--shared` tears down the shared instance).",
     // Both branches serialize on a lifecycle lock (the worktree's, #178, or the
-    // shared one with `--shared`) → LOCK_CONTENTION.
-    details: errorCodeFooter(["PROCESS_COMPOSE_NOT_FOUND", "LOCK_CONTENTION", "UNKNOWN"]),
+    // shared one with `--shared`) → LOCK_CONTENTION. A socket whose liveness
+    // stays unknown after the probe retries → INSTANCE_UNRESPONSIVE (#186).
+    details: errorCodeFooter([
+      "PROCESS_COMPOSE_NOT_FOUND",
+      "LOCK_CONTENTION",
+      "INSTANCE_UNRESPONSIVE",
+      "UNKNOWN",
+    ]),
   });
 
   shared = Option.Boolean("--shared", false, {
@@ -575,7 +584,14 @@ class PruneCommand extends DevtreesCommand {
       // Issue #148: a failed orphan reap surfaces as a stderr warning (human) /
       // `prune.warnings[]` (JSON) so the sweep never reports a clean teardown
       // while out-of-band resources may have survived.
-      const out = formatPrune(result.pruned, this.mode, result.warnings ?? []);
+      // Issue #186: orphans left in place because they could not be stopped
+      // surface the same way (stderr / `prune.unreclaimed[]`).
+      const out = formatPrune(
+        result.pruned,
+        this.mode,
+        result.warnings ?? [],
+        result.unreclaimed ?? [],
+      );
       if (out.stdout) this.context.stdout.write(out.stdout);
       if (out.stderr) this.context.stderr.write(out.stderr);
       return 0;

@@ -23,7 +23,9 @@ import {
 } from "./deriver.js";
 import {
   discoverInstances,
+  PROBE_RETRY_DELAYS_MS,
   probeSocket as defaultProbeSocket,
+  probeUntilDefinitive,
   type InstanceInfo,
   type InstanceStatus,
   type Service,
@@ -323,6 +325,37 @@ class InstanceGoneError extends Error {
         `\`devtrees up\` to start it again.`,
     );
     this.name = "InstanceGoneError";
+  }
+}
+
+/**
+ * Thrown when a control socket still exists but repeated probes could not
+ * tell whether process-compose behind it is alive (issue #186): every connect
+ * timed out, or was refused while a process still held the socket. `up` and
+ * `down` refuse to guess. Treating the instance as gone would unlink its
+ * socket and orphan a possibly live process-compose and its services, which
+ * keep their ports, so a fresh `up` would then collide on them. The socket is
+ * kept and nothing is started or stopped. `details.instance` is the worktree
+ * id, or `shared` for the shared instance.
+ */
+class InstanceUnresponsiveError extends Error {
+  readonly code = "INSTANCE_UNRESPONSIVE" as const;
+  constructor(
+    command: string,
+    readonly details: {
+      readonly instance: string;
+      readonly socket_path: string;
+      readonly attempts: number;
+      readonly remedy: string;
+    },
+  ) {
+    super(
+      `devtrees ${command}: the ${details.instance === SHARED_INSTANCE_ID ? "shared" : `'${details.instance}'`} ` +
+        `instance's control socket did not answer after ${details.attempts} probes ` +
+        `(${details.socket_path}); process-compose may be busy or frozen. Nothing was ` +
+        `started or stopped and the socket was kept. ${details.remedy}`,
+    );
+    this.name = "InstanceUnresponsiveError";
   }
 }
 
@@ -638,6 +671,12 @@ export interface CommandDeps {
    * instances without binding real sockets.
    */
   readonly probeSocket?: (socketPath: string) => Promise<InstanceStatus>;
+  /**
+   * Backoff between re-probes while a socket's liveness stays `unknown`
+   * (issue #186). Default: `PROBE_RETRY_DELAYS_MS`. Injected so tests of the
+   * unknown path don't sit out the real backoff.
+   */
+  readonly probeRetryDelaysMs?: ReadonlyArray<number>;
   /**
    * Identify the holder of a concrete port — used by `up`'s pre-flight
    * stale-port-block check (#58). Default: `defaultPortHolder` (bind probe
@@ -998,30 +1037,75 @@ function resolveLifecycleSeams(deps: CommandDeps) {
   } as const;
 }
 
+/** A socket-liveness probe plus its retry backoff for `unknown` (#80, #186). */
+interface LivenessProbe {
+  readonly probe: (socketPath: string) => Promise<InstanceStatus>;
+  readonly retryDelaysMs: ReadonlyArray<number>;
+}
+
 /**
  * Resolve the #80 socket-liveness probe seam — needed by both `runUp` (via
  * `resolveUpSeams`) and `runDown`, which doesn't share the up-seam bundle.
  */
-function resolveProbe(deps: CommandDeps): (socketPath: string) => Promise<InstanceStatus> {
-  return deps.probeSocket ?? defaultProbeSocket;
+function resolveProbe(deps: CommandDeps): LivenessProbe {
+  return {
+    probe: deps.probeSocket ?? defaultProbeSocket,
+    retryDelaysMs: deps.probeRetryDelaysMs ?? PROBE_RETRY_DELAYS_MS,
+  };
+}
+
+/** Which command is asking, and about which instance — for the #186 envelope. */
+interface LivenessContext {
+  readonly command: "up" | "down";
+  /** Worktree id, or `SHARED_INSTANCE_ID` for the shared instance. */
+  readonly instance: string;
 }
 
 /**
  * Liveness gate for the write paths (issue #80). A control-socket *file* is
  * not proof of a live instance — it lives in anchor state, which survives
  * `kill -9` and reboots, so after a crash the file points at nothing. Probe
- * the UDS: a listener means live; anything else means the file is an orphan,
- * so unlink it and report "not live" — the caller then falls through to its
- * fresh-start (or idempotent no-op) path instead of trusting a dead instance.
+ * the UDS (retrying while the answer is `unknown`):
+ *
+ *  - a listener means live (`true`);
+ *  - a definitive "nothing listening" means the file is an orphan, so unlink
+ *    it and report "not live" (`false`) — the caller then falls through to
+ *    its fresh-start (or idempotent no-op) path;
+ *  - still `unknown` after the retries (#186) throws `INSTANCE_UNRESPONSIVE`
+ *    and keeps the socket. Every caller is about to start or stop processes,
+ *    and guessing either way is worse than failing: "not live" would orphan
+ *    a live process-compose (and a fresh start would collide on its ports),
+ *    "live" would hand the driver a socket that does not answer.
  */
 async function socketIsLive(
   socketPath: string,
-  probe: (socketPath: string) => Promise<InstanceStatus>,
+  liveness: LivenessProbe,
+  context: LivenessContext,
 ): Promise<boolean> {
   if (!existsSync(socketPath)) return false;
-  if ((await probe(socketPath)) === "running") return true;
-  rmSync(socketPath, { force: true });
-  return false;
+  const status = await probeUntilDefinitive(socketPath, liveness.probe, liveness.retryDelaysMs);
+  if (status === "running") return true;
+  if (status === "stale") {
+    rmSync(socketPath, { force: true });
+    return false;
+  }
+  throw new InstanceUnresponsiveError(context.command, {
+    instance: context.instance,
+    socket_path: socketPath,
+    attempts: liveness.retryDelaysMs.length + 1,
+    remedy: unresponsiveRemedy(socketPath, context),
+  });
+}
+
+/** The `details.remedy` an `INSTANCE_UNRESPONSIVE` envelope carries (#186). */
+function unresponsiveRemedy(socketPath: string, context: LivenessContext): string {
+  const down = context.instance === SHARED_INSTANCE_ID ? "devtrees down --shared" : "devtrees down";
+  const retry = context.command === "down" ? down : "devtrees up";
+  return (
+    `Retry \`${retry}\` in a moment. If it keeps failing, find the process-compose ` +
+    `holding the socket with \`lsof -U -a ${socketPath}\`: resume it if it is stopped ` +
+    `(\`kill -CONT <pid>\`), or kill it, then run \`${down}\` to clean up.`
+  );
 }
 
 /**
@@ -1136,8 +1220,13 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     // actual listener. A SIGKILLed instance leaves its socket file behind in
     // anchor state; trusting it would take the already-running branch against a
     // dead instance AND skip the #58 pre-flight below. A stale file is unlinked
-    // here so this up falls through to the fresh-start path.
-    const ownInstanceLive = await socketIsLive(paths.socketPath, seams.probe);
+    // here so this up falls through to the fresh-start path. A socket whose
+    // liveness stays unknown (#186) fails INSTANCE_UNRESPONSIVE instead: a
+    // fresh start beside a live-but-busy instance would collide on its ports.
+    const ownInstanceLive = await socketIsLive(paths.socketPath, seams.probe, {
+      command: "up",
+      instance: anchor.worktreeId,
+    });
 
     // Fresh-start namespace selection (issue #176, ADR-0008): resolved here,
     // so a bare `up` that would select nothing fails with
@@ -1622,7 +1711,7 @@ async function ensureSharedStarted(
   sharedLock: WithSharedLock,
   deps: {
     driver: ReturnType<typeof createDriver>;
-    probe: (socketPath: string) => Promise<InstanceStatus>;
+    probe: LivenessProbe;
     /** Socket-bind wait window for the lazy start (issue #92). Default: 3s. */
     socketTimeoutMs?: number;
     /** Sink for the shared-field-change warnings (#185). */
@@ -1631,7 +1720,13 @@ async function ensureSharedStarted(
 ): Promise<EnsuredShared> {
   return await sharedLock(anchor, async () => {
     const paths = sharedInstancePaths(anchor);
-    if (await socketIsLive(paths.socketPath, deps.probe)) {
+    // Unknown liveness (#186) fails INSTANCE_UNRESPONSIVE rather than
+    // lazy-starting a second shared instance onto the same ports.
+    const live = await socketIsLive(paths.socketPath, deps.probe, {
+      command: "up",
+      instance: SHARED_INSTANCE_ID,
+    });
+    if (live) {
       const state = readSharedState(anchor);
       // Legacy fallback: a pre-#83 shared instance left no persisted map.
       // Positional computation is all we have — same behaviour as before.
@@ -1886,7 +1981,12 @@ export async function runDown(
       // against the dead UDS fails. A live instance is signalled through the
       // driver; a stale socket is unlinked by the probe gate itself, so
       // either way the call converges to "shared is down" — idempotently.
-      const live = await socketIsLive(paths.socketPath, probe);
+      // Unknown liveness (#186) fails INSTANCE_UNRESPONSIVE: never report
+      // "not running" (or drop the config) for an instance that may be live.
+      const live = await socketIsLive(paths.socketPath, probe, {
+        command: "down",
+        instance: SHARED_INSTANCE_ID,
+      });
       if (live) {
         await driver.down({ configPath: paths.configPath, socketPath: paths.socketPath });
       }
@@ -1920,7 +2020,14 @@ export async function runDown(
   const paths = instancePaths(anchor.anchor, anchor.worktreeId);
   const lifecycleLock = deps.withLifecycleLock ?? defaultWithLifecycleLock;
   const live = await lifecycleLock(anchor.anchor, anchor.worktreeId, async () => {
-    if (!(await socketIsLive(paths.socketPath, resolveProbe(deps)))) return false;
+    // Unknown liveness (#186) throws INSTANCE_UNRESPONSIVE out of the lock:
+    // neither "nothing running" nor the dead-supervisor reap below may run
+    // against an instance that might still be live.
+    const live = await socketIsLive(paths.socketPath, resolveProbe(deps), {
+      command: "down",
+      instance: anchor.worktreeId,
+    });
+    if (!live) return false;
     // Live supervisor: a graceful `process-compose down` fires each process's
     // `shutdown.command` from its `working_dir` (the worktree, which is present
     // on the normal `down` path). devtrees must NOT also run the hook directly
@@ -2081,7 +2188,7 @@ export interface PrunedOrphan {
   readonly id: string;
   readonly kind: "worktree" | "shared";
   /** Prior status at discovery — used by the human renderer only. */
-  readonly status: "running" | "stale";
+  readonly status: "running" | "stale" | "unknown";
   /**
    * Absolute path of the worktree the orphan was anchored at, recovered from
    * the orphan's derived config (`working_dir`) before cleanup. Empty when
@@ -2102,6 +2209,25 @@ export interface PruneResult {
    * tells an agent/operator the reap itself did not cleanly complete.
    */
   readonly warnings: ReadonlyArray<ReapWarning>;
+  /**
+   * Orphans prune could NOT reclaim (issue #186): their liveness was unknown
+   * (a possibly-live process-compose that did not answer the probe) and the
+   * graceful `process-compose down` failed. Their socket, derived config and
+   * registry entry are all kept so the instance stays visible to `ls` and a
+   * later `prune` can retry; unlinking the socket would orphan a live
+   * supervisor on its ports. Never listed in `pruned`.
+   */
+  readonly unreclaimed: ReadonlyArray<UnreclaimedOrphan>;
+}
+
+/** An orphan `prune` left in place because it could not stop it (#186). */
+export interface UnreclaimedOrphan {
+  readonly id: string;
+  readonly kind: "worktree" | "shared";
+  readonly worktreePath: string;
+  readonly socketPath: string;
+  /** Why the graceful `process-compose down` failed. */
+  readonly message: string;
 }
 
 /**
@@ -2121,6 +2247,10 @@ export interface PruneResult {
  *   2. Remove the orphan's control socket and derived config from the anchor
  *      state.
  *   3. Drop the orphan's allocation-registry entry under the registry lock.
+ *
+ * Exception (#186): an orphan whose liveness was `unknown` and whose `down`
+ * failed is left entirely in place (socket, config, registry entry) and
+ * reported in `unreclaimed`, never in `pruned`.
  *
  * The shared instance is never an orphan: it is anchored at the git common
  * dir, not at any single worktree, and its lifecycle is decoupled from any
@@ -2165,7 +2295,9 @@ export async function runPrune(deps: PruneDeps = {}): Promise<PruneResult> {
   }));
 
   const orphans = [...socketOrphans, ...deadReservations];
-  if (orphans.length === 0) return { anchor: anchor.anchor, pruned: [], warnings: [] };
+  if (orphans.length === 0) {
+    return { anchor: anchor.anchor, pruned: [], warnings: [], unreclaimed: [] };
+  }
 
   // Capture identity-only metadata for each orphan *before* tearing down its
   // derived config — `worktreePath` is recovered from the on-disk YAML and
@@ -2178,17 +2310,30 @@ export async function runPrune(deps: PruneDeps = {}): Promise<PruneResult> {
   }));
 
   const warnings: ReapWarning[] = [];
-  for (const orphan of orphans) {
-    const warning = await reapAndCleanupOrphan(orphan, anchor.anchor, reap, driver);
-    if (warning !== undefined) warnings.push(warning);
+  const unreclaimed: UnreclaimedOrphan[] = [];
+  for (const [i, orphan] of orphans.entries()) {
+    const outcome = await reapAndCleanupOrphan(orphan, anchor.anchor, reap, driver);
+    if (outcome.warning !== undefined) warnings.push(outcome.warning);
+    if (outcome.downFailure !== undefined) {
+      unreclaimed.push({
+        id: orphan.id,
+        kind: orphan.kind,
+        worktreePath: reported[i]?.worktreePath ?? "",
+        socketPath: orphan.socketPath,
+        message: outcome.downFailure,
+      });
+    }
   }
+  const keptIds = new Set(unreclaimed.map((u) => u.id));
+  const reclaimed = orphans.filter((o) => !keptIds.has(o.id));
 
-  // Drop every orphan's registry entry under one lock acquire so concurrent
-  // `up`s can re-use the freed block bases.
+  // Drop every reclaimed orphan's registry entry under one lock acquire so
+  // concurrent `up`s can re-use the freed block bases. An unreclaimed one
+  // keeps its entry: its supervisor may still hold those ports (#186).
   await lock(anchor.anchor, (snapshot) => {
     let next = snapshot;
     let changed = false;
-    for (const orphan of orphans) {
+    for (const orphan of reclaimed) {
       if (next[orphan.id] !== undefined) {
         const { [orphan.id]: _drop, ...rest } = next;
         void _drop;
@@ -2199,14 +2344,21 @@ export async function runPrune(deps: PruneDeps = {}): Promise<PruneResult> {
     return changed ? next : snapshot;
   });
 
-  return { anchor: anchor.anchor, pruned: reported, warnings };
+  return {
+    anchor: anchor.anchor,
+    pruned: reported.filter((r) => !keptIds.has(r.id)),
+    warnings,
+    unreclaimed,
+  };
 }
 
 /**
  * Reap one orphan's out-of-band resources, stop its supervisor if live, and
  * clear its on-disk state (issue #148). Factored out of `runPrune`'s loop so
- * the orchestrator stays under the complexity gate. Returns a `ReapWarning`
- * when the reap failed, else `undefined`.
+ * the orchestrator stays under the complexity gate. `warning` is set when the
+ * reap failed. `downFailure` is set when the orphan's liveness was `unknown`
+ * and the graceful `down` failed (#186): its on-disk state is then left in
+ * place rather than unlinking the socket of a possibly-live supervisor.
  *
  * The reap runs each derived `shutdown.command` ourselves, socket-free, from
  * the anchor — a directory that still exists — instead of relying on
@@ -2221,7 +2373,7 @@ async function reapAndCleanupOrphan(
   anchor: string,
   reap: Reaper,
   driver: ReturnType<typeof createDriver>,
-): Promise<ReapWarning | undefined> {
+): Promise<{ warning?: ReapWarning; downFailure?: string }> {
   const paths = instancePaths(anchor, orphan.id);
   // Use the socket path discovery actually found, not the canonical one: an
   // instance started before #156 still has its socket in the old
@@ -2229,23 +2381,40 @@ async function reapAndCleanupOrphan(
   // able to reclaim it.
   const socketPath = orphan.socketPath;
   const warning = await reapDerivedConfig(paths.configPath, orphan.id, anchor, reap);
-
-  if (orphan.status === "running") {
-    // Stop the supervisor too — a graceful `down` over its still-live socket.
-    // The direct hook run above IS the reap; this just reclaims the running
-    // process-compose. Best-effort: a failed/half-dead down must not abort the
-    // sweep, and the on-disk state is cleared below regardless.
-    try {
-      await driver.down({ configPath: paths.configPath, socketPath });
-    } catch {
-      // Best-effort: a failed down still leaves us removing the on-disk state.
-    }
+  const downFailure = await stopOrphanSupervisor(orphan, paths.configPath, driver);
+  // An `unknown` orphan (#186) whose `down` failed may still be a live
+  // supervisor: keep its socket and config so it stays visible and a later
+  // prune can retry, instead of recreating the invisible orphan.
+  if (orphan.status === "unknown" && downFailure !== undefined) {
+    return warning === undefined ? { downFailure } : { warning, downFailure };
   }
   // Remove the socket file (driver.down typically removes it on a clean exit,
   // but stale/failed orphans need explicit cleanup) and the derived config.
   rmSync(socketPath, { force: true });
   rmSync(paths.configPath, { force: true });
-  return warning;
+  return warning === undefined ? {} : { warning };
+}
+
+/**
+ * Stop a possibly-live orphan's supervisor with a graceful `down` over its
+ * socket. The direct hook run in `reapAndCleanupOrphan` IS the reap; this just
+ * reclaims the process-compose. An `unknown` orphan (#186) gets the same
+ * attempt a running one does; a stale one has nothing to stop. Best-effort:
+ * returns the failure message rather than throwing, so one half-dead orphan
+ * never aborts the sweep.
+ */
+async function stopOrphanSupervisor(
+  orphan: InstanceInfo,
+  configPath: string,
+  driver: ReturnType<typeof createDriver>,
+): Promise<string | undefined> {
+  if (orphan.status === "stale") return undefined;
+  try {
+    await driver.down({ configPath, socketPath: orphan.socketPath });
+    return undefined;
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err);
+  }
 }
 
 /**
@@ -2834,7 +3003,13 @@ async function restartDeadServices(args: {
   }
   const { lifecycleLock } = resolveLifecycleSeams(args.deps);
   return lifecycleLock(args.anchor.anchor, args.anchor.worktreeId, async () => {
-    if (!(await socketIsLive(args.socketPath, resolveProbe(args.deps)))) {
+    // Unknown liveness (#186) fails INSTANCE_UNRESPONSIVE: it is neither
+    // "gone" (INSTANCE_NOT_FOUND) nor safe to `process start` against.
+    const live = await socketIsLive(args.socketPath, resolveProbe(args.deps), {
+      command: "up",
+      instance: args.anchor.worktreeId,
+    });
+    if (!live) {
       throw new InstanceGoneError({ worktree_id: args.anchor.worktreeId });
     }
     const fresh = await readStatusesWithin(

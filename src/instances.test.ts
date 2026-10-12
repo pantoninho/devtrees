@@ -10,12 +10,20 @@
  */
 
 import { afterEach, describe, expect, it } from "vite-plus/test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createServer, type Server } from "node:net";
+import { connect, createServer, type Server, type Socket } from "node:net";
+import { spawn, type ChildProcess } from "node:child_process";
 import { deriveWorktreeId } from "./anchor.js";
-import { discoverInstances } from "./instances.js";
+import {
+  classifyProbe,
+  discoverInstances,
+  probeSocket,
+  probeUntilDefinitive,
+  socketHeldByProcess,
+  type InstanceStatus,
+} from "./instances.js";
 import {
   SHARED_INSTANCE_ID,
   SHARED_REGISTRY_KEY,
@@ -425,5 +433,249 @@ describe("discoverInstances", () => {
 
     const instances = await discoverInstances(anchor);
     expect(instances.map((i) => i.id)).toEqual([SHARED_INSTANCE_ID, "billing", "login"]);
+  });
+});
+
+/**
+ * Probe classification (issue #186). Only a definitive "nothing is listening"
+ * may read as `stale` (and so license unlinking the socket); a timeout or an
+ * ambiguous error is `unknown`.
+ */
+describe("classifyProbe", () => {
+  it("a connect is running", () => {
+    expect(classifyProbe({ kind: "connected" })).toBe("running");
+  });
+
+  it("ENOENT, ECONNREFUSED and ENOTSOCK are stale: nothing is listening", () => {
+    expect(classifyProbe({ kind: "error", code: "ENOENT" })).toBe("stale");
+    expect(classifyProbe({ kind: "error", code: "ECONNREFUSED" })).toBe("stale");
+    expect(classifyProbe({ kind: "error", code: "ENOTSOCK" })).toBe("stale");
+  });
+
+  it("a timeout is unknown, never stale", () => {
+    expect(classifyProbe({ kind: "timeout" })).toBe("unknown");
+  });
+
+  it("any other error is unknown", () => {
+    for (const code of ["EAGAIN", "EACCES", "EMFILE", "ETIMEDOUT", undefined]) {
+      expect(classifyProbe({ kind: "error", code })).toBe("unknown");
+    }
+  });
+});
+
+/**
+ * Bind a unix socket at `path` in a child process (so it can be frozen or
+ * killed without touching this test runner). Resolves once it listens.
+ */
+async function spawnListener(path: string, backlog = 511): Promise<ChildProcess> {
+  const child = spawn(
+    process.execPath,
+    [
+      "-e",
+      `require("net").createServer().listen({ path: ${JSON.stringify(path)}, backlog: ${backlog} }, () => console.log("up"))`,
+    ],
+    { stdio: ["ignore", "pipe", "inherit"] },
+  );
+  cleanups.push(() => {
+    child.kill("SIGCONT");
+    child.kill("SIGKILL");
+  });
+  await new Promise((resolve) => child.stdout?.once("data", resolve));
+  return child;
+}
+
+/** Leave a real socket file with no listener, the way a SIGKILLed process-compose does. */
+async function leaveDeadSocket(path: string): Promise<void> {
+  const child = await spawnListener(path);
+  const exited = new Promise((resolve) => child.once("exit", resolve));
+  child.kill("SIGKILL");
+  await exited;
+}
+
+describe("probeSocket", () => {
+  it("a path with no file is stale (ENOENT)", async () => {
+    const anchor = tmpAnchor();
+    expect(await probeSocket(instancePaths(anchor, "gone").socketPath)).toBe("stale");
+  });
+
+  it("a plain file at the socket path is stale (ENOTSOCK)", async () => {
+    const anchor = tmpAnchor();
+    touchSocketMarker(anchor, "login");
+    expect(await probeSocket(instancePaths(anchor, "login").socketPath)).toBe("stale");
+  });
+
+  it("a socket file whose listener was SIGKILLed is stale (ECONNREFUSED, nobody holds it)", async () => {
+    const anchor = tmpAnchor();
+    const path = instancePaths(anchor, "login").socketPath;
+    await leaveDeadSocket(path);
+    expect(await probeSocket(path)).toBe("stale");
+    expect(await probeSocket(path, { heldByProcess: async () => false })).toBe("stale");
+    // lsof unavailable or failing: the refusal's verdict stands.
+    expect(await probeSocket(path, { heldByProcess: async () => undefined })).toBe("stale");
+  });
+
+  it("a refused connect is unknown while a process still holds the socket (a full backlog)", async () => {
+    const anchor = tmpAnchor();
+    const path = instancePaths(anchor, "login").socketPath;
+    await leaveDeadSocket(path);
+    expect(await probeSocket(path, { heldByProcess: async () => true })).toBe("unknown");
+  });
+
+  it("a live listener whose probe stalls past the timeout is unknown, not stale", async () => {
+    // The #186 mechanism: on a loaded machine the event loop wakes with the
+    // connect timer already due, and timers run before the connect callback.
+    // Blocking the loop past the timeout reproduces that against a real,
+    // healthy listener. This relies on libuv's loop order: an expired timer
+    // fires in the timers phase, before the poll phase delivers the connect
+    // completion, so the 5ms timer always wins after the 50ms stall.
+    const anchor = tmpAnchor();
+    await bindSocketServer(anchor, "login");
+    const pending = probeSocket(instancePaths(anchor, "login").socketPath, { timeoutMs: 5 });
+    const until = Date.now() + 50;
+    while (Date.now() < until) {
+      // Busy-wait: starve the event loop the way a loaded machine does.
+    }
+    expect(await pending).toBe("unknown");
+  });
+
+  it("a live listener that answers in time is running", async () => {
+    const anchor = tmpAnchor();
+    await bindSocketServer(anchor, "login");
+    expect(await probeSocket(instancePaths(anchor, "login").socketPath)).toBe("running");
+  });
+
+  // macOS: a listener with a full accept backlog refuses connects with
+  // ECONNREFUSED, the same errno as a socket file with no listener. Only the
+  // lsof cross-check tells them apart, and it is verified on this platform.
+  it.runIf(process.platform === "darwin")(
+    "a frozen listener with a full backlog is unknown, not stale (SIGSTOP)",
+    async () => {
+      const anchor = tmpAnchor();
+      const path = instancePaths(anchor, "frozen").socketPath;
+      const child = await spawnListener(path, 1);
+      const held: Socket[] = [];
+      cleanups.push(() => {
+        for (const s of held) s.destroy();
+      });
+      child.kill("SIGSTOP");
+      // Queue connections behind the frozen listener until one is refused.
+      for (let i = 0; i < 64; i++) {
+        const connected = await new Promise<boolean>((resolve) => {
+          const s = connect(path);
+          held.push(s);
+          s.once("connect", () => resolve(true));
+          s.once("error", () => resolve(false));
+        });
+        if (!connected) break;
+      }
+      expect(await socketHeldByProcess(path)).toBe(true);
+      expect(await probeSocket(path)).toBe("unknown");
+    },
+  );
+
+  it.runIf(process.platform === "darwin")(
+    "socketHeldByProcess: false for a dead socket file, true for a live listener's",
+    async () => {
+      const anchor = tmpAnchor();
+      const dead = instancePaths(anchor, "dead").socketPath;
+      await leaveDeadSocket(dead);
+      expect(await socketHeldByProcess(dead)).toBe(false);
+      const live = instancePaths(anchor, "live").socketPath;
+      await spawnListener(live);
+      expect(await socketHeldByProcess(live)).toBe(true);
+    },
+  );
+
+  it("socketHeldByProcess: an lsof that times out counts as held, so a refusal stays unknown", async () => {
+    // On a loaded machine lsof itself can be slow exactly when process-compose
+    // is; a timeout must never fall through to "stale" and unlink the socket.
+    const anchor = tmpAnchor();
+    const slowLsof = join(anchor, "slow-lsof.sh");
+    writeFileSync(slowLsof, "#!/bin/sh\nsleep 5\n", { mode: 0o755 });
+    const path = instancePaths(anchor, "login").socketPath;
+    expect(await socketHeldByProcess(path, { lsofPath: slowLsof, timeoutMs: 100 })).toBe(true);
+
+    await leaveDeadSocket(path);
+    const status = await probeSocket(path, {
+      heldByProcess: (p) => socketHeldByProcess(p, { lsofPath: slowLsof, timeoutMs: 100 }),
+    });
+    expect(status).toBe("unknown");
+  });
+
+  it("socketHeldByProcess: a missing lsof binary is 'not known', so a crash still reads stale", async () => {
+    const anchor = tmpAnchor();
+    const path = instancePaths(anchor, "login").socketPath;
+    const missing = join(anchor, "no-such-lsof");
+    expect(await socketHeldByProcess(path, { lsofPath: missing })).toBeUndefined();
+
+    await leaveDeadSocket(path);
+    const status = await probeSocket(path, {
+      heldByProcess: (p) => socketHeldByProcess(p, { lsofPath: missing }),
+    });
+    expect(status).toBe("stale");
+  });
+});
+
+describe("probeUntilDefinitive", () => {
+  it("re-probes while unknown and returns the first definitive answer", async () => {
+    const answers: InstanceStatus[] = ["unknown", "unknown", "running"];
+    let i = 0;
+    const status = await probeUntilDefinitive(
+      "/x.sock",
+      async () => answers[i++] ?? "unknown",
+      [0, 0, 0],
+    );
+    expect(status).toBe("running");
+    expect(i).toBe(3);
+  });
+
+  it("gives up as unknown after one probe per backoff step plus the first", async () => {
+    let probes = 0;
+    const status = await probeUntilDefinitive(
+      "/x.sock",
+      async () => {
+        probes++;
+        return "unknown";
+      },
+      [0, 0],
+    );
+    expect(status).toBe("unknown");
+    expect(probes).toBe(3);
+  });
+
+  it("does not retry a definitive answer", async () => {
+    let probes = 0;
+    const status = await probeUntilDefinitive("/x.sock", async () => {
+      probes++;
+      return "stale";
+    });
+    expect(status).toBe("stale");
+    expect(probes).toBe(1);
+  });
+});
+
+describe("discoverInstances — unknown liveness (#186)", () => {
+  it("lists an instance whose probe stays unknown as `unknown` and makes no driver call for it", async () => {
+    const anchor = tmpAnchor();
+    writeRegistry(anchor, { login: 20000 });
+    writeDerivedConfig(anchor, "login", { web: { ports: [["WEB_PORT", 20000]] } });
+    touchSocketMarker(anchor, "login");
+    const fetched: string[] = [];
+
+    const [instance] = await discoverInstances(anchor, {
+      probeSocket: async () => "unknown",
+      probeRetryDelaysMs: [0],
+      getServiceStatuses: async (p) => {
+        fetched.push(p);
+        return [];
+      },
+    });
+
+    expect(instance?.status).toBe("unknown");
+    expect(instance?.ports).toEqual({ WEB_PORT: 20000 });
+    expect(instance?.services).toEqual([]);
+    expect(fetched).toEqual([]);
+    // Discovery is read-only: the socket file is never removed.
+    expect(existsSync(instancePaths(anchor, "login").socketPath)).toBe(true);
   });
 });

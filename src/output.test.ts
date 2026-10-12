@@ -73,6 +73,10 @@ describe("output formatter — constants", () => {
   it("declares NO_SERVICES_SELECTED so a bare up with nothing in `default` fails loudly (#176)", () => {
     expect(ERROR_CODES).toContain("NO_SERVICES_SELECTED");
   });
+
+  it("declares INSTANCE_UNRESPONSIVE so an unanswered probe fails instead of guessing (#186)", () => {
+    expect(ERROR_CODES).toContain("INSTANCE_UNRESPONSIVE");
+  });
 });
 
 describe("output formatter — classifyError", () => {
@@ -205,6 +209,23 @@ describe("output formatter — formatLs", () => {
     expect(result.stdout).toContain("beta");
     expect(result.stdout).toContain("CACHE=40001");
     expect(result.stdout).toContain("API=40097");
+  });
+
+  it("shows an instance whose liveness is unknown with that status, in both modes (#186)", () => {
+    const unknown: LsInstanceRow = {
+      id: "gamma",
+      kind: "worktree",
+      status: "unknown",
+      ports: { WEB: 40129 },
+      blockBase: 40129,
+    };
+    expect(formatLs([unknown], "human").stdout).toMatch(/gamma\s+worktree\s+unknown\s+WEB=40129/);
+    const parsed = JSON.parse(formatLs([unknown], "json").stdout) as {
+      ls: { instances: ReadonlyArray<{ id: string; status: string }> };
+    };
+    expect(parsed.ls.instances).toEqual([
+      expect.objectContaining({ id: "gamma", status: "unknown" }),
+    ]);
   });
 
   it("in human mode with no instances, prints the existing 'no instances' line", () => {
@@ -895,6 +916,26 @@ describe("output formatter — formatPrune", () => {
     const parsed = JSON.parse(result.stdout) as { prune: { warnings: unknown[] } };
     expect(parsed.prune.warnings).toEqual([]);
     expect(result.stderr).toBe("");
+  });
+
+  it("surfaces an unreclaimed orphan: stderr warning in human mode, prune.unreclaimed[] in JSON (#186)", () => {
+    const kept = [
+      {
+        id: "removed",
+        kind: "worktree" as const,
+        worktreePath: "/gone/removed",
+        socketPath: "/run/removed.sock",
+        message: "process-compose down exited with code 1",
+      },
+    ];
+    const human = formatPrune([], "human", [], kept);
+    expect(human.stderr).toContain("orphan 'removed'");
+    expect(human.stderr).toContain("NOT reclaimed");
+    expect(human.stderr).toContain("lsof -U -a /run/removed.sock");
+    const json = formatPrune([], "json", [], kept);
+    expect(json.stderr).toBe("");
+    const parsed = JSON.parse(json.stdout) as { prune: { unreclaimed: unknown[] } };
+    expect(parsed.prune.unreclaimed).toEqual(kept);
   });
 });
 
