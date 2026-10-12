@@ -45,7 +45,11 @@ function canonicalDependency(dep: ServiceDependency): unknown {
   return dep.condition === undefined ? dep.name : { name: dep.name, condition: dep.condition };
 }
 
-function canonicalService(s: ResolvedService): unknown {
+/**
+ * The fields shared by both hashes: identity, wiring and the opaque
+ * passthrough blocks that predate #175.
+ */
+function canonicalBase(s: ResolvedService): Record<string, unknown> {
   return {
     name: s.name,
     tier: s.tier,
@@ -58,6 +62,25 @@ function canonicalService(s: ResolvedService): unknown {
     readinessProbe: canonicalValue(s.readinessProbe ?? null),
     livenessProbe: canonicalValue(s.livenessProbe ?? null),
     availability: canonicalValue(s.availability ?? null),
+  };
+}
+
+/**
+ * Every field devtrees forwards to process-compose, so editing any of them on
+ * a running instance registers as drift and hot-reloads (#175). Absent fields
+ * hash as null; object blocks are key-sorted by `canonicalValue`. `namespace`
+ * goes through `canonicalValue` too, so a list-valued namespace (planned in
+ * #179) is hashed in authored order without this function changing again.
+ */
+function canonicalService(s: ResolvedService): unknown {
+  return {
+    ...canonicalBase(s),
+    namespace: canonicalValue(s.namespace ?? null),
+    shutdown: canonicalValue(s.shutdown ?? null),
+    isDaemon: s.isDaemon ?? null,
+    launchTimeoutSeconds: s.launchTimeoutSeconds ?? null,
+    logLocation: s.logLocation ?? null,
+    logConfiguration: canonicalValue(s.logConfiguration ?? null),
   };
 }
 
@@ -95,11 +118,17 @@ export function stackHash(stack: ResolvedStack): string {
  * Allocator overrides are deliberately excluded: the running shared
  * instance's concrete port numbers are carried by the persisted map, so a
  * `port_base` change alone does not invalidate what is actually bound.
+ *
+ * It also deliberately omits the process-compose fields #175 added to
+ * `stackHash` (namespace, shutdown, ...): a shared instance has no hot-reload
+ * path, so a drifted shared hash is a hard `SHARED_DRIFT` that forces a manual
+ * `down --shared`. Widening it would break every already-running shared
+ * instance on upgrade for fields that never affect the injected port map.
  */
 export function sharedStackHash(stack: ResolvedStack): string {
   const services = stack.services
     .filter((s) => s.tier === "shared")
     .sort((a, b) => a.name.localeCompare(b.name))
-    .map(canonicalService);
+    .map(canonicalBase);
   return createHash("sha256").update(JSON.stringify({ services })).digest("hex");
 }
