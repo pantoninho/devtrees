@@ -37,6 +37,9 @@ _Avoid_: conflating "anchored to main" with "owned by main"; conflating the comm
 **Tier**:
 The per-service classification that decides where a service runs: `shared` (one instance for the whole repo) or `isolated` (one copy per worktree). Set per service; defaults to `isolated`.
 
+**Namespace**:
+A process-compose namespace — an optional per-service grouping, set with `namespace:` (a string, or a list for a service that belongs to several; process-compose ≥ v1.122.0) and copied through the derived config untouched. A service with no `namespace:` is in the implicit `default` namespace. Namespaces are **opt-in** and **exact**: a **fresh** bare `devtrees up` starts only `default`; `-n/--namespace` (repeatable) selects exactly what it names and does not imply `default`; a fresh bare `up` whose `default` selection resolves to zero services fails with `NO_SERVICES_SELECTED`. The selection is fixed when an instance boots: a bare `up` on a running instance targets the namespaces whose declared services are all present in the process-compose project, and `up -n <unbooted namespace>` fails with `NAMESPACE_NOT_RUNNING` (switch with `down` then `up`). Not the same as a **Tier**: a tier decides _which instance_ a service runs in, a namespace decides _whether it starts in this run_ (ADR-0008).
+
 **devtrees.yaml**:
 The single config file a developer edits. Defines services either inline or by extending an existing `process-compose.yaml` (the **base config**), and attaches a `tier` to each service. The only devtrees-specific addition to the process-compose schema is the per-service `tier` field. It is never run by process-compose directly.
 
