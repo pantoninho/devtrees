@@ -1339,6 +1339,50 @@ describe("runUp — namespace selection (#128)", () => {
     ],
   };
 
+  /** #179: list-valued `db`; `api` (two) needs `db`, `web` (one) needs `api`. */
+  const listNamespaces: ResolvedStack = {
+    services: [
+      { ...isolated("db", "postgres"), namespace: ["one", "two"] },
+      { ...isolated("api", "node api.js"), namespace: "two", dependsOn: [{ name: "db" }] },
+      { ...isolated("web", "node web.js"), namespace: "one", dependsOn: [{ name: "api" }] },
+    ],
+  };
+
+  it("#179: -n two selects the list-valued db and api, and health-waits on exactly them", async () => {
+    let waited: string[] | undefined;
+    const warnings: string[] = [];
+    const deps: CommandDeps = {
+      ...stubDeps({ stack: listNamespaces, track: { invocations: [], touchSocket: false } }),
+      namespaces: ["two"],
+      warn: (m) => warnings.push(m),
+      waitForHealth: async ({ serviceNames }) => {
+        waited = [...serviceNames];
+      },
+    };
+    const result = await runUp(deps);
+    expect(waited).toEqual(["db", "api"]);
+    expect(result.droppedNamespaceEdges).toEqual([]);
+    expect(warnings.filter((w) => /cross-namespace/.test(w))).toEqual([]);
+  });
+
+  it("#179: warns once per depends_on edge whose target no selected namespace covers", async () => {
+    const warnings: string[] = [];
+    const deps: CommandDeps = {
+      ...stubDeps({ stack: listNamespaces, track: { invocations: [], touchSocket: false } }),
+      namespaces: ["one"],
+      warn: (m) => warnings.push(m),
+      waitForHealth: async () => {},
+    };
+    const result = await runUp(deps);
+    expect(result.droppedNamespaceEdges).toEqual([
+      { from: "web", to: "api", toNamespaces: ["two"] },
+    ]);
+    const lines = warnings.filter((w) => /cross-namespace/.test(w));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("'web' -> 'api'");
+    expect(lines[0]).toContain("[two]");
+  });
+
   it("forwards each requested namespace verbatim to the worktree up-spawn", async () => {
     const track: StubSpawn = { invocations: [], touchSocket: false };
     const baseDeps = stubDeps({ stack: mixedNamespaces, track });
@@ -2234,6 +2278,21 @@ describe("runUpDryRun — derive the config(s) with no side effects (#124)", () 
     // The edge really is gone from the previewed config — that is the whole
     // reason the preview has to say so.
     expect(result.config.processes.web?.depends_on).toBeUndefined();
+  });
+
+  it("#179: reports depends_on edges the namespace selection would drop", async () => {
+    const stack: ResolvedStack = {
+      services: [
+        { ...isolated("db", "postgres"), namespace: ["one", "three"] },
+        { ...isolated("api", "node api.js"), namespace: "two", dependsOn: [{ name: "db" }] },
+      ],
+    };
+    const result = await runUpDryRun({ ...stubDeps({ stack }), namespaces: ["two"] });
+    expect(result.droppedNamespaceEdges).toEqual([
+      { from: "api", to: "db", toNamespaces: ["one", "three"] },
+    ]);
+    const kept = await runUpDryRun({ ...stubDeps({ stack }), namespaces: ["two", "three"] });
+    expect(kept.droppedNamespaceEdges).toEqual([]);
   });
 
   it("reports no dropped edges when every depends_on stays within a tier", async () => {
@@ -4100,6 +4159,57 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
       { ...isolated("b", "python3 -m http.server", ["B_PORT"]), namespace: "two" },
     ],
   };
+
+  /** #179: `db` in [one, two], `api` (two) depends on `db`, `web` (one) depends on `api`. */
+  const listNamespaces: ResolvedStack = {
+    services: [
+      { ...isolated("db", "sleep 100000"), namespace: ["one", "two"] },
+      { ...isolated("api", "sleep 100000"), namespace: "two", dependsOn: [{ name: "db" }] },
+      { ...isolated("web", "sleep 100000"), namespace: "one", dependsOn: [{ name: "api" }] },
+    ],
+  };
+
+  it("#179: bare up after -n two targets `two` only — `one` is not running although db is present", async () => {
+    const waited: string[][] = [];
+    const warnings: string[] = [];
+    const { deps } = liveInstance(
+      listNamespaces,
+      { worktree: [running("db"), running("api")] },
+      {
+        warn: (m) => warnings.push(m),
+        waitForHealth: async ({ serviceNames }) => {
+          waited.push([...serviceNames]);
+        },
+      },
+    );
+    const result = await runUp(deps);
+    expect(waited).toEqual([["db", "api"]]);
+    expect(result.droppedNamespaceEdges).toEqual([]);
+    expect(warnings.filter((w) => /cross-namespace/.test(w))).toEqual([]);
+  });
+
+  it("#179: -n one on an instance booted with -n two names only the absent web", async () => {
+    const { deps } = liveInstance(listNamespaces, { worktree: [running("db"), running("api")] });
+    const err = await failure({ ...deps, namespaces: ["one"] });
+    expect(err?.code).toBe("NAMESPACE_NOT_RUNNING");
+    expect(err?.details?.["services"]).toEqual(["web"]);
+  });
+
+  it("#179: warns about edges the effective (read-back) selection drops on a bare up", async () => {
+    // Booted with -n one: web and db present, api absent. web -> api is dropped.
+    const warnings: string[] = [];
+    const { deps } = liveInstance(
+      listNamespaces,
+      { worktree: [running("db"), running("web")] },
+      { warn: (m) => warnings.push(m), waitForHealth: async () => {} },
+    );
+    const result = await runUp(deps);
+    expect(result.droppedNamespaceEdges).toEqual([
+      { from: "web", to: "api", toNamespaces: ["two"] },
+    ]);
+    const line = warnings.find((w) => /cross-namespace/.test(w));
+    expect(line).toContain("'web' -> 'api'");
+  });
 
   it("#170: -n naming a namespace the instance was not booted with fails with NAMESPACE_NOT_RUNNING", async () => {
     const { deps, spawned, id } = liveInstance(twoNamespaces, { worktree: [running("a")] });

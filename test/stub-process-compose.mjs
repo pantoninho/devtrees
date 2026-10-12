@@ -94,11 +94,26 @@ function flagAll(name, short) {
 /**
  * process-compose's namespace model (issue #128): a process with no
  * `namespace` is in the implicit `default` namespace. `-n` selects a subset;
- * an empty selection means all namespaces.
+ * an empty selection means all namespaces. A list-valued `namespace` (#179,
+ * v1.122.0+) is selected when ANY of its entries is.
  */
 function selectedByNamespace(proc, namespaces) {
   if (namespaces.length === 0) return true;
-  return namespaces.includes(proc?.namespace ?? "default");
+  return namespacesOf(proc).some((ns) => namespaces.includes(ns));
+}
+
+/** A process's namespaces as a list — `default` when it declares none. */
+function namespacesOf(proc) {
+  const ns = proc?.namespace ?? "default";
+  return Array.isArray(ns) ? ns : [ns];
+}
+
+/**
+ * The `namespace` field `process list -o json` reports (#179): v1.122.0 echoes
+ * the authored shape — a string, or a list for a service in several.
+ */
+function reportedNamespace(proc) {
+  return proc?.namespace ?? "default";
 }
 
 function killChild(pid) {
@@ -329,6 +344,7 @@ if (cmd === "up") {
         if (deadNames.has(name) || doneNames.has(name)) {
           return {
             name,
+            namespace: reportedNamespace(proc),
             status: "Completed",
             is_ready: "-",
             exit_code: deadNames.has(name) ? -1 : 0,
@@ -339,6 +355,7 @@ if (cmd === "up") {
         if (probed && process.env.DEVTREES_STUB_DEAD_PROBED === "1") {
           return {
             name,
+            namespace: reportedNamespace(proc),
             status: "Completed",
             is_ready: "Ready",
             exit_code: -1,
@@ -347,6 +364,7 @@ if (cmd === "up") {
         }
         return {
           name,
+          namespace: reportedNamespace(proc),
           status: "Running",
           is_ready: !probed ? "-" : probedReady ? "Ready" : "Not Ready",
           is_running: true,

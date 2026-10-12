@@ -90,9 +90,46 @@ services:
     command: npm run api
 ```
 
+A service can belong to several namespaces: `namespace:` also takes a list
+(process-compose ≥ v1.122.0). The service starts when **any** of its
+namespaces is selected. The list must be non-empty and contain distinct names.
+
+```yaml
+services:
+  db: # starts with -n backoffice, -n backoffice-be, or both
+    tier: isolated
+    namespace: [backoffice, backoffice-be]
+    command: supabase start
+  admin-api: # `devtrees up -n backoffice-be` starts db + admin-api
+    tier: isolated
+    namespace: backoffice-be
+    command: npm run admin-api
+    depends_on: [db]
+  admin-ui:
+    tier: isolated
+    namespace: backoffice
+    command: npm run admin-ui
+    depends_on: [admin-api]
+```
+
+A `depends_on` on a service that is not selected is **dropped** by
+process-compose: the dependent starts anyway, without waiting. Above,
+`devtrees up -n backoffice` starts `admin-ui` without `admin-api`. devtrees
+warns about each dropped edge on stderr, naming both services, in `up` and
+`up --dry-run`:
+
+```
+devtrees: dropped cross-namespace depends_on 'admin-ui' -> 'admin-api': 'admin-api' is in namespace(s) [backoffice-be], none of which is selected, so process-compose starts 'admin-ui' without waiting for it. Select one of [backoffice-be] with -n to start 'admin-api' too.
+```
+
+Under `--json`, the same edges are in `dropped_namespace_edges`
+(`[{from, to, to_namespaces}]`, always present) on both the `up` and
+`up_dry_run` envelopes. On a running stack, a bare `up` reports the edges
+dropped by the namespaces it was booted with.
+
 Before ADR-0008, a bare `up` started every namespace. Stacks that relied on
-that now need `-n`. Only isolated services can declare a namespace; shared
-services always run.
+that now need `-n`. Only isolated services can declare a namespace, as a
+string or a list; shared services always run.
 
 ### Where devtrees keeps its state
 

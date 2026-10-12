@@ -80,6 +80,21 @@ describe("process-compose driver — argv construction", () => {
 });
 
 describe("process-compose driver — parseServiceStatuses", () => {
+  it("parses `namespace` as a string or a list into `namespaces` (#179, v1.122.0)", () => {
+    const stdout = JSON.stringify([
+      { name: "web", status: "Running", is_ready: "-", namespace: "one" },
+      { name: "db", status: "Running", is_ready: "-", namespace: ["one", "two"] },
+      { name: "x", status: "Running", is_ready: "-", namespace: [] },
+      { name: "y", status: "Running", is_ready: "-", namespace: 7 },
+    ]);
+    expect(parseServiceStatuses(stdout)).toEqual([
+      { name: "web", status: "Running", health: "unknown", namespaces: ["one"] },
+      { name: "db", status: "Running", health: "unknown", namespaces: ["one", "two"] },
+      { name: "x", status: "Running", health: "unknown" },
+      { name: "y", status: "Running", health: "unknown" },
+    ]);
+  });
+
   it("maps each process entry to {name, status, health}, normalising is_ready", () => {
     const stdout = JSON.stringify([
       { name: "web", status: "Running", is_ready: "Ready" },

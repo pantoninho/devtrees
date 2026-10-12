@@ -1051,3 +1051,92 @@ describe("built CLI e2e — up verifies a running instance (#177)", () => {
     expect(existsSync(sock)).toBe(false);
   }, 60_000);
 });
+
+describe("built CLI e2e — list-valued namespaces and dropped cross-namespace edges (#179)", () => {
+  interface NsEdgeDoc {
+    readonly up?: { readonly dropped_namespace_edges?: unknown };
+    readonly up_dry_run?: {
+      readonly dropped_namespace_edges?: unknown;
+      readonly selected_services?: string[];
+    };
+    readonly error?: { readonly code?: string; readonly message?: string };
+  }
+
+  /** `db` in [one, two]; `api` (two) depends on `db`; `web` (one) depends on `api`. */
+  function listScenario(prefix: string): Scenario {
+    return setupRepoWithStack(
+      prefix,
+      [
+        "services:",
+        "  db:",
+        "    namespace: [one, two]",
+        '    command: "sleep 300"',
+        "  api:",
+        "    namespace: two",
+        '    command: "sleep 300"',
+        "    depends_on: [db]",
+        "  web:",
+        "    namespace: one",
+        '    command: "sleep 300"',
+        "    depends_on: [api]",
+        "",
+      ].join("\n"),
+    );
+  }
+
+  const names = (wt: string, id: string): string[] | undefined =>
+    (devtrees(wt, ["ls", "--json"]).doc as LsDoc).ls.instances
+      .find((i) => i.id === id)
+      ?.services.map((s) => s.name)
+      .sort();
+
+  it("up -n two starts db and api, not web, and a bare re-up targets `two` only", () => {
+    const { wt, id } = listScenario("dt-bcl1-");
+    const up = devtrees(wt, ["up", "-n", "two", "--json", "--wait-timeout", "10"]);
+    expect(up.code, `up failed: ${up.stderr} ${up.stdout}`).toBe(0);
+    expect((up.doc as NsEdgeDoc).up?.dropped_namespace_edges).toEqual([]);
+    expect(names(wt, id)).toEqual(["api", "db"]);
+
+    const again = devtrees(wt, ["up", "--json", "--wait-timeout", "10"]);
+    expect(again.code, `bare re-up failed: ${again.stderr} ${again.stdout}`).toBe(0);
+    expect((again.doc as UpDoc).up.services.map((s) => s.name).sort()).toEqual(["api", "db"]);
+
+    // `one` is not running even though db (in [one, two]) is present.
+    const one = devtrees(wt, ["up", "-n", "one", "--json", "--wait-timeout", "10"]);
+    expect(one.code).toBe(1);
+    expect((one.doc as NsEdgeDoc).error?.code).toBe("NAMESPACE_NOT_RUNNING");
+  }, 60_000);
+
+  it("up -n one warns about the dropped web -> api edge in human, --json and --dry-run output", () => {
+    const { wt, id } = listScenario("dt-bcl2-");
+    const edge = { from: "web", to: "api", to_namespaces: ["two"] };
+
+    const dryJson = devtrees(wt, ["up", "-n", "one", "--dry-run", "--json"]);
+    expect(dryJson.code).toBe(0);
+    expect((dryJson.doc as NsEdgeDoc).up_dry_run?.dropped_namespace_edges).toEqual([edge]);
+    expect((dryJson.doc as NsEdgeDoc).up_dry_run?.selected_services).toEqual(["db", "web"]);
+    const dryHuman = devtrees(wt, ["up", "-n", "one", "--dry-run"]);
+    expect(dryHuman.stderr).toContain("dropped cross-namespace depends_on 'web' -> 'api'");
+
+    const human = devtrees(wt, ["up", "-n", "one", "--no-attach", "--wait-timeout", "10"]);
+    expect(human.code, `up failed: ${human.stderr}`).toBe(0);
+    expect(human.stderr).toContain("dropped cross-namespace depends_on 'web' -> 'api'");
+    expect(names(wt, id)).toEqual(["db", "web"]);
+
+    // A bare re-up uses the effective (booted) selection: still `one`.
+    const json = devtrees(wt, ["up", "--json", "--wait-timeout", "10"]);
+    expect(json.code, `re-up failed: ${json.stderr} ${json.stdout}`).toBe(0);
+    expect((json.doc as NsEdgeDoc).up?.dropped_namespace_edges).toEqual([edge]);
+  }, 60_000);
+
+  it("rejects an empty namespace list as CONFIG_INVALID", () => {
+    const { wt } = setupRepoWithStack(
+      "dt-bcl3-",
+      ["services:", "  db:", "    namespace: []", '    command: "sleep 300"', ""].join("\n"),
+    );
+    const r = devtrees(wt, ["up", "--json"]);
+    expect(r.code).toBe(1);
+    expect((r.doc as NsEdgeDoc).error?.code).toBe("CONFIG_INVALID");
+    expect((r.doc as NsEdgeDoc).error?.message).toContain("namespace list is empty");
+  }, 30_000);
+});

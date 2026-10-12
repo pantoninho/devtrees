@@ -79,8 +79,11 @@ export interface ResolvedService {
    * when the author declared none, in which case process-compose places the
    * service in its implicit `default` namespace. Unlike `tier`, this is a
    * process-compose-native field — it is re-emitted into the derived config.
+   * A string or a non-empty list of distinct strings (#179, ADR-0008; lists
+   * need process-compose v1.122.0+): a listed service is selected when ANY of
+   * its namespaces is.
    */
-  readonly namespace?: string;
+  readonly namespace?: Namespace;
   /**
    * process-compose `shutdown` block (issue #134), opaque object passthrough.
    * Holds the teardown hook (`command`, `timeout_seconds`, `signal`,
@@ -118,6 +121,12 @@ export interface ResolvedService {
    */
   readonly logConfiguration?: Readonly<Record<string, unknown>>;
 }
+
+/**
+ * A service's authored `namespace:` — one name, or a list of names (#179).
+ * Kept in the authored shape so the derived config carries it verbatim.
+ */
+export type Namespace = string | ReadonlyArray<string>;
 
 /** Per-repo allocator overrides, partial — unspecified fields fall back to defaults. */
 export interface AllocatorOverrides {
@@ -238,15 +247,47 @@ function resolvePassthrough(
  * a non-empty string, so `"namespace" in svc` reflects authoring intent and a
  * namespace-less service derives without a `namespace` key. Non-string scalars
  * coerce through `asString`; an empty result is treated as "no namespace".
+ *
+ * A list (#179, ADR-0008) is kept as a list — process-compose v1.122.0+ takes
+ * it verbatim — but must be non-empty, of non-empty strings, without
+ * duplicates; anything else is `CONFIG_INVALID`, since process-compose would
+ * either reject it or silently select nothing.
  */
 function resolveNamespace(
+  service: string,
   over: RawService,
   base: RawService,
 ): Partial<Pick<ResolvedService, "namespace">> {
   const raw = over.namespace ?? base.namespace;
   if (raw === undefined || raw === null) return {};
+  if (Array.isArray(raw)) return { namespace: validateNamespaceList(service, raw) };
   const ns = asString(raw);
   return ns === "" ? {} : { namespace: ns };
+}
+
+/** Validate a list-valued `namespace:` (#179); returns it unchanged when valid. */
+function validateNamespaceList(service: string, raw: ReadonlyArray<unknown>): string[] {
+  const hint = `Write a string (namespace: app) or a list of distinct names (namespace: [app, api]).`;
+  if (raw.length === 0) {
+    throw new StackConfigError(
+      `service '${service}': namespace list is empty; a service must belong to at least one namespace. ` +
+        `Remove the key to put '${service}' in the default namespace. ${hint}`,
+    );
+  }
+  const bad = raw.find((entry) => typeof entry !== "string" || entry === "");
+  if (bad !== undefined) {
+    throw new StackConfigError(
+      `service '${service}': namespace list entries must be non-empty strings, got ${JSON.stringify(bad)}. ${hint}`,
+    );
+  }
+  const names = raw as string[];
+  const duplicate = names.find((ns, i) => names.indexOf(ns) !== i);
+  if (duplicate !== undefined) {
+    throw new StackConfigError(
+      `service '${service}': namespace '${duplicate}' is listed more than once. ${hint}`,
+    );
+  }
+  return names;
 }
 
 /**
@@ -471,7 +512,7 @@ export function parseStack(yamlText: string, options: ParseStackOptions = {}): R
       // only set when authored, so `"namespace" in svc` reflects intent and a
       // namespace-less service is emitted without the key (lands in
       // process-compose's implicit `default` namespace — no behaviour change).
-      ...resolveNamespace(over, base),
+      ...resolveNamespace(name, over, base),
       // Opaque passthrough fields — only present when authored, so
       // `"readinessProbe" in svc` reflects intent (no `undefined` leak).
       ...resolvePassthrough(over, base),
@@ -560,6 +601,7 @@ function parseYamlConfig(yamlText: string, sourceLabel: string): unknown {
  *    instance; the shared singleton (ADR-0001) runs regardless of any one
  *    worktree's `-n`, so a namespace on a shared service is inert for
  *    selection. Reject it loudly instead of letting it pass through silently.
+ *    A list-valued namespace (#179) is rejected the same way.
  */
 function validateStack(stack: ResolvedStack): void {
   const tierOf = new Map(stack.services.map((s) => [s.name, s.tier]));

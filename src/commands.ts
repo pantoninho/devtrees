@@ -37,7 +37,7 @@ import {
   logsDir,
   sharedInstancePaths,
 } from "./paths.js";
-import { formatDroppedEdgeWarning } from "./output.js";
+import { formatDroppedEdgeWarning, formatDroppedNamespaceEdgeWarning } from "./output.js";
 import { findDeadReservations, findOrphans, parseWorktreeIds } from "./prune.js";
 import { reapShutdownHooks, type ReapDeps, type ReapOutcome } from "./reaper.js";
 import { loadStack, type ResolvedService, type ResolvedStack, type Tier } from "./stack.js";
@@ -69,9 +69,11 @@ import {
 import {
   DEFAULT_NAMESPACE,
   declaredNamespaces,
+  droppedNamespaceEdges,
   formatUpCommand,
   namespaceSelected,
   resolveRunningSelection,
+  type DroppedNamespaceEdge,
   type NamespaceNotRunning,
 } from "./selection.js";
 import { findDeadServices } from "./service-state.js";
@@ -667,6 +669,13 @@ export interface UpResult {
    * driver call cannot fail an otherwise-healthy `up`.
    */
   readonly services: ReadonlyArray<Service>;
+  /**
+   * `depends_on` edges process-compose dropped because their target is in no
+   * selected namespace (ADR-0008, #179) — computed from the fresh selection,
+   * or the effective one on a running instance. Each was also warned about on
+   * stderr as `up` ran. Empty when nothing was dropped.
+   */
+  readonly droppedNamespaceEdges: ReadonlyArray<DroppedNamespaceEdge>;
 }
 
 /**
@@ -723,6 +732,12 @@ export interface DryRunResult {
    * `-n` at launch, not by removing services from the derived config.
    */
   readonly selectedServices: ReadonlyArray<string>;
+  /**
+   * `depends_on` edges a fresh `up` with the same flags would lose because
+   * their target is in no selected namespace (ADR-0008, #179): process-compose
+   * drops them and starts the dependent ungated. Empty when none would be.
+   */
+  readonly droppedNamespaceEdges: ReadonlyArray<DroppedNamespaceEdge>;
 }
 
 export interface DownOptions {
@@ -1147,6 +1162,13 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
       return { kind: "running", env: derived.env, sharedStarted } as const;
     }
 
+    // Same-tier edges the fresh selection leaves dangling (ADR-0008, #179):
+    // process-compose drops them at launch and only says so in its own log.
+    // Warned before the spawn, so the line is on screen before any attach and
+    // survives a later HEALTH_TIMEOUT. The running path warns in
+    // `verifyRunning`, against the selection it reads back.
+    const nsEdges = warnDroppedNamespaceEdges(stack, freshSelection.services, warn);
+
     // The run dir now lives outside the git dir (issue #156), so the anchor
     // state dir the derived config goes in has to be created on its own —
     // creating the run dir no longer implies it.
@@ -1206,6 +1228,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
       sharedStarted,
       selected: freshSelection.services,
       namespaces: freshSelection.namespaces,
+      droppedNamespaceEdges: nsEdges,
     } as const;
   });
 
@@ -1222,12 +1245,13 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     // it exists. Runs AFTER the lifecycle lock is released, like the fresh
     // path's health wait, so a slow wait never shows up as LOCK_CONTENTION to
     // a concurrent `up`. Headless always — this path never attaches a TTY.
-    const rows = await verifyRunning({
+    const verified = await verifyRunning({
       stack,
       anchor,
       socketPath: paths.socketPath,
       deps,
       driver,
+      warn,
     });
     const services = await collectIsolatedServices(
       stack,
@@ -1235,9 +1259,9 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
       portFor,
       deps,
       driver,
-      rows,
+      verified.rows,
     );
-    return { ...result, services };
+    return { ...result, services, droppedNamespaceEdges: verified.droppedNamespaceEdges };
   }
 
   if (shouldAttachAfterUp(deps)) {
@@ -1254,7 +1278,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     // Snapshot the per-service rows after the human detaches so the post-TUI
     // summary line reflects the state at detach time. Best-effort (issue #29).
     const services = await collectIsolatedServices(stack, paths.socketPath, portFor, deps, driver);
-    return { ...result, services };
+    return { ...result, services, droppedNamespaceEdges: outcome.droppedNamespaceEdges };
   }
 
   // Headless paths (`--json` / `--no-attach`): no TUI to render progress, so the
@@ -1269,7 +1293,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
   // applies, issue #29).
   const services = await collectIsolatedServices(stack, paths.socketPath, portFor, deps, driver);
 
-  return { ...result, services };
+  return { ...result, services, droppedNamespaceEdges: outcome.droppedNamespaceEdges };
 }
 
 /**
@@ -1388,6 +1412,7 @@ export async function runUpDryRun(deps: CommandDeps = {}): Promise<DryRunResult>
     droppedEdges: derivedWt.droppedEdges,
     namespaces: selection.namespaces,
     selectedServices: selection.services.map((s) => s.name),
+    droppedNamespaceEdges: droppedNamespaceEdges(stack.services, selection.services),
   };
 
   if (!sharedNeeded) return base;
@@ -2588,7 +2613,8 @@ async function reconcileRunning(args: {
  *
  * Dead shared services are checked earlier, inside the lifecycle lock, on
  * both paths (`assertSharedServicesAlive`). Returns the rows the last poll
- * saw, so the envelope needs no extra read.
+ * saw, so the envelope needs no extra read, and the `depends_on` edges the
+ * effective selection drops (#179), each already warned about.
  *
  * Never stops or restarts anything: a narrower `-n` than what is running only
  * narrows what is checked.
@@ -2599,7 +2625,11 @@ async function verifyRunning(args: {
   readonly socketPath: string;
   readonly deps: CommandDeps;
   readonly driver: ReturnType<typeof createDriver>;
-}): Promise<ServiceStatus[] | undefined> {
+  readonly warn: (message: string) => void;
+}): Promise<{
+  readonly rows: ServiceStatus[] | undefined;
+  readonly droppedNamespaceEdges: ReadonlyArray<DroppedNamespaceEdge>;
+}> {
   const { stack, anchor, socketPath, deps, driver } = args;
   const isolated = stack.services.filter((s) => s.tier === "isolated");
   const timeoutMs = deps.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS;
@@ -2622,10 +2652,29 @@ async function verifyRunning(args: {
     throw namespaceNotRunningError(anchor.worktreeId, selection.notRunning, deps.namespaces ?? []);
   }
 
-  return await waitForSelectedHealth(selection.services, socketPath, deps, driver, {
+  // Dropped cross-namespace edges against the effective selection (#179):
+  // on a bare `up` that is the booted one read back above, not `default`.
+  const nsEdges = warnDroppedNamespaceEdges(stack, selection.services, args.warn);
+
+  const finalRows = await waitForSelectedHealth(selection.services, socketPath, deps, driver, {
     remedy: `devtrees down && ${formatUpCommand(stack.services, selection.namespaces)}`,
     firstRead: rows,
   });
+  return { rows: finalRows, droppedNamespaceEdges: nsEdges };
+}
+
+/**
+ * Compute the `depends_on` edges `selected` leaves dangling (ADR-0008, #179)
+ * and warn once per edge; returns them for the `up --json` envelope.
+ */
+function warnDroppedNamespaceEdges(
+  stack: ResolvedStack,
+  selected: ReadonlyArray<ResolvedService>,
+  warn: (message: string) => void,
+): DroppedNamespaceEdge[] {
+  const edges = droppedNamespaceEdges(stack.services, selected);
+  for (const edge of edges) warn(formatDroppedNamespaceEdgeWarning(edge));
+  return edges;
 }
 
 function namespaceNotRunningError(

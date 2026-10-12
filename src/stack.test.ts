@@ -308,6 +308,53 @@ services:
     expect(stack.services[0]?.namespace).toBe("local-backend");
   });
 
+  it("carries a list-valued namespace through as a list (#179)", () => {
+    const yaml = `
+services:
+  db:
+    command: "postgres"
+    namespace: [backoffice, backoffice-be]
+`;
+    expect(parseStack(yaml).services[0]?.namespace).toEqual(["backoffice", "backoffice-be"]);
+  });
+
+  it("lets the overlay give a base-defined service a list-valued namespace (#179)", () => {
+    const base = `
+processes:
+  db:
+    command: "postgres"
+`;
+    const devtrees = `
+extends: ./process-compose.yaml
+services:
+  db:
+    namespace: [one, two]
+`;
+    expect(parseStack(devtrees, { baseYaml: base }).services[0]?.namespace).toEqual(["one", "two"]);
+  });
+
+  it.each([
+    ["an empty list", "[]", /namespace list is empty/],
+    ["a non-string entry", "[one, 2]", /non-empty strings, got 2/],
+    ["a nested list", "[one, [two]]", /non-empty strings/],
+    ["an empty-string entry", '[one, ""]', /non-empty strings/],
+    ["a duplicate entry", "[one, two, one]", /'one' is listed more than once/],
+  ])("rejects %s as a namespace with CONFIG_INVALID (#179)", (_label, value, message) => {
+    const yaml = `
+services:
+  db:
+    command: "postgres"
+    namespace: ${value}
+`;
+    expect(() => parseStack(yaml)).toThrow(message);
+    try {
+      parseStack(yaml);
+    } catch (err) {
+      expect((err as { code?: string }).code).toBe("CONFIG_INVALID");
+      expect((err as Error).message).toContain("service 'db'");
+    }
+  });
+
   it("omits namespace from ResolvedService when the author didn't declare one", () => {
     const yaml = `
 services:
@@ -982,6 +1029,17 @@ services:
     tier: shared
     command: "postgres"
     namespace: local-backend
+`;
+    expect(() => parseStack(yaml)).toThrow(/namespace.*isolated/i);
+  });
+
+  it("rejects a shared service with a list-valued namespace (#179)", () => {
+    const yaml = `
+services:
+  postgres:
+    tier: shared
+    command: "postgres"
+    namespace: [one, two]
 `;
     expect(() => parseStack(yaml)).toThrow(/namespace.*isolated/i);
   });

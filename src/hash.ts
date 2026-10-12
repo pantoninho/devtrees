@@ -69,8 +69,8 @@ function canonicalBase(s: ResolvedService): Record<string, unknown> {
  * Every field devtrees forwards to process-compose, so editing any of them on
  * a running instance registers as drift and hot-reloads (#175). Absent fields
  * hash as null; object blocks are key-sorted by `canonicalValue`. `namespace`
- * goes through `canonicalValue` too, so a list-valued namespace (planned in
- * #179) is hashed in authored order without this function changing again.
+ * goes through `canonicalValue` too, so a list-valued namespace (#179) is
+ * hashed in authored order, as process-compose receives it.
  */
 function canonicalService(s: ResolvedService): unknown {
   return {

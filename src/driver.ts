@@ -200,6 +200,13 @@ export interface ServiceStatus {
    * `classifyService` (ADR-0008). Never published in `ls`/`up --json` rows.
    */
   readonly exitCode?: number;
+  /**
+   * The namespaces process-compose reports for the process (#179). v1.122.0
+   * emits `namespace` as a string, or as a list for a service declared in
+   * several; both normalise to a list here. Absent when the row carries no
+   * usable `namespace`. Not published in `ls`/`up --json` rows.
+   */
+  readonly namespaces?: ReadonlyArray<string>;
 }
 
 interface RawProc {
@@ -209,6 +216,19 @@ interface RawProc {
   readonly ready?: unknown;
   readonly is_running?: unknown;
   readonly exit_code?: unknown;
+  readonly namespace?: unknown;
+}
+
+/**
+ * Normalise process-compose's `namespace` (#179): a string, or a list of
+ * strings for a service in several namespaces. Anything else — absent, empty,
+ * a list with no string entries — is `undefined` rather than a guess.
+ */
+function readNamespaces(raw: unknown): string[] | undefined {
+  if (typeof raw === "string") return raw === "" ? undefined : [raw];
+  if (!Array.isArray(raw)) return undefined;
+  const names = raw.filter((ns): ns is string => typeof ns === "string" && ns !== "");
+  return names.length > 0 ? names : undefined;
 }
 
 function readProbeVerdict(raw: RawProc): HealthState {
@@ -248,8 +268,14 @@ export function parseServiceStatuses(stdout: string): ServiceStatus[] {
   const out: ServiceStatus[] = [];
   for (const raw of items) {
     if (typeof raw.name !== "string" || typeof raw.status !== "string") continue;
-    const row = { name: raw.name, status: raw.status, health: readHealth(raw) };
-    out.push(typeof raw.exit_code === "number" ? { ...row, exitCode: raw.exit_code } : row);
+    const namespaces = readNamespaces(raw.namespace);
+    out.push({
+      name: raw.name,
+      status: raw.status,
+      health: readHealth(raw),
+      ...(typeof raw.exit_code === "number" ? { exitCode: raw.exit_code } : {}),
+      ...(namespaces !== undefined ? { namespaces } : {}),
+    });
   }
   return out;
 }

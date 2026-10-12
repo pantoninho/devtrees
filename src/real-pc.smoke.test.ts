@@ -1058,6 +1058,88 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
     expect(bare.code, `bare re-up failed: ${bare.stderr} ${bare.stdout}`).toBe(0);
     expect((bare.doc as UpDoc).up.services.map((s) => s.name)).toEqual(["a"]);
   }, 120_000);
+
+  /**
+   * #179's list-valued stack: `db` in [one, two], `api` (two) depends on `db`,
+   * `web` (one) depends on `api`. Each command carries `<role> <root>` in its
+   * argv so `pidsMatching` can tell exactly which services run.
+   */
+  function writeListNamespaceStack(wt: string, root: string): void {
+    const cmd = (role: string) =>
+      `    command: "python3 -c 'import time; time.sleep(300)' rpc179-${role} ${root}"`;
+    writeFileSync(
+      join(wt, "devtrees.yaml"),
+      [
+        "services:",
+        "  db:",
+        "    namespace: [one, two]",
+        cmd("db"),
+        "  api:",
+        "    namespace: two",
+        cmd("api"),
+        "    depends_on: [db]",
+        "  web:",
+        "    namespace: one",
+        cmd("web"),
+        "    depends_on: [api]",
+        "",
+      ].join("\n"),
+    );
+  }
+
+  it("scenario 30: a list-valued namespace — up -n two starts db and api, not web (#179)", async () => {
+    const repo = buildSmokeRepo("dt-rpc30-", ["login"]);
+    currentCtx = { pidNeedle: repo.root, root: repo.root };
+    const wt = repo.worktrees.login!;
+    writeListNamespaceStack(wt, repo.root);
+    cleanupStack.push(() => devtrees(wt, ["down"]));
+
+    const first = devtrees(wt, ["up", "-n", "two", "--json", "--wait-timeout", "30"]);
+    expect(first.code, `up -n two failed: ${first.stderr} ${first.stdout}`).toBe(0);
+    expect(pidsMatching(`rpc179-db ${repo.root}`).length).toBeGreaterThan(0);
+    expect(pidsMatching(`rpc179-api ${repo.root}`).length).toBeGreaterThan(0);
+    expect(pidsMatching(`rpc179-web ${repo.root}`)).toEqual([]);
+    const ls = devtrees(wt, ["ls", "--json"]).doc as LsDoc;
+    const names = ls.ls.instances.find((i) => i.id === wtId(wt))?.services.map((s) => s.name);
+    expect(names?.sort()).toEqual(["api", "db"]);
+
+    // A bare re-up targets `two` only: `one` is not counted as running even
+    // though db (in [one, two]) is present, because web is absent.
+    const bare = devtrees(wt, ["up", "--json", "--wait-timeout", "20"]);
+    expect(bare.code, `bare re-up failed: ${bare.stderr} ${bare.stdout}`).toBe(0);
+    expect((bare.doc as UpDoc).up.services.map((s) => s.name).sort()).toEqual(["api", "db"]);
+    const one = devtrees(wt, ["up", "-n", "one", "--json", "--wait-timeout", "20"]);
+    expect(one.code).toBe(1);
+    const err = (one.doc as { error?: { code?: string; details?: unknown } }).error;
+    expect(err?.code).toBe("NAMESPACE_NOT_RUNNING");
+    expect(err?.details).toMatchObject({ namespaces: ["one"], services: ["web"] });
+  }, 120_000);
+
+  it("scenario 31: up -n one warns about the dropped cross-namespace web -> api edge (#179)", async () => {
+    const repo = buildSmokeRepo("dt-rpc31-", ["login"]);
+    currentCtx = { pidNeedle: repo.root, root: repo.root };
+    const wt = repo.worktrees.login!;
+    writeListNamespaceStack(wt, repo.root);
+    cleanupStack.push(() => devtrees(wt, ["down"]));
+    const edge = { from: "web", to: "api", to_namespaces: ["two"] };
+
+    const dry = devtrees(wt, ["up", "-n", "one", "--dry-run", "--json"]);
+    expect(dry.code).toBe(0);
+    expect(
+      (dry.doc as { up_dry_run: { dropped_namespace_edges: unknown } }).up_dry_run
+        .dropped_namespace_edges,
+    ).toEqual([edge]);
+
+    const up = devtrees(wt, ["up", "-n", "one", "--json", "--wait-timeout", "30"]);
+    expect(up.code, `up -n one failed: ${up.stderr} ${up.stdout}`).toBe(0);
+    expect(
+      (up.doc as { up: { dropped_namespace_edges: unknown } }).up.dropped_namespace_edges,
+    ).toEqual([edge]);
+    expect(up.stderr).toContain("dropped cross-namespace depends_on 'web' -> 'api'");
+    // process-compose really dropped the edge: web runs although api never started.
+    expect(pidsMatching(`rpc179-web ${repo.root}`).length).toBeGreaterThan(0);
+    expect(pidsMatching(`rpc179-api ${repo.root}`)).toEqual([]);
+  }, 120_000);
 });
 
 // Without the gate, log once so a developer running `vp test run` locally

@@ -25,13 +25,14 @@ import type { ResolvedService } from "./stack.js";
 export const DEFAULT_NAMESPACE = "default";
 
 /**
- * The namespaces a service belongs to — its declared one, or the implicit
- * `default`. Returned as a list so membership checks already read "selected
- * if ANY of its namespaces is", which is what list-valued `namespace:`
- * (ADR-0008, #179) needs.
+ * The namespaces a service belongs to — its declared one(s), or the implicit
+ * `default`. A list-valued `namespace:` (ADR-0008, #179) contributes every
+ * entry, so membership checks read "selected if ANY of its namespaces is".
  */
 function serviceNamespaces(service: Pick<ResolvedService, "namespace">): string[] {
-  return [service.namespace ?? DEFAULT_NAMESPACE];
+  const ns = service.namespace;
+  if (ns === undefined) return [DEFAULT_NAMESPACE];
+  return typeof ns === "string" ? [ns] : [...ns];
 }
 
 /**
@@ -141,4 +142,44 @@ export function formatUpCommand(
     return "devtrees up";
   }
   return ["devtrees up", ...target.map((ns) => `-n ${ns}`)].join(" ");
+}
+
+/**
+ * A `depends_on` edge process-compose drops at launch because its target is
+ * not selected (ADR-0008, #179): none of the target's namespaces is among the
+ * `-n` values, so process-compose (v1.120+) omits it and starts the dependent
+ * ungated, warning only in its own log file. devtrees reports these the way
+ * ADR-0003 asks it to report dropped cross-tier edges.
+ */
+export interface DroppedNamespaceEdge {
+  readonly from: string;
+  readonly to: string;
+  /** The target's namespaces — selecting any of them would keep the edge. */
+  readonly toNamespaces: ReadonlyArray<string>;
+}
+
+/**
+ * Every `depends_on` edge from a selected isolated service to an isolated
+ * service the selection leaves out, in declaration order. `stackServices` is
+ * the whole stack (to resolve each target), `selected` the services the `up`
+ * targets — the fresh selection, or the effective one on a running instance.
+ * Edges to shared services are not namespace edges (the shared instance runs
+ * regardless of `-n`, #130); they are the deriver's cross-tier drops.
+ */
+export function droppedNamespaceEdges(
+  stackServices: ReadonlyArray<Pick<ResolvedService, "name" | "tier" | "namespace" | "dependsOn">>,
+  selected: ReadonlyArray<Pick<ResolvedService, "name">>,
+): DroppedNamespaceEdge[] {
+  const selectedNames = new Set(selected.map((s) => s.name));
+  const byName = new Map(stackServices.map((s) => [s.name, s]));
+  const edges: DroppedNamespaceEdge[] = [];
+  for (const from of stackServices) {
+    if (!selectedNames.has(from.name)) continue;
+    for (const dep of from.dependsOn) {
+      const to = byName.get(dep.name);
+      if (to === undefined || to.tier !== "isolated" || selectedNames.has(to.name)) continue;
+      edges.push({ from: from.name, to: to.name, toNamespaces: serviceNamespaces(to) });
+    }
+  }
+  return edges;
 }

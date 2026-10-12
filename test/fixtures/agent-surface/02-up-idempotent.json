@@ -18,6 +18,7 @@
       }
     ],
     "shared_started": false,
+    "dropped_namespace_edges": [],
     "block_base": 0
   }
 }
