@@ -4445,31 +4445,64 @@ describe("runUp — pending-reload guard (#191)", () => {
     expect(marker()).toBeUndefined();
   });
 
-  it("no marker: a declared service absent from a booted namespace refuses (stateless fallback)", async () => {
+  it("no marker: a service absent from the project does not block a reload", async () => {
+    // Without a marker there is nothing to wait on: the project's shape alone
+    // is not evidence (a timed-out rename leaves a stale on-disk config).
     const { state, deps } = fixture(stackA, [row("web", 100), row("api", 200)]);
     await runUp(deps);
-    // A timeout from a build that wrote no marker: `web` is gone, `api`
-    // (same namespace) is still there.
     state.rows = [row("api", 200)];
     state.stack = stackB;
-    const err = await upError(deps);
-    expect(err.details).toEqual({ reason: "reload_pending", services: ["web"], pids: [] });
-    expect(err.message).toMatch(/devtrees down && devtrees up`/);
-    expect(state.reloads).toBe(0);
+    await runUp(deps);
+    expect(state.reloads).toBe(1);
   });
 
-  it("the no-PID remedy keeps the namespaces the instance was booted with", async () => {
-    const one: ResolvedStack = {
-      services: [svc("web", "node a.js", "one"), svc("api", "node api.js", "one")],
+  it("a timed-out rename converges: once the old pid exits, up succeeds and the next up is a noop", async () => {
+    const before: ResolvedStack = {
+      services: [svc("keeper", "node k.js"), svc("web", "node a.js")],
     };
-    const { state, deps } = fixture(one, [row("web", 100), row("api", 200)]);
-    await runUp({ ...deps, namespaces: ["one"] });
-    state.rows = [row("api", 200)];
+    const { state, deps, marker } = fixture(before, [row("keeper", 50), row("web", 100)]);
+    await runUp(deps);
+    // Rename web -> web2; the old `web` never stops, so the reload times out.
+    state.stack = { services: [svc("keeper", "node k.js"), svc("web2", "node a.js")] };
+    state.reload = "hang";
+    await upError(deps);
+    expect(marker()).toEqual({ services: [], oldRuns: [{ name: "web", pid: 100 }] });
+
+    // Still pending while the old pid lives...
+    state.rows = [row("keeper", 50)];
+    const pending = await upError(deps);
+    expect(pending.details).toEqual({ reason: "reload_pending", services: ["web"], pids: [100] });
+
+    // ...and converged once it exits: process-compose runs keeper + web2. The
+    // restored on-disk config still names `web`; that must not read as stuck.
+    state.alive.delete(100);
+    state.rows = [row("keeper", 50), row("web2", 101)];
+    state.alive.add(101);
+    state.reload = 200;
+    await runUp(deps);
+    expect(state.reloads).toBe(2);
+    expect(marker()).toBeUndefined();
+    await runUp(deps);
+    expect(state.reloads).toBe(2);
+  });
+
+  it("the no-PID remedy keeps every booted namespace, not just a narrower -n", async () => {
+    const wide: ResolvedStack = {
+      services: [svc("web", "node a.js", "one"), svc("worker", "node w.js", "two")],
+    };
+    const { state, deps } = fixture(wide, [row("web", 100), row("worker", 300)]);
+    await runUp({ ...deps, namespaces: ["one", "two"] });
     state.stack = {
-      services: [svc("web", "node b.js", "one"), svc("api", "node api.js", "one")],
+      services: [svc("web", "node b.js", "one"), svc("worker", "node w.js", "two")],
     };
-    const err = await upError(deps);
-    expect(err.message).toContain("`devtrees down && devtrees up -n one`");
+    state.reload = "hang";
+    await upError({ ...deps, namespaces: ["one"] });
+    // The old `web` exited; process-compose has not started the new one yet.
+    state.alive.delete(100);
+    state.rows = [row("worker", 300)];
+    const err = await upError({ ...deps, namespaces: ["one"] });
+    expect(err.details).toEqual({ reason: "reload_pending", services: ["web"], pids: [] });
+    expect(err.message).toContain("`devtrees down && devtrees up -n one -n two`");
   });
 
   it("no marker: an instance booted on a namespace with no services reloads normally (#176)", async () => {
@@ -4481,20 +4514,7 @@ describe("runUp — pending-reload guard (#191)", () => {
     expect(state.reloads).toBe(1);
   });
 
-  it("an unselected namespace's absent services do not trip the fallback", async () => {
-    const one: ResolvedStack = {
-      services: [svc("web", "node a.js", "one"), svc("worker", "node w.js", "two")],
-    };
-    const { state, deps } = fixture(one, [row("web", 100)]);
-    await runUp({ ...deps, namespaces: ["one"] });
-    state.stack = {
-      services: [svc("web", "node b.js", "one"), svc("worker", "node w.js", "two")],
-    };
-    await runUp({ ...deps, namespaces: ["one"] });
-    expect(state.reloads).toBe(1);
-  });
-
-  it("a list-valued namespace proves nothing about which namespace booted (#179)", async () => {
+  it("an instance booted through a list-valued namespace reloads normally (#179)", async () => {
     const stack: ResolvedStack = {
       services: [
         svc("db", "node db.js", ["one", "two"]),

@@ -9,7 +9,6 @@ import {
   planPendingReload,
   readPendingReload,
   stuckFromMarker,
-  stuckFromProject,
   writePendingReload,
 } from "./reload-pending.js";
 
@@ -90,45 +89,6 @@ describe("stuckFromMarker", () => {
   it("takes only the PIDs as evidence when the read failed", () => {
     expect(stuckFromMarker(marker, undefined, () => false)).toBeUndefined();
     expect(stuckFromMarker(marker, undefined, () => true)?.pids).toEqual([1]);
-  });
-});
-
-describe("stuckFromProject", () => {
-  const noMarker = { emptyIsPending: false };
-
-  it("flags a service absent from a namespace another present service proves booted", () => {
-    const declared = { web: {}, api: {} };
-    expect(stuckFromProject(declared, [row("api")], noMarker)).toEqual({
-      services: ["web"],
-      pids: [],
-    });
-  });
-
-  it("an empty project is pending only when a marker says a reload timed out", () => {
-    // `up -n <ns>` on a namespace with no services boots an empty project (#176).
-    expect(stuckFromProject({ web: {} }, [], noMarker)).toBeUndefined();
-    expect(stuckFromProject({ web: {} }, [], { emptyIsPending: true })).toEqual({
-      services: ["web"],
-      pids: [],
-    });
-  });
-
-  it("ignores namespaces nothing proves booted, list-valued ones included", () => {
-    const declared = {
-      db: { namespace: ["one", "two"] },
-      web: { namespace: "one" },
-      worker: { namespace: "two" },
-    };
-    expect(stuckFromProject(declared, [row("db"), row("worker")], noMarker)).toBeUndefined();
-    expect(stuckFromProject(declared, [row("db")], noMarker)).toBeUndefined();
-  });
-
-  it("a single-entry list proves its namespace like a string does", () => {
-    const declared = { a: { namespace: ["one"] }, b: { namespace: "one" } };
-    expect(stuckFromProject(declared, [row("a")], noMarker)).toEqual({
-      services: ["b"],
-      pids: [],
-    });
   });
 });
 

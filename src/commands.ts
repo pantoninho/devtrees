@@ -101,7 +101,6 @@ import {
   readPendingReload,
   stuckFromMarker,
   provenNamespaces,
-  stuckFromProject,
   writePendingReload,
   type PendingReload,
   type StuckReload,
@@ -134,8 +133,7 @@ export type { WaitForHealth, WaitForSharedHealth } from "./health.js";
  * reload is still waiting on an old process, and a second one would start an
  * untracked copy of the service. `details.services` names the stuck services
  * and `details.pids` the old processes to kill (empty when the old process
- * has exited but the service is not back yet, or when only the shape of the
- * project gave it away). It can fire with no drift: reverting devtrees.yaml
+ * has exited but the service is not back yet). It can fire with no drift: reverting devtrees.yaml
  * does not stop process-compose applying the pending config.
  */
 type ConfigDriftDetails =
@@ -2948,7 +2946,6 @@ async function reconcileRunning(args: {
     anchor,
     marker,
     rows,
-    drift,
     previous: derivedProcesses(previousConfig),
     isolated: args.stack.services.filter((s) => s.tier === "isolated"),
     requested: args.deps.namespaces ?? [],
@@ -3031,39 +3028,33 @@ const RELOAD_TIMED_OUT_HASH = "reload-timed-out";
 
 /**
  * Refuse to reload while a previous reload is still pending (#191; see
- * src/reload-pending.ts for both signals). The marker is checked whenever
- * there is one, and cleared once a successful read shows it converged. The
- * stateless check runs only on drift, against the on-disk config (`previous`)
- * and the same read; a failed read is not evidence of anything.
+ * src/reload-pending.ts). The marker is checked whenever there is one, and
+ * cleared once a successful read shows it converged; a failed read leaves it
+ * in place, with only the old PIDs as evidence.
  */
 function assertNoPendingReload(args: {
   readonly anchor: { readonly anchor: string; readonly worktreeId: string };
   readonly marker: PendingReload | undefined;
   readonly rows: ServiceStatus[] | undefined;
-  readonly drift: boolean;
   readonly previous: DerivedProcessMap | undefined;
   readonly isolated: ReadonlyArray<ResolvedService>;
   readonly requested: ReadonlyArray<string>;
   readonly isAlive: (pid: number) => boolean;
 }): void {
-  const { anchor, marker, rows, previous } = args;
-  const fail = (stuck: StuckReload): ConfigDriftError =>
-    reloadPendingError(anchor.worktreeId, stuck, pendingRemedyUp({ ...args, stuck }));
-  if (marker !== undefined) {
-    const stuck = stuckFromMarker(marker, rows, args.isAlive);
-    if (stuck !== undefined) throw fail(stuck);
-    if (rows !== undefined) clearPendingReload(anchor.anchor, anchor.worktreeId);
+  const { anchor, marker, rows } = args;
+  if (marker === undefined) return;
+  const stuck = stuckFromMarker(marker, rows, args.isAlive);
+  if (stuck !== undefined) {
+    throw reloadPendingError(anchor.worktreeId, stuck, pendingRemedyUp({ ...args, stuck }));
   }
-  if (!args.drift || previous === undefined || rows === undefined) return;
-  const stuck = stuckFromProject(previous, rows, { emptyIsPending: marker !== undefined });
-  if (stuck !== undefined) throw fail(stuck);
+  if (rows !== undefined) clearPendingReload(anchor.anchor, anchor.worktreeId);
 }
 
 /**
  * The `down` + `up` that reboots the instance with the namespaces it runs:
- * the ones this `up` asked for, else those the project proves booted plus the
- * stuck services' own when they have exactly one (they were running before the
- * reload).
+ * the ones this `up` asked for, those the project proves booted (a narrower
+ * `-n` must not drop the rest), and the stuck services' own when they have
+ * exactly one (they were running before the reload).
  */
 function pendingRemedyUp(args: {
   readonly rows: ServiceStatus[] | undefined;
@@ -3072,9 +3063,6 @@ function pendingRemedyUp(args: {
   readonly requested: ReadonlyArray<string>;
   readonly stuck: StuckReload;
 }): string {
-  if (args.requested.length > 0) {
-    return `devtrees down && ${formatUpCommand(args.isolated, args.requested)}`;
-  }
   const proven =
     args.previous !== undefined && args.rows !== undefined
       ? provenNamespaces(args.previous, args.rows)
@@ -3083,7 +3071,7 @@ function pendingRemedyUp(args: {
     .filter((s) => args.stuck.services.includes(s.name))
     .map((s) => serviceNamespaces(s))
     .flatMap((ns) => (ns.length === 1 ? ns : []));
-  const namespaces = [...new Set([...proven, ...stuckOwn])].sort();
+  const namespaces = [...new Set([...args.requested, ...proven, ...stuckOwn])].sort();
   return `devtrees down && ${formatUpCommand(args.isolated, namespaces)}`;
 }
 
@@ -3101,11 +3089,9 @@ function reloadPendingError(
           `Kill the old process (\`kill ${pids}\`), then run \`devtrees up\` again.`,
         ]
       : [
-          `it is missing from the process-compose project although its namespace is ` +
-            `running, which is what a reload still waiting for an old process looks like`,
-          `Kill the service's old process if one is still running, wait a moment for ` +
-            `process-compose to start the new one, then run \`devtrees up\` again. If no old ` +
-            `process is running and this persists, run \`${rebootCommand}\`.`,
+          `its old process has exited, but process-compose has not brought it back yet`,
+          `Wait a moment for process-compose to start the new one, then run ` +
+            `\`devtrees up\` again. If this persists, run \`${rebootCommand}\`.`,
         ];
   return new ConfigDriftError(
     `devtrees up: a previous hot-reload of '${worktreeId}' is still pending for ${names}: ` +

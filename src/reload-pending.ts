@@ -13,26 +13,22 @@
  * collides on ports).
  *
  * `up` therefore refuses to reload while a previous reload is still pending.
- * Two signals, both read under the worktree's lifecycle lock:
+ * The signal is a marker, read under the worktree's lifecycle lock. When a
+ * reload times out, `up` persists which changed services must reappear and
+ * the PIDs of their old runs, taken from a `process list` snapshot made just
+ * before the reload. An entry is pending while its service is absent from the
+ * project, or while its old PID is alive and the project does not show the
+ * service back under a different PID (process-compose re-adds it only once the
+ * old process has exited, so a new PID there means a reused PID is not ours).
+ * Once a read shows nothing pending, the marker is cleared. `down` and a fresh
+ * start clear it too: the instance it describes is gone.
  *
- *  1. **The marker** (primary). When a reload times out, `up` persists which
- *     changed services must reappear and the PIDs of their old runs, taken
- *     from a `process list` snapshot made just before the reload. An entry is
- *     pending while its service is absent from the project, or while its old
- *     PID is alive and the project does not show the service back under a
- *     different PID (process-compose re-adds it only once the old process has
- *     exited, so a new PID there means a reused PID is not ours). Once a read
- *     shows nothing pending, the marker is cleared. `down` and a fresh start
- *     clear it too: the instance it describes is gone.
- *  2. **The stateless check** (fallback, for a timeout no marker recorded,
- *     e.g. from an older build). A service the on-disk config declares is
- *     absent from the project although its namespace is booted. A namespace
- *     is "booted" when a present service declares it as its only namespace:
- *     a list-valued service (#179) is present when ANY of its namespaces is
- *     booted, so it proves nothing about which. Unselected namespaces are
- *     absent by design and never trip it. An empty project counts only when
- *     a marker exists: `up -n <ns>` on a namespace with no services boots an
- *     empty project legitimately (#176), so on its own it proves nothing.
+ * There is deliberately no stateless fallback (reading the project's shape
+ * against the on-disk config): the restored on-disk config is stale after a
+ * timed-out rename or removal, and an empty project is legitimate after
+ * `up -n <ns>` on a namespace with no services (#176), so every version of
+ * it refused healthy instances. Only builds without the marker could need it,
+ * and none was released.
  *
  * Pure apart from the marker file I/O. The process list is read by the
  * caller and handed in, as is the liveness check.
@@ -65,8 +61,7 @@ export interface StuckReload {
   readonly services: ReadonlyArray<string>;
   /**
    * Old PIDs still alive. Empty when the old process has exited but the
-   * update has not brought the service back yet, or when only the stateless
-   * check fired.
+   * update has not brought the service back yet.
    */
   readonly pids: ReadonlyArray<number>;
 }
@@ -115,9 +110,8 @@ export function readPendingReload(anchor: string, worktreeId: string): PendingRe
       oldRuns: Array.isArray(parsed?.oldRuns) ? parsed.oldRuns : [],
     };
   } catch {
-    // A torn or hand-edited marker still says "a reload timed out here":
-    // keep it, with nothing specific to wait on, so the stateless check and
-    // the next converged read decide.
+    // A torn or hand-edited marker records nothing to wait on: the next
+    // successful read clears it.
     return { services: [], oldRuns: [] };
   }
 }
@@ -144,8 +138,8 @@ export function clearPendingReload(anchor: string, worktreeId: string): void {
  * appears), `after` still declares it, and it stays in a booted namespace:
  * its namespaces are unchanged, or one of them is proven booted by the
  * snapshot. A service moved into an unbooted namespace never reappears.
- * Without a snapshot the marker records nothing specific, and the stateless
- * check decides.
+ * Without a snapshot the marker records nothing to wait on (guessing would
+ * risk waiting forever on an unselected service), so it guards nothing.
  */
 export function planPendingReload(
   before: DerivedProcesses | undefined,
@@ -198,29 +192,6 @@ export function stuckFromMarker(
   const services = [...new Set([...alive.map((r) => r.name), ...absent])];
   if (services.length === 0) return undefined;
   return { services, pids: alive.map((r) => r.pid) };
-}
-
-/**
- * The stateless fallback: services `declared` (the on-disk derived config,
- * which describes the running instance) that are absent from `rows` although
- * their namespace is booted. See the module doc for what counts as booted.
- * `emptyIsPending` makes an empty project count too (only when a marker says
- * a reload timed out here).
- */
-export function stuckFromProject(
-  declared: DerivedProcesses,
-  rows: ReadonlyArray<ServiceStatus>,
-  opts: { readonly emptyIsPending: boolean },
-): StuckReload | undefined {
-  const names = Object.keys(declared);
-  if (names.length === 0) return undefined;
-  if (rows.length === 0) return opts.emptyIsPending ? { services: names, pids: [] } : undefined;
-  const present = new Set(rows.map((r) => r.name));
-  const booted = provenNamespaces(declared, rows);
-  const missing = names.filter(
-    (name) => !present.has(name) && namespaceSelected(namespaceOf(declared[name]), booted),
-  );
-  return missing.length === 0 ? undefined : { services: missing, pids: [] };
 }
 
 /** Default liveness check: signal 0 (EPERM means alive, owned by someone else). */
