@@ -510,6 +510,21 @@ describe("built CLI e2e — argv→commands wiring over the stub process-compose
     expect(webRow?.health).toBe("unknown");
   }, 90_000);
 
+  it("ls --json never reports health ready for a dead probed service (#174)", () => {
+    const { wt } = setupScenario("dt-bc7-");
+
+    const up = devtrees(wt, ["up", "--json", "--wait-timeout", "30"]);
+    expect(up.code, `up failed: stderr=${up.stderr} stdout=${up.stdout}`).toBe(0);
+
+    // The stub now models a killed probed process: Completed, is_running
+    // false, with the stale `is_ready: "Ready"` the real binary keeps.
+    const ls = devtrees(wt, ["ls", "--json"], { env: { DEVTREES_STUB_DEAD_PROBED: "1" } });
+    expect(ls.code, `ls failed: ${ls.stderr}`).toBe(0);
+    const inst = (ls.doc as LsDoc).ls.instances.find((i) => i.kind === "worktree");
+    const web = inst?.services.find((s) => s.name === "web");
+    expect(web?.health).toBe("not_ready");
+  }, 90_000);
+
   it("logs --tail N reaches the driver argv (stub trims to the last N lines)", () => {
     const { wt, sock } = setupScenario("dt-bc3-");
 

@@ -106,13 +106,28 @@ interface RawProc {
   readonly status?: unknown;
   readonly is_ready?: unknown;
   readonly ready?: unknown;
+  readonly is_running?: unknown;
 }
 
-function readHealth(raw: RawProc): HealthState {
+function readProbeVerdict(raw: RawProc): HealthState {
   if (typeof raw.ready === "boolean") return raw.ready ? "ready" : "not_ready";
   if (raw.is_ready === "Ready") return "ready";
   if (raw.is_ready === "Not Ready") return "not_ready";
   return "unknown";
+}
+
+/**
+ * process-compose keeps reporting `is_ready: "Ready"` after a probed process
+ * dies (issue #174), so a stale verdict must not outlive the process: a row
+ * that says `is_running: false` is never `ready`. Only a `ready` verdict is
+ * overridden — an unprobed one-shot that finished (`is_ready: "-"`) stays
+ * `unknown`, which is what keeps the status-based health wait passing for it.
+ * A row without `is_running` (older shape) keeps the probe verdict as-is.
+ */
+function readHealth(raw: RawProc): HealthState {
+  const verdict = readProbeVerdict(raw);
+  if (verdict === "ready" && raw.is_running === false) return "not_ready";
+  return verdict;
 }
 
 /**

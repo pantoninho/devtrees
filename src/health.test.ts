@@ -6,7 +6,12 @@ import {
   createWaitForSharedHealth,
   type ServiceStatusSource,
 } from "./health.js";
-import { createDriver, type ServiceStatus, type SpawnedProcess } from "./driver.js";
+import {
+  createDriver,
+  parseServiceStatuses,
+  type ServiceStatus,
+  type SpawnedProcess,
+} from "./driver.js";
 
 /** Build a status source from a queue of canned responses (last one repeats). */
 function sourceFromQueue(
@@ -58,6 +63,38 @@ describe("health — createWaitForHealth (worktree instance gate)", () => {
         socketPath: "/run/x.sock",
         serviceNames: ["web", "migrate", "worker"],
         probedServiceNames: [],
+        timeoutMs: 1000,
+      }),
+    ).resolves.toBeUndefined();
+  });
+
+  it("passes a finished exit-0 one-shot parsed from real process-compose output (#174)", async () => {
+    // A one-shot has no probe: is_ready "-" -> health unknown, so the wait
+    // gates on status `Completed`. The #174 not-running override must not
+    // turn it into a failure or a hang.
+    const source: ServiceStatusSource = {
+      getServiceStatuses: () =>
+        Promise.resolve(
+          parseServiceStatuses(
+            JSON.stringify([
+              {
+                name: "migrate",
+                status: "Completed",
+                is_ready: "-",
+                exit_code: 0,
+                is_running: false,
+              },
+              { name: "web", status: "Running", is_ready: "Ready", is_running: true },
+            ]),
+          ),
+        ),
+    };
+    const wait = createWaitForHealth(source, { pollMs: 1 });
+    await expect(
+      wait({
+        socketPath: "/run/x.sock",
+        serviceNames: ["migrate", "web"],
+        probedServiceNames: ["web"],
         timeoutMs: 1000,
       }),
     ).resolves.toBeUndefined();

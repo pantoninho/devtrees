@@ -279,6 +279,15 @@ if (cmd === "up") {
     //                                   until the instance is n ms old (aged
     //                                   off the `<socket>.config` mtime), then
     //                                   "Ready" — a converging probe.
+    //
+    //   DEVTREES_STUB_DEAD_PROBED=1     probed services model a process that
+    //                                   was killed (issue #174): status
+    //                                   "Completed", exit_code -1,
+    //                                   is_running false, yet the STALE
+    //                                   is_ready "Ready" the real binary keeps
+    //                                   reporting. Unprobed services stay
+    //                                   Running. Set it on the `ls` call, not
+    //                                   `up` (the health wait would not pass).
     const cfgPath = `${socketPath}.config`;
     if (!existsSync(cfgPath)) {
       process.stderr.write(`stub-process-compose: no instance at ${socketPath}\n`);
@@ -300,11 +309,24 @@ if (cmd === "up") {
       (!Number.isFinite(readyAfterMs) || instanceAgeMs >= readyAfterMs);
     const procs = Object.entries(config.processes ?? {})
       .filter(([, proc]) => selectedByNamespace(proc, namespaces))
-      .map(([name, proc]) => ({
-        name,
-        status: "Running",
-        is_ready: proc?.readiness_probe === undefined ? "-" : probedReady ? "Ready" : "Not Ready",
-      }));
+      .map(([name, proc]) => {
+        const probed = proc?.readiness_probe !== undefined;
+        if (probed && process.env.DEVTREES_STUB_DEAD_PROBED === "1") {
+          return {
+            name,
+            status: "Completed",
+            is_ready: "Ready",
+            exit_code: -1,
+            is_running: false,
+          };
+        }
+        return {
+          name,
+          status: "Running",
+          is_ready: !probed ? "-" : probedReady ? "Ready" : "Not Ready",
+          is_running: true,
+        };
+      });
     process.stdout.write(JSON.stringify(procs));
     process.exit(0);
   }
