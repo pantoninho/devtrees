@@ -1434,7 +1434,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
         deps.waitForSharedHealth ??
         createWaitForSharedHealth(
           { getServiceStatuses: statusReader(deps, driver) },
-          { notify: warn },
+          { notify: warn, probe: probeOf(deps) },
         );
       await wait({
         anchor: anchor.anchor,
@@ -3286,7 +3286,7 @@ async function verifyRunning(args: {
     { getServiceStatuses: statusReader(deps, driver) },
     socketPath,
     timeoutMs,
-    { notify: args.warn },
+    { notify: args.warn, probe: probeOf(deps) },
   );
   const present = new Set(rows.map((r) => r.name));
   const selection = resolveRunningSelection(isolated, present, deps.namespaces);
@@ -3623,7 +3623,8 @@ async function waitForSelectedHealth(
     return lastRows;
   };
   const wait =
-    deps.waitForHealth ?? createWaitForHealth({ getServiceStatuses }, { notify: opts.warn });
+    deps.waitForHealth ??
+    createWaitForHealth({ getServiceStatuses }, { notify: opts.warn, probe: probeOf(deps) });
   await wait({
     socketPath,
     serviceNames: services.map((s) => s.name),
@@ -3633,6 +3634,11 @@ async function waitForSelectedHealth(
     ...(opts.restarted !== undefined ? { restarted: opts.restarted } : {}),
   });
   return lastRows;
+}
+
+/** The control-socket probe the health waits use after a failed read (#205): the injected seam, else `probeSocket`. */
+function probeOf(deps: CommandDeps): (socketPath: string) => Promise<InstanceStatus> {
+  return deps.probeSocket ?? defaultProbeSocket;
 }
 
 /** The per-service status read: the injected seam, else the driver. */

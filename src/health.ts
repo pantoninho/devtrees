@@ -14,6 +14,7 @@
  */
 
 import { READ_TIMEOUT_MS, type ServiceStatus } from "./driver.js";
+import { probeSocket, type InstanceStatus } from "./instances.js";
 import {
   classifyService,
   deadServicesDetails,
@@ -114,6 +115,61 @@ class HealthTimeoutError extends Error {
 }
 
 /**
+ * Thrown when a status read failed and the control socket probe then proved
+ * the instance is gone (#205): a concurrent `devtrees down` stopped it while
+ * `up` was waiting outside the lifecycle lock (or the instance exited).
+ * `INSTANCE_NOT_FOUND` because that is the state `up` now finds, the same
+ * code `up` uses when it finds the instance gone under the lock (#178). It
+ * also covers the shared instance ("no worktree (or shared) instance"), so no
+ * new code is needed; `details.instance` says which one. Module-private like
+ * `HealthTimeoutError`; build it with `instanceStoppedError`.
+ */
+class InstanceStoppedError extends Error {
+  readonly code = "INSTANCE_NOT_FOUND" as const;
+  constructor(
+    message: string,
+    readonly details: {
+      readonly instance: "worktree" | "shared";
+      readonly socket_path: string;
+      readonly remedy: string;
+    },
+  ) {
+    super(message);
+    this.name = "InstanceStoppedError";
+  }
+}
+
+function instanceStoppedError(
+  instance: "worktree" | "shared",
+  socketPath: string,
+): InstanceStoppedError {
+  const remedy = "devtrees up";
+  const which = instance === "shared" ? "the shared instance" : "the worktree instance";
+  return new InstanceStoppedError(
+    `devtrees up: ${which} was stopped while \`up\` was waiting for it (most likely a ` +
+      `concurrent \`devtrees down\`). Its control socket is gone, so there is nothing to ` +
+      `wait for. Run \`${remedy}\` to start it again.`,
+    { instance, socket_path: socketPath, remedy },
+  );
+}
+
+/**
+ * After a failed status read: is the instance definitively gone (#186's
+ * `stale`)? `unknown` (busy or frozen) and `running` (slow or unhealthy) keep
+ * waiting. Called only after a failed read, so a healthy wait never probes.
+ */
+async function isGone(
+  probe: (socketPath: string) => Promise<InstanceStatus>,
+  socketPath: string,
+): Promise<boolean> {
+  try {
+    return (await probe(socketPath)) === "stale";
+  } catch {
+    return false;
+  }
+}
+
+/**
  * One successful read of an instance's per-service state, retrying failed
  * reads (a busy or briefly unreachable socket). `timeoutMs` bounds the whole
  * call: each read gets at most what is left of the budget (and never more
@@ -122,15 +178,18 @@ class HealthTimeoutError extends Error {
  * `timeoutMs` plus one poll delay. `up` on a running instance needs this read
  * to know what was booted (ADR-0008), and must never report success without
  * it. When the deadline passes after a failed read it throws `HEALTH_TIMEOUT`,
- * leaving the instance running like any other wait failure. The first failed
+ * leaving the instance running like any other wait failure. A failed read
+ * followed by a definitively stale socket probe throws `INSTANCE_NOT_FOUND`
+ * at once instead (#205). The first failed
  * read is reported once through `tuning.notify`.
  */
 export async function readStatusesWithin(
   source: ServiceStatusSource,
   socketPath: string,
   timeoutMs: number,
-  tuning: Pick<PollerTuning, "pollMs" | "notify"> = {},
+  tuning: Pick<PollerTuning, "pollMs" | "notify" | "probe"> = {},
 ): Promise<ServiceStatus[]> {
+  const probe = tuning.probe ?? probeSocket;
   const pollMs = tuning.pollMs ?? HEALTH_POLL_MS;
   const deadline = Date.now() + timeoutMs;
   const notifyFailure = createFailureNotifier(tuning.notify, timeoutMs);
@@ -141,6 +200,7 @@ export async function readStatusesWithin(
     } catch (err) {
       lastError = err;
       notifyFailure(err);
+      if (await isGone(probe, socketPath)) throw instanceStoppedError("worktree", socketPath);
     }
     await sleep(Math.min(pollMs, Math.max(0, deadline - Date.now())));
   } while (Date.now() < deadline);
@@ -205,6 +265,11 @@ export interface PollerTuning {
   readonly timeoutMs?: number;
   /** Told once when status reads start failing and being retried. Default: silent. */
   readonly notify?: (message: string) => void;
+  /**
+   * Probe a control socket after a failed read (#205). Default: `probeSocket`
+   * (#186's classification). Only `stale` ends the wait.
+   */
+  readonly probe?: (socketPath: string) => Promise<InstanceStatus>;
 }
 
 /** One poll's verdict over the named services. */
@@ -316,6 +381,7 @@ export function createWaitForSharedHealth(
 ): WaitForSharedHealth {
   const pollMs = tuning.pollMs ?? HEALTH_POLL_MS;
   const timeoutMs = tuning.timeoutMs ?? SHARED_HEALTH_TIMEOUT_MS;
+  const probe = tuning.probe ?? probeSocket;
   return async ({ socketPath, sharedServiceNames, probedServiceNames }) => {
     if (sharedServiceNames.length === 0) return;
     const deadline = Date.now() + timeoutMs;
@@ -330,7 +396,10 @@ export function createWaitForSharedHealth(
         deadline,
       );
       if (verdict.healthy) return;
-      if (verdict.readError !== undefined) notifyFailure(verdict.readError);
+      if (verdict.readError !== undefined) {
+        notifyFailure(verdict.readError);
+        if (await isGone(probe, socketPath)) throw instanceStoppedError("shared", socketPath);
+      }
       // Same two-consecutive-reads rule as the worktree wait: a shared service
       // that died (e.g. right after this `up` lazy-started it) will not come
       // back by waiting, and it is reported, never restarted (ADR-0008).
@@ -370,6 +439,7 @@ export function createWaitForHealth(
   tuning: PollerTuning = {},
 ): WaitForHealth {
   const pollMs = tuning.pollMs ?? HEALTH_POLL_MS;
+  const probe = tuning.probe ?? probeSocket;
   return async (args) => {
     const { socketPath, serviceNames, probedServiceNames, timeoutMs } = args;
     if (serviceNames.length === 0) return;
@@ -382,7 +452,10 @@ export function createWaitForHealth(
     while (Date.now() < deadline) {
       last = await poll(source, socketPath, serviceNames, probedServiceNames, deadline);
       if (last.healthy) return;
-      if (last.readError !== undefined) notifyFailure(last.readError);
+      if (last.readError !== undefined) {
+        notifyFailure(last.readError);
+        if (await isGone(probe, socketPath)) throw instanceStoppedError("worktree", socketPath);
+      }
       const dead = countable(last);
       if (dead.length > 0 && sameDead(dead, lastDead)) throw dying(dead);
       lastDead = dead;

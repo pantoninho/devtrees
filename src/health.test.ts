@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vite-plus/test";
+import type { InstanceStatus } from "./instances.js";
 import { EventEmitter } from "node:events";
 import { Readable } from "node:stream";
 import {
@@ -13,6 +14,24 @@ import {
   type ServiceStatus,
   type SpawnedProcess,
 } from "./driver.js";
+
+/** A probe that cannot tell (#186): the canned sources' fake paths must not read as stale. */
+const unknownProbe = async (): Promise<InstanceStatus> => "unknown";
+
+/** A probe that answers `status` and records the sockets it was asked about. */
+function probeReturning(status: InstanceStatus): {
+  probe: (socketPath: string) => Promise<InstanceStatus>;
+  calls: string[];
+} {
+  const calls: string[] = [];
+  return {
+    calls,
+    probe: async (socketPath) => {
+      calls.push(socketPath);
+      return status;
+    },
+  };
+}
 
 /** Build a status source from a queue of canned responses (last one repeats). */
 function sourceFromQueue(
@@ -43,7 +62,7 @@ describe("health — createWaitForHealth (worktree instance gate)", () => {
       [row("web", "Pending"), row("worker", "Running")],
       [row("web", "Running"), row("worker", "Running")],
     ]);
-    const wait = createWaitForHealth(source, { pollMs: 1 });
+    const wait = createWaitForHealth(source, { probe: unknownProbe, pollMs: 1 });
     await expect(
       wait({
         socketPath: "/run/x.sock",
@@ -58,7 +77,7 @@ describe("health — createWaitForHealth (worktree instance gate)", () => {
     const source = sourceFromQueue([
       [row("web", "Ready"), row("migrate", "Completed"), row("worker", "Running")],
     ]);
-    const wait = createWaitForHealth(source, { pollMs: 1 });
+    const wait = createWaitForHealth(source, { probe: unknownProbe, pollMs: 1 });
     await expect(
       wait({
         socketPath: "/run/x.sock",
@@ -90,7 +109,7 @@ describe("health — createWaitForHealth (worktree instance gate)", () => {
           ),
         ),
     };
-    const wait = createWaitForHealth(source, { pollMs: 1 });
+    const wait = createWaitForHealth(source, { probe: unknownProbe, pollMs: 1 });
     await expect(
       wait({
         socketPath: "/run/x.sock",
@@ -106,7 +125,7 @@ describe("health — createWaitForHealth (worktree instance gate)", () => {
       new Error("connect ENOENT /run/x.sock"),
       [row("web", "Running")],
     ]);
-    const wait = createWaitForHealth(source, { pollMs: 1 });
+    const wait = createWaitForHealth(source, { probe: unknownProbe, pollMs: 1 });
     await expect(
       wait({
         socketPath: "/run/x.sock",
@@ -119,7 +138,7 @@ describe("health — createWaitForHealth (worktree instance gate)", () => {
 
   it("throws HealthTimeoutError (code HEALTH_TIMEOUT) when the deadline passes", async () => {
     const source = sourceFromQueue([[row("web", "Pending")]]);
-    const wait = createWaitForHealth(source, { pollMs: 1 });
+    const wait = createWaitForHealth(source, { probe: unknownProbe, pollMs: 1 });
     const err = await wait({
       socketPath: "/run/x.sock",
       serviceNames: ["web"],
@@ -139,7 +158,7 @@ describe("health — createWaitForHealth (worktree instance gate)", () => {
   it("a zero-service wait returns immediately without touching the instance", async () => {
     const calls = { count: 0 };
     const source = sourceFromQueue([[]], calls);
-    const wait = createWaitForHealth(source, { pollMs: 1 });
+    const wait = createWaitForHealth(source, { probe: unknownProbe, pollMs: 1 });
     await wait({
       socketPath: "/run/x.sock",
       serviceNames: [],
@@ -151,7 +170,7 @@ describe("health — createWaitForHealth (worktree instance gate)", () => {
 
   it("an unknown service name keeps the wait unhealthy until timeout", async () => {
     const source = sourceFromQueue([[row("web", "Running")]]);
-    const wait = createWaitForHealth(source, { pollMs: 1 });
+    const wait = createWaitForHealth(source, { probe: unknownProbe, pollMs: 1 });
     await expect(
       wait({
         socketPath: "/run/x.sock",
@@ -168,7 +187,7 @@ describe("health — createWaitForHealth (worktree instance gate)", () => {
   // first probe can fire.
   it("a probed service that is Running but not ready keeps the wait unhealthy until timeout", async () => {
     const source = sourceFromQueue([[row("web", "Running", "not_ready")]]);
-    const wait = createWaitForHealth(source, { pollMs: 1 });
+    const wait = createWaitForHealth(source, { probe: unknownProbe, pollMs: 1 });
     await expect(
       wait({
         socketPath: "/run/x.sock",
@@ -184,7 +203,7 @@ describe("health — createWaitForHealth (worktree instance gate)", () => {
       [row("web", "Running", "not_ready")],
       [row("web", "Running", "ready")],
     ]);
-    const wait = createWaitForHealth(source, { pollMs: 1 });
+    const wait = createWaitForHealth(source, { probe: unknownProbe, pollMs: 1 });
     await expect(
       wait({
         socketPath: "/run/x.sock",
@@ -207,7 +226,7 @@ describe("health — createWaitForHealth (worktree instance gate)", () => {
         return source.getServiceStatuses(s);
       },
     };
-    const wait = createWaitForHealth(counted, { pollMs: 1 });
+    const wait = createWaitForHealth(counted, { probe: unknownProbe, pollMs: 1 });
     await expect(
       wait({
         socketPath: "/run/x.sock",
@@ -224,7 +243,7 @@ describe("health — createWaitForHealth (worktree instance gate)", () => {
     // e.g. process-compose returned a row before the probe machinery
     // initialised — readiness has not been observed, so keep waiting.
     const source = sourceFromQueue([[row("web", "Running", "unknown")]]);
-    const wait = createWaitForHealth(source, { pollMs: 1 });
+    const wait = createWaitForHealth(source, { probe: unknownProbe, pollMs: 1 });
     await expect(
       wait({
         socketPath: "/run/x.sock",
@@ -248,7 +267,7 @@ describe("health — createWaitForHealth fails fast on a dead service (ADR-0008,
     // #162: health is `unknown` for an unprobed service, so only the exit
     // code tells the corpse apart from a finished one-shot.
     const source = sourceFromQueue([[dead("toy", -1), row("keeper", "Running")]]);
-    const wait = createWaitForHealth(source, { pollMs: 1 });
+    const wait = createWaitForHealth(source, { probe: unknownProbe, pollMs: 1 });
     const started = Date.now();
     const err = await wait({
       socketPath: "/run/x.sock",
@@ -273,7 +292,7 @@ describe("health — createWaitForHealth fails fast on a dead service (ADR-0008,
 
   it("Failed and Error count as dead too", async () => {
     const source = sourceFromQueue([[row("a", "Failed"), row("b", "Error")]]);
-    const wait = createWaitForHealth(source, { pollMs: 1 });
+    const wait = createWaitForHealth(source, { probe: unknownProbe, pollMs: 1 });
     await expect(
       wait({
         socketPath: "/s",
@@ -289,7 +308,7 @@ describe("health — createWaitForHealth fails fast on a dead service (ADR-0008,
 
   it("a Completed exit-0 one-shot is done, not dead", async () => {
     const source = sourceFromQueue([[dead("migrate", 0), row("web", "Running")]]);
-    const wait = createWaitForHealth(source, { pollMs: 1 });
+    const wait = createWaitForHealth(source, { probe: unknownProbe, pollMs: 1 });
     await expect(
       wait({
         socketPath: "/s",
@@ -309,7 +328,7 @@ describe("health — createWaitForHealth fails fast on a dead service (ADR-0008,
       [row("web", "Restarting")],
       [row("web", "Running")],
     ]);
-    const wait = createWaitForHealth(source, { pollMs: 1 });
+    const wait = createWaitForHealth(source, { probe: unknownProbe, pollMs: 1 });
     await expect(
       wait({ socketPath: "/s", serviceNames: ["web"], probedServiceNames: [], timeoutMs: 1000 }),
     ).resolves.toBeUndefined();
@@ -317,7 +336,7 @@ describe("health — createWaitForHealth fails fast on a dead service (ADR-0008,
 
   it("a dead service that is not waited on does not fail the wait", async () => {
     const source = sourceFromQueue([[dead("other", -1), row("web", "Running")]]);
-    const wait = createWaitForHealth(source, { pollMs: 1 });
+    const wait = createWaitForHealth(source, { probe: unknownProbe, pollMs: 1 });
     await expect(
       wait({ socketPath: "/s", serviceNames: ["web"], probedServiceNames: [], timeoutMs: 1000 }),
     ).resolves.toBeUndefined();
@@ -327,7 +346,7 @@ describe("health — createWaitForHealth fails fast on a dead service (ADR-0008,
     const source = sourceFromQueue([
       [{ name: "web", status: "Completed", health: "not_ready", exitCode: -1 }],
     ]);
-    const wait = createWaitForHealth(source, { pollMs: 1 });
+    const wait = createWaitForHealth(source, { probe: unknownProbe, pollMs: 1 });
     await expect(
       wait({
         socketPath: "/s",
@@ -352,7 +371,11 @@ describe("health — createWaitForSharedHealth (cross-tier gate)", () => {
         row("cache", "Running"),
       ],
     ]);
-    const wait = createWaitForSharedHealth(source, { pollMs: 1, timeoutMs: 60_000 });
+    const wait = createWaitForSharedHealth(source, {
+      probe: unknownProbe,
+      pollMs: 1,
+      timeoutMs: 60_000,
+    });
     const started = Date.now();
     const err = await wait({
       anchor: "/a",
@@ -374,7 +397,7 @@ describe("health — createWaitForSharedHealth (cross-tier gate)", () => {
 
   it("resolves once every shared service is healthy", async () => {
     const source = sourceFromQueue([[row("db", "Pending")], [row("db", "Running")]]);
-    const wait = createWaitForSharedHealth(source, { pollMs: 1 });
+    const wait = createWaitForSharedHealth(source, { probe: unknownProbe, pollMs: 1 });
     await expect(
       wait({
         anchor: "/a",
@@ -388,7 +411,7 @@ describe("health — createWaitForSharedHealth (cross-tier gate)", () => {
   it("a zero-service wait returns immediately without touching the instance", async () => {
     const calls = { count: 0 };
     const source = sourceFromQueue([[]], calls);
-    const wait = createWaitForSharedHealth(source, { pollMs: 1 });
+    const wait = createWaitForSharedHealth(source, { probe: unknownProbe, pollMs: 1 });
     await wait({
       anchor: "/a",
       socketPath: "/run/shared.sock",
@@ -400,7 +423,11 @@ describe("health — createWaitForSharedHealth (cross-tier gate)", () => {
 
   it("times out with a plain Error pointing at the shared instance's logs", async () => {
     const source = sourceFromQueue([[row("db", "Restarting")]]);
-    const wait = createWaitForSharedHealth(source, { pollMs: 1, timeoutMs: 10 });
+    const wait = createWaitForSharedHealth(source, {
+      probe: unknownProbe,
+      pollMs: 1,
+      timeoutMs: 10,
+    });
     const err = await wait({
       anchor: "/a",
       socketPath: "/run/shared.sock",
@@ -430,7 +457,7 @@ describe("health — createWaitForSharedHealth (cross-tier gate)", () => {
         return source.getServiceStatuses(s);
       },
     };
-    const wait = createWaitForSharedHealth(counted, { pollMs: 1 });
+    const wait = createWaitForSharedHealth(counted, { probe: unknownProbe, pollMs: 1 });
     await expect(
       wait({
         anchor: "/a",
@@ -473,7 +500,7 @@ describe("health — default waits go through the driver (issue #87)", () => {
       },
     });
 
-    const wait = createWaitForHealth(driver, { pollMs: 1 });
+    const wait = createWaitForHealth(driver, { probe: unknownProbe, pollMs: 1 });
     await expect(
       wait({
         socketPath: "/run/x.sock",
@@ -494,14 +521,16 @@ describe("health — default waits go through the driver (issue #87)", () => {
 describe("health — readStatusesWithin (running-instance selection read, #177)", () => {
   it("retries a failed read until one succeeds", async () => {
     const source = sourceFromQueue([new Error("busy"), new Error("busy"), [row("web", "Running")]]);
-    await expect(readStatusesWithin(source, "/s", 1000, { pollMs: 1 })).resolves.toEqual([
-      row("web", "Running"),
-    ]);
+    await expect(
+      readStatusesWithin(source, "/s", 1000, { probe: unknownProbe, pollMs: 1 }),
+    ).resolves.toEqual([row("web", "Running")]);
   });
 
   it("fails with HEALTH_TIMEOUT when no read succeeds in time — never an empty success", async () => {
     const source = sourceFromQueue([new Error("connect ECONNREFUSED /s")]);
-    await expect(readStatusesWithin(source, "/s", 20, { pollMs: 1 })).rejects.toMatchObject({
+    await expect(
+      readStatusesWithin(source, "/s", 20, { probe: unknownProbe, pollMs: 1 }),
+    ).rejects.toMatchObject({
       code: "HEALTH_TIMEOUT",
       message: expect.stringContaining("ECONNREFUSED"),
     });
@@ -517,7 +546,9 @@ describe("health — readStatusesWithin (running-instance selection read, #177)"
         }),
     };
     const started = Date.now();
-    await expect(readStatusesWithin(source, "/s", 60, { pollMs: 5 })).rejects.toMatchObject({
+    await expect(
+      readStatusesWithin(source, "/s", 60, { probe: unknownProbe, pollMs: 5 }),
+    ).rejects.toMatchObject({
       code: "HEALTH_TIMEOUT",
       message: expect.stringContaining("did not answer"),
     });
@@ -529,7 +560,11 @@ describe("health — readStatusesWithin (running-instance selection read, #177)"
   it("tells the caller once that reads are failing and being retried (#192)", async () => {
     const notices: string[] = [];
     const source = sourceFromQueue([new Error("busy"), new Error("busy"), [row("web", "Running")]]);
-    await readStatusesWithin(source, "/s", 1000, { pollMs: 1, notify: (m) => notices.push(m) });
+    await readStatusesWithin(source, "/s", 1000, {
+      probe: unknownProbe,
+      pollMs: 1,
+      notify: (m) => notices.push(m),
+    });
     expect(notices).toHaveLength(1);
     expect(notices[0]).toMatch(/service status failed \(busy\); retrying for up to 1s/);
   });
@@ -554,7 +589,11 @@ describe("health — a wedged instance cannot outlive --wait-timeout (#192)", ()
           setTimeout(() => reject(new Error("process list did not answer")), opts?.timeoutMs);
         }),
     };
-    const wait = createWaitForHealth(source, { pollMs: 5, notify: (m) => notices.push(m) });
+    const wait = createWaitForHealth(source, {
+      probe: unknownProbe,
+      pollMs: 5,
+      notify: (m) => notices.push(m),
+    });
     const started = Date.now();
     await expect(
       wait({
@@ -567,5 +606,133 @@ describe("health — a wedged instance cannot outlive --wait-timeout (#192)", ()
     expect(Date.now() - started).toBeLessThan(500);
     expect(budgets.every((b) => b >= 1 && b <= 60)).toBe(true);
     expect(notices).toHaveLength(1);
+  });
+});
+
+describe("health — the instance vanishing mid-wait (#205)", () => {
+  const gone = () => [new Error("connect ENOENT /s")];
+
+  it("worktree wait: a failed read plus a stale socket fails INSTANCE_NOT_FOUND at once", async () => {
+    const { probe, calls } = probeReturning("stale");
+    const wait = createWaitForHealth(sourceFromQueue(gone()), { probe, pollMs: 1 });
+    const started = Date.now();
+    await expect(
+      wait({ socketPath: "/s", serviceNames: ["web"], probedServiceNames: [], timeoutMs: 60_000 }),
+    ).rejects.toMatchObject({
+      code: "INSTANCE_NOT_FOUND",
+      message: expect.stringContaining("stopped while `up` was waiting"),
+      details: { instance: "worktree", socket_path: "/s", remedy: "devtrees up" },
+    });
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(calls).toEqual(["/s"]);
+  });
+
+  it("worktree wait: an unknown probe keeps retrying and ends in HEALTH_TIMEOUT", async () => {
+    const { probe, calls } = probeReturning("unknown");
+    const wait = createWaitForHealth(sourceFromQueue(gone()), { probe, pollMs: 1 });
+    await expect(
+      wait({ socketPath: "/s", serviceNames: ["web"], probedServiceNames: [], timeoutMs: 40 }),
+    ).rejects.toMatchObject({ code: "HEALTH_TIMEOUT" });
+    expect(calls.length).toBeGreaterThan(1);
+  });
+
+  it("worktree wait: a running probe (slow, unhealthy) stays HEALTH_TIMEOUT", async () => {
+    const { probe } = probeReturning("running");
+    const wait = createWaitForHealth(sourceFromQueue(gone()), { probe, pollMs: 1 });
+    await expect(
+      wait({ socketPath: "/s", serviceNames: ["web"], probedServiceNames: [], timeoutMs: 40 }),
+    ).rejects.toMatchObject({ code: "HEALTH_TIMEOUT" });
+  });
+
+  it("worktree wait: a healthy wait never probes", async () => {
+    const { probe, calls } = probeReturning("stale");
+    const wait = createWaitForHealth(sourceFromQueue([[row("web", "Running")]]), {
+      probe,
+      pollMs: 1,
+    });
+    await wait({
+      socketPath: "/s",
+      serviceNames: ["web"],
+      probedServiceNames: [],
+      timeoutMs: 1000,
+    });
+    expect(calls).toEqual([]);
+  });
+
+  it("worktree wait: a probe that throws is treated as not gone", async () => {
+    const wait = createWaitForHealth(sourceFromQueue(gone()), {
+      probe: async () => {
+        throw new Error("boom");
+      },
+      pollMs: 1,
+    });
+    await expect(
+      wait({ socketPath: "/s", serviceNames: ["web"], probedServiceNames: [], timeoutMs: 30 }),
+    ).rejects.toMatchObject({ code: "HEALTH_TIMEOUT" });
+  });
+
+  it("shared wait: a failed read plus a stale socket fails INSTANCE_NOT_FOUND naming the shared instance", async () => {
+    const { probe } = probeReturning("stale");
+    const wait = createWaitForSharedHealth(sourceFromQueue(gone()), {
+      probe,
+      pollMs: 1,
+      timeoutMs: 60_000,
+    });
+    await expect(
+      wait({
+        anchor: "/a",
+        socketPath: "/shared.sock",
+        sharedServiceNames: ["db"],
+        probedServiceNames: [],
+      }),
+    ).rejects.toMatchObject({
+      code: "INSTANCE_NOT_FOUND",
+      message: expect.stringContaining("shared instance"),
+      details: { instance: "shared", socket_path: "/shared.sock" },
+    });
+  });
+
+  it("shared wait: an unknown probe keeps retrying until the shared timeout", async () => {
+    const wait = createWaitForSharedHealth(sourceFromQueue(gone()), {
+      probe: unknownProbe,
+      pollMs: 1,
+      timeoutMs: 30,
+    });
+    await expect(
+      wait({
+        anchor: "/a",
+        socketPath: "/shared.sock",
+        sharedServiceNames: ["db"],
+        probedServiceNames: [],
+      }),
+    ).rejects.toThrow(/timed out waiting for shared services/);
+  });
+
+  it("shared wait: a healthy wait never probes", async () => {
+    const { probe, calls } = probeReturning("stale");
+    const wait = createWaitForSharedHealth(sourceFromQueue([[row("db", "Running")]]), {
+      probe,
+      pollMs: 1,
+    });
+    await wait({
+      anchor: "/a",
+      socketPath: "/shared.sock",
+      sharedServiceNames: ["db"],
+      probedServiceNames: [],
+    });
+    expect(calls).toEqual([]);
+  });
+
+  it("readStatusesWithin: a failed read plus a stale socket fails INSTANCE_NOT_FOUND", async () => {
+    const { probe } = probeReturning("stale");
+    await expect(
+      readStatusesWithin(sourceFromQueue(gone()), "/s", 60_000, { probe, pollMs: 1 }),
+    ).rejects.toMatchObject({ code: "INSTANCE_NOT_FOUND" });
+  });
+
+  it("readStatusesWithin: a healthy read never probes", async () => {
+    const { probe, calls } = probeReturning("stale");
+    await readStatusesWithin(sourceFromQueue([[row("web", "Running")]]), "/s", 1000, { probe });
+    expect(calls).toEqual([]);
   });
 });
