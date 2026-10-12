@@ -108,6 +108,7 @@ Branch on \`error.code\`:
 | \`SERVICE_NOT_FOUND\`         | You named a service that isn't in the instance. \`details.valid_services\` lists the real names; pick one. |
 | \`NO_SERVICES_SELECTED\`      | A bare \`up\` starts only services with no \`namespace:\`, and there are none. \`details.namespaces\` lists the namespaces; retry with \`devtrees up -n <ns>\`. |
 | \`INSTANCE_NOT_FOUND\`        | No instance is running for this worktree. Run \`devtrees up\` first.                            |
+| \`INSTANCE_UNRESPONSIVE\`     | The instance may be running but its process-compose did not answer (busy or frozen). Nothing changed. **Retry** in a moment; if it persists, follow \`details.remedy\`. Do not delete the socket by hand. |
 | \`PROCESS_COMPOSE_NOT_FOUND\` | The \`process-compose\` binary is missing. **Surface this to the human** — it's an environment setup gap you can't fix.   |
 | \`PROCESS_COMPOSE_TOO_OLD\`   | The installed \`process-compose\` is below the minimum (v1.122.0). **Surface this to the human** — they need to upgrade it. |
 | \`CONFIG_INVALID\` / \`INVALID_ARGS\` | The config or your arguments are malformed. Fix the input; don't retry blindly.        |

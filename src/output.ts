@@ -35,6 +35,7 @@ export const ERROR_CODES = [
   "PROCESS_COMPOSE_NOT_FOUND",
   "PROCESS_COMPOSE_TOO_OLD",
   "INSTANCE_NOT_FOUND",
+  "INSTANCE_UNRESPONSIVE",
   "SERVICE_NOT_FOUND",
   "HEALTH_TIMEOUT",
   "NAMESPACE_NOT_RUNNING",
@@ -71,6 +72,8 @@ export const ERROR_CODE_DESCRIPTIONS: Readonly<Record<ErrorCode, string>> = {
   PROCESS_COMPOSE_TOO_OLD:
     "The installed `process-compose` is older than the minimum devtrees supports; `details` carries the installed and minimum versions.",
   INSTANCE_NOT_FOUND: "No worktree (or shared) instance is running for this anchor.",
+  INSTANCE_UNRESPONSIVE:
+    "The instance's control socket exists but did not answer repeated probes (process-compose busy or frozen); nothing was started or stopped, the socket was kept, `details.remedy` says what to do.",
   SERVICE_NOT_FOUND:
     "The named service does not exist in the target instance; `details.valid_services` lists the known ones.",
   HEALTH_TIMEOUT:
@@ -137,7 +140,7 @@ export interface LsServiceRow {
 export interface LsInstanceRow {
   readonly id: string;
   readonly kind: "worktree" | "shared";
-  readonly status: "running" | "stale";
+  readonly status: "running" | "stale" | "unknown";
   readonly ports: Readonly<Record<string, number>>;
   readonly blockBase?: number;
   readonly services?: ReadonlyArray<LsServiceRow>;
@@ -183,7 +186,7 @@ interface LsServiceJson {
 interface LsInstanceJson {
   readonly id: string;
   readonly kind: "worktree" | "shared";
-  readonly status: "running" | "stale";
+  readonly status: "running" | "stale" | "unknown";
   readonly ports: Readonly<Record<string, number>>;
   readonly services: ReadonlyArray<LsServiceJson>;
   readonly block_base?: number;
@@ -239,7 +242,7 @@ export interface PrunedRow {
   readonly id: string;
   readonly kind: "worktree" | "shared";
   /** Prior status at discovery — used by the human renderer only. */
-  readonly status: "running" | "stale";
+  readonly status: "running" | "stale" | "unknown";
   /**
    * Absolute path of the worktree the orphan was anchored at. Used by both
    * renderers: human output shows it for context, JSON output emits it as the

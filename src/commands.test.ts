@@ -49,6 +49,8 @@ import type {
   ServiceStatus,
   SpawnedProcess,
 } from "./driver.js";
+import type { InstanceStatus } from "./instances.js";
+import { classifyError } from "./output.js";
 import {
   SHARED_REGISTRY_KEY,
   SOCKET_PATH_MAX_BYTES,
@@ -238,7 +240,7 @@ function stubDeps(opts: {
    * mirrors the pre-#80 "file present ⇒ live" fiction the older tests fake
    * instances with (a plain file would probe stale against a real UDS connect).
    */
-  probeSocket?: (socketPath: string) => Promise<"running" | "stale">;
+  probeSocket?: (socketPath: string) => Promise<InstanceStatus>;
 }): StubbedDeps {
   const tmp = tmpAnchor();
   const anchor = opts.anchorOverride ?? tmp.anchor;
@@ -2758,7 +2760,7 @@ describe("runPrune — reconcile instances against git worktree list", () => {
     id: string,
     overrides: {
       kind?: "worktree" | "shared";
-      status?: "running" | "stale";
+      status?: "running" | "stale" | "unknown";
       socketPath?: string;
     } = {},
   ) {
@@ -2889,6 +2891,38 @@ describe("runPrune — reconcile instances against git worktree list", () => {
     expect(registryRef.snapshot.login).toBe(20000);
     // Acceptance: the orphan's registry entry is gone.
     expect("removed" in registryRef.snapshot).toBe(false);
+  });
+
+  it("an orphan whose liveness is unknown gets the graceful driver.down a running one does (#186)", async () => {
+    // Its worktree is gone, so prune still reclaims it, but it may be a live
+    // process-compose that was merely slow to answer: stopping it through the
+    // driver is the only way it doesn't outlive the sweep.
+    const tmp = tmpAnchor();
+    mkdirSync(runDir(tmp.anchor), { recursive: true });
+    const orphanSocket = instancePaths(tmp.anchor, "removed").socketPath;
+    writeFileSync(orphanSocket, "");
+    const downSockets: string[] = [];
+    const { runPrune } = await import("./commands.js");
+    const result = await runPrune({
+      cwd: join(tmp.worktreeRoot, "login"),
+      git: pruneGit({
+        anchor: tmp.anchor,
+        worktreeRoot: tmp.worktreeRoot,
+        worktreeId: "login",
+        porcelain: [`worktree ${join(tmp.worktreeRoot, "login")}`, "HEAD x", ""].join("\n"),
+      }),
+      discover: async () => [instance("removed", { status: "unknown", socketPath: orphanSocket })],
+      withRegistryLock: async (_anchor, mutate) => mutate({}),
+      driver: {
+        exists: () => Promise.resolve(true),
+        spawner: (_binary, args) => {
+          if (args[0] === "down") downSockets.push(args[args.indexOf("-u") + 1] ?? "");
+          return spawnedOk();
+        },
+      },
+    });
+    expect(result.pruned.map((p) => p.id)).toEqual(["removed"]);
+    expect(downSockets).toEqual([orphanSocket]);
   });
 
   it("cleans up a stale orphan (socket file with no listener) without calling driver.down", async () => {
@@ -4657,6 +4691,26 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
       expect(starts(spawned)).toEqual([]);
     });
 
+    it("an instance that stops answering before the restart: nothing started, INSTANCE_UNRESPONSIVE, socket kept (#186)", async () => {
+      let probes = 0;
+      const { deps, spawned, id, wtSocket } = liveInstance(
+        toyStack,
+        { worktree: [killed("toy"), running("keeper")] },
+        {
+          namespaces: ["test"],
+          probeRetryDelaysMs: [0, 0],
+          // Live for up's own gate, then every re-probe under the restart's
+          // lock times out: not "gone", so not INSTANCE_NOT_FOUND either.
+          probeSocket: async () => (++probes === 1 ? "running" : "unknown"),
+        },
+      );
+      const err = await failure(deps);
+      expect(err?.code).toBe("INSTANCE_UNRESPONSIVE");
+      expect(err?.details).toMatchObject({ instance: id, socket_path: wtSocket, attempts: 3 });
+      expect(starts(spawned)).toEqual([]);
+      expect(existsSync(wtSocket)).toBe(true);
+    });
+
     it("re-reads under the lock: a service no longer dead there is not started", async () => {
       let readsSoFar = 0;
       const { deps, spawned } = liveInstance(
@@ -5232,6 +5286,164 @@ describe("runDown — crash recovery: stale shared socket (#80)", () => {
  * shared instance did not bind. A semantically-diverged shared subset fails
  * with `SHARED_DRIFT` instead.
  */
+/**
+ * A probe that cannot tell live from dead (#186). A timeout on a loaded
+ * machine used to read as "stale", so the gate unlinked a LIVE instance's
+ * socket: `ls` lost it, `down` said "nothing running", and process-compose
+ * plus its services were orphaned on their ports. Now only a definitive
+ * answer unlinks; `unknown` is retried and then fails INSTANCE_UNRESPONSIVE
+ * with the socket kept.
+ */
+describe("liveness unknown — retry, then fail without touching the socket (#186)", () => {
+  const isolatedStack: ResolvedStack = {
+    services: [isolated("web", "node server.js", ["WEB_PORT"])],
+  };
+  const mixedStack: ResolvedStack = {
+    services: [
+      isolated("web", "node server.js", ["WEB_PORT"]),
+      shared("postgres", "postgres -D ./pgdata", ["DB_PORT"]),
+    ],
+  };
+
+  /**
+   * A worktree instance whose socket file is on disk (unchanged config, `web`
+   * running, so a live verdict takes the quiet already-running path), with
+   * every spawn and reap recorded.
+   */
+  function staged(
+    probeSocket: (socketPath: string) => Promise<InstanceStatus>,
+    stack: ResolvedStack = isolatedStack,
+  ) {
+    const tmp = tmpAnchor();
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const base = stubDeps({
+      stack,
+      track,
+      anchorOverride: tmp.anchor,
+      worktreeRootOverride: tmp.worktreeRoot,
+      probeSocket,
+    });
+    const wtSocket = instancePaths(tmp.anchor, base.expectedWorktreeId).socketPath;
+    const sharedSocket = sharedInstancePaths(tmp.anchor).socketPath;
+    mkdirSync(runDir(tmp.anchor), { recursive: true });
+    writeFileSync(wtSocket, "");
+    const spawned: string[][] = [];
+    const reaped: string[] = [];
+    const inner = base.driver?.spawner;
+    if (inner === undefined) throw new Error("expected stub spawner");
+    const deps: CommandDeps = {
+      ...base,
+      probeRetryDelaysMs: [0, 0, 0],
+      readStoredHash: () => stackHash(stack),
+      writeStoredHash: () => {},
+      getServiceStatuses: async () => [{ name: "web", status: "Running", health: "unknown" }],
+      reap: async () => {
+        reaped.push("reap");
+        return { ranCount: 0, failures: [] };
+      },
+      driver: {
+        ...base.driver,
+        spawner: (binary, args, options) => {
+          spawned.push([...args]);
+          return inner(binary, args, options);
+        },
+      },
+    };
+    return { deps, track, spawned, reaped, wtSocket, sharedSocket, id: base.expectedWorktreeId };
+  }
+
+  async function rejection(p: Promise<unknown>) {
+    return p.then(
+      () => undefined,
+      (e: unknown) => e as Error & { code?: string; details?: Record<string, unknown> },
+    );
+  }
+
+  it("up: an unknown worktree socket is re-probed, then fails INSTANCE_UNRESPONSIVE without a fresh start", async () => {
+    const probed: string[] = [];
+    const fx = staged(async (p) => {
+      probed.push(p);
+      return "unknown";
+    });
+    const err = await rejection(runUp(fx.deps));
+    expect(err?.code).toBe("INSTANCE_UNRESPONSIVE");
+    expect(err?.details).toMatchObject({ instance: fx.id, socket_path: fx.wtSocket, attempts: 4 });
+    expect(String(err?.details?.remedy)).toContain("devtrees up");
+    // One probe plus one per backoff step, all against the worktree socket.
+    expect(probed).toEqual([fx.wtSocket, fx.wtSocket, fx.wtSocket, fx.wtSocket]);
+    // No fresh start beside a possibly-live instance (it would collide on ports).
+    expect(fx.track.invocations).toEqual([]);
+    expect(existsSync(fx.wtSocket)).toBe(true);
+  });
+
+  it("up: a probe that answers on a retry takes the already-running path", async () => {
+    let probes = 0;
+    const fx = staged(async () => (++probes < 3 ? "unknown" : "running"));
+    const result = await runUp(fx.deps);
+    expect(result.worktreeId).toBe(fx.id);
+    expect(probes).toBe(3);
+    expect(fx.track.invocations).toEqual([]);
+    expect(existsSync(fx.wtSocket)).toBe(true);
+  });
+
+  it("up: a definitive stale after an unknown still unlinks and starts fresh", async () => {
+    let probes = 0;
+    const fx = staged(async () => (++probes === 1 ? "unknown" : "stale"));
+    await runUp(fx.deps);
+    expect(fx.track.invocations.map((i) => i.socketPath)).toEqual([fx.wtSocket]);
+  });
+
+  it("up: an unknown shared socket fails INSTANCE_UNRESPONSIVE instead of lazy-starting a second shared instance", async () => {
+    const fx = staged(async () => "unknown", mixedStack);
+    rmSync(fx.wtSocket);
+    writeFileSync(fx.sharedSocket, "");
+    const err = await rejection(runUp(fx.deps));
+    expect(err?.code).toBe("INSTANCE_UNRESPONSIVE");
+    expect(err?.details).toMatchObject({ instance: "shared", socket_path: fx.sharedSocket });
+    expect(fx.track.invocations.some((i) => i.socketPath === fx.sharedSocket)).toBe(false);
+    expect(existsSync(fx.sharedSocket)).toBe(true);
+  });
+
+  it("down: an unknown socket fails INSTANCE_UNRESPONSIVE — never 'nothing running', never the dead-supervisor reap", async () => {
+    const fx = staged(async () => "unknown");
+    const err = await rejection(runDown(fx.deps));
+    expect(err?.code).toBe("INSTANCE_UNRESPONSIVE");
+    expect(err?.message).toContain("socket was kept");
+    expect(String(err?.details?.remedy)).toContain("devtrees down");
+    expect(fx.spawned.filter((a) => a[0] === "down")).toEqual([]);
+    expect(fx.reaped).toEqual([]);
+    expect(existsSync(fx.wtSocket)).toBe(true);
+  });
+
+  it("down: a probe that answers on a retry stops the instance through the driver", async () => {
+    let probes = 0;
+    const fx = staged(async () => (++probes === 1 ? "unknown" : "running"));
+    const result = await runDown(fx.deps);
+    expect(result.stopped).toBe(true);
+    expect(fx.spawned.filter((a) => a[0] === "down")).toHaveLength(1);
+  });
+
+  it("down --shared: an unknown shared socket fails INSTANCE_UNRESPONSIVE and keeps the socket", async () => {
+    const fx = staged(async () => "unknown", mixedStack);
+    writeFileSync(fx.sharedSocket, "");
+    const err = await rejection(runDown(fx.deps, { shared: true }));
+    expect(err?.code).toBe("INSTANCE_UNRESPONSIVE");
+    expect(err?.details).toMatchObject({ instance: "shared" });
+    expect(String(err?.details?.remedy)).toContain("devtrees down --shared");
+    expect(fx.spawned.filter((a) => a[0] === "down")).toEqual([]);
+    expect(existsSync(fx.sharedSocket)).toBe(true);
+  });
+
+  it("the envelope classifies as INSTANCE_UNRESPONSIVE with its details", async () => {
+    const fx = staged(async () => "unknown");
+    const err = await rejection(runDown(fx.deps));
+    if (err === undefined) throw new Error("expected runDown to reject");
+    const payload = classifyError(err);
+    expect(payload.code).toBe("INSTANCE_UNRESPONSIVE");
+    expect(payload.details).toMatchObject({ socket_path: fx.wtSocket, attempts: 4 });
+  });
+});
+
 describe("runUp / runEnv — shared port map persistence & drift (#83)", () => {
   // The shared subset as worktree A's branch declares it.
   const stackA: ResolvedStack = {

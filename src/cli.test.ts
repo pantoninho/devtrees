@@ -135,13 +135,15 @@ describe("devtrees CLI", () => {
         "SHARED_SERVICE_DEAD",
         "SERVICE_START_FAILED",
         "INSTANCE_NOT_FOUND",
+        "INSTANCE_UNRESPONSIVE",
         "PROCESS_COMPOSE_NOT_FOUND",
         "INVALID_ARGS",
         "UNKNOWN",
       ],
     ],
-    // `down` serializes on a lifecycle lock (worktree or shared) → LOCK_CONTENTION.
-    ["down", ["PROCESS_COMPOSE_NOT_FOUND", "LOCK_CONTENTION", "UNKNOWN"]],
+    // `down` serializes on a lifecycle lock (worktree or shared) → LOCK_CONTENTION;
+    // a socket that never answers the probes → INSTANCE_UNRESPONSIVE (#186).
+    ["down", ["PROCESS_COMPOSE_NOT_FOUND", "LOCK_CONTENTION", "INSTANCE_UNRESPONSIVE", "UNKNOWN"]],
     ["ls", ["UNKNOWN"]],
     ["attach", ["INSTANCE_NOT_FOUND", "PROCESS_COMPOSE_NOT_FOUND", "UNKNOWN"]],
     // `prune` drops orphan registry entries under the registry lock.
@@ -159,6 +161,7 @@ describe("devtrees CLI", () => {
   const ALL_KNOWN_CODES = [
     "PROCESS_COMPOSE_NOT_FOUND",
     "INSTANCE_NOT_FOUND",
+    "INSTANCE_UNRESPONSIVE",
     "SERVICE_NOT_FOUND",
     "HEALTH_TIMEOUT",
     "NAMESPACE_NOT_RUNNING",

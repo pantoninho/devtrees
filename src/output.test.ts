@@ -73,6 +73,10 @@ describe("output formatter — constants", () => {
   it("declares NO_SERVICES_SELECTED so a bare up with nothing in `default` fails loudly (#176)", () => {
     expect(ERROR_CODES).toContain("NO_SERVICES_SELECTED");
   });
+
+  it("declares INSTANCE_UNRESPONSIVE so an unanswered probe fails instead of guessing (#186)", () => {
+    expect(ERROR_CODES).toContain("INSTANCE_UNRESPONSIVE");
+  });
 });
 
 describe("output formatter — classifyError", () => {
@@ -205,6 +209,23 @@ describe("output formatter — formatLs", () => {
     expect(result.stdout).toContain("beta");
     expect(result.stdout).toContain("CACHE=40001");
     expect(result.stdout).toContain("API=40097");
+  });
+
+  it("shows an instance whose liveness is unknown with that status, in both modes (#186)", () => {
+    const unknown: LsInstanceRow = {
+      id: "gamma",
+      kind: "worktree",
+      status: "unknown",
+      ports: { WEB: 40129 },
+      blockBase: 40129,
+    };
+    expect(formatLs([unknown], "human").stdout).toMatch(/gamma\s+worktree\s+unknown\s+WEB=40129/);
+    const parsed = JSON.parse(formatLs([unknown], "json").stdout) as {
+      ls: { instances: ReadonlyArray<{ id: string; status: string }> };
+    };
+    expect(parsed.ls.instances).toEqual([
+      expect.objectContaining({ id: "gamma", status: "unknown" }),
+    ]);
   });
 
   it("in human mode with no instances, prints the existing 'no instances' line", () => {

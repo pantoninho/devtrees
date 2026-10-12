@@ -10,7 +10,8 @@
  * `devtrees prune` (#9) walks to reconcile against `git worktree list`.
  *
  * Status comes from probing the socket itself — a connectable UDS means
- * `running`, a leftover file with no listener means `stale`. The allocation
+ * `running`, a leftover file with no listener means `stale`, and a probe that
+ * cannot tell (a timeout, a busy listener) means `unknown` (#186). The allocation
  * registry contributes the port block base; the per-instance derived config
  * (already on disk under `<anchor>/devtrees/<id>.yaml`) contributes the
  * human-meaningful named-port mapping so `ls` can print `WEB_PORT=20512`
@@ -20,6 +21,7 @@
  * attempt per socket. No registry write, no spawn.
  */
 
+import { execFile } from "node:child_process";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { connect } from "node:net";
 import { join } from "node:path";
@@ -40,9 +42,12 @@ export type InstanceKind = "worktree" | "shared";
 
 /**
  * Whether the control socket is currently held by a live process-compose
- * (running) or is an orphaned file no one is listening on (stale).
+ * (running), is an orphaned file no one is listening on (stale), or could not
+ * be told apart from a live-but-busy instance (unknown, issue #186): the
+ * connect timed out or failed in a way that does not prove the listener is
+ * gone. Only `stale` licenses unlinking the socket file.
  */
-export type InstanceStatus = "running" | "stale";
+export type InstanceStatus = "running" | "stale" | "unknown";
 
 /**
  * One service inside a worktree (or shared) instance, as exposed by `ls`.
@@ -100,11 +105,46 @@ export interface InstanceInfo {
 }
 
 /**
- * How long to wait for a UDS connect attempt before declaring the socket
- * stale. Kept tiny — a live process-compose accepts immediately; anything
- * longer is almost certainly the kernel's "no one is listening" path.
+ * How long to wait for one UDS connect attempt. A live process-compose
+ * accepts at once, but on a loaded machine the event loop can wake with the
+ * timer already due before it services the connect (#186). A timeout is
+ * therefore never read as "stale": it is `unknown`, and callers retry
+ * (`probeUntilDefinitive`) rather than wait longer on one attempt.
  */
 const CONNECT_TIMEOUT_MS = 250;
+
+/**
+ * Backoff between probe attempts while the answer is `unknown` (#186): four
+ * attempts over roughly 2.3s in the worst case. Short enough that a frozen
+ * instance fails `up`/`down` promptly, long enough to ride out a scheduling
+ * stall on a loaded machine.
+ */
+export const PROBE_RETRY_DELAYS_MS: ReadonlyArray<number> = [100, 300, 900];
+
+/** What a single UDS connect attempt observed, before any interpretation. */
+export type ProbeOutcome =
+  | { readonly kind: "connected" }
+  | { readonly kind: "timeout" }
+  | { readonly kind: "error"; readonly code: string | undefined };
+
+/**
+ * Connect errors that prove nothing is listening at the path: the file is
+ * gone (`ENOENT`), no socket is bound to it (`ECONNREFUSED`), or it is not a
+ * socket at all (`ENOTSOCK`, a plain file left at the path).
+ */
+const NOTHING_LISTENING: ReadonlySet<string> = new Set(["ENOENT", "ECONNREFUSED", "ENOTSOCK"]);
+
+/**
+ * Classify one probe outcome (#186). Pure. A connect means `running`; only
+ * `ENOENT`/`ECONNREFUSED`/`ENOTSOCK` mean `stale`; a timeout or any other
+ * error is `unknown`, because a live process-compose on a loaded machine can
+ * produce either, and treating it as stale deletes a live instance's socket.
+ */
+export function classifyProbe(outcome: ProbeOutcome): InstanceStatus {
+  if (outcome.kind === "connected") return "running";
+  if (outcome.kind === "error" && NOTHING_LISTENING.has(outcome.code ?? "")) return "stale";
+  return "unknown";
+}
 
 /**
  * Resolve the on-disk filename stem of a socket to its registry key. The
@@ -156,38 +196,98 @@ function listSockets(anchor: string): DiscoveredSocket[] {
   return [...found].map(([stem, socketPath]) => ({ stem, socketPath }));
 }
 
+/** One UDS connect attempt, reported raw. Never rejects. */
+function connectOnce(socketPath: string, timeoutMs: number): Promise<ProbeOutcome> {
+  return new Promise<ProbeOutcome>((resolve) => {
+    const socket = connect(socketPath);
+    let settled = false;
+    const settle = (outcome: ProbeOutcome): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      resolve(outcome);
+    };
+    const timer = setTimeout(() => settle({ kind: "timeout" }), timeoutMs);
+    timer.unref?.();
+    socket.once("connect", () => settle({ kind: "connected" }));
+    socket.once("error", (err: NodeJS.ErrnoException) => settle({ kind: "error", code: err.code }));
+  });
+}
+
 /**
- * Probe the socket: attempt a UDS connect with a short timeout. The socket is
- * the same UDS process-compose serves its API on, so anything that accepts the
- * connection — even before reading a byte — is a live instance. Anything else
- * (ENOENT, ECONNREFUSED, timeout) means the file is orphaned.
+ * Does any process hold a unix socket bound at `socketPath`? `true`/`false`
+ * from `lsof`, `undefined` when `lsof` is missing or fails (the answer is then
+ * not known, and the caller keeps the connect error's verdict).
+ *
+ * Needed because `ECONNREFUSED` is not proof of death on macOS (#186): a
+ * listener whose accept backlog is full, such as a frozen or wedged
+ * process-compose with clients queued behind it, refuses new connects exactly
+ * as a socket file with no listener does.
+ */
+export function socketHeldByProcess(socketPath: string): Promise<boolean | undefined> {
+  return new Promise((resolve) => {
+    execFile("lsof", ["-t", "-U", "-a", socketPath], { timeout: 1000 }, (err, stdout) => {
+      if (err === null) {
+        resolve(stdout.trim().length > 0);
+        return;
+      }
+      // lsof exits 1 with no output when nothing matches: a definitive "no".
+      const noMatch = (err as { code?: unknown }).code === 1 && stdout.trim() === "";
+      resolve(noMatch ? false : undefined);
+    });
+  });
+}
+
+/** Seams for `probeSocket`; tests inject them, production uses the defaults. */
+export interface ProbeOptions {
+  readonly timeoutMs?: number;
+  readonly heldByProcess?: (socketPath: string) => Promise<boolean | undefined>;
+}
+
+/**
+ * Probe the socket: attempt one UDS connect with a short timeout and classify
+ * it (`classifyProbe`). The socket is the same UDS process-compose serves its
+ * API on, so anything that accepts the connection — even before reading a
+ * byte — is a live instance. `ENOENT`/`ENOTSOCK` mean stale. `ECONNREFUSED` means stale
+ * unless a process still holds the socket (a full backlog, see
+ * `socketHeldByProcess`), which makes it `unknown`. A timeout or any other
+ * error is `unknown` (#186).
  *
  * Exported because liveness is a repo-wide concern, not just `ls`'s: the
  * write paths (`up`, the shared lazy-start, `down --shared`) must not trust
  * socket-file existence — the file lives in anchor state and survives
  * `kill -9` and reboots (issue #80).
  */
-export async function probeSocket(socketPath: string): Promise<InstanceStatus> {
-  return new Promise<InstanceStatus>((resolve) => {
-    const socket = connect(socketPath);
-    let settled = false;
-    const settle = (status: InstanceStatus): void => {
-      if (settled) return;
-      settled = true;
-      socket.destroy();
-      resolve(status);
-    };
-    const timer = setTimeout(() => settle("stale"), CONNECT_TIMEOUT_MS);
-    timer.unref?.();
-    socket.once("connect", () => {
-      clearTimeout(timer);
-      settle("running");
-    });
-    socket.once("error", () => {
-      clearTimeout(timer);
-      settle("stale");
-    });
-  });
+export async function probeSocket(
+  socketPath: string,
+  options: ProbeOptions = {},
+): Promise<InstanceStatus> {
+  const outcome = await connectOnce(socketPath, options.timeoutMs ?? CONNECT_TIMEOUT_MS);
+  const status = classifyProbe(outcome);
+  if (outcome.kind !== "error" || outcome.code !== "ECONNREFUSED") return status;
+  const held = await (options.heldByProcess ?? socketHeldByProcess)(socketPath);
+  return held === true ? "unknown" : status;
+}
+
+/**
+ * Probe until the answer is definitive (`running` or `stale`), backing off
+ * between attempts per `delaysMs`; `unknown` if every attempt was (#186).
+ * A busy instance gets a few chances to answer before a caller has to choose
+ * between failing and guessing.
+ */
+export async function probeUntilDefinitive(
+  socketPath: string,
+  probe: (socketPath: string) => Promise<InstanceStatus>,
+  delaysMs: ReadonlyArray<number> = PROBE_RETRY_DELAYS_MS,
+): Promise<InstanceStatus> {
+  let status = await probe(socketPath);
+  for (const delay of delaysMs) {
+    if (status !== "unknown") return status;
+    await new Promise((r) => setTimeout(r, delay));
+    status = await probe(socketPath);
+  }
+  return status;
 }
 
 /**
@@ -309,6 +409,10 @@ export interface DiscoverDeps {
    * path supplies this.
    */
   readonly getServiceStatuses?: (socketPath: string) => Promise<ServiceStatus[]>;
+  /** Probe one control socket. Default: `probeSocket`. Injected by tests. */
+  readonly probeSocket?: (socketPath: string) => Promise<InstanceStatus>;
+  /** Backoff while a probe stays `unknown`. Default: `PROBE_RETRY_DELAYS_MS`. */
+  readonly probeRetryDelaysMs?: ReadonlyArray<number>;
 }
 
 /**
@@ -328,14 +432,14 @@ async function safeGetServiceStatuses(
 }
 
 /**
- * Discover every running (and stale) devtrees instance at `anchor`. The result
+ * Discover every running, stale or unknown devtrees instance at `anchor`. The result
  * is the same primitive `devtrees ls` renders and `devtrees prune` walks — no
  * caller has to enumerate sockets themselves. Lock-free: no allocation-registry
  * write happens here.
  *
  * When `deps.getServiceStatuses` is provided, each running instance is
  * enriched with one shell-out to the driver, populating `services[]`. Stale
- * instances never see a driver call.
+ * and unknown instances never see a driver call.
  */
 export async function discoverInstances(
   anchor: string,
@@ -349,7 +453,14 @@ export async function discoverInstances(
   const infos = await Promise.all(
     sockets.map(async ({ stem, socketPath }): Promise<InstanceInfo> => {
       const paths = instancePaths(anchor, stem);
-      const status = await probeSocket(socketPath);
+      // Read-only: discovery never unlinks a socket. An instance that stays
+      // `unknown` after the retries is listed as such (#186) rather than
+      // hidden, and gets no driver call, which would only hang on it.
+      const status = await probeUntilDefinitive(
+        socketPath,
+        deps.probeSocket ?? ((path) => probeSocket(path)),
+        deps.probeRetryDelaysMs,
+      );
       const blockBase = registry[registryKeyFor(stem)];
       const configDoc = readDerivedConfig(paths.configPath);
       const services =

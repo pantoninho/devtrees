@@ -323,6 +323,7 @@ class UpCommand extends DevtreesCommand {
       "SHARED_SERVICE_DEAD",
       "SERVICE_START_FAILED",
       "INSTANCE_NOT_FOUND",
+      "INSTANCE_UNRESPONSIVE",
       "PROCESS_COMPOSE_NOT_FOUND",
       "INVALID_ARGS",
       "UNKNOWN",
@@ -482,8 +483,14 @@ class DownCommand extends DevtreesCommand {
   static override usage = Command.Usage({
     description: "Stop this worktree's stack (`--shared` tears down the shared instance).",
     // Both branches serialize on a lifecycle lock (the worktree's, #178, or the
-    // shared one with `--shared`) → LOCK_CONTENTION.
-    details: errorCodeFooter(["PROCESS_COMPOSE_NOT_FOUND", "LOCK_CONTENTION", "UNKNOWN"]),
+    // shared one with `--shared`) → LOCK_CONTENTION. A socket whose liveness
+    // stays unknown after the probe retries → INSTANCE_UNRESPONSIVE (#186).
+    details: errorCodeFooter([
+      "PROCESS_COMPOSE_NOT_FOUND",
+      "LOCK_CONTENTION",
+      "INSTANCE_UNRESPONSIVE",
+      "UNKNOWN",
+    ]),
   });
 
   shared = Option.Boolean("--shared", false, {
