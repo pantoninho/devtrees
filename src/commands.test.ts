@@ -6407,16 +6407,21 @@ describe("bounded down — force-kill and DOWN_TIMEOUT (#190)", () => {
 
   type Failure = Error & { code?: string; details?: Record<string, unknown> };
 
+  const PENDING: PendingReload = { services: ["web"], oldRuns: [{ name: "web", pid: 99 }] };
+
   it("worktree down force-kills only the stuck service and reports it", async () => {
     const deps = stubDeps({ stack: isolatedStack, track: { invocations: [], touchSocket: true } });
     await runUp(deps);
     const paths = instancePaths(anchorOf(deps), deps.expectedWorktreeId);
     const { seams, kills } = stopSeams(paths.socketPath, { pcExits: true });
+    // A successful bounded stop clears any pending reload (#191).
+    writePendingReload(anchorOf(deps), deps.expectedWorktreeId, PENDING);
     const result = await runDown({ ...deps, driver: stuckDriver(), stop: seams });
     expect(result).toMatchObject({ shared: false, stopped: true });
     expect(result.forceKilled).toEqual([{ service: "web", pid: WEB_PID }]);
     // The service's process group, never process-compose itself.
     expect(kills).toEqual([[-WEB_PID, "SIGKILL"]]);
+    expect(readPendingReload(anchorOf(deps), deps.expectedWorktreeId)).toBeUndefined();
   });
 
   it("worktree down fails DOWN_TIMEOUT and keeps the socket and config when process-compose never exits", async () => {
@@ -6424,6 +6429,8 @@ describe("bounded down — force-kill and DOWN_TIMEOUT (#190)", () => {
     await runUp(deps);
     const paths = instancePaths(anchorOf(deps), deps.expectedWorktreeId);
     const { seams, kills } = stopSeams(paths.socketPath, { pcExits: false });
+    // A pending reload (#191) must survive a DOWN_TIMEOUT: the instance is still up.
+    writePendingReload(anchorOf(deps), deps.expectedWorktreeId, PENDING);
     const err = (await runDown({ ...deps, driver: stuckDriver(), stop: seams }).catch(
       (e: unknown) => e,
     )) as Failure;
@@ -6441,6 +6448,7 @@ describe("bounded down — force-kill and DOWN_TIMEOUT (#190)", () => {
     expect(kills).toEqual([[-WEB_PID, "SIGKILL"]]);
     expect(existsSync(paths.socketPath)).toBe(true);
     expect(existsSync(paths.configPath)).toBe(true);
+    expect(readPendingReload(anchorOf(deps), deps.expectedWorktreeId)).toEqual(PENDING);
   });
 
   it("the down budget is the base plus the derived config's shutdown.timeout_seconds", async () => {
