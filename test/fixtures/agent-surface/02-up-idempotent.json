@@ -19,6 +19,7 @@
     ],
     "shared_started": false,
     "dropped_namespace_edges": [],
+    "braced_env_vars": [],
     "shared_config_changes": [],
     "restarted": [],
     "block_base": 0

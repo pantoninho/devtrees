@@ -19,7 +19,7 @@
  * non-breaking; renames and removals bump this. New error codes are additive.
  */
 import { stringify as stringifyYaml } from "yaml";
-import type { DerivedConfig, DroppedEdge } from "./deriver.js";
+import type { BracedEnvVar, DerivedConfig, DroppedEdge } from "./deriver.js";
 import type { DroppedNamespaceEdge } from "./selection.js";
 import type { SharedFieldChange } from "./shared-state.js";
 
@@ -407,6 +407,12 @@ export interface UpPayload {
    */
   readonly droppedNamespaceEdges?: ReadonlyArray<DroppedNamespaceEdge>;
   /**
+   * `${NAME}` references to devtrees-injected variables in service commands
+   * (#200). Human mode does not repeat them (`up` warned on stderr); JSON mode
+   * always emits `braced_env_vars` (possibly empty).
+   */
+  readonly bracedEnvVars?: ReadonlyArray<BracedEnvVar>;
+  /**
    * Shared-service fields edited since the running shared instance started
    * (#185). Human mode does not repeat them — `up` warned on stderr as it ran;
    * JSON mode always emits `shared_config_changes` (possibly empty).
@@ -453,6 +459,8 @@ export function formatUp(payload: UpPayload, mode: FormatMode): OutputResult {
       // Always present, even empty (#179) — the `up_dry_run.dropped_edges`
       // contract (#169): an empty list is the answer "nothing was dropped".
       dropped_namespace_edges: (payload.droppedNamespaceEdges ?? []).map(droppedNamespaceEdgeJson),
+      // Always present, even empty (#200), same contract.
+      braced_env_vars: (payload.bracedEnvVars ?? []).map(bracedEnvVarJson),
       // Always present, even empty (#185), same contract.
       shared_config_changes: (payload.sharedFieldChanges ?? []).map(sharedFieldChangeJson),
       restarted: payload.restarted ?? [],
@@ -556,6 +564,8 @@ export interface UpDryRunPayload {
    * Defaults to empty, like `droppedEdges`.
    */
   readonly droppedNamespaceEdges?: ReadonlyArray<DroppedNamespaceEdge>;
+  /** `${NAME}` references to injected variables in service commands (#200). */
+  readonly bracedEnvVars?: ReadonlyArray<BracedEnvVar>;
   /**
    * The namespace selection a fresh `up` would pass to process-compose and the
    * isolated services it starts (issue #176). Optional so a caller with no
@@ -610,6 +620,26 @@ export function formatDroppedNamespaceEdgeWarning(edge: DroppedNamespaceEdge): s
 }
 
 /**
+ * One warning line per `${NAME}` in a service command that names a
+ * devtrees-injected variable (#200). process-compose expands it at config load
+ * from its own environment, so it runs empty; devtrees does not rewrite the
+ * author's command (ADR-0002), it says so.
+ */
+export function formatBracedEnvVarWarning(v: BracedEnvVar): string {
+  return (
+    `devtrees: service '${v.service}' command uses '\${${v.variable}}', which process-compose ` +
+    `expands at config load from its own environment (empty), not the process's. ` +
+    `Use '$${v.variable}' (the shell expands it at run time) or '$\${${v.variable}}' ` +
+    `to escape the interpolation.`
+  );
+}
+
+/** Snake_case row for a `braced_env_vars[]` envelope entry (#200). */
+function bracedEnvVarJson(v: BracedEnvVar): Record<string, string> {
+  return { service: v.service, variable: v.variable };
+}
+
+/**
  * One warning line per shared-service field edited since the running shared
  * instance started (#185). Shared has no hot-reload, so the edit sits unapplied
  * until shared is restarted.
@@ -641,7 +671,7 @@ function droppedEdgeJson(edge: DroppedEdge): Record<string, string> {
  * Render `devtrees up --dry-run` output.
  *
  *   - `json`: `{schema_version, up_dry_run: {worktree_id, env, config,
- *     dropped_edges, dropped_namespace_edges, namespaces?,
+ *     dropped_edges, dropped_namespace_edges, braced_env_vars, namespaces?,
  *     selected_services?, shared_env?, shared_config?}}` — one byte-clean document
  *     on stdout, the agent-readable preview of what `up` would run. `shared_*`
  *     keys are omitted when the stack has no shared services; `dropped_edges`
@@ -659,6 +689,7 @@ function droppedEdgeJson(edge: DroppedEdge): Record<string, string> {
 export function formatUpDryRun(payload: UpDryRunPayload, mode: FormatMode): OutputResult {
   const droppedEdges = payload.droppedEdges ?? [];
   const nsEdges = payload.droppedNamespaceEdges ?? [];
+  const braced = payload.bracedEnvVars ?? [];
   if (mode === "json") {
     const dry: Record<string, unknown> = {
       worktree_id: payload.worktreeId,
@@ -673,6 +704,8 @@ export function formatUpDryRun(payload: UpDryRunPayload, mode: FormatMode): Outp
       dropped_edges: droppedEdges.map(droppedEdgeJson),
       // Same always-present contract for edges lost to namespace selection (#179).
       dropped_namespace_edges: nsEdges.map(droppedNamespaceEdgeJson),
+      // Same always-present contract for braced injected variables (#200).
+      braced_env_vars: braced.map(bracedEnvVarJson),
     };
     if (payload.selection !== undefined) {
       // What a fresh `up` with the same flags would start (issue #176): the
@@ -703,7 +736,8 @@ export function formatUpDryRun(payload: UpDryRunPayload, mode: FormatMode): Outp
   const stderr =
     selection +
     droppedEdges.map((e) => `${formatDroppedEdgeWarning(e)}\n`).join("") +
-    nsEdges.map((e) => `${formatDroppedNamespaceEdgeWarning(e)}\n`).join("");
+    nsEdges.map((e) => `${formatDroppedNamespaceEdgeWarning(e)}\n`).join("") +
+    braced.map((v) => `${formatBracedEnvVarWarning(v)}\n`).join("");
   return { stdout: body, stderr };
 }
 

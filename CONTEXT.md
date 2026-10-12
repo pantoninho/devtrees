@@ -53,7 +53,7 @@ A clean process-compose config that devtrees generates from `devtrees.yaml` + ba
 A value devtrees computes and passes into a worktree instance as an environment variable / process-compose var, for the author to reference in their commands. Three kinds: an **allocated port** (this worktree's own isolated named ports, unique per worktree), **shared-service connection info** (the shared services' named ports, injected repo-wide and identical in every worktree), and the **worktree id**.
 
 **Named port**:
-A port a service declares in its `ports` list as the verbatim env-var name it should be injected as (e.g. `ports: [WEB_PORT]`). Devtrees allocates a number for it — worktree-unique for an isolated service, repo-wide for a shared one — and injects it as exactly that env var. The author references it as `${WEB_PORT}` in commands or reads it straight from the process environment; devtrees imposes no naming convention and does no name mangling.
+A port a service declares in its `ports` list as the verbatim env-var name it should be injected as (e.g. `ports: [WEB_PORT]`). Devtrees allocates a number for it — worktree-unique for an isolated service, repo-wide for a shared one — and injects it as exactly that env var. The author references it as bare `$WEB_PORT` in a command (the shell expands it at run time from the process environment) or reads it straight from the process environment. Never `${WEB_PORT}` in a `command`: process-compose expands that at config load from its own environment, where the port is not set, so it runs empty (write `$${WEB_PORT}` to escape the interpolation); `up` and `up --dry-run` warn about each one (`braced_env_vars` under `--json`). devtrees imposes no naming convention and does no name mangling.
 
 **Worktree id**:
 A stable per-worktree identifier devtrees injects so the author can de-collide otherwise-global names — unix sockets, container names, absolute state paths — that working-directory isolation does not cover. Derived from the worktree's absolute path: a human-readable slug of the directory basename plus a short path-hash suffix (e.g. `login-3f9c2a1b`), so same-basename worktrees at different paths get distinct ids and no worktree id can ever equal the reserved `shared` stem.
@@ -85,7 +85,7 @@ _(none yet)_
 >
 > **Dev:** And the web server?
 >
-> **Maintainer:** That's `isolated`, so each worktree runs its own in its own **worktree instance**. They got different **allocated ports** out of their **port blocks** — `login` is on one number, `billing` on another. You reference it as `${WEB_PORT}` and never think about the number.
+> **Maintainer:** That's `isolated`, so each worktree runs its own in its own **worktree instance**. They got different **allocated ports** out of their **port blocks** — `login` is on one number, `billing` on another. You reference it as `$WEB_PORT` and never think about the number.
 >
 > **Dev:** What if I `devtrees down` the `login` worktree — does Postgres go too?
 >

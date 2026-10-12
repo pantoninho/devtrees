@@ -130,7 +130,7 @@ async function waitForGone(port: number, timeoutMs = 4000): Promise<boolean> {
   return false;
 }
 
-/** A worktree whose single isolated service binds ${WEB_PORT} and writes a relative file. */
+/** A worktree whose single isolated service binds $WEB_PORT and writes a relative file. */
 function writeStackConfig(worktreeRoot: string): void {
   // Inline Node HTTP server: reads its port verbatim from the environment, and
   // touches a relative file to exercise working-directory isolation.

@@ -461,7 +461,7 @@ describe("runUp — unmanaged port warning", () => {
 
   it("stays silent when every port literal in the command is inside the allocated block", async () => {
     const stack: ResolvedStack = {
-      services: [isolated("web", "node server.js --port ${WEB_PORT}", ["WEB_PORT"])],
+      services: [isolated("web", "node server.js --port $WEB_PORT", ["WEB_PORT"])],
     };
     const warnings: string[] = [];
     await runUp(stubDeps({ stack, warn: (m) => warnings.push(m) }));
@@ -1385,6 +1385,21 @@ describe("runUp — namespace selection (#128)", () => {
       { ...isolated("web", "node web.js"), namespace: "one", dependsOn: [{ name: "api" }] },
     ],
   };
+
+  it("#200: up warns once per braced injected variable and returns it for the envelope", async () => {
+    const warnings: string[] = [];
+    const stack: ResolvedStack = {
+      services: [isolated("web", "serve ${WEB_PORT} $WEB_PORT", ["WEB_PORT"])],
+    };
+    const deps: CommandDeps = {
+      ...stubDeps({ stack, track: { invocations: [], touchSocket: false } }),
+      warn: (m) => warnings.push(m),
+      waitForHealth: async () => {},
+    };
+    const result = await runUp(deps);
+    expect(result.bracedEnvVars).toEqual([{ service: "web", variable: "WEB_PORT" }]);
+    expect(warnings.filter((w) => w.includes("'${WEB_PORT}'"))).toHaveLength(1);
+  });
 
   it("#179: -n two selects the list-valued db and api, and health-waits on exactly them", async () => {
     let waited: string[] | undefined;
@@ -2390,6 +2405,22 @@ describe("runUpDryRun — derive the config(s) with no side effects (#124)", () 
     // The edge really is gone from the previewed config — that is the whole
     // reason the preview has to say so.
     expect(result.config.processes.web?.depends_on).toBeUndefined();
+  });
+
+  it("#200: reports ${NAME} of an injected variable in a command, escaped and bare forms excluded", async () => {
+    const stack: ResolvedStack = {
+      services: [
+        isolated("web", "serve ${WEB_PORT} $WEB_PORT $${WEB_PORT}", ["WEB_PORT"]),
+        isolated("api", "serve ${DEVTREES_WORKTREE_ID} ${HOME}"),
+      ],
+    };
+    const result = await runUpDryRun(stubDeps({ stack }));
+    expect(result.bracedEnvVars).toEqual([
+      { service: "web", variable: "WEB_PORT" },
+      { service: "api", variable: "DEVTREES_WORKTREE_ID" },
+    ]);
+    // The command is not rewritten (ADR-0002).
+    expect(result.config.processes.web?.command).toBe("serve ${WEB_PORT} $WEB_PORT $${WEB_PORT}");
   });
 
   it("#179: reports depends_on edges the namespace selection would drop", async () => {

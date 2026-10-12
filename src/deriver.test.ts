@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 import { stringify as stringifyYaml } from "yaml";
-import { deriveSharedConfig, deriveWorktreeConfig } from "./deriver.js";
+import { bracedEnvVars, deriveSharedConfig, deriveWorktreeConfig } from "./deriver.js";
 import { parseStack, type ResolvedStack } from "./stack.js";
 
 const stack: ResolvedStack = {
@@ -1162,5 +1162,63 @@ describe("config deriver — per-service port metadata (`x-devtrees`, issue #110
     const yaml = stringifyYaml(derived.config);
     expect(yaml).toContain("x-devtrees:");
     expect(yaml).toContain("WEB_PORT: 20512");
+  });
+});
+
+describe("bracedEnvVars (#200)", () => {
+  const svc = (
+    name: string,
+    tier: "isolated" | "shared",
+    command: string,
+    ports: string[] = [],
+  ) => ({ name, tier, command, ports, dependsOn: [], environment: [] });
+
+  it("reports ${NAME} for an own port, a visible shared port and the worktree id", () => {
+    const found = bracedEnvVars({
+      services: [
+        svc("db", "shared", "pg", ["DB_PORT"]),
+        svc("web", "isolated", "serve ${WEB_PORT} ${DB_PORT} ${DEVTREES_WORKTREE_ID}", [
+          "WEB_PORT",
+        ]),
+      ],
+    });
+    expect(found).toEqual([
+      { service: "web", variable: "WEB_PORT" },
+      { service: "web", variable: "DB_PORT" },
+      { service: "web", variable: "DEVTREES_WORKTREE_ID" },
+    ]);
+  });
+
+  it("ignores bare $NAME, the $${NAME} escape, and names devtrees does not inject", () => {
+    const found = bracedEnvVars({
+      services: [
+        svc("web", "isolated", "echo $WEB_PORT $${WEB_PORT} ${HOME} ${OTHER_PORT}", ["WEB_PORT"]),
+      ],
+    });
+    expect(found).toEqual([]);
+  });
+
+  it("treats an odd run of dollars as live and an even run as escaped", () => {
+    const found = bracedEnvVars({
+      services: [svc("web", "isolated", "a $$${WEB_PORT} b $$$${WEB_PORT}", ["WEB_PORT"])],
+    });
+    expect(found).toEqual([{ service: "web", variable: "WEB_PORT" }]);
+  });
+
+  it("reports a variable once per service, even when repeated", () => {
+    const found = bracedEnvVars({
+      services: [svc("web", "isolated", "${WEB_PORT} ${WEB_PORT}", ["WEB_PORT"])],
+    });
+    expect(found).toEqual([{ service: "web", variable: "WEB_PORT" }]);
+  });
+
+  it("does not offer the worktree id or isolated ports to a shared service", () => {
+    const found = bracedEnvVars({
+      services: [
+        svc("web", "isolated", "x", ["WEB_PORT"]),
+        svc("db", "shared", "pg ${DB_PORT} ${WEB_PORT} ${DEVTREES_WORKTREE_ID}", ["DB_PORT"]),
+      ],
+    });
+    expect(found).toEqual([{ service: "db", variable: "DB_PORT" }]);
   });
 });

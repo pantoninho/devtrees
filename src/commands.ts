@@ -16,8 +16,10 @@ import {
 } from "./allocator.js";
 import { resolveAnchor, type GitProbe } from "./anchor.js";
 import {
+  bracedEnvVars,
   deriveSharedConfig,
   deriveWorktreeConfig,
+  type BracedEnvVar,
   type DerivedConfig,
   type DroppedEdge,
 } from "./deriver.js";
@@ -40,6 +42,7 @@ import {
   sharedInstancePaths,
 } from "./paths.js";
 import {
+  formatBracedEnvVarWarning,
   formatDroppedEdgeWarning,
   formatDroppedNamespaceEdgeWarning,
   formatSharedFieldChangeWarning,
@@ -774,6 +777,12 @@ export interface UpResult {
    */
   readonly droppedNamespaceEdges: ReadonlyArray<DroppedNamespaceEdge>;
   /**
+   * `${NAME}` references to devtrees-injected variables in service commands
+   * (#200): process-compose expands them from its own environment, so they run
+   * empty. Each was warned about on stderr; the command is never rewritten.
+   */
+  readonly bracedEnvVars: ReadonlyArray<BracedEnvVar>;
+  /**
    * Shared-service fields (shutdown, is_daemon, ...) edited since the running
    * shared instance started (#185). They do not apply until
    * `devtrees down --shared && devtrees up`; each was warned about on stderr.
@@ -849,6 +858,8 @@ export interface DryRunResult {
    * drops them and starts the dependent ungated. Empty when none would be.
    */
   readonly droppedNamespaceEdges: ReadonlyArray<DroppedNamespaceEdge>;
+  /** `${NAME}` references to injected variables in service commands (#200). */
+  readonly bracedEnvVars: ReadonlyArray<BracedEnvVar>;
 }
 
 export interface DownOptions {
@@ -1215,6 +1226,9 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
   // long health/attach phases run AFTER release, so the lock never outlives
   // the spawn window on the happy path; a holder stuck inside it surfaces to
   // contenders as LOCK_CONTENTION once the wait budget lapses.
+  // Pure of the stack, so the same on every path below (#200).
+  const braced = bracedEnvVars(stack);
+
   const outcome = await seams.lifecycleLock(anchor.anchor, anchor.worktreeId, async () => {
     // Liveness, not file existence (issue #80): probe the control socket for an
     // actual listener. A SIGKILLed instance leaves its socket file behind in
@@ -1315,6 +1329,10 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
       warn(formatDroppedEdgeWarning(edge));
     }
 
+    // `${NAME}` of an injected variable in a command runs empty: process-compose
+    // expands it from its own environment (#200). Warned, never rewritten.
+    warnBracedEnvVars(braced, warn);
+
     // Idempotency branch (issue #31): if this worktree's control socket is held
     // by a live listener (probed above, #80 — file existence alone is not
     // enough), the instance is up. Compare the current resolved-stack hash to
@@ -1407,6 +1425,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     env: outcome.env,
     sharedStarted: outcome.sharedStarted,
     sharedFieldChanges: outcome.sharedChanges,
+    bracedEnvVars: braced,
     blockBase,
   } as const;
 
@@ -1598,6 +1617,7 @@ export async function runUpDryRun(deps: CommandDeps = {}): Promise<DryRunResult>
     namespaces: selection.namespaces,
     selectedServices: selection.services.map((s) => s.name),
     droppedNamespaceEdges: droppedNamespaceEdges(stack.services, selection.services),
+    bracedEnvVars: bracedEnvVars(stack),
   };
 
   if (!sharedNeeded) return base;
@@ -1884,7 +1904,7 @@ function formatUnmanagedPortWarning(
     `devtrees: service '${serviceName}' command appears to bind port ${port}, ` +
     `which is outside this worktree's allocated block [${blockBase}, ${blockEnd - 1}]. ` +
     `Devtrees did not allocate it — declare it as a named port (e.g. ports: [WEB_PORT]) ` +
-    `and reference it as \${WEB_PORT} instead.`
+    `and reference it as $WEB_PORT instead.`
   );
 }
 
@@ -3096,6 +3116,14 @@ function warnDroppedNamespaceEdges(
   const edges = droppedNamespaceEdges(stack.services, selected, kept);
   for (const edge of edges) warn(formatDroppedNamespaceEdgeWarning(edge));
   return edges;
+}
+
+/** One stderr line per braced injected variable (#200). */
+function warnBracedEnvVars(
+  vars: ReadonlyArray<BracedEnvVar>,
+  warn: (message: string) => void,
+): void {
+  for (const v of vars) warn(formatBracedEnvVarWarning(v));
 }
 
 function namespaceNotRunningError(
