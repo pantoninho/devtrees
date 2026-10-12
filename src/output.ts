@@ -39,6 +39,7 @@ export const ERROR_CODES = [
   "SHARED_DRIFT",
   "SHARED_START_FAILED",
   "WORKTREE_START_FAILED",
+  "NO_SERVICES_SELECTED",
   "SOCKET_PATH_TOO_LONG",
   "STALE_PORT_BLOCK",
   "LOCK_CONTENTION",
@@ -76,6 +77,8 @@ export const ERROR_CODE_DESCRIPTIONS: Readonly<Record<ErrorCode, string>> = {
     "The lazy-started shared instance died before binding its control socket; `details.config_path` is the config to run by hand.",
   WORKTREE_START_FAILED:
     "This worktree's instance died before binding its control socket; `details.config_path` is the config to run by hand.",
+  NO_SERVICES_SELECTED:
+    "A bare `up` starts only the `default` namespace and it has no services; `details.namespaces` lists the namespaces to pass with `-n`.",
   SOCKET_PATH_TOO_LONG:
     "The control socket path exceeds the platform's unix-socket limit; set DEVTREES_RUNTIME_DIR to a shorter directory.",
   STALE_PORT_BLOCK:
@@ -470,6 +473,23 @@ export interface UpDryRunPayload {
    * to empty so a caller that has nothing to report can omit it (issue #168).
    */
   readonly droppedEdges?: ReadonlyArray<DroppedEdge>;
+  /**
+   * The namespace selection a fresh `up` would pass to process-compose and the
+   * isolated services it starts (issue #176). Optional so a caller with no
+   * selection to report can omit it; the real `runUpDryRun` always fills it.
+   */
+  readonly selection?: {
+    readonly namespaces: ReadonlyArray<string>;
+    readonly services: ReadonlyArray<string>;
+  };
+}
+
+/** Stderr line naming what a fresh `up` would start (issue #176). */
+function formatSelectionNotice(selection: NonNullable<UpDryRunPayload["selection"]>): string {
+  const services = selection.services.length > 0 ? selection.services.join(", ") : "(none)";
+  return (
+    `devtrees: up would start namespace(s) [${selection.namespaces.join(", ")}]: ` + `${services}\n`
+  );
 }
 
 /**
@@ -499,7 +519,8 @@ function droppedEdgeJson(edge: DroppedEdge): Record<string, string> {
  * Render `devtrees up --dry-run` output.
  *
  *   - `json`: `{schema_version, up_dry_run: {worktree_id, env, config,
- *     dropped_edges, shared_env?, shared_config?}}` — one byte-clean document
+ *     dropped_edges, namespaces?, selected_services?, shared_env?,
+ *     shared_config?}}` — one byte-clean document
  *     on stdout, the agent-readable preview of what `up` would run. `shared_*`
  *     keys are omitted when the stack has no shared services; `dropped_edges`
  *     is always present (possibly empty). Stderr stays untouched.
@@ -508,7 +529,8 @@ function droppedEdgeJson(edge: DroppedEdge): Record<string, string> {
  *     same derived config `up` writes to disk; here it goes to stdout so a
  *     developer can eyeball it or pipe it into `process-compose -f -`. Any
  *     dropped cross-tier `depends_on` edge is reported on **stderr** (issue
- *     #168) so stdout stays byte-identical to the document alone.
+ *     #168) so stdout stays byte-identical to the document alone; so is the
+ *     namespace selection a fresh `up` would start (issue #176).
  */
 export function formatUpDryRun(payload: UpDryRunPayload, mode: FormatMode): OutputResult {
   const droppedEdges = payload.droppedEdges ?? [];
@@ -525,6 +547,14 @@ export function formatUpDryRun(payload: UpDryRunPayload, mode: FormatMode): Outp
       // already offer.
       dropped_edges: droppedEdges.map(droppedEdgeJson),
     };
+    if (payload.selection !== undefined) {
+      // What a fresh `up` with the same flags would start (issue #176): the
+      // `-n` values forwarded to process-compose (`["default"]` for a bare
+      // `up`) and the isolated services they select. `config` still lists
+      // every service — process-compose applies `-n` at launch.
+      dry.namespaces = payload.selection.namespaces;
+      dry.selected_services = payload.selection.services;
+    }
     if (payload.sharedConfig !== undefined) {
       dry.shared_env = payload.sharedEnv ?? {};
       dry.shared_config = payload.sharedConfig;
@@ -542,7 +572,8 @@ export function formatUpDryRun(payload: UpDryRunPayload, mode: FormatMode): Outp
   // Warnings go to stderr so stdout stays the previewed document verbatim —
   // `devtrees up --dry-run > stack.yaml` (or a pipe into `process-compose -f -`)
   // must not pick up prose.
-  const stderr = droppedEdges.map((e) => `${formatDroppedEdgeWarning(e)}\n`).join("");
+  const selection = payload.selection !== undefined ? formatSelectionNotice(payload.selection) : "";
+  const stderr = selection + droppedEdges.map((e) => `${formatDroppedEdgeWarning(e)}\n`).join("");
   return { stdout: body, stderr };
 }
 

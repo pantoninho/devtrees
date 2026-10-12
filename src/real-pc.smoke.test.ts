@@ -391,6 +391,32 @@ beforeAll(() => {
 });
 
 /**
+ * A namespaced stack (#176): `api` in `local-backend` with a readiness probe,
+ * plus — when `withDefault` — an un-namespaced `web` in the implicit
+ * `default` namespace.
+ */
+function writeNamespacedStack(worktreeRoot: string, opts: { withDefault: boolean }): void {
+  const yaml = [
+    "services:",
+    ...(opts.withDefault
+      ? ["  web:", "    tier: isolated", '    command: "sleep 300"', "    ports: [WEB_PORT]"]
+      : []),
+    "  api:",
+    "    tier: isolated",
+    "    namespace: local-backend",
+    '    command: "sleep 300"',
+    "    ports: [API_PORT]",
+    "    readiness_probe:",
+    "      exec:",
+    '        command: "echo ok"',
+    "      initial_delay_seconds: 0",
+    "      period_seconds: 1",
+    "",
+  ].join("\n");
+  writeFileSync(join(worktreeRoot, "devtrees.yaml"), yaml);
+}
+
+/**
  * Per-scenario tmp-repo + worktree builder. Wires up:
  *   - a fresh git repo with one worktree (`login` by default)
  *   - the minimal devtrees.yaml (optionally with a readiness_probe)
@@ -788,6 +814,41 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
       contents.includes(marker),
       `external tail of ${logFile} should observe the marker while the stack runs`,
     ).toBe(true);
+  }, 120_000);
+
+  it("scenario 13a: a bare fresh up starts only the default namespace; -n stays exact (#176)", () => {
+    // Against the real binary: `-n default` (what a bare `up` now passes)
+    // omits the `local-backend` service from the project entirely, and the
+    // health wait does not hang on its excluded readiness probe.
+    const repo = buildSmokeRepo("dt-rpc13-", ["login"]);
+    currentCtx = { pidNeedle: repo.root, root: repo.root };
+    const wt = repo.worktrees.login!;
+    writeNamespacedStack(wt, { withDefault: true });
+    cleanupStack.push(() => devtrees(wt, ["down"]));
+
+    const bare = up(wt);
+    expect(bare.code, `bare up failed: ${bare.stderr}`).toBe(0);
+    expect((bare.doc as UpDoc).up.services.map((s) => s.name)).toEqual(["web"]);
+    expect(devtrees(wt, ["down"]).code).toBe(0);
+
+    const scoped = devtrees(wt, ["up", "--json", "--wait-timeout", "30", "-n", "local-backend"]);
+    expect(scoped.code, `up -n local-backend failed: ${scoped.stderr}`).toBe(0);
+    expect((scoped.doc as UpDoc).up.services.map((s) => s.name)).toEqual(["api"]);
+  }, 120_000);
+
+  it("scenario 13b: a bare fresh up with no default services fails NO_SERVICES_SELECTED (#176)", () => {
+    const repo = buildSmokeRepo("dt-rpc13b-", ["login"]);
+    currentCtx = { pidNeedle: repo.root, root: repo.root };
+    const wt = repo.worktrees.login!;
+    writeNamespacedStack(wt, { withDefault: false });
+    cleanupStack.push(() => devtrees(wt, ["down"]));
+
+    const bare = up(wt);
+    expect(bare.code).not.toBe(0);
+    const err = (bare.doc as { error?: { code?: string; details?: { namespaces?: string[] } } })
+      .error;
+    expect(err?.code).toBe("NO_SERVICES_SELECTED");
+    expect(err?.details?.namespaces).toEqual(["local-backend"]);
   }, 120_000);
 });
 

@@ -46,8 +46,9 @@ Commands (from the exported `COMMANDS` manifest in [`src/cli.ts`](src/cli.ts)):
 Flag highlights (run `devtrees <cmd> --help` for the full per-command surface):
 
 - `devtrees up` accepts `--attach` / `--no-attach` (default: attach only when
-  stdout & stderr are TTYs) and `--wait-timeout <seconds>` (health-wait window,
-  default 120s).
+  stdout & stderr are TTYs), `--wait-timeout <seconds>` (health-wait window,
+  default 120s) and `-n/--namespace <ns>` (repeatable; see
+  [Namespaces](#namespaces)).
 - `devtrees logs` takes a service name positionally (`devtrees logs web`) or
   `--all` to interleave every service; `--follow`/`-f` keeps streaming,
   `--tail <N>` prints the last N lines, `--since <DUR>` filters by age
@@ -55,6 +56,40 @@ Flag highlights (run `devtrees <cmd> --help` for the full per-command surface):
 - `down`, `attach`, and `logs` accept `--shared` to target the shared instance
   instead of this worktree's.
 - Every command accepts `--json` (see below).
+
+### Namespaces
+
+A service can declare a process-compose `namespace:` to make it optional.
+Namespaces are **opt-in** and selection is **exact**
+([ADR-0008](docs/adr/0008-up-converges-to-declared-state-and-namespace-selection.md)):
+
+- A fresh `devtrees up` with no `-n` starts only the `default` namespace — the
+  services that declare no `namespace:`. A service in a named namespace never
+  starts unless you ask for it.
+- `-n/--namespace` (repeatable) starts exactly the namespaces it names.
+  `-n app` starts `app` and nothing else; it does **not** add `default`. To
+  run both, write `devtrees up -n default -n app`.
+- If every service declares a namespace, a bare `up` has nothing to start and
+  fails with `NO_SERVICES_SELECTED`, listing the namespaces to pick from with
+  `-n`.
+- `devtrees up --dry-run` (with the same `-n` flags) shows the selection — the
+  `namespaces` and `selected_services` fields under `--json` — and fails the
+  same way.
+
+```yaml
+services:
+  web: # default namespace: starts on a bare `devtrees up`
+    tier: isolated
+    command: npm run dev
+  api: # starts only with `devtrees up -n local-backend`
+    tier: isolated
+    namespace: local-backend
+    command: npm run api
+```
+
+Before ADR-0008, a bare `up` started every namespace. Stacks that relied on
+that now need `-n`. Only isolated services can declare a namespace; shared
+services always run.
 
 ### Where devtrees keeps its state
 
@@ -122,6 +157,7 @@ footer lists the subset that command can actually emit.
 | `SHARED_DRIFT`              | This worktree's shared services diverge from the running shared instance; bring shared down and up again. |
 | `SHARED_START_FAILED`       | The lazy-started shared instance died before binding its control socket; `details.config_path` is the config to run by hand. |
 | `WORKTREE_START_FAILED`     | This worktree's instance died before binding its control socket; `details.config_path` is the config to run by hand. |
+| `NO_SERVICES_SELECTED`      | A bare `up` starts only the `default` namespace and it has no services; `details.namespaces` lists the namespaces to pass with `-n`. |
 | `SOCKET_PATH_TOO_LONG`      | The control socket path exceeds the platform's unix-socket limit; set `DEVTREES_RUNTIME_DIR` to a shorter directory. |
 | `STALE_PORT_BLOCK`          | Foreign listeners hold ports in this worktree's allocated block (likely orphans).   |
 | `LOCK_CONTENTION`           | Another devtrees process holds a devtrees lock (allocation registry or an instance's lifecycle lock). |
@@ -202,6 +238,7 @@ Branch on `error.code`:
 | `SHARED_DRIFT`              | This worktree's shared services diverge from the running shared instance. Follow the message: `devtrees down --shared && devtrees up`. |
 | `CONFIG_DRIFT`              | The running config differs from `devtrees.yaml` and hot-reload failed. Follow the message — usually `devtrees down && devtrees up`. |
 | `SERVICE_NOT_FOUND`         | You named a service that isn't in the instance. `details.valid_services` lists the real names; pick one. |
+| `NO_SERVICES_SELECTED`      | A bare `up` starts only services with no `namespace:`, and there are none. `details.namespaces` lists the namespaces; retry with `devtrees up -n <ns>`. |
 | `INSTANCE_NOT_FOUND`        | No instance is running for this worktree. Run `devtrees up` first.                            |
 | `PROCESS_COMPOSE_NOT_FOUND` | The `process-compose` binary is missing. **Surface this to the human** — it's an environment setup gap you can't fix.   |
 | `PROCESS_COMPOSE_TOO_OLD`   | The installed `process-compose` is below the minimum (v1.122.0). **Surface this to the human** — they need to upgrade it. |

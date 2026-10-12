@@ -191,6 +191,76 @@ class WorktreeStartFailedError extends Error {
 }
 
 /**
+ * Thrown when a bare fresh `up` (no `-n`) selects zero services (issue #176,
+ * ADR-0008). Namespaces are opt-in, so a bare fresh start selects only the
+ * implicit `default` namespace; when every isolated service declares a named
+ * namespace that selection is empty, and starting an empty instance and
+ * reporting it healthy would be a lie. `details.namespaces` lists the
+ * namespaces the stack declares so an agent can retry with `-n` without a
+ * second round-trip.
+ */
+class NoServicesSelectedError extends Error {
+  readonly code = "NO_SERVICES_SELECTED" as const;
+  readonly details: {
+    readonly worktree_id: string;
+    readonly selected_namespaces: ReadonlyArray<string>;
+    readonly namespaces: ReadonlyArray<string>;
+  };
+  constructor(worktreeId: string, available: ReadonlyArray<string>) {
+    const example = available[0] ?? "<ns>";
+    super(
+      `devtrees up: no services selected (NO_SERVICES_SELECTED) for '${worktreeId}'. A bare \`devtrees up\` starts only ` +
+        `the \`${DEFAULT_NAMESPACE}\` namespace (services with no \`namespace:\`), and this stack has none. ` +
+        `Available namespaces: ${available.join(", ")}. ` +
+        `Name the ones to start with -n, e.g. \`devtrees up -n ${example}\` ` +
+        `(repeat -n for several).`,
+    );
+    this.name = "NoServicesSelectedError";
+    this.details = {
+      worktree_id: worktreeId,
+      selected_namespaces: [DEFAULT_NAMESPACE],
+      namespaces: available,
+    };
+  }
+}
+
+/**
+ * The namespace selection a **fresh** start applies (issue #176, ADR-0008).
+ * Namespaces are opt-in: with no `-n`, only the implicit `default` namespace
+ * starts; `-n` is exact and forwarded verbatim (it never implies `default`).
+ * The returned `namespaces` is never empty, so the worktree up-spawn always
+ * passes `-n` and process-compose never falls back to "every namespace".
+ *
+ * Throws `NoServicesSelectedError` when a bare selection resolves to zero
+ * isolated services. Only isolated services are counted: namespace selection
+ * applies to this worktree's instance only (shared services cannot declare a
+ * namespace, #130). An explicit `-n` naming an empty namespace is deliberately
+ * NOT an error here — ADR-0008 left that case open.
+ *
+ * Not used on the running-instance path: what a bare `up` targets there is
+ * #177's to define.
+ */
+function resolveFreshSelection(
+  stack: ResolvedStack,
+  worktreeId: string,
+  requested: ReadonlyArray<string> | undefined,
+): { readonly namespaces: ReadonlyArray<string>; readonly services: ResolvedService[] } {
+  const bare = requested === undefined || requested.length === 0;
+  const namespaces = bare ? [DEFAULT_NAMESPACE] : requested;
+  const isolated = stack.services.filter((s) => s.tier === "isolated");
+  const services = isolated.filter((s) => namespaceSelected(s, namespaces));
+  if (bare && services.length === 0 && isolated.length > 0) {
+    throw new NoServicesSelectedError(worktreeId, declaredNamespaces(isolated));
+  }
+  return { namespaces, services };
+}
+
+/** Distinct namespaces the given services declare, sorted, `default` included when used. */
+function declaredNamespaces(services: ReadonlyArray<ResolvedService>): string[] {
+  return [...new Set(services.map((s) => s.namespace ?? DEFAULT_NAMESPACE))].sort();
+}
+
+/**
  * Compare this worktree's shared subset against the persisted identity of
  * the running shared instance; throw `SharedDriftError` on mismatch. The
  * hash is order-insensitive (`sharedStackHash`), so pure reordering in
@@ -516,8 +586,10 @@ export interface CommandDeps {
    * process-compose namespaces to start (issue #128) — the `-n/--namespace`
    * selection. Forwarded verbatim to the worktree up-spawn AND used to narrow
    * the worktree health-wait's expected set, so `up -n default` neither spawns
-   * nor waits on a probed service in an excluded namespace. Empty / omitted
-   * starts every namespace (process-compose's default — unchanged behaviour).
+   * nor waits on a probed service in an excluded namespace. Exact: `-n app`
+   * does not imply `default`. Empty / omitted on a fresh start selects only
+   * the `default` namespace (namespaces are opt-in, issue #176 / ADR-0008),
+   * and fails with `NO_SERVICES_SELECTED` if that selects nothing.
    */
   readonly namespaces?: ReadonlyArray<string>;
   /**
@@ -598,6 +670,19 @@ export interface DryRunResult {
    * than a documented design decision (issue #168).
    */
   readonly droppedEdges: ReadonlyArray<DroppedEdge>;
+  /**
+   * The namespace selection a fresh `up` with the same flags would pass to
+   * process-compose (issue #176): the `-n` values verbatim, or `["default"]`
+   * for a bare `up` (namespaces are opt-in, ADR-0008).
+   */
+  readonly namespaces: ReadonlyArray<string>;
+  /**
+   * The isolated services that selection starts, in declaration order — the
+   * set a real fresh `up` would spawn and health-wait on. `config` still
+   * carries every service: the selection is applied by process-compose's
+   * `-n` at launch, not by removing services from the derived config.
+   */
+  readonly selectedServices: ReadonlyArray<string>;
 }
 
 export interface DownOptions {
@@ -914,6 +999,15 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     // here so this up falls through to the fresh-start path.
     const ownInstanceLive = await socketIsLive(paths.socketPath, seams.probe);
 
+    // Fresh-start namespace selection (issue #176, ADR-0008): resolved here,
+    // before any start-side effect (shared lazy-start, config write, spawn),
+    // so a bare `up` that would select nothing fails with
+    // NO_SERVICES_SELECTED without touching anything. `undefined` on the
+    // running-instance path, whose bare-`up` target is #177's to define.
+    const freshSelection = ownInstanceLive
+      ? undefined
+      : resolveFreshSelection(stack, anchor.worktreeId, deps.namespaces);
+
     // Pre-flight stale-port-block check (issue #58). Self-gates on the
     // own-instance-live flag so the idempotent re-up path skips the probe
     // (those listeners ARE our own); on the first-up path, any listener on a
@@ -983,7 +1077,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     // the one stored from the previous successful `up`:
     //   - match  -> noop, re-emit the envelope (no driver.up, no registry write)
     //   - drift  -> attempt hot-reload via the driver; map failure to CONFIG_DRIFT.
-    if (ownInstanceLive) {
+    if (freshSelection === undefined) {
       const result = await reconcileRunning({
         stack,
         anchor,
@@ -1031,7 +1125,9 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
       });
     }
 
-    await driver.up(inst, deps.namespaces ?? []);
+    // Always a non-empty selection: a bare fresh `up` passes `-n default`, so
+    // process-compose never falls back to starting every namespace (#176).
+    await driver.up(inst, freshSelection.namespaces);
 
     // `driver.up` is fire-and-forget: spawn returns before the child binds the
     // UDS. Hold the lifecycle lock until the socket is observable so the next
@@ -1050,7 +1146,12 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     // the instance was just started from (issue #31 bookkeeping, #91 timing).
     writeHash(anchor.anchor, anchor.worktreeId, stackHash(stack));
 
-    return { kind: "started", env: derived.env, sharedStarted } as const;
+    return {
+      kind: "started",
+      env: derived.env,
+      sharedStarted,
+      selected: freshSelection.services,
+    } as const;
   });
 
   if (outcome.kind === "reconciled") return outcome.result;
@@ -1083,7 +1184,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
   // Headless paths (`--json` / `--no-attach`): no TUI to render progress, so the
   // silent health-wait is what turns "up returned" into "the stack is serving
   // traffic" (PRD #26, ADR-0005), and HEALTH_TIMEOUT surfaces a stuck start.
-  await waitForWorktreeHealth(stack, paths.socketPath, deps, driver);
+  await waitForWorktreeHealth(outcome.selected, paths.socketPath, deps, driver);
 
   // After the health-wait, snapshot the per-service runtime rows so the
   // issue-#30 `up --json` envelope can publish them without a follow-up
@@ -1177,6 +1278,10 @@ export async function runUpDryRun(deps: CommandDeps = {}): Promise<DryRunResult>
   const isPortFree = deps.isPortFree ?? defaultIsPortFree;
 
   const stack = readStack(anchor.worktreeRoot);
+  // Preview the fresh-start selection (issue #176): same namespaces, same
+  // NO_SERVICES_SELECTED failure a real fresh `up` would hit — checked before
+  // the registry is touched, so a failing preview has no side effect at all.
+  const selection = resolveFreshSelection(stack, anchor.worktreeId, deps.namespaces);
   const options = resolveAllocatorOptions(stack, deps.allocator ?? DEFAULT_ALLOCATOR);
   const sharedNeeded = hasTier(stack, "shared");
 
@@ -1204,6 +1309,8 @@ export async function runUpDryRun(deps: CommandDeps = {}): Promise<DryRunResult>
     env: derivedWt.env,
     config: derivedWt.config,
     droppedEdges: derivedWt.droppedEdges,
+    namespaces: selection.namespaces,
+    selectedServices: selection.services.map((s) => s.name),
   };
 
   if (!sharedNeeded) return base;
@@ -2434,20 +2541,17 @@ function defaultIsTTY(): boolean {
  * ADR-0005 choice so the agent can inspect logs after the timeout.
  */
 async function waitForWorktreeHealth(
-  stack: ResolvedStack,
+  isolated: ReadonlyArray<ResolvedService>,
   socketPath: string,
   deps: CommandDeps,
   driver: { getServiceStatuses(socketPath: string): Promise<ServiceStatus[]> },
 ): Promise<void> {
   const wait = deps.waitForHealth ?? createWaitForHealth(driver);
-  // Narrow the expected set to the services process-compose actually started:
-  // the isolated tier, intersected with the selected namespaces (issue #128).
-  // Without the namespace narrowing, `up -n default` would wait on a probed
-  // service in an excluded namespace process-compose never started and
-  // HEALTH_TIMEOUT (the critical #108 interaction).
-  const isolated = stack.services.filter(
-    (s) => s.tier === "isolated" && namespaceSelected(s, deps.namespaces),
-  );
+  // `isolated` is the fresh selection (`resolveFreshSelection`): the isolated
+  // tier intersected with the selected namespaces (issue #128) — `default`
+  // alone on a bare `up` (#176). Without the namespace narrowing, `up -n
+  // default` would wait on a probed service in an excluded namespace
+  // process-compose never started and HEALTH_TIMEOUT (the #108 interaction).
   await wait({
     socketPath,
     serviceNames: isolated.map((s) => s.name),
@@ -2464,18 +2568,14 @@ async function waitForWorktreeHealth(
 const DEFAULT_NAMESPACE = "default";
 
 /**
- * Is this service part of the selected namespace set (issue #128)? An empty /
- * absent selection means "all namespaces" (process-compose's default), so
- * everything is selected. Otherwise a service is selected iff its namespace —
- * the implicit `default` when unlabelled — is among the requested values. This
- * mirrors what process-compose's `-n` actually starts, so the health-wait
- * expects exactly the running set.
+ * Is this service part of the selected namespace set (issue #128)? A service
+ * is selected iff its namespace — the implicit `default` when unlabelled — is
+ * among the selected values. This mirrors what process-compose's `-n`
+ * actually starts, so the health-wait expects exactly the running set. The
+ * caller resolves a bare `up` to `["default"]` first (`resolveFreshSelection`,
+ * #176), so there is no "empty means all" case here.
  */
-function namespaceSelected(
-  service: ResolvedService,
-  namespaces: ReadonlyArray<string> | undefined,
-): boolean {
-  if (namespaces === undefined || namespaces.length === 0) return true;
+function namespaceSelected(service: ResolvedService, namespaces: ReadonlyArray<string>): boolean {
   return namespaces.includes(service.namespace ?? DEFAULT_NAMESPACE);
 }
 

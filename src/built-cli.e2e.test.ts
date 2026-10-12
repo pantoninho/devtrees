@@ -221,6 +221,31 @@ function setupNamespaceScenario(prefix: string): Scenario {
 }
 
 /**
+ * Every isolated service namespaced (#176): nothing is in `default`, so a bare
+ * fresh `up` selects zero services and must fail NO_SERVICES_SELECTED rather
+ * than start an empty instance and report it healthy.
+ */
+function setupAllNamespacedScenario(prefix: string): Scenario {
+  return setupRepoWithStack(
+    prefix,
+    [
+      "services:",
+      "  web:",
+      "    tier: isolated",
+      "    namespace: app",
+      '    command: "sleep 300"',
+      "    ports: [WEB_PORT]",
+      "  api:",
+      "    tier: isolated",
+      "    namespace: local-backend",
+      '    command: "sleep 300"',
+      "    ports: [API_PORT]",
+      "",
+    ].join("\n"),
+  );
+}
+
+/**
  * The shared scaffold both built-CLI scenarios sit on: a fresh tmp git repo
  * with one `login` worktree carrying the given `devtrees.yaml` body. Registers
  * the rm + worktree `down` cleanups (callers add `down --shared` when their
@@ -296,7 +321,11 @@ interface ErrorDoc {
   readonly error?: {
     readonly code?: string;
     readonly message?: string;
-    readonly details?: { readonly service?: string; readonly valid_services?: string[] };
+    readonly details?: {
+      readonly service?: string;
+      readonly valid_services?: string[];
+      readonly namespaces?: string[];
+    };
   };
 }
 
@@ -756,6 +785,61 @@ describe("built CLI e2e — argv→commands wiring over the stub process-compose
       ?.services.map((s) => s.name)
       .sort();
     expect(names).toEqual(["web"]);
+  }, 60_000);
+
+  it("a bare fresh up starts only the default namespace (namespaces are opt-in, #176)", () => {
+    const { wt, id } = setupNamespaceScenario("dt-bcns0-");
+
+    // The probed `api` is in `local-backend`: a bare `up` must neither start
+    // nor wait on it, so the short wait-timeout cannot lapse on it.
+    const up = devtrees(wt, ["up", "--json", "--wait-timeout", "10"]);
+    expect(up.code, `bare up failed: stderr=${up.stderr} stdout=${up.stdout}`).toBe(0);
+    expect((up.doc as UpDoc).up.services.map((s) => s.name)).toEqual(["web"]);
+
+    const names = (devtrees(wt, ["ls", "--json"]).doc as LsDoc).ls.instances
+      .find((i) => i.id === id)
+      ?.services.map((s) => s.name)
+      .sort();
+    expect(names).toEqual(["web"]);
+  }, 60_000);
+
+  it("a bare fresh up with no default services fails NO_SERVICES_SELECTED, human and --json (#176)", () => {
+    const { wt, sock } = setupAllNamespacedScenario("dt-bcns3-");
+
+    const json = devtrees(wt, ["up", "--json"]);
+    expect(json.code).not.toBe(0);
+    const err = (json.doc as ErrorDoc).error;
+    expect(err?.code).toBe("NO_SERVICES_SELECTED");
+    expect(err?.details?.namespaces).toEqual(["app", "local-backend"]);
+    expect(err?.message).toContain("devtrees up -n app");
+
+    const human = devtrees(wt, ["up", "--no-attach"]);
+    expect(human.code).not.toBe(0);
+    expect(human.stderr).toContain("NO_SERVICES_SELECTED");
+    expect(human.stderr).toContain("Available namespaces: app, local-backend");
+
+    // Nothing was started.
+    expect(existsSync(sock)).toBe(false);
+  }, 60_000);
+
+  it("up --dry-run previews the same selection and the same NO_SERVICES_SELECTED failure (#176)", () => {
+    const mixed = setupNamespaceScenario("dt-bcns4-");
+    const dry = devtrees(mixed.wt, ["up", "--dry-run", "--json"]);
+    expect(dry.code, `dry-run failed: ${dry.stderr}`).toBe(0);
+    const preview = (dry.doc as { up_dry_run: Record<string, unknown> }).up_dry_run;
+    expect(preview.namespaces).toEqual(["default"]);
+    expect(preview.selected_services).toEqual(["web"]);
+
+    const scoped = devtrees(mixed.wt, ["up", "--dry-run", "--json", "-n", "local-backend"]);
+    const scopedPreview = (scoped.doc as { up_dry_run: Record<string, unknown> }).up_dry_run;
+    expect(scopedPreview.namespaces).toEqual(["local-backend"]);
+    expect(scopedPreview.selected_services).toEqual(["api"]);
+
+    const none = setupAllNamespacedScenario("dt-bcns5-");
+    const failed = devtrees(none.wt, ["up", "--dry-run", "--json"]);
+    expect(failed.code).not.toBe(0);
+    expect((failed.doc as ErrorDoc).error?.code).toBe("NO_SERVICES_SELECTED");
+    expect(existsSync(none.sock)).toBe(false);
   }, 60_000);
 
   it("up -n local-backend starts only that namespace and still gates on its probed service (#128)", () => {

@@ -126,6 +126,7 @@ describe("devtrees CLI", () => {
         "SHARED_DRIFT",
         "SHARED_START_FAILED",
         "WORKTREE_START_FAILED",
+        "NO_SERVICES_SELECTED",
         "SOCKET_PATH_TOO_LONG",
         "CONFIG_INVALID",
         "LOCK_CONTENTION",
@@ -160,6 +161,7 @@ describe("devtrees CLI", () => {
     "SHARED_DRIFT",
     "SHARED_START_FAILED",
     "WORKTREE_START_FAILED",
+    "NO_SERVICES_SELECTED",
     "SOCKET_PATH_TOO_LONG",
     "STALE_PORT_BLOCK",
     "LOCK_CONTENTION",
@@ -1228,6 +1230,79 @@ describe("devtrees CLI — up --dry-run (#124)", () => {
     expect(help).toMatch(/--dry-run/);
     expect(help).toMatch(/CONFIG_INVALID/);
     expect(help).toMatch(/LOCK_CONTENTION/);
+  });
+
+  /**
+   * Issue #176: namespaces are opt-in, and `--dry-run` previews the same
+   * selection (and the same NO_SERVICES_SELECTED failure) a fresh `up` hits.
+   */
+  describe("namespace selection (#176)", () => {
+    const withSelection = { ...dryResult, namespaces: ["default"], selectedServices: ["web"] };
+
+    it("forwards -n values to upDryRun verbatim; omits them when absent", async () => {
+      const upDryRun = vi.fn().mockResolvedValue(withSelection);
+      await execute(["up", "--dry-run", "-n", "app", "-n", "default"], {
+        up: vi.fn(),
+        down: vi.fn(),
+        upDryRun,
+      });
+      expect(upDryRun).toHaveBeenCalledWith({ namespaces: ["app", "default"] });
+      upDryRun.mockClear();
+      await execute(["up", "--dry-run"], { up: vi.fn(), down: vi.fn(), upDryRun });
+      expect(upDryRun).toHaveBeenCalledWith({});
+    });
+
+    it("--json carries namespaces + selected_services; stderr stays silent", async () => {
+      const result = await execute(["up", "--dry-run", "--json"], {
+        up: vi.fn(),
+        down: vi.fn(),
+        upDryRun: vi.fn().mockResolvedValue(withSelection),
+      });
+      expect(result.stderr).toBe("");
+      const parsed = JSON.parse(result.stdout) as { up_dry_run: Record<string, unknown> };
+      expect(parsed.up_dry_run.namespaces).toEqual(["default"]);
+      expect(parsed.up_dry_run.selected_services).toEqual(["web"]);
+    });
+
+    it("human mode names the selection on stderr and leaves stdout the YAML alone", async () => {
+      const result = await execute(["up", "--dry-run"], {
+        up: vi.fn(),
+        down: vi.fn(),
+        upDryRun: vi.fn().mockResolvedValue(withSelection),
+      });
+      expect(result.stderr).toContain("up would start namespace(s) [default]: web");
+      expect(result.stdout).not.toContain("would start");
+    });
+
+    const noneSelected = Object.assign(new Error("devtrees up: no services selected"), {
+      code: "NO_SERVICES_SELECTED" as const,
+      details: { worktree_id: "login", selected_namespaces: ["default"], namespaces: ["app"] },
+    });
+
+    it("routes NO_SERVICES_SELECTED through the --json error envelope with its details", async () => {
+      for (const argv of [
+        ["up", "--json"],
+        ["up", "--dry-run", "--json"],
+      ]) {
+        const result = await execute(argv, {
+          up: vi.fn().mockRejectedValue(noneSelected),
+          down: vi.fn(),
+          upDryRun: vi.fn().mockRejectedValue(noneSelected),
+        });
+        expect(result.code).toBe(1);
+        const parsed = JSON.parse(result.stdout) as {
+          error: { code: string; details: Record<string, unknown> };
+        };
+        expect(parsed.error.code).toBe("NO_SERVICES_SELECTED");
+        expect(parsed.error.details.namespaces).toEqual(["app"]);
+      }
+    });
+
+    it("`devtrees up --help` documents opt-in namespaces and NO_SERVICES_SELECTED", async () => {
+      const help = (await run(["up", "--help"])).stdout;
+      expect(help).toContain("NO_SERVICES_SELECTED");
+      expect(help).toMatch(/does not imply\s+`?default/);
+    });
   });
 
   /**

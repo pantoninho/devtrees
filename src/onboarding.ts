@@ -82,6 +82,7 @@ Branch on \`error.code\`:
 | \`SHARED_DRIFT\`              | This worktree's shared services diverge from the running shared instance. Follow the message: \`devtrees down --shared && devtrees up\`. |
 | \`CONFIG_DRIFT\`              | The running config differs from \`devtrees.yaml\` and hot-reload failed. Follow the message — usually \`devtrees down && devtrees up\`. |
 | \`SERVICE_NOT_FOUND\`         | You named a service that isn't in the instance. \`details.valid_services\` lists the real names; pick one. |
+| \`NO_SERVICES_SELECTED\`      | A bare \`up\` starts only services with no \`namespace:\`, and there are none. \`details.namespaces\` lists the namespaces; retry with \`devtrees up -n <ns>\`. |
 | \`INSTANCE_NOT_FOUND\`        | No instance is running for this worktree. Run \`devtrees up\` first.                            |
 | \`PROCESS_COMPOSE_NOT_FOUND\` | The \`process-compose\` binary is missing. **Surface this to the human** — it's an environment setup gap you can't fix.   |
 | \`PROCESS_COMPOSE_TOO_OLD\`   | The installed \`process-compose\` is below the minimum (v1.122.0). **Surface this to the human** — they need to upgrade it. |
