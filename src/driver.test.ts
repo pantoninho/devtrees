@@ -3,7 +3,6 @@ import { EventEmitter } from "node:events";
 import { Readable } from "node:stream";
 import {
   MissingProcessComposeError,
-  ProcessComposeTooOldError,
   isAtLeastVersion,
   parseProcessComposeVersion,
   buildUpArgs,
@@ -507,19 +506,24 @@ describe("process-compose minimum version (#173)", () => {
       exists: async () => true,
       spawner: versionSpawner("v1.110.0\n"),
     });
-    const err = await driver.assertSupportedVersion().catch((e: unknown) => e);
-    expect(err).toBeInstanceOf(ProcessComposeTooOldError);
-    const e = err as ProcessComposeTooOldError;
-    expect(e.code).toBe("PROCESS_COMPOSE_TOO_OLD");
-    expect(e.message).toContain("v1.110.0");
-    expect(e.message).toContain("v1.122.0");
-    expect(e.details).toMatchObject({ installed_version: "1.110.0", minimum_version: "1.122.0" });
+    const err = (await driver.assertSupportedVersion().catch((e: unknown) => e)) as Error;
+    expect(err).toMatchObject({
+      name: "ProcessComposeTooOldError",
+      code: "PROCESS_COMPOSE_TOO_OLD",
+      details: { installed_version: "1.110.0", minimum_version: "1.122.0" },
+    });
+    expect(err.message).toContain("v1.110.0");
+    expect(err.message).toContain("v1.122.0");
   });
 
   it("treats unparseable output as an undeterminable version", async () => {
     const driver = createDriver({ exists: async () => true, spawner: versionSpawner("???") });
     const err = (await driver.assertSupportedVersion().catch((e: unknown) => e)) as Error;
-    expect(err).toBeInstanceOf(ProcessComposeTooOldError);
+    expect(err).toMatchObject({
+      name: "ProcessComposeTooOldError",
+      code: "PROCESS_COMPOSE_TOO_OLD",
+      details: { installed_version: null },
+    });
     expect(err.message).toContain("could not determine");
   });
 

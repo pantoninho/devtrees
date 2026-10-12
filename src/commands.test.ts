@@ -42,7 +42,7 @@ import { withLifecycleLock } from "./registry.js";
 import { deriveWorktreeId } from "./anchor.js";
 import { deriveSharedConfig, deriveWorktreeConfig, type DerivedConfig } from "./deriver.js";
 import type { RegistrySnapshot } from "./allocator.js";
-import { ProcessComposeTooOldError, type LogEvent, type SpawnedProcess } from "./driver.js";
+import type { LogEvent, SpawnedProcess } from "./driver.js";
 import {
   SHARED_REGISTRY_KEY,
   SOCKET_PATH_MAX_BYTES,
@@ -317,7 +317,7 @@ describe("runUp — minimum process-compose version (#173)", () => {
       ...stubDeps({ stack, track }),
       assertProcessComposeVersion: async () => {
         probed += 1;
-        throw new ProcessComposeTooOldError("1.110.0");
+        throw Object.assign(new Error("too old"), { code: "PROCESS_COMPOSE_TOO_OLD" });
       },
     };
     await expect(runUp(deps)).rejects.toMatchObject({ code: "PROCESS_COMPOSE_TOO_OLD" });

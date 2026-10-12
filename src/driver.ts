@@ -33,12 +33,12 @@ export class MissingProcessComposeError extends Error {
  * that accepts a list-valued `namespace` (issue #173), which namespace
  * selection builds on.
  */
-export const MIN_PROCESS_COMPOSE_VERSION = "1.122.0";
+const MIN_PROCESS_COMPOSE_VERSION = "1.122.0";
 
 const PROCESS_COMPOSE_UPGRADE_URL = "https://f1bonacc1.github.io/process-compose/installation/";
 
 /** Raised when the installed process-compose is older than the supported minimum. */
-export class ProcessComposeTooOldError extends Error {
+class ProcessComposeTooOldError extends Error {
   readonly code = "PROCESS_COMPOSE_TOO_OLD" as const;
   readonly details: {
     readonly installed_version: string | null;
