@@ -1471,7 +1471,7 @@ describe("devtrees CLI — down/prune --json envelopes (#48)", () => {
       down: Record<string, unknown>;
     };
     expect(parsed.schema_version).toBeDefined();
-    expect(parsed.down).toEqual({ worktreeId: "login", stopped: true });
+    expect(parsed.down).toEqual({ worktreeId: "login", stopped: true, force_killed: [] });
     expect(parsed.down).not.toHaveProperty("shared");
     expect(parsed.down).not.toHaveProperty("env");
     expect(parsed.down).not.toHaveProperty("services");
@@ -1485,7 +1485,7 @@ describe("devtrees CLI — down/prune --json envelopes (#48)", () => {
     const parsed = JSON.parse(result.stdout) as {
       down: Record<string, unknown>;
     };
-    expect(parsed.down).toEqual({ shared: true, stopped: true });
+    expect(parsed.down).toEqual({ shared: true, stopped: true, force_killed: [] });
     expect(parsed.down).not.toHaveProperty("worktreeId");
     expect(parsed.down).not.toHaveProperty("env");
     expect(parsed.down).not.toHaveProperty("services");
@@ -1498,7 +1498,7 @@ describe("devtrees CLI — down/prune --json envelopes (#48)", () => {
     expect(result.code).toBe(0);
     expect(result.stderr).toBe("");
     const parsed = JSON.parse(result.stdout) as { down: Record<string, unknown> };
-    expect(parsed.down).toEqual({ worktreeId: "login", stopped: false });
+    expect(parsed.down).toEqual({ worktreeId: "login", stopped: false, force_killed: [] });
   });
 
   it("`down` no-op (nothing running) exits 0 with the idempotent human notice (#92)", async () => {
@@ -1550,6 +1550,7 @@ describe("devtrees CLI — down/prune --json envelopes (#48)", () => {
       id: "removed",
       kind: "worktree",
       worktreePath: "/abs/path/.../devtrees-example-removed",
+      force_killed: [],
     });
   });
 

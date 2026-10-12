@@ -225,10 +225,15 @@ interface CliResult {
 }
 
 /** Invoke the built CLI from inside a worktree. Captures stdout/stderr. */
-function devtrees(cwd: string, args: ReadonlyArray<string>): CliResult {
+function devtrees(
+  cwd: string,
+  args: ReadonlyArray<string>,
+  env: Readonly<Record<string, string>> = {},
+): CliResult {
   const out = spawnSync(process.execPath, [CLI, ...args], {
     cwd,
     encoding: "utf8",
+    env: { ...process.env, ...env },
     // Be defensive: cap wall time per CLI call so a hung process-compose
     // shows up as a test failure rather than a vitest timeout.
     timeout: 60_000,
@@ -662,7 +667,7 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
     expect(downShared.code).toBe(0);
     expect(downShared.doc).toEqual({
       schema_version: "1",
-      down: { shared: true, stopped: true },
+      down: { shared: true, stopped: true, force_killed: [] },
     });
 
     const second = up(wt);
@@ -744,7 +749,7 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
     expect(down.code).toBe(0);
     expect(normaliseEnvelope(down.doc, wtId(wt))).toEqual({
       schema_version: "1",
-      down: { worktreeId: "<WT>", stopped: false },
+      down: { worktreeId: "<WT>", stopped: false, force_killed: [] },
     });
   }, 90_000);
 
@@ -977,7 +982,8 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
     const wt = repo.worktrees.login!;
     const [holdA, holdB] = [join(repo.root, "hold-a"), join(repo.root, "hold-b")];
     writeReloadStack(wt, { hold: holdA, shutdownCommand: "echo bye" });
-    // `devtrees down` would block on the same never-stopping process, so tear
+    // `devtrees down` cannot force-kill the old process (process-compose no
+    // longer lists it) and would fail DOWN_TIMEOUT after its budget, so tear
     // down by killing everything this scenario spawned.
     cleanupStack.push(() => reapPids(pidsMatching(repo.root)));
 
@@ -1393,6 +1399,88 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
     expect(await waitForNoPids(holdApiA!, 10_000), "old api should be stopped").toEqual([]);
     // The unchanged service was not restarted: the same process still runs.
     expect(pidsMatching(holdWeb!)).toEqual(webPids);
+  }, 120_000);
+
+  // Issue #190: process-compose v1.122.0 never escalates to SIGKILL for these
+  // two shapes, so its `down` (and `devtrees down`) used to block forever.
+  // The base budget is shrunk to 3s through the test seam so each scenario
+  // stays fast; `shutdown.timeout_seconds` still adds on top.
+  const STOP_BUDGET_ENV = { DEVTREES_DOWN_BASE_TIMEOUT_MS: "3000" };
+
+  /**
+   * Bring up `web` (the stuck service, `webLines`) next to `api`, a service
+   * that stops normally, then `down --json` and check the bounded stop:
+   * within budget, only `web` force-killed, nothing left behind.
+   */
+  async function expectBoundedDown(prefix: string, webLines: (root: string) => string[]) {
+    const repo = buildSmokeRepo(prefix, ["login"]);
+    currentCtx = { pidNeedle: repo.root, root: repo.root };
+    const wt = repo.worktrees.login!;
+    const api = sleeper(repo.root, "api");
+    writeFileSync(
+      join(wt, "devtrees.yaml"),
+      [
+        "services:",
+        ...webLines(repo.root),
+        "  api:",
+        "    tier: isolated",
+        `    command: "python3 ${api}"`,
+        "",
+      ].join("\n"),
+    );
+    // If the bound regressed, `down` would hang: kill what we started.
+    cleanupStack.push(() => reapPids(pidsMatching(repo.root)));
+
+    expect(up(wt).code).toBe(0);
+    const needle = join(repo.root, "web");
+    expect(await waitForPid(needle, 10_000), "web should be running").toBe(true);
+    expect(await waitForPid(api, 10_000), "api should be running").toBe(true);
+    const webPids = pidsMatching(needle);
+    const commonDir = execGit(wt, ["rev-parse", "--git-common-dir"]);
+    const absCommon = commonDir.startsWith("/") ? commonDir : join(wt, commonDir);
+    const socketPath = instancePaths(absCommon, wtId(wt)).socketPath;
+    expect(existsSync(socketPath)).toBe(true);
+
+    const started = Date.now();
+    const down = devtrees(wt, ["down", "--json"], STOP_BUDGET_ENV);
+    const elapsed = Date.now() - started;
+    expect(down.code, `down should finish, not hang: ${down.stderr}`).toBe(0);
+    const doc = down.doc as { down: { stopped: boolean; force_killed: unknown[] } };
+    expect(doc.down.stopped).toBe(true);
+    expect(doc.down.force_killed).toHaveLength(1);
+    expect(doc.down.force_killed[0]).toMatchObject({ service: "web" });
+    expect(webPids).toContain((doc.down.force_killed[0] as { pid: number }).pid);
+    // Budget (3s + timeouts) plus the grace and process-compose's own work.
+    expect(elapsed).toBeLessThan(30_000);
+    expect(await waitForNoPids(repo.root, 10_000), "nothing should survive down").toEqual([]);
+    expect(orphanedServices(repo.root)).toEqual([]);
+    expect(existsSync(socketPath)).toBe(false);
+  }
+
+  it("scenario 50: a shutdown.command that does not stop its service no longer hangs down (#190)", async () => {
+    await expectBoundedDown("dt-rpc50-", (root) => {
+      const hold = join(root, "web");
+      writeFileSync(hold, "");
+      return [
+        "  web:",
+        "    tier: isolated",
+        `    command: "tail -f ${hold}"`,
+        "    shutdown:",
+        '      command: "echo bye"',
+        "      timeout_seconds: 1",
+      ];
+    });
+  }, 120_000);
+
+  it("scenario 51: a SIGTERM-ignoring service with no shutdown timeout no longer hangs down (#190)", async () => {
+    await expectBoundedDown("dt-rpc51-", (root) => {
+      const script = join(root, "web.py");
+      writeFileSync(
+        script,
+        "import signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(300)\n",
+      );
+      return ["  web:", "    tier: isolated", `    command: "python3 ${script}"`];
+    });
   }, 120_000);
 });
 

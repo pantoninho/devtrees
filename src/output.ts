@@ -36,6 +36,7 @@ export const ERROR_CODES = [
   "PROCESS_COMPOSE_TOO_OLD",
   "INSTANCE_NOT_FOUND",
   "INSTANCE_UNRESPONSIVE",
+  "DOWN_TIMEOUT",
   "SERVICE_NOT_FOUND",
   "HEALTH_TIMEOUT",
   "NAMESPACE_NOT_RUNNING",
@@ -74,6 +75,8 @@ export const ERROR_CODE_DESCRIPTIONS: Readonly<Record<ErrorCode, string>> = {
   INSTANCE_NOT_FOUND: "No worktree (or shared) instance is running for this anchor.",
   INSTANCE_UNRESPONSIVE:
     "The instance's control socket exists but did not answer repeated probes (process-compose busy or frozen); nothing was started or stopped, the socket was kept, `details.remedy` says what to do.",
+  DOWN_TIMEOUT:
+    "The stop did not finish within its budget and process-compose was still running after devtrees force-killed the stuck services; the socket and config were kept, `details` names the stuck services, their pids and the process-compose pid, `details.remedy` says what to do.",
   SERVICE_NOT_FOUND:
     "The named service does not exist in the target instance; `details.valid_services` lists the known ones.",
   HEALTH_TIMEOUT:
@@ -249,6 +252,34 @@ export interface PrunedRow {
    * sole non-identity field per #48.
    */
   readonly worktreePath: string;
+  /**
+   * Service processes devtrees had to SIGKILL to stop the orphan (#190).
+   * JSON mode always emits `force_killed` (possibly empty).
+   */
+  readonly forceKilled?: ReadonlyArray<ForceKilledRow>;
+}
+
+/** A service process devtrees had to SIGKILL to finish a stop (issue #190). */
+export interface ForceKilledRow {
+  readonly service: string;
+  readonly pid: number;
+}
+
+/**
+ * The human stderr line for a stop that needed force (issue #190). Empty when
+ * nothing was killed.
+ */
+function formatForceKilledStderr(
+  command: string,
+  what: string,
+  killed: ReadonlyArray<ForceKilledRow>,
+): string {
+  if (killed.length === 0) return "";
+  const list = killed.map((k) => `${k.service} (pid ${k.pid})`).join(", ");
+  return (
+    `devtrees ${command}: WARNING — ${what} did not stop within its budget; devtrees ` +
+    `force-killed (SIGKILL) ${list} so process-compose could finish shutting down.\n`
+  );
 }
 
 /**
@@ -298,16 +329,25 @@ export interface UnreclaimedRow {
   readonly worktreePath: string;
   readonly socketPath: string;
   readonly message: string;
+  /** Service processes devtrees SIGKILLed before the stop timed out (#190). */
+  readonly forceKilled?: ReadonlyArray<ForceKilledRow>;
 }
 
 function formatUnreclaimedStderr(u: UnreclaimedRow): string {
   const where = u.worktreePath !== "" ? ` (was at ${u.worktreePath})` : "";
   return (
-    `devtrees: WARNING — orphan '${u.id}'${where} was NOT reclaimed: its process-compose did ` +
-    `not answer and \`process-compose down\` failed (${u.message}). Its socket and state were ` +
+    `devtrees: WARNING — orphan '${u.id}'${where} was NOT reclaimed: its process-compose could ` +
+    `not be stopped (${u.message}). Its socket and state were ` +
     `kept. Find the holder with \`lsof -U -a ${u.socketPath}\`, stop it, then run ` +
     `\`devtrees prune\` again.\n`
   );
+}
+
+/** JSON shape for `force_killed` (#190): always an array, possibly empty. */
+function forceKilledJson(
+  killed: ReadonlyArray<ForceKilledRow> | undefined,
+): Array<{ service: string; pid: number }> {
+  return (killed ?? []).map((k) => ({ service: k.service, pid: k.pid }));
 }
 
 /** JSON shape for a reap warning — flat identity + failures, no wrapper. */
@@ -356,6 +396,8 @@ export function formatPrune(
           id: p.id,
           kind: p.kind,
           worktreePath: p.worktreePath,
+          // Issue #190: service processes force-killed to stop the orphan.
+          force_killed: forceKilledJson(p.forceKilled),
         })),
         // Issue #148: a failed shutdown-hook reap is reflected here so an agent
         // does not read a clean teardown when out-of-band resources may survive.
@@ -367,6 +409,7 @@ export function formatPrune(
           worktreePath: u.worktreePath,
           socketPath: u.socketPath,
           message: u.message,
+          force_killed: forceKilledJson(u.forceKilled),
         })),
       },
     };
@@ -375,6 +418,9 @@ export function formatPrune(
     return { stdout: `${JSON.stringify(doc)}\n`, stderr: "" };
   }
   const stderr =
+    pruned
+      .map((p) => formatForceKilledStderr("prune", `orphan '${p.id}'`, p.forceKilled ?? []))
+      .join("") +
     warnings.map(formatReapWarningStderr).join("") +
     unreclaimed.map(formatUnreclaimedStderr).join("");
   return { stdout: formatPruneHuman(pruned), stderr };
@@ -481,11 +527,19 @@ export function formatUp(payload: UpPayload, mode: FormatMode): OutputResult {
  * `down`; the action envelope does not pre-bake either snapshot.
  */
 export type DownPayload =
-  | { readonly shared: true; readonly worktreeId?: undefined; readonly stopped?: boolean }
+  | {
+      readonly shared: true;
+      readonly worktreeId?: undefined;
+      readonly stopped?: boolean;
+      /** Service processes devtrees had to SIGKILL to finish the stop (#190). */
+      readonly forceKilled?: ReadonlyArray<ForceKilledRow>;
+    }
   | {
       readonly shared?: false;
       readonly worktreeId: string;
       readonly stopped?: boolean;
+      /** Service processes devtrees had to SIGKILL to finish the stop (#190). */
+      readonly forceKilled?: ReadonlyArray<ForceKilledRow>;
       /**
        * Present when the dead-supervisor reap failed for at least one shutdown
        * hook (issue #148) — out-of-band resources may have survived. Human mode
@@ -508,6 +562,10 @@ export type DownPayload =
  *     it defaults to `true` for older callers that don't thread it. No env /
  *     services / block_base — that pre-teardown state belongs to `ls --json`,
  *     called before or after the action.
+ *
+ * Both modes report a stop that needed force (issue #190): JSON always carries
+ * `down.force_killed` (`[{service, pid}]`, empty on a clean stop); human mode
+ * adds a stderr warning naming each killed process.
  */
 export function formatDown(payload: DownPayload, mode: FormatMode): OutputResult {
   const shared = payload.shared === true;
@@ -516,9 +574,10 @@ export function formatDown(payload: DownPayload, mode: FormatMode): OutputResult
   // the anchor, which never disappears — issue #148).
   const warning = !shared ? payload.warning : undefined;
   if (mode === "json") {
+    const forceKilled = forceKilledJson(payload.forceKilled);
     const down: Record<string, unknown> = shared
-      ? { shared: true, stopped }
-      : { worktreeId: payload.worktreeId, stopped };
+      ? { shared: true, stopped, force_killed: forceKilled }
+      : { worktreeId: payload.worktreeId, stopped, force_killed: forceKilled };
     if (warning !== undefined) down.warning = reapWarningJson(warning);
     const doc = { schema_version: SCHEMA_VERSION, down };
     // `--json` stdout stays byte-clean (ADR-0005): the warning is in the envelope.
@@ -531,7 +590,10 @@ export function formatDown(payload: DownPayload, mode: FormatMode): OutputResult
     : stopped
       ? "devtrees down: worktree instance stopped.\n"
       : "devtrees down: no worktree instance running; nothing to do.\n";
-  const stderr = warning !== undefined ? formatReapWarningStderr(warning) : "";
+  const what = shared ? "the shared instance" : "the worktree instance";
+  const stderr =
+    formatForceKilledStderr("down", what, payload.forceKilled ?? []) +
+    (warning !== undefined ? formatReapWarningStderr(warning) : "");
   return { stdout: text, stderr };
 }
 

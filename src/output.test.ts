@@ -817,6 +817,19 @@ describe("output formatter — formatPrune", () => {
     expect(result.stdout).toMatch(/was stale/);
   });
 
+  it("reports an orphan stop that needed force: stderr (human), force_killed (JSON) (#190)", () => {
+    const forced: ReadonlyArray<PrunedRow> = [
+      { ...rows[0]!, forceKilled: [{ service: "web", pid: 4242 }] },
+    ];
+    const human = formatPrune(forced, "human");
+    expect(human.stderr).toContain("orphan 'removed'");
+    expect(human.stderr).toContain("force-killed (SIGKILL) web (pid 4242)");
+    const json = JSON.parse(formatPrune(forced, "json").stdout) as {
+      prune: { pruned: ReadonlyArray<Record<string, unknown>> };
+    };
+    expect(json.prune.pruned[0]?.force_killed).toEqual([{ service: "web", pid: 4242 }]);
+  });
+
   it("in human mode with no orphans, prints the existing 'no orphans' line", () => {
     const result = formatPrune([], "human");
     expect(result.stdout).toMatch(/no orphan/i);
@@ -835,11 +848,13 @@ describe("output formatter — formatPrune", () => {
       id: "removed",
       kind: "worktree",
       worktreePath: "/abs/path/.../devtrees-example-removed",
+      force_killed: [],
     });
     expect(parsed.prune.pruned[1]).toEqual({
       id: "gone",
       kind: "worktree",
       worktreePath: "/abs/path/.../devtrees-example-gone",
+      force_killed: [],
     });
   });
 
@@ -936,7 +951,24 @@ describe("output formatter — formatPrune", () => {
     const json = formatPrune([], "json", [], kept);
     expect(json.stderr).toBe("");
     const parsed = JSON.parse(json.stdout) as { prune: { unreclaimed: unknown[] } };
-    expect(parsed.prune.unreclaimed).toEqual(kept);
+    expect(parsed.prune.unreclaimed).toEqual([{ ...kept[0], force_killed: [] }]);
+  });
+
+  it("carries force_killed on an unreclaimed orphan whose stop timed out (#190)", () => {
+    const kept = [
+      {
+        id: "removed",
+        kind: "worktree" as const,
+        worktreePath: "/gone/removed",
+        socketPath: "/run/removed.sock",
+        message: "DOWN_TIMEOUT",
+        forceKilled: [{ service: "web", pid: 4242 }],
+      },
+    ];
+    const parsed = JSON.parse(formatPrune([], "json", [], kept).stdout) as {
+      prune: { unreclaimed: Array<Record<string, unknown>> };
+    };
+    expect(parsed.prune.unreclaimed[0]?.force_killed).toEqual([{ service: "web", pid: 4242 }]);
   });
 });
 
@@ -969,7 +1001,7 @@ describe("output formatter — formatDown", () => {
       down: Record<string, unknown>;
     };
     expect(parsed.schema_version).toBe(SCHEMA_VERSION);
-    expect(parsed.down).toEqual({ worktreeId: "login", stopped: true });
+    expect(parsed.down).toEqual({ worktreeId: "login", stopped: true, force_killed: [] });
     expect(parsed.down).not.toHaveProperty("shared");
     expect(parsed.down).not.toHaveProperty("env");
     expect(parsed.down).not.toHaveProperty("services");
@@ -984,7 +1016,7 @@ describe("output formatter — formatDown", () => {
       down: Record<string, unknown>;
     };
     expect(parsed.schema_version).toBe(SCHEMA_VERSION);
-    expect(parsed.down).toEqual({ shared: true, stopped: true });
+    expect(parsed.down).toEqual({ shared: true, stopped: true, force_killed: [] });
     expect(parsed.down).not.toHaveProperty("worktreeId");
     expect(parsed.down).not.toHaveProperty("env");
     expect(parsed.down).not.toHaveProperty("services");
@@ -1011,7 +1043,43 @@ describe("output formatter — formatDown", () => {
   it("in JSON mode a no-op down carries stopped: false (#92)", () => {
     const result = formatDown({ worktreeId: "login", stopped: false }, "json");
     const parsed = JSON.parse(result.stdout) as { down: Record<string, unknown> };
-    expect(parsed.down).toEqual({ worktreeId: "login", stopped: false });
+    expect(parsed.down).toEqual({ worktreeId: "login", stopped: false, force_killed: [] });
+  });
+
+  /**
+   * Issue #190 — a stop that needed force reports every SIGKILLed service:
+   * a stderr warning (human), `down.force_killed` (JSON, always present).
+   */
+  it("in JSON mode reports force-killed services under down.force_killed (#190)", () => {
+    const forceKilled = [{ service: "web", pid: 4242 }];
+    const worktree = formatDown({ worktreeId: "login", stopped: true, forceKilled }, "json");
+    expect(JSON.parse(worktree.stdout).down.force_killed).toEqual([{ service: "web", pid: 4242 }]);
+    expect(worktree.stderr).toBe("");
+    const shared = formatDown({ shared: true, stopped: true, forceKilled }, "json");
+    expect(JSON.parse(shared.stdout).down.force_killed).toEqual([{ service: "web", pid: 4242 }]);
+  });
+
+  it("in human mode warns on stderr naming each force-killed service (#190)", () => {
+    const result = formatDown(
+      {
+        worktreeId: "login",
+        stopped: true,
+        forceKilled: [
+          { service: "web", pid: 4242 },
+          { service: "api", pid: 4243 },
+        ],
+      },
+      "human",
+    );
+    expect(result.stdout).toBe("devtrees down: worktree instance stopped.\n");
+    expect(result.stderr).toContain("WARNING");
+    expect(result.stderr).toContain("force-killed (SIGKILL) web (pid 4242), api (pid 4243)");
+  });
+
+  it("in human mode a clean stop has no force-kill warning (#190)", () => {
+    expect(
+      formatDown({ worktreeId: "login", stopped: true, forceKilled: [] }, "human").stderr,
+    ).toBe("");
   });
 
   it("JSON output ends with a single trailing newline (line-friendly for shell consumers)", () => {

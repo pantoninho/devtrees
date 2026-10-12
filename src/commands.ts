@@ -51,7 +51,15 @@ import { findDeadReservations, findOrphans, parseWorktreeIds } from "./prune.js"
 import { reapShutdownHooks, type ReapDeps, type ReapOutcome } from "./reaper.js";
 import { loadStack, type ResolvedService, type ResolvedStack, type Tier } from "./stack.js";
 import {
+  boundedDown,
+  DownTimeoutError,
+  type ForceKilled,
+  type StopDriver,
+  type StopSeams,
+} from "./bounded-down.js";
+import {
   createDriver,
+  downTimeoutMs,
   mergeAsyncIterables,
   READ_TIMEOUT_MS,
   reloadTimeoutMs,
@@ -127,7 +135,8 @@ export type { WaitForHealth, WaitForSharedHealth } from "./health.js";
  *
  * `details.reason` lets an agent branch without parsing the message:
  * `timeout` means process-compose is still waiting for a changed service's
- * old process to exit (`down` would block too). `not_supported` / `error`
+ * old process to exit (`down` fails with `DOWN_TIMEOUT`: the old process is
+ * no longer listed, so it is not force-killed). `not_supported` / `error`
  * mean the reload was refused and the instance is untouched.
  * `reload_pending` (#191) means `up` did not reload at all: an earlier
  * reload is still waiting on an old process, and a second one would start an
@@ -716,6 +725,12 @@ export interface CommandDeps {
    */
   readonly allocator?: AllocatorOptions;
   readonly driver?: DriverDeps;
+  /**
+   * Seams and budgets for the bounded stop (issue #190): the process-table
+   * read, the kill, the base `down` budget and the post-escalation grace.
+   * Default: real `ps`/`process.kill`, 30s base, 10s grace.
+   */
+  readonly stop?: StopSeams;
   /**
    * Verify the installed process-compose meets the minimum version (issue
    * #173). Default: one `process-compose version --short` shell-out through
@@ -1989,11 +2004,19 @@ export function findUnmanagedPortBinds(
  * dropped it.
  */
 export type DownResult =
-  | { readonly shared: true; readonly worktreeId?: undefined; readonly stopped: boolean }
+  | {
+      readonly shared: true;
+      readonly worktreeId?: undefined;
+      readonly stopped: boolean;
+      /** Service processes devtrees had to SIGKILL to finish the stop (#190). */
+      readonly forceKilled?: ReadonlyArray<ForceKilled>;
+    }
   | {
       readonly shared: false;
       readonly worktreeId: string;
       readonly stopped: boolean;
+      /** Service processes devtrees had to SIGKILL to finish the stop (#190). */
+      readonly forceKilled?: ReadonlyArray<ForceKilled>;
       /**
        * Present when the dead-supervisor direct reap (issue #148) failed for at
        * least one shutdown hook — out-of-band resources may have survived. The
@@ -2037,7 +2060,7 @@ export async function runDown(
     const probe = resolveProbe(deps);
     const paths = sharedInstancePaths(anchor.anchor);
 
-    const stopped = await sharedLock(anchor.anchor, async () => {
+    const stop = await sharedLock(anchor.anchor, async () => {
       // Probe, don't trust the file (#80): after a SIGKILL the socket file
       // survives with no listener behind it, and `process-compose down`
       // against the dead UDS fails. A live instance is signalled through the
@@ -2049,12 +2072,14 @@ export async function runDown(
         command: "down",
         instance: SHARED_INSTANCE_ID,
       });
-      if (live) {
-        await driver.down({ configPath: paths.configPath, socketPath: paths.socketPath });
-      }
+      // A stop that times out (#190) throws DOWN_TIMEOUT before the config
+      // is removed, so a retry still finds the instance.
+      const forceKilled = live
+        ? (await stopInstance(driver, paths, SHARED_INSTANCE_ID, "down", deps.stop)).forceKilled
+        : [];
       // Best-effort cleanup of the derived config — a future `up` re-derives it.
       rmSync(paths.configPath, { force: true });
-      return live;
+      return { stopped: live, forceKilled };
     });
 
     // Keep the `__shared__` registry entry across the teardown (issue #51).
@@ -2064,7 +2089,7 @@ export async function runDown(
     // from socket presence (instances.ts), not the registry, so dropping the
     // entry was tidy theatre at the cost of port stability.
 
-    return { shared: true, stopped };
+    return { shared: true, stopped: stop.stopped, forceKilled: stop.forceKilled };
   }
 
   // Worktree branch mirrors the shared branch's idempotency (issue #92): a
@@ -2081,7 +2106,11 @@ export async function runDown(
   // orphaned). A contended lock waits ~10s, then fails LOCK_CONTENTION.
   const paths = instancePaths(anchor.anchor, anchor.worktreeId);
   const lifecycleLock = deps.withLifecycleLock ?? defaultWithLifecycleLock;
-  const live = await lifecycleLock(anchor.anchor, anchor.worktreeId, async () => {
+  //
+  // The stop is bounded (#190), so the lock is never held forever: a
+  // concurrent `up` waiting on it fails LOCK_CONTENTION after ~10s while a
+  // slow stop runs out its budget.
+  const stop = await lifecycleLock(anchor.anchor, anchor.worktreeId, async () => {
     // Unknown liveness (#186) throws INSTANCE_UNRESPONSIVE out of the lock:
     // neither "nothing running" nor the dead-supervisor reap below may run
     // against an instance that might still be live.
@@ -2093,15 +2122,22 @@ export async function runDown(
     // `shutdown.command` from its `working_dir` (the worktree, which is present
     // on the normal `down` path). devtrees must NOT also run the hook directly
     // here — that would double-run it (acceptance #4: no regression).
-    if (wasLive) {
-      await driver.down({ configPath: paths.configPath, socketPath: paths.socketPath });
-    }
+    const stopped = wasLive
+      ? await stopInstance(driver, paths, anchor.worktreeId, "down", deps.stop)
+      : undefined;
     // The instance is gone either way, and with it any reload still pending
-    // in it (#191). Not reached when the stop throws.
+    // in it (#191). Not reached when the stop throws (DOWN_TIMEOUT keeps it).
     clearPendingReload(anchor.anchor, anchor.worktreeId);
-    return wasLive;
+    return stopped;
   });
-  if (live) return { shared: false, worktreeId: anchor.worktreeId, stopped: true };
+  if (stop !== undefined) {
+    return {
+      shared: false,
+      worktreeId: anchor.worktreeId,
+      stopped: true,
+      forceKilled: stop.forceKilled,
+    };
+  }
 
   // Dead-supervisor `down` path (issue #148): the socket probed stale (a
   // SIGKILLed/rebooted supervisor), so no process-compose remains to launch the
@@ -2116,8 +2152,64 @@ export async function runDown(
     shared: false,
     worktreeId: anchor.worktreeId,
     stopped: false,
+    forceKilled: [],
     ...(warning !== undefined ? { warning } : {}),
   };
+}
+
+/**
+ * Stop a live instance with the bounded `down` (#190): a budget of 30s plus
+ * every `shutdown.timeout_seconds` in its derived config, then a surgical
+ * SIGKILL of the service processes that kept it from stopping. Throws
+ * `DOWN_TIMEOUT` (nothing removed) when process-compose still has not exited.
+ */
+function stopInstance(
+  driver: StopDriver,
+  paths: { readonly configPath: string; readonly socketPath: string },
+  instance: string,
+  command: "down" | "prune",
+  seams: StopSeams | undefined,
+): Promise<{ readonly forceKilled: ReadonlyArray<ForceKilled> }> {
+  return boundedDown(
+    {
+      inst: { configPath: paths.configPath, socketPath: paths.socketPath },
+      instance,
+      command,
+      timeoutMs: downTimeoutMs(readDerivedConfig(paths.configPath), seams?.baseTimeoutMs),
+      remedy: (pid) => downTimeoutRemedy(instance, command, paths.socketPath, pid),
+    },
+    driver,
+    seams,
+  );
+}
+
+/**
+ * The `details.remedy` a `DOWN_TIMEOUT` carries (#190). devtrees does not
+ * kill process-compose itself: that would skip the shutdown hooks it has not
+ * run yet. The operator does, knowingly, and the follow-up command cleans up.
+ */
+function downTimeoutRemedy(
+  instance: string,
+  command: "down" | "prune",
+  socketPath: string,
+  processComposePid: number | undefined,
+): string {
+  const shared = instance === SHARED_INSTANCE_ID;
+  const retry =
+    command === "prune" ? "devtrees prune" : shared ? "devtrees down --shared" : "devtrees down";
+  const pid = processComposePid === undefined ? "<pid>" : String(processComposePid);
+  const find =
+    processComposePid === undefined
+      ? `find process-compose with \`lsof -U -a ${socketPath}\` and stop it`
+      : "stop process-compose by hand";
+  const after = shared
+    ? "Shutdown hooks it had not run yet will not run: check for anything they would have cleaned up."
+    : "With process-compose gone, devtrees runs the shutdown hooks itself.";
+  return (
+    `Retry \`${retry}\` in a moment. If it still does not finish, ${find} ` +
+    `(\`kill ${pid}\`, then \`kill -9 ${pid}\` if it ignores that) and run \`${retry}\` ` +
+    `again to clean up. ${after}`
+  );
 }
 
 /** Inputs unique to `runLs` — same anchor resolution as the other commands. */
@@ -2218,6 +2310,8 @@ export interface PruneDeps {
    * observe the reap surface without spawning a shell.
    */
   readonly reap?: Reaper;
+  /** Seams and budgets for the bounded orphan stop (#190); see `CommandDeps.stop`. */
+  readonly stop?: StopSeams;
 }
 
 /** Type of the orphan-reap collaborator `runPrune`/`runDown` inject (issue #148). */
@@ -2262,6 +2356,8 @@ export interface PrunedOrphan {
    * emits the field so the shape stays stable.
    */
   readonly worktreePath: string;
+  /** Service processes devtrees had to SIGKILL to stop the orphan (#190). */
+  readonly forceKilled?: ReadonlyArray<ForceKilled>;
 }
 
 export interface PruneResult {
@@ -2278,7 +2374,9 @@ export interface PruneResult {
   /**
    * Orphans prune could NOT reclaim (issue #186): their liveness was unknown
    * (a possibly-live process-compose that did not answer the probe) and the
-   * graceful `process-compose down` failed. Their socket, derived config and
+   * graceful `process-compose down` failed — or their bounded `down` timed
+   * out with process-compose still running (`DOWN_TIMEOUT`, issue #190),
+   * whatever their liveness. Their socket, derived config and
    * registry entry are all kept so the instance stays visible to `ls` and a
    * later `prune` can retry; unlinking the socket would orphan a live
    * supervisor on its ports. Never listed in `pruned`.
@@ -2294,6 +2392,8 @@ export interface UnreclaimedOrphan {
   readonly socketPath: string;
   /** Why the graceful `process-compose down` failed. */
   readonly message: string;
+  /** Service processes devtrees SIGKILLed before the stop timed out (#190). */
+  readonly forceKilled?: ReadonlyArray<ForceKilled>;
 }
 
 /**
@@ -2316,7 +2416,8 @@ export interface UnreclaimedOrphan {
  *
  * Exception (#186): an orphan whose liveness was `unknown` and whose `down`
  * failed is left entirely in place (socket, config, registry entry) and
- * reported in `unreclaimed`, never in `pruned`.
+ * reported in `unreclaimed`, never in `pruned`. So is any orphan whose
+ * bounded `down` timed out with process-compose still running (#190).
  *
  * The shared instance is never an orphan: it is anchored at the git common
  * dir, not at any single worktree, and its lifecycle is decoupled from any
@@ -2377,9 +2478,11 @@ export async function runPrune(deps: PruneDeps = {}): Promise<PruneResult> {
 
   const warnings: ReapWarning[] = [];
   const unreclaimed: UnreclaimedOrphan[] = [];
+  const forceKilled = new Map<string, ReadonlyArray<ForceKilled>>();
   for (const [i, orphan] of orphans.entries()) {
-    const outcome = await reapAndCleanupOrphan(orphan, anchor.anchor, reap, driver);
+    const outcome = await reapAndCleanupOrphan(orphan, anchor.anchor, reap, driver, deps.stop);
     if (outcome.warning !== undefined) warnings.push(outcome.warning);
+    forceKilled.set(orphan.id, outcome.forceKilled);
     if (outcome.downFailure !== undefined) {
       unreclaimed.push({
         id: orphan.id,
@@ -2387,6 +2490,7 @@ export async function runPrune(deps: PruneDeps = {}): Promise<PruneResult> {
         worktreePath: reported[i]?.worktreePath ?? "",
         socketPath: orphan.socketPath,
         message: outcome.downFailure,
+        forceKilled: outcome.forceKilled,
       });
     }
   }
@@ -2412,7 +2516,9 @@ export async function runPrune(deps: PruneDeps = {}): Promise<PruneResult> {
 
   return {
     anchor: anchor.anchor,
-    pruned: reported.filter((r) => !keptIds.has(r.id)),
+    pruned: reported
+      .filter((r) => !keptIds.has(r.id))
+      .map((r) => ({ ...r, forceKilled: forceKilled.get(r.id) ?? [] })),
     warnings,
     unreclaimed,
   };
@@ -2439,7 +2545,12 @@ async function reapAndCleanupOrphan(
   anchor: string,
   reap: Reaper,
   driver: ReturnType<typeof createDriver>,
-): Promise<{ warning?: ReapWarning; downFailure?: string }> {
+  seams: StopSeams | undefined,
+): Promise<{
+  warning?: ReapWarning;
+  downFailure?: string;
+  forceKilled: ReadonlyArray<ForceKilled>;
+}> {
   const paths = instancePaths(anchor, orphan.id);
   // Use the socket path discovery actually found, not the canonical one: an
   // instance started before #156 still has its socket in the old
@@ -2447,40 +2558,56 @@ async function reapAndCleanupOrphan(
   // able to reclaim it.
   const socketPath = orphan.socketPath;
   const warning = await reapDerivedConfig(paths.configPath, orphan.id, anchor, reap);
-  const downFailure = await stopOrphanSupervisor(orphan, paths.configPath, driver);
+  const stop = await stopOrphanSupervisor(orphan, paths.configPath, driver, seams);
+  const reapPart = warning === undefined ? {} : { warning };
   // An `unknown` orphan (#186) whose `down` failed may still be a live
-  // supervisor: keep its socket and config so it stays visible and a later
-  // prune can retry, instead of recreating the invisible orphan.
-  if (orphan.status === "unknown" && downFailure !== undefined) {
-    return warning === undefined ? { downFailure } : { warning, downFailure };
+  // supervisor, and one whose bounded `down` timed out (#190) certainly is:
+  // keep its socket and config so it stays visible and a later prune can
+  // retry, instead of recreating the invisible orphan.
+  if (stop.failure !== undefined && (orphan.status === "unknown" || stop.failure.timedOut)) {
+    return { ...reapPart, downFailure: stop.failure.message, forceKilled: stop.forceKilled };
   }
   // Remove the socket file (driver.down typically removes it on a clean exit,
   // but stale/failed orphans need explicit cleanup) and the derived config.
   rmSync(socketPath, { force: true });
   rmSync(paths.configPath, { force: true });
   clearPendingReload(anchor, orphan.id);
-  return warning === undefined ? {} : { warning };
+  return { ...reapPart, forceKilled: stop.forceKilled };
 }
 
 /**
- * Stop a possibly-live orphan's supervisor with a graceful `down` over its
- * socket. The direct hook run in `reapAndCleanupOrphan` IS the reap; this just
- * reclaims the process-compose. An `unknown` orphan (#186) gets the same
- * attempt a running one does; a stale one has nothing to stop. Best-effort:
- * returns the failure message rather than throwing, so one half-dead orphan
- * never aborts the sweep.
+ * Stop a possibly-live orphan's supervisor with the bounded `down` (#190)
+ * over its socket. The direct hook run in `reapAndCleanupOrphan` IS the reap;
+ * this just reclaims the process-compose. An `unknown` orphan (#186) gets the
+ * same attempt a running one does; a stale one has nothing to stop.
+ * Best-effort: returns the failure rather than throwing, so one half-dead
+ * orphan never aborts the sweep. `timedOut` marks a `DOWN_TIMEOUT`: the
+ * supervisor is known to be still running.
  */
 async function stopOrphanSupervisor(
   orphan: InstanceInfo,
   configPath: string,
   driver: ReturnType<typeof createDriver>,
-): Promise<string | undefined> {
-  if (orphan.status === "stale") return undefined;
+  seams: StopSeams | undefined,
+): Promise<{
+  forceKilled: ReadonlyArray<ForceKilled>;
+  failure?: { readonly message: string; readonly timedOut: boolean };
+}> {
+  if (orphan.status === "stale") return { forceKilled: [] };
   try {
-    await driver.down({ configPath, socketPath: orphan.socketPath });
-    return undefined;
+    const paths = { configPath, socketPath: orphan.socketPath };
+    return await stopInstance(driver, paths, orphan.id, "prune", seams);
   } catch (err) {
-    return err instanceof Error ? err.message : String(err);
+    if (err instanceof DownTimeoutError) {
+      return {
+        forceKilled: err.details.force_killed,
+        failure: { message: err.message, timedOut: true },
+      };
+    }
+    return {
+      forceKilled: [],
+      failure: { message: err instanceof Error ? err.message : String(err), timedOut: false },
+    };
   }
 }
 
@@ -2871,7 +2998,8 @@ const RELOAD_FAILED_REMEDIATION =
 
 /**
  * A timed-out reload means process-compose is still waiting for an old process
- * to exit, and `down` would wait on the same process. Killing that process
+ * to exit, and `down` would wait on the same process until its budget runs
+ * out, then fail with `DOWN_TIMEOUT`. Killing that process
  * unblocks process-compose, which then finishes applying the new config. A
  * second reload before then would start a new copy next to the old process,
  * and the pending update would later start another one, orphaning the first
@@ -2879,7 +3007,8 @@ const RELOAD_FAILED_REMEDIATION =
  */
 const RELOAD_TIMEOUT_REMEDIATION =
   ". The instance is still running, but process-compose stays blocked until the old " +
-  "process exits, and `devtrees down` would block on it too. Kill the service's old process " +
+  "process exits, and `devtrees down` cannot force-kill it either (process-compose no " +
+  "longer lists it), so it fails with `DOWN_TIMEOUT` after its budget. Kill the service's old process " +
   "to let the reload finish, then run `devtrees up` again to resync the on-disk config and " +
   "stored hash; until that process has exited, `devtrees up` refuses with " +
   "`reload_pending` instead of reloading again (a second reload would start an untracked " +

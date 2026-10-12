@@ -2,6 +2,7 @@
   "schema_version": "1",
   "down": {
     "shared": true,
-    "stopped": true
+    "stopped": true,
+    "force_killed": []
   }
 }
