@@ -42,6 +42,7 @@ import {
   type LsServiceRow,
   type PrunedRow,
   type ReapWarningRow,
+  type UnreclaimedRow,
   type UpDryRunPayload,
 } from "./output.js";
 
@@ -167,6 +168,7 @@ export interface ExecuteDeps {
     anchor: string;
     pruned: ReadonlyArray<PrunedRow>;
     warnings?: ReadonlyArray<ReapWarningRow>;
+    unreclaimed?: ReadonlyArray<UnreclaimedRow>;
   }>;
   env?: () => Promise<{ worktreeId: string; env: Record<string, string> }>;
   logs?: (options: LogsCliOptions) => Promise<{
@@ -582,7 +584,14 @@ class PruneCommand extends DevtreesCommand {
       // Issue #148: a failed orphan reap surfaces as a stderr warning (human) /
       // `prune.warnings[]` (JSON) so the sweep never reports a clean teardown
       // while out-of-band resources may have survived.
-      const out = formatPrune(result.pruned, this.mode, result.warnings ?? []);
+      // Issue #186: orphans left in place because they could not be stopped
+      // surface the same way (stderr / `prune.unreclaimed[]`).
+      const out = formatPrune(
+        result.pruned,
+        this.mode,
+        result.warnings ?? [],
+        result.unreclaimed ?? [],
+      );
       if (out.stdout) this.context.stdout.write(out.stdout);
       if (out.stderr) this.context.stderr.write(out.stderr);
       return 0;

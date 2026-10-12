@@ -217,25 +217,45 @@ function connectOnce(socketPath: string, timeoutMs: number): Promise<ProbeOutcom
 
 /**
  * Does any process hold a unix socket bound at `socketPath`? `true`/`false`
- * from `lsof`, `undefined` when `lsof` is missing or fails (the answer is then
- * not known, and the caller keeps the connect error's verdict).
+ * from `lsof`; `true` too when `lsof` times out (treated as busy, never as
+ * proof of death); `undefined` when `lsof` is missing or fails some other way
+ * (the answer is then not known, and the caller keeps the connect error's
+ * verdict). `lsofPath`/`timeoutMs` are test seams.
  *
  * Needed because `ECONNREFUSED` is not proof of death on macOS (#186): a
  * listener whose accept backlog is full, such as a frozen or wedged
  * process-compose with clients queued behind it, refuses new connects exactly
  * as a socket file with no listener does.
  */
-export function socketHeldByProcess(socketPath: string): Promise<boolean | undefined> {
+export function socketHeldByProcess(
+  socketPath: string,
+  options: { readonly lsofPath?: string; readonly timeoutMs?: number } = {},
+): Promise<boolean | undefined> {
   return new Promise((resolve) => {
-    execFile("lsof", ["-t", "-U", "-a", socketPath], { timeout: 1000 }, (err, stdout) => {
-      if (err === null) {
-        resolve(stdout.trim().length > 0);
-        return;
-      }
-      // lsof exits 1 with no output when nothing matches: a definitive "no".
-      const noMatch = (err as { code?: unknown }).code === 1 && stdout.trim() === "";
-      resolve(noMatch ? false : undefined);
-    });
+    execFile(
+      options.lsofPath ?? "lsof",
+      ["-t", "-U", "-a", socketPath],
+      { timeout: options.timeoutMs ?? 1000 },
+      (err, stdout) => {
+        if (err === null) {
+          resolve(stdout.trim().length > 0);
+          return;
+        }
+        // An lsof that ran out of time says nothing about the socket, and on a
+        // loaded machine it is exactly when a live instance is also slow to
+        // answer: report it as held (so the probe stays `unknown`) rather than
+        // letting the refusal unlink a possibly-live socket.
+        if ((err as { killed?: unknown }).killed === true) {
+          resolve(true);
+          return;
+        }
+        // lsof exits 1 with no output when nothing matches: a definitive "no".
+        // Anything else (lsof not installed, spawn failure) is "not known", so
+        // the refusal's verdict stands and a crashed instance still recovers.
+        const noMatch = (err as { code?: unknown }).code === 1 && stdout.trim() === "";
+        resolve(noMatch ? false : undefined);
+      },
+    );
   });
 }
 

@@ -525,7 +525,9 @@ describe("probeSocket", () => {
     // The #186 mechanism: on a loaded machine the event loop wakes with the
     // connect timer already due, and timers run before the connect callback.
     // Blocking the loop past the timeout reproduces that against a real,
-    // healthy listener.
+    // healthy listener. This relies on libuv's loop order: an expired timer
+    // fires in the timers phase, before the poll phase delivers the connect
+    // completion, so the 5ms timer always wins after the 50ms stall.
     const anchor = tmpAnchor();
     await bindSocketServer(anchor, "login");
     const pending = probeSocket(instancePaths(anchor, "login").socketPath, { timeoutMs: 5 });
@@ -583,6 +585,35 @@ describe("probeSocket", () => {
       expect(await socketHeldByProcess(live)).toBe(true);
     },
   );
+
+  it("socketHeldByProcess: an lsof that times out counts as held, so a refusal stays unknown", async () => {
+    // On a loaded machine lsof itself can be slow exactly when process-compose
+    // is; a timeout must never fall through to "stale" and unlink the socket.
+    const anchor = tmpAnchor();
+    const slowLsof = join(anchor, "slow-lsof.sh");
+    writeFileSync(slowLsof, "#!/bin/sh\nsleep 5\n", { mode: 0o755 });
+    const path = instancePaths(anchor, "login").socketPath;
+    expect(await socketHeldByProcess(path, { lsofPath: slowLsof, timeoutMs: 100 })).toBe(true);
+
+    await leaveDeadSocket(path);
+    const status = await probeSocket(path, {
+      heldByProcess: (p) => socketHeldByProcess(p, { lsofPath: slowLsof, timeoutMs: 100 }),
+    });
+    expect(status).toBe("unknown");
+  });
+
+  it("socketHeldByProcess: a missing lsof binary is 'not known', so a crash still reads stale", async () => {
+    const anchor = tmpAnchor();
+    const path = instancePaths(anchor, "login").socketPath;
+    const missing = join(anchor, "no-such-lsof");
+    expect(await socketHeldByProcess(path, { lsofPath: missing })).toBeUndefined();
+
+    await leaveDeadSocket(path);
+    const status = await probeSocket(path, {
+      heldByProcess: (p) => socketHeldByProcess(p, { lsofPath: missing }),
+    });
+    expect(status).toBe("stale");
+  });
 });
 
 describe("probeUntilDefinitive", () => {

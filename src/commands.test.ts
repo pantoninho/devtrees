@@ -2923,6 +2923,78 @@ describe("runPrune — reconcile instances against git worktree list", () => {
     });
     expect(result.pruned.map((p) => p.id)).toEqual(["removed"]);
     expect(downSockets).toEqual([orphanSocket]);
+    expect(result.unreclaimed).toEqual([]);
+    expect(existsSync(orphanSocket)).toBe(false);
+  });
+
+  it("an unknown orphan whose down fails is NOT reclaimed: socket, config and registry entry kept, reported unreclaimed (#186)", async () => {
+    // Unlinking here would recreate #186's invisible orphan: a possibly-live
+    // process-compose that no `ls`/`down`/`prune` could see any more.
+    const tmp = tmpAnchor();
+    mkdirSync(runDir(tmp.anchor), { recursive: true });
+    const orphanSocket = instancePaths(tmp.anchor, "removed").socketPath;
+    const orphanConfig = instancePaths(tmp.anchor, "removed").configPath;
+    writeFileSync(orphanSocket, "");
+    writeFileSync(orphanConfig, "processes: {}\n");
+    const liveId = idFor(tmp.worktreeRoot, "login");
+    const registryRef = {
+      snapshot: { [liveId]: 20000, removed: 20032 } as RegistrySnapshot,
+    };
+    const { runPrune } = await import("./commands.js");
+    const result = await runPrune({
+      cwd: join(tmp.worktreeRoot, "login"),
+      git: pruneGit({
+        anchor: tmp.anchor,
+        worktreeRoot: tmp.worktreeRoot,
+        worktreeId: "login",
+        porcelain: [`worktree ${join(tmp.worktreeRoot, "login")}`, "HEAD x", ""].join("\n"),
+      }),
+      discover: async () => [instance("removed", { status: "unknown", socketPath: orphanSocket })],
+      readRegistry: () => registryRef.snapshot,
+      withRegistryLock: async (_anchor, mutate) => {
+        registryRef.snapshot = await mutate(registryRef.snapshot);
+        return registryRef.snapshot;
+      },
+      driver: {
+        exists: () => Promise.resolve(true),
+        spawner: (_binary, args) =>
+          args[0] === "down" ? refusedStart("connection refused") : spawnedOk(),
+      },
+    });
+    expect(result.pruned).toEqual([]);
+    expect(result.unreclaimed).toEqual([
+      expect.objectContaining({ id: "removed", kind: "worktree", socketPath: orphanSocket }),
+    ]);
+    expect(result.unreclaimed[0]?.message).not.toBe("");
+    expect(existsSync(orphanSocket)).toBe(true);
+    expect(existsSync(orphanConfig)).toBe(true);
+    expect(registryRef.snapshot.removed).toBe(20032);
+  });
+
+  it("a running orphan whose down fails is still reclaimed (only `unknown` is held back)", async () => {
+    const tmp = tmpAnchor();
+    mkdirSync(runDir(tmp.anchor), { recursive: true });
+    const orphanSocket = instancePaths(tmp.anchor, "removed").socketPath;
+    writeFileSync(orphanSocket, "");
+    const { runPrune } = await import("./commands.js");
+    const result = await runPrune({
+      cwd: join(tmp.worktreeRoot, "login"),
+      git: pruneGit({
+        anchor: tmp.anchor,
+        worktreeRoot: tmp.worktreeRoot,
+        worktreeId: "login",
+        porcelain: [`worktree ${join(tmp.worktreeRoot, "login")}`, "HEAD x", ""].join("\n"),
+      }),
+      discover: async () => [instance("removed", { status: "running", socketPath: orphanSocket })],
+      withRegistryLock: async (_anchor, mutate) => mutate({}),
+      driver: {
+        exists: () => Promise.resolve(true),
+        spawner: (_binary, args) => (args[0] === "down" ? refusedStart("boom") : spawnedOk()),
+      },
+    });
+    expect(result.pruned.map((p) => p.id)).toEqual(["removed"]);
+    expect(result.unreclaimed).toEqual([]);
+    expect(existsSync(orphanSocket)).toBe(false);
   });
 
   it("cleans up a stale orphan (socket file with no listener) without calling driver.down", async () => {

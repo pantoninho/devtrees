@@ -917,6 +917,26 @@ describe("output formatter — formatPrune", () => {
     expect(parsed.prune.warnings).toEqual([]);
     expect(result.stderr).toBe("");
   });
+
+  it("surfaces an unreclaimed orphan: stderr warning in human mode, prune.unreclaimed[] in JSON (#186)", () => {
+    const kept = [
+      {
+        id: "removed",
+        kind: "worktree" as const,
+        worktreePath: "/gone/removed",
+        socketPath: "/run/removed.sock",
+        message: "process-compose down exited with code 1",
+      },
+    ];
+    const human = formatPrune([], "human", [], kept);
+    expect(human.stderr).toContain("orphan 'removed'");
+    expect(human.stderr).toContain("NOT reclaimed");
+    expect(human.stderr).toContain("lsof -U -a /run/removed.sock");
+    const json = formatPrune([], "json", [], kept);
+    expect(json.stderr).toBe("");
+    const parsed = JSON.parse(json.stdout) as { prune: { unreclaimed: unknown[] } };
+    expect(parsed.prune.unreclaimed).toEqual(kept);
+  });
 });
 
 /**

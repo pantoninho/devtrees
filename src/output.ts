@@ -286,6 +286,30 @@ function formatReapWarningStderr(w: ReapWarningRow): string {
   );
 }
 
+/**
+ * An orphan `prune` could not reclaim (issue #186): its process-compose did
+ * not answer the liveness probe and `process-compose down` failed, so its
+ * socket, config and registry entry were kept rather than orphaning a
+ * possibly-live supervisor on its ports.
+ */
+export interface UnreclaimedRow {
+  readonly id: string;
+  readonly kind: "worktree" | "shared";
+  readonly worktreePath: string;
+  readonly socketPath: string;
+  readonly message: string;
+}
+
+function formatUnreclaimedStderr(u: UnreclaimedRow): string {
+  const where = u.worktreePath !== "" ? ` (was at ${u.worktreePath})` : "";
+  return (
+    `devtrees: WARNING — orphan '${u.id}'${where} was NOT reclaimed: its process-compose did ` +
+    `not answer and \`process-compose down\` failed (${u.message}). Its socket and state were ` +
+    `kept. Find the holder with \`lsof -U -a ${u.socketPath}\`, stop it, then run ` +
+    `\`devtrees prune\` again.\n`
+  );
+}
+
 /** JSON shape for a reap warning — flat identity + failures, no wrapper. */
 function reapWarningJson(w: ReapWarningRow): Record<string, unknown> {
   return {
@@ -322,6 +346,7 @@ export function formatPrune(
   pruned: ReadonlyArray<PrunedRow>,
   mode: FormatMode,
   warnings: ReadonlyArray<ReapWarningRow> = [],
+  unreclaimed: ReadonlyArray<UnreclaimedRow> = [],
 ): OutputResult {
   if (mode === "json") {
     const doc = {
@@ -335,13 +360,23 @@ export function formatPrune(
         // Issue #148: a failed shutdown-hook reap is reflected here so an agent
         // does not read a clean teardown when out-of-band resources may survive.
         warnings: warnings.map(reapWarningJson),
+        // Issue #186: orphans left in place because they could not be stopped.
+        unreclaimed: unreclaimed.map((u) => ({
+          id: u.id,
+          kind: u.kind,
+          worktreePath: u.worktreePath,
+          socketPath: u.socketPath,
+          message: u.message,
+        })),
       },
     };
     // Keep `--json` stdout byte-clean (ADR-0005): the warning goes only into the
     // structured envelope, never to stderr, in JSON mode.
     return { stdout: `${JSON.stringify(doc)}\n`, stderr: "" };
   }
-  const stderr = warnings.map(formatReapWarningStderr).join("");
+  const stderr =
+    warnings.map(formatReapWarningStderr).join("") +
+    unreclaimed.map(formatUnreclaimedStderr).join("");
   return { stdout: formatPruneHuman(pruned), stderr };
 }
 

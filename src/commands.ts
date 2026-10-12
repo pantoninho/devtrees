@@ -2209,6 +2209,25 @@ export interface PruneResult {
    * tells an agent/operator the reap itself did not cleanly complete.
    */
   readonly warnings: ReadonlyArray<ReapWarning>;
+  /**
+   * Orphans prune could NOT reclaim (issue #186): their liveness was unknown
+   * (a possibly-live process-compose that did not answer the probe) and the
+   * graceful `process-compose down` failed. Their socket, derived config and
+   * registry entry are all kept so the instance stays visible to `ls` and a
+   * later `prune` can retry; unlinking the socket would orphan a live
+   * supervisor on its ports. Never listed in `pruned`.
+   */
+  readonly unreclaimed: ReadonlyArray<UnreclaimedOrphan>;
+}
+
+/** An orphan `prune` left in place because it could not stop it (#186). */
+export interface UnreclaimedOrphan {
+  readonly id: string;
+  readonly kind: "worktree" | "shared";
+  readonly worktreePath: string;
+  readonly socketPath: string;
+  /** Why the graceful `process-compose down` failed. */
+  readonly message: string;
 }
 
 /**
@@ -2228,6 +2247,10 @@ export interface PruneResult {
  *   2. Remove the orphan's control socket and derived config from the anchor
  *      state.
  *   3. Drop the orphan's allocation-registry entry under the registry lock.
+ *
+ * Exception (#186): an orphan whose liveness was `unknown` and whose `down`
+ * failed is left entirely in place (socket, config, registry entry) and
+ * reported in `unreclaimed`, never in `pruned`.
  *
  * The shared instance is never an orphan: it is anchored at the git common
  * dir, not at any single worktree, and its lifecycle is decoupled from any
@@ -2272,7 +2295,9 @@ export async function runPrune(deps: PruneDeps = {}): Promise<PruneResult> {
   }));
 
   const orphans = [...socketOrphans, ...deadReservations];
-  if (orphans.length === 0) return { anchor: anchor.anchor, pruned: [], warnings: [] };
+  if (orphans.length === 0) {
+    return { anchor: anchor.anchor, pruned: [], warnings: [], unreclaimed: [] };
+  }
 
   // Capture identity-only metadata for each orphan *before* tearing down its
   // derived config — `worktreePath` is recovered from the on-disk YAML and
@@ -2285,17 +2310,30 @@ export async function runPrune(deps: PruneDeps = {}): Promise<PruneResult> {
   }));
 
   const warnings: ReapWarning[] = [];
-  for (const orphan of orphans) {
-    const warning = await reapAndCleanupOrphan(orphan, anchor.anchor, reap, driver);
-    if (warning !== undefined) warnings.push(warning);
+  const unreclaimed: UnreclaimedOrphan[] = [];
+  for (const [i, orphan] of orphans.entries()) {
+    const outcome = await reapAndCleanupOrphan(orphan, anchor.anchor, reap, driver);
+    if (outcome.warning !== undefined) warnings.push(outcome.warning);
+    if (outcome.downFailure !== undefined) {
+      unreclaimed.push({
+        id: orphan.id,
+        kind: orphan.kind,
+        worktreePath: reported[i]?.worktreePath ?? "",
+        socketPath: orphan.socketPath,
+        message: outcome.downFailure,
+      });
+    }
   }
+  const keptIds = new Set(unreclaimed.map((u) => u.id));
+  const reclaimed = orphans.filter((o) => !keptIds.has(o.id));
 
-  // Drop every orphan's registry entry under one lock acquire so concurrent
-  // `up`s can re-use the freed block bases.
+  // Drop every reclaimed orphan's registry entry under one lock acquire so
+  // concurrent `up`s can re-use the freed block bases. An unreclaimed one
+  // keeps its entry: its supervisor may still hold those ports (#186).
   await lock(anchor.anchor, (snapshot) => {
     let next = snapshot;
     let changed = false;
-    for (const orphan of orphans) {
+    for (const orphan of reclaimed) {
       if (next[orphan.id] !== undefined) {
         const { [orphan.id]: _drop, ...rest } = next;
         void _drop;
@@ -2306,14 +2344,21 @@ export async function runPrune(deps: PruneDeps = {}): Promise<PruneResult> {
     return changed ? next : snapshot;
   });
 
-  return { anchor: anchor.anchor, pruned: reported, warnings };
+  return {
+    anchor: anchor.anchor,
+    pruned: reported.filter((r) => !keptIds.has(r.id)),
+    warnings,
+    unreclaimed,
+  };
 }
 
 /**
  * Reap one orphan's out-of-band resources, stop its supervisor if live, and
  * clear its on-disk state (issue #148). Factored out of `runPrune`'s loop so
- * the orchestrator stays under the complexity gate. Returns a `ReapWarning`
- * when the reap failed, else `undefined`.
+ * the orchestrator stays under the complexity gate. `warning` is set when the
+ * reap failed. `downFailure` is set when the orphan's liveness was `unknown`
+ * and the graceful `down` failed (#186): its on-disk state is then left in
+ * place rather than unlinking the socket of a possibly-live supervisor.
  *
  * The reap runs each derived `shutdown.command` ourselves, socket-free, from
  * the anchor — a directory that still exists — instead of relying on
@@ -2328,7 +2373,7 @@ async function reapAndCleanupOrphan(
   anchor: string,
   reap: Reaper,
   driver: ReturnType<typeof createDriver>,
-): Promise<ReapWarning | undefined> {
+): Promise<{ warning?: ReapWarning; downFailure?: string }> {
   const paths = instancePaths(anchor, orphan.id);
   // Use the socket path discovery actually found, not the canonical one: an
   // instance started before #156 still has its socket in the old
@@ -2336,26 +2381,40 @@ async function reapAndCleanupOrphan(
   // able to reclaim it.
   const socketPath = orphan.socketPath;
   const warning = await reapDerivedConfig(paths.configPath, orphan.id, anchor, reap);
-
-  // An `unknown` orphan (#186) may still be live, so it gets the same
-  // graceful `down` attempt a running one does instead of being treated as a
-  // dead file.
-  if (orphan.status !== "stale") {
-    // Stop the supervisor too — a graceful `down` over its still-live socket.
-    // The direct hook run above IS the reap; this just reclaims the running
-    // process-compose. Best-effort: a failed/half-dead down must not abort the
-    // sweep, and the on-disk state is cleared below regardless.
-    try {
-      await driver.down({ configPath: paths.configPath, socketPath });
-    } catch {
-      // Best-effort: a failed down still leaves us removing the on-disk state.
-    }
+  const downFailure = await stopOrphanSupervisor(orphan, paths.configPath, driver);
+  // An `unknown` orphan (#186) whose `down` failed may still be a live
+  // supervisor: keep its socket and config so it stays visible and a later
+  // prune can retry, instead of recreating the invisible orphan.
+  if (orphan.status === "unknown" && downFailure !== undefined) {
+    return warning === undefined ? { downFailure } : { warning, downFailure };
   }
   // Remove the socket file (driver.down typically removes it on a clean exit,
   // but stale/failed orphans need explicit cleanup) and the derived config.
   rmSync(socketPath, { force: true });
   rmSync(paths.configPath, { force: true });
-  return warning;
+  return warning === undefined ? {} : { warning };
+}
+
+/**
+ * Stop a possibly-live orphan's supervisor with a graceful `down` over its
+ * socket. The direct hook run in `reapAndCleanupOrphan` IS the reap; this just
+ * reclaims the process-compose. An `unknown` orphan (#186) gets the same
+ * attempt a running one does; a stale one has nothing to stop. Best-effort:
+ * returns the failure message rather than throwing, so one half-dead orphan
+ * never aborts the sweep.
+ */
+async function stopOrphanSupervisor(
+  orphan: InstanceInfo,
+  configPath: string,
+  driver: ReturnType<typeof createDriver>,
+): Promise<string | undefined> {
+  if (orphan.status === "stale") return undefined;
+  try {
+    await driver.down({ configPath, socketPath: orphan.socketPath });
+    return undefined;
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err);
+  }
 }
 
 /**
