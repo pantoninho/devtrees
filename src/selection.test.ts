@@ -162,6 +162,17 @@ describe("droppedNamespaceEdges (#179)", () => {
     expect(droppedNamespaceEdges(stack, selected)).toEqual([]);
   });
 
+  it("a target still in the project is kept even when the selection is narrower (running instance)", () => {
+    const stack = [s("db", ["one", "two"]), s("api", "two", ["db"]), s("web", "one", ["api"])];
+    const selected = stack.filter((x) => namespaceSelected(x, ["one"]));
+    // Booted with -n one -n two: api is present, so web -> api was never dropped.
+    expect(droppedNamespaceEdges(stack, selected, new Set(["db", "api", "web"]))).toEqual([]);
+    // Booted with -n one only: api is absent, so the edge is dropped.
+    expect(droppedNamespaceEdges(stack, selected, new Set(["db", "web"]))).toEqual([
+      { from: "web", to: "api", toNamespaces: ["two"] },
+    ]);
+  });
+
   it("an unlabelled target is reported as being in `default`", () => {
     const stack = [s("db", undefined), s("api", "two", ["db"])];
     expect(droppedNamespaceEdges(stack, stack.slice(1))).toEqual([

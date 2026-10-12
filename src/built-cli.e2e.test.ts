@@ -1129,6 +1129,16 @@ describe("built CLI e2e — list-valued namespaces and dropped cross-namespace e
     expect((json.doc as NsEdgeDoc).up?.dropped_namespace_edges).toEqual([edge]);
   }, 60_000);
 
+  it("a narrower -n on an instance booted with both namespaces reports no dropped edge", () => {
+    const { wt } = listScenario("dt-bcl4-");
+    const boot = devtrees(wt, ["up", "-n", "one", "-n", "two", "--json", "--wait-timeout", "10"]);
+    expect(boot.code, `boot failed: ${boot.stderr} ${boot.stdout}`).toBe(0);
+    const narrow = devtrees(wt, ["up", "-n", "one", "--json", "--wait-timeout", "10"]);
+    expect(narrow.code, `narrow re-up failed: ${narrow.stderr} ${narrow.stdout}`).toBe(0);
+    expect((narrow.doc as NsEdgeDoc).up?.dropped_namespace_edges).toEqual([]);
+    expect(narrow.stderr).not.toContain("cross-namespace");
+  }, 60_000);
+
   it("rejects an empty namespace list as CONFIG_INVALID", () => {
     const { wt } = setupRepoWithStack(
       "dt-bcl3-",

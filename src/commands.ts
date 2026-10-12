@@ -2642,11 +2642,8 @@ async function verifyRunning(args: {
     socketPath,
     timeoutMs,
   );
-  const selection = resolveRunningSelection(
-    isolated,
-    new Set(rows.map((r) => r.name)),
-    deps.namespaces,
-  );
+  const present = new Set(rows.map((r) => r.name));
+  const selection = resolveRunningSelection(isolated, present, deps.namespaces);
 
   if (selection.notRunning.length > 0) {
     throw namespaceNotRunningError(anchor.worktreeId, selection.notRunning, deps.namespaces ?? []);
@@ -2654,7 +2651,9 @@ async function verifyRunning(args: {
 
   // Dropped cross-namespace edges against the effective selection (#179):
   // on a bare `up` that is the booted one read back above, not `default`.
-  const nsEdges = warnDroppedNamespaceEdges(stack, selection.services, args.warn);
+  // A target counts as kept when it is in the project, so a narrower `-n`
+  // than the boot selection does not report edges to services still running.
+  const nsEdges = warnDroppedNamespaceEdges(stack, selection.services, args.warn, present);
 
   const finalRows = await waitForSelectedHealth(selection.services, socketPath, deps, driver, {
     remedy: `devtrees down && ${formatUpCommand(stack.services, selection.namespaces)}`,
@@ -2665,14 +2664,17 @@ async function verifyRunning(args: {
 
 /**
  * Compute the `depends_on` edges `selected` leaves dangling (ADR-0008, #179)
- * and warn once per edge; returns them for the `up --json` envelope.
+ * and warn once per edge; returns them for the `up --json` envelope. `kept`
+ * is forwarded to `droppedNamespaceEdges` (the project's services on a
+ * running instance; omitted on a fresh start).
  */
 function warnDroppedNamespaceEdges(
   stack: ResolvedStack,
   selected: ReadonlyArray<ResolvedService>,
   warn: (message: string) => void,
+  kept?: ReadonlySet<string>,
 ): DroppedNamespaceEdge[] {
-  const edges = droppedNamespaceEdges(stack.services, selected);
+  const edges = droppedNamespaceEdges(stack.services, selected, kept);
   for (const edge of edges) warn(formatDroppedNamespaceEdgeWarning(edge));
   return edges;
 }

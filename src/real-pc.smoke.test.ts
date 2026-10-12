@@ -402,6 +402,10 @@ function rmRoot(root: string): void {
   }
 }
 
+// Cleanup runs `devtrees down` per scenario and waits for PIDs to exit; under
+// heavy machine load that outlasts vitest's 10s default hook timeout.
+const CLEANUP_HOOK_TIMEOUT_MS = 30_000;
+
 afterEach(async () => {
   await drainCleanups();
   const ctx = currentCtx;
@@ -414,7 +418,7 @@ afterEach(async () => {
     survivors,
     `process-compose-spawned PIDs survived teardown: ${survivors.join(", ")}`,
   ).toEqual([]);
-});
+}, CLEANUP_HOOK_TIMEOUT_MS);
 
 beforeAll(() => {
   if (!ENABLED) {

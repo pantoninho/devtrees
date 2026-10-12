@@ -160,15 +160,23 @@ export interface DroppedNamespaceEdge {
 
 /**
  * Every `depends_on` edge from a selected isolated service to an isolated
- * service the selection leaves out, in declaration order. `stackServices` is
- * the whole stack (to resolve each target), `selected` the services the `up`
- * targets — the fresh selection, or the effective one on a running instance.
- * Edges to shared services are not namespace edges (the shared instance runs
- * regardless of `-n`, #130); they are the deriver's cross-tier drops.
+ * service process-compose does not keep, in declaration order. `stackServices`
+ * is the whole stack (to resolve each target), `selected` the services the
+ * `up` targets — the fresh selection, or the effective one on a running
+ * instance. Edges to shared services are not namespace edges (the shared
+ * instance runs regardless of `-n`, #130); they are the deriver's cross-tier
+ * drops.
+ *
+ * `kept` is the set of services process-compose actually has in the project;
+ * an edge is dropped only when its target is absent from it. It defaults to
+ * the selected names, which is exact for a fresh start. On a running instance
+ * it must be the project's services: a narrower `-n` than the boot selection
+ * leaves a booted target running, and that edge was never dropped.
  */
 export function droppedNamespaceEdges(
   stackServices: ReadonlyArray<Pick<ResolvedService, "name" | "tier" | "namespace" | "dependsOn">>,
   selected: ReadonlyArray<Pick<ResolvedService, "name">>,
+  kept: ReadonlySet<string> = new Set(selected.map((s) => s.name)),
 ): DroppedNamespaceEdge[] {
   const selectedNames = new Set(selected.map((s) => s.name));
   const byName = new Map(stackServices.map((s) => [s.name, s]));
@@ -177,7 +185,7 @@ export function droppedNamespaceEdges(
     if (!selectedNames.has(from.name)) continue;
     for (const dep of from.dependsOn) {
       const to = byName.get(dep.name);
-      if (to === undefined || to.tier !== "isolated" || selectedNames.has(to.name)) continue;
+      if (to === undefined || to.tier !== "isolated" || kept.has(to.name)) continue;
       edges.push({ from: from.name, to: to.name, toNamespaces: serviceNamespaces(to) });
     }
   }

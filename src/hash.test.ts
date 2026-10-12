@@ -166,6 +166,33 @@ describe("stackHash", () => {
       });
     }
 
+    it("ignores namespace list order, which process-compose ignores (#179)", () => {
+      expect(stackHash(web({ namespace: ["a", "b"] }))).toBe(
+        stackHash(web({ namespace: ["b", "a"] })),
+      );
+    });
+
+    it("hashes a one-element namespace list as the bare string (#179)", () => {
+      expect(stackHash(web({ namespace: ["a"] }))).toBe(stackHash(web({ namespace: "a" })));
+    });
+
+    it("changes when a namespace list gains or loses an entry (#179)", () => {
+      expect(stackHash(web({ namespace: ["a", "b"] }))).not.toBe(
+        stackHash(web({ namespace: "a" })),
+      );
+    });
+
+    it("hashes a string namespace exactly as before lists existed (#179)", () => {
+      // Pinned against the digest the pre-#179 code (main at 561eb6e) gives
+      // this stack, so upgrading does not hot-reload string-namespace stacks.
+      const stack: ResolvedStack = {
+        services: [{ ...svc("api", "node api.js"), namespace: "local-backend" }],
+      };
+      expect(stackHash(stack)).toBe(
+        "7482f2c13be4f02cf1a656bf1e43ea545f9b58306e9261fe3f843b49a2fb97ac",
+      );
+    });
+
     it("is independent of key order inside shutdown and log_configuration", () => {
       const a = web({
         shutdown: { command: "x", timeout_seconds: 3 },
