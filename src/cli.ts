@@ -71,7 +71,7 @@ export const VERSION = readVersion();
 export const COMMANDS: ReadonlyArray<{ name: string; summary: string }> = [
   { name: "up", summary: "Bring up this worktree's stack" },
   { name: "down", summary: "Stop this worktree's stack (--shared tears down the shared instance)" },
-  { name: "ls", summary: "List every instance across the repo with status and ports" },
+  { name: "ls", summary: "List every instance with status, namespaces and ports (--services)" },
   {
     name: "attach",
     summary: "Attach a TUI to this worktree's instance (--shared for the shared one)",
@@ -599,15 +599,30 @@ class DownCommand extends DevtreesCommand {
 class LsCommand extends DevtreesCommand {
   static override paths = [["ls"]];
   static override usage = Command.Usage({
-    description: "List every devtrees instance across the repo with status and ports.",
-    details: errorCodeFooter(["UNKNOWN"]),
+    description:
+      "List every devtrees instance across the repo with status, booted namespaces and ports.",
+    details:
+      "With `--services`, print one row per service instead: its instance, namespaces, " +
+      "tier (isolated or shared), state (active, dead or done) and pid (shown only while " +
+      "the process is running). A stopped service reads `dead`, like a crashed one. " +
+      "`--json` always carries each instance's `namespaces`, `services_read` and " +
+      "`reload_pending`, and each service's `namespaces`, `tier`, `state` and `pid` next " +
+      "to process-compose's own `status`. Each instance is read for at most 5s; one that " +
+      "does not answer is listed with its namespaces and services unknown " +
+      "(`services_read: unresponsive`). In the tables `?` means not known and `-` means " +
+      "none.\n\n" +
+      errorCodeFooter(["UNKNOWN"]),
+  });
+
+  services = Option.Boolean("--services", false, {
+    description: "One row per service: namespaces, tier, state (active|dead|done) and pid.",
   });
 
   override async execute(): Promise<number> {
     return this.dispatch(async () => {
       if (!this.context.deps.ls) return 0;
       const result = await this.context.deps.ls();
-      const out = formatLs(result.instances, this.mode);
+      const out = formatLs(result.instances, this.mode, { services: this.services });
       this.emit(out);
       return 0;
     });

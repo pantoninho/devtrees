@@ -2751,6 +2751,14 @@ export interface LsDeps {
    * tests stub it.
    */
   readonly driver?: DriverDeps;
+  /**
+   * Budget for one instance's service read, retries included (#226). Default:
+   * `READ_TIMEOUT_MS` (5s). An instance that does not answer within it is
+   * listed with its services unknown.
+   */
+  readonly readTimeoutMs?: number;
+  /** Socket probe the bounded read uses after a failed read. Default: `probeSocket`. */
+  readonly probeSocket?: (socketPath: string) => Promise<InstanceStatus>;
 }
 
 export interface LsResult {
@@ -2768,14 +2776,23 @@ export interface LsResult {
  *
  * `ls` stays lock-free: discovery never writes the allocation registry, and
  * the driver's `getServiceStatuses` call talks to each instance's UDS only —
- * a stale or failing instance does not abort the walk.
+ * a stale or failing instance does not abort the walk. Each read is bounded
+ * (#226): one that does not answer in time lists the instance as
+ * `unresponsive` instead of hanging `ls`.
  */
 export async function runLs(deps: LsDeps = {}): Promise<LsResult> {
   const { anchor } = resolve(deps);
   const discover = deps.discover ?? discoverInstances;
   const driver = createDriver(deps.driver ?? {});
+  const budgetMs = deps.readTimeoutMs ?? READ_TIMEOUT_MS;
+  // Each instance's read is bounded like the dry run's (#210, #226): retried
+  // while it fails, killed at the deadline. Discovery reads every instance
+  // in parallel, so a wedged one costs `ls` one budget, not one per instance.
   const instances = await discover(anchor.anchor, {
-    getServiceStatuses: (socketPath) => driver.getServiceStatuses(socketPath),
+    getServiceStatuses: (socketPath) =>
+      readStatusesWithin(driver, socketPath, budgetMs, {
+        probe: deps.probeSocket ?? defaultProbeSocket,
+      }),
   });
   return { anchor: anchor.anchor, instances };
 }

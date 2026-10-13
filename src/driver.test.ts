@@ -139,8 +139,8 @@ describe("process-compose driver — parseServiceStatuses", () => {
       { name: "api", status: "Completed", ready: true, is_running: false },
     ]);
     expect(parseServiceStatuses(stdout)).toEqual([
-      { name: "web", status: "Completed", health: "not_ready", exitCode: -1 },
-      { name: "api", status: "Completed", health: "not_ready" },
+      { name: "web", status: "Completed", health: "not_ready", exitCode: -1, running: false },
+      { name: "api", status: "Completed", health: "not_ready", running: false },
     ]);
   });
 
@@ -155,14 +155,23 @@ describe("process-compose driver — parseServiceStatuses", () => {
     ]);
   });
 
+  it("carries is_running, so a Restarting row's dead pid is told apart from a live one (#226)", () => {
+    const stdout = JSON.stringify([
+      { name: "flaky", status: "Restarting", is_ready: "-", pid: 777, is_running: false },
+    ]);
+    expect(parseServiceStatuses(stdout)).toEqual([
+      { name: "flaky", status: "Restarting", health: "unknown", pid: 777, running: false },
+    ]);
+  });
+
   it("keeps a running probed process ready and a finished one-shot unknown (#174)", () => {
     const stdout = JSON.stringify([
       { name: "web", status: "Running", is_ready: "Ready", is_running: true },
       { name: "migrate", status: "Completed", is_ready: "-", exit_code: 0, is_running: false },
     ]);
     expect(parseServiceStatuses(stdout)).toEqual([
-      { name: "web", status: "Running", health: "ready" },
-      { name: "migrate", status: "Completed", health: "unknown", exitCode: 0 },
+      { name: "web", status: "Running", health: "ready", running: true },
+      { name: "migrate", status: "Completed", health: "unknown", exitCode: 0, running: false },
     ]);
   });
 

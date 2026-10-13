@@ -305,6 +305,8 @@ const FIELD_HANDLERS: Readonly<Record<string, FieldHandler>> = {
   env: (v) => handleEnvField(v),
   ports: (v) => handlePortsField(v),
   block_base: () => 0,
+  // A service's live pid (#226) — which one it is changes every run.
+  pid: (v) => (typeof v === "number" ? 0 : PASS),
 };
 
 function normaliseField(key: string, value: unknown, worktreeId: string): unknown {
@@ -1716,6 +1718,237 @@ describe.skipIf(!ENABLED)("real-pc smoke — up --dry-run on a running instance 
     expect(sorted((bare.doc as UpDoc).up.services.map((s) => s.name))).toEqual(
       sorted(dryBare.selected_services),
     );
+  }, 120_000);
+
+  // -- Scenarios 95-96: `ls` shows namespaces and services (#226, ADR-0009). --
+  interface LsServicesDoc {
+    readonly ls: {
+      readonly instances: ReadonlyArray<{
+        readonly id: string;
+        readonly kind: string;
+        readonly namespaces: ReadonlyArray<string> | null;
+        readonly services_read: string;
+        readonly services: ReadonlyArray<{
+          readonly name: string;
+          readonly status: string;
+          readonly namespaces: ReadonlyArray<string>;
+          readonly tier: string;
+          readonly state: string;
+          readonly pid: number | null;
+        }>;
+      }>;
+    };
+  }
+
+  /**
+   * A stack with two isolated namespaces (`backend`: api + worker, `ios`:
+   * sim) and a shared `db`. Every command carries the scenario root in argv
+   * so the PID-hygiene check sees all of it.
+   */
+  function writeTwoNamespaceStack(wt: string, root: string): Record<string, string> {
+    const scripts = Object.fromEntries(
+      ["db", "api", "worker", "sim"].map((n) => [n, sleeper(root, n)]),
+    );
+    writeFileSync(
+      join(wt, "devtrees.yaml"),
+      [
+        "services:",
+        "  db:",
+        "    tier: shared",
+        `    command: "python3 ${scripts.db}"`,
+        "  api:",
+        "    tier: isolated",
+        "    namespace: backend",
+        `    command: "python3 ${scripts.api}"`,
+        "  worker:",
+        "    tier: isolated",
+        "    namespace: backend",
+        `    command: "python3 ${scripts.worker}"`,
+        "  sim:",
+        "    tier: isolated",
+        "    namespace: ios",
+        `    command: "python3 ${scripts.sim}"`,
+        "",
+      ].join("\n"),
+    );
+    return scripts;
+  }
+
+  /** The worktree's control socket and derived config, as devtrees lays them out. */
+  function worktreeInstance(wt: string): { socketPath: string; configPath: string } {
+    const commonDir = execGit(wt, ["rev-parse", "--git-common-dir"]);
+    const absCommon = commonDir.startsWith("/") ? commonDir : join(wt, commonDir);
+    return instancePaths(absCommon, wtId(wt));
+  }
+
+  /**
+   * A fresh repo running the two-namespace stack booted with `-n backend`,
+   * with the scenario's cleanups registered.
+   */
+  function bootBackendOnly(prefix: string): {
+    wt: string;
+    id: string;
+    scripts: Record<string, string>;
+  } {
+    const repo = buildSmokeRepo(prefix, ["login"]);
+    currentCtx = { pidNeedle: repo.root, root: repo.root };
+    const wt = repo.worktrees.login!;
+    const scripts = writeTwoNamespaceStack(wt, repo.root);
+    cleanupStack.push(() => devtrees(wt, ["down", "--shared"]));
+    cleanupStack.push(() => devtrees(wt, ["down"]));
+    const booted = devtrees(wt, ["up", "-n", "backend", "--json", "--wait-timeout", "30"]);
+    expect(booted.code, `up -n backend failed: ${booted.stderr} ${booted.stdout}`).toBe(0);
+    return { wt, id: wtId(wt), scripts };
+  }
+
+  type LsServiceJsonRow = LsServicesDoc["ls"]["instances"][number]["services"][number];
+
+  /** Poll `ls --json` until `service` in instance `id` `matches`; the last document. */
+  async function pollServiceState(
+    wt: string,
+    id: string,
+    service: string,
+    matches: (row: LsServiceJsonRow) => boolean,
+  ): Promise<LsServicesDoc> {
+    const deadline = Date.now() + 15_000;
+    for (;;) {
+      const ls = devtrees(wt, ["ls", "--json"]);
+      expect(ls.code, `ls failed: ${ls.stderr}`).toBe(0);
+      const doc = ls.doc as LsServicesDoc;
+      const row = doc.ls.instances
+        .find((i) => i.id === id)
+        ?.services.find((s) => s.name === service);
+      if ((row !== undefined && matches(row)) || Date.now() >= deadline) return doc;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+  }
+
+  it("scenario 95: ls shows the booted namespace and each service, a stopped one as dead, shared included (#226)", async () => {
+    const { wt, id, scripts } = bootBackendOnly("dt-rpc95-");
+    expect(await waitForPid(scripts.worker!, 10_000), "worker should be running").toBe(true);
+
+    const { socketPath } = worktreeInstance(wt);
+    const stop = spawnSync("process-compose", ["process", "stop", "worker", "-u", socketPath], {
+      encoding: "utf8",
+    });
+    expect(stop.status, stop.stderr).toBe(0);
+    expect(await waitForNoPids(scripts.worker!, 10_000)).toEqual([]);
+
+    // process-compose reports the stop like a crash (`Completed`, exit -1):
+    // `ls` classifies it `dead`, as ADR-0009 says it will.
+    const doc = await pollServiceState(wt, id, "worker", (s) => s.state === "dead");
+    const worktree = doc.ls.instances.find((i) => i.id === id)!;
+    // `ios` was not booted: its `sim` is not in the project.
+    expect(worktree).toMatchObject({ services_read: "ok", namespaces: ["backend"] });
+    const byName = new Map(worktree.services.map((s) => [s.name, s]));
+    expect([...byName.keys()].sort()).toEqual(["api", "worker"]);
+    const isolated = { namespaces: ["backend"], tier: "isolated" };
+    expect(byName.get("api")).toMatchObject({ ...isolated, state: "active", status: "Running" });
+    expect(byName.get("worker")).toMatchObject({
+      ...isolated,
+      state: "dead",
+      status: "Completed",
+      pid: null,
+    });
+    // The pid is the live service process.
+    const apiPid = byName.get("api")!.pid!;
+    expect(() => process.kill(apiPid, 0)).not.toThrow();
+    expect(doc.ls.instances.find((i) => i.kind === "shared")).toMatchObject({
+      services_read: "ok",
+      namespaces: ["default"],
+      services: [{ name: "db", namespaces: ["default"], tier: "shared", state: "active" }],
+    });
+
+    // Human output: the NAMESPACES column, and one row per service.
+    const table = devtrees(wt, ["ls"]).stdout;
+    expect(table).toMatch(/^ID\s+KIND\s+STATUS\s+NAMESPACES\s+PORTS$/m);
+    expect(table).toMatch(new RegExp(`^${id}\\s+worktree\\s+running\\s+backend\\s`, "m"));
+    const rows = devtrees(wt, ["ls", "--services"]).stdout;
+    expect(rows).toMatch(/^INSTANCE\s+SERVICE\s+NAMESPACES\s+TIER\s+STATE\s+PID$/m);
+    expect(rows).toMatch(new RegExp(`^${id}\\s+worker\\s+backend\\s+isolated\\s+dead\\s+-$`, "m"));
+    expect(rows).toMatch(
+      new RegExp(`^${id}\\s+api\\s+backend\\s+isolated\\s+active\\s+${apiPid}$`, "m"),
+    );
+    expect(rows).toMatch(/^shared\s+db\s+default\s+shared\s+active\s+\d+$/m);
+    expect(rows).not.toMatch(/\bsim\b/);
+  }, 120_000);
+
+  it("scenario 96: ls lists a frozen instance as unresponsive within its read budget, and the others in full (#226)", async () => {
+    const { wt, id } = bootBackendOnly("dt-rpc96-");
+
+    // Freeze the worktree's process-compose: its socket still accepts
+    // connections, but `process list` never answers.
+    const { configPath } = worktreeInstance(wt);
+    const ps = spawnSync("ps", ["-A", "-o", "pid=,args="], { encoding: "utf8" });
+    const pcPids = ps.stdout
+      .split("\n")
+      .filter((l) => l.includes("process-compose") && l.includes(configPath))
+      .map((l) => Number(l.trim().split(/\s+/)[0]));
+    expect(pcPids.length, "the worktree's process-compose should be running").toBe(1);
+    process.kill(pcPids[0]!, "SIGSTOP");
+    // Runs before the `down`s (LIFO), so they find it answering.
+    cleanupStack.push(() => process.kill(pcPids[0]!, "SIGCONT"));
+
+    const started = Date.now();
+    const ls = await devtreesAsync(wt, ["ls", "--json"]);
+    const elapsed = Date.now() - started;
+    expect(ls.code, `ls failed: ${ls.stderr} ${ls.stdout}`).toBe(0);
+    // One 5s read budget (plus the CLI's own start-up), not a hang.
+    expect(elapsed).toBeLessThan(15_000);
+    const doc = ls.doc as LsServicesDoc;
+    expect(doc.ls.instances.find((i) => i.id === id)).toMatchObject({
+      status: "running",
+      services_read: "unresponsive",
+      namespaces: null,
+      services: [],
+    });
+    expect(doc.ls.instances.find((i) => i.kind === "shared")).toMatchObject({
+      services_read: "ok",
+      services: [{ name: "db", state: "active" }],
+    });
+
+    const human = await devtreesAsync(wt, ["ls", "--services"]);
+    expect(human.code).toBe(0);
+    expect(human.stdout).toMatch(
+      new RegExp(`^${id}\\s+\\(unresponsive\\)\\s+\\?\\s+isolated\\s+\\?\\s+-$`, "m"),
+    );
+    expect(human.stderr).toMatch(/did not answer/);
+  }, 120_000);
+
+  it("scenario 97: a service in its restart backoff reads active with no pid, not the dead run's (#226)", async () => {
+    const repo = buildSmokeRepo("dt-rpc97-", ["login"]);
+    currentCtx = { pidNeedle: repo.root, root: repo.root };
+    const wt = repo.worktrees.login!;
+    const keeper = sleeper(repo.root, "keeper");
+    const flaky = join(repo.root, "flaky.py");
+    writeFileSync(flaky, "import sys, time\ntime.sleep(1)\nsys.exit(3)\n");
+    writeFileSync(
+      join(wt, "devtrees.yaml"),
+      [
+        "services:",
+        "  keeper:",
+        "    tier: isolated",
+        `    command: "python3 ${keeper}"`,
+        "  flaky:",
+        "    tier: isolated",
+        `    command: "python3 ${flaky}"`,
+        "    availability:",
+        "      restart: always",
+        "      backoff_seconds: 20",
+        "",
+      ].join("\n"),
+    );
+    cleanupStack.push(() => devtrees(wt, ["down"]));
+    // `up` may or may not call flaky healthy; only `ls` is under test here.
+    devtrees(wt, ["up", "--json", "--wait-timeout", "5"]);
+    const id = wtId(wt);
+
+    const doc = await pollServiceState(wt, id, "flaky", (s) => s.status === "Restarting");
+    const row = doc.ls.instances.find((i) => i.id === id)?.services.find((s) => s.name === "flaky");
+    expect(row).toMatchObject({ status: "Restarting", state: "active", pid: null });
+    expect(pidsMatching(flaky)).toEqual([]);
+    const rows = devtrees(wt, ["ls", "--services"]).stdout;
+    expect(rows).toMatch(new RegExp(`^${id}\\s+flaky\\s+default\\s+isolated\\s+active\\s+-$`, "m"));
   }, 120_000);
 });
 

@@ -606,18 +606,16 @@ describe("devtrees CLI — --json (agent-facing surface)", () => {
     expect(() => JSON.parse(result.stdout)).not.toThrow();
   });
 
-  it("`ls` without --json is byte-for-byte unchanged from today's table", async () => {
-    // The exact pre-formatter output (from cli.ts at HEAD), captured here so a
-    // regression in the human path is impossible to introduce silently.
+  it("`ls` without --json prints the instance table, NAMESPACES column included (#226)", async () => {
     const ls = vi.fn().mockResolvedValue(lsRows);
     const result = await execute(["ls"], { up: vi.fn(), down: vi.fn(), ls });
     expect(result.code).toBe(0);
     expect(result.stderr).toBe("");
     expect(result.stdout).toBe(
       [
-        "ID      KIND      STATUS   PORTS",
-        "shared  shared    running  DB_PORT=30000",
-        "login   worktree  running  WEB_PORT=20512",
+        "ID      KIND      STATUS   NAMESPACES  PORTS",
+        "shared  shared    running  -           DB_PORT=30000",
+        "login   worktree  running  -           WEB_PORT=20512",
         "",
       ].join("\n"),
     );
@@ -731,10 +729,51 @@ describe("devtrees CLI — --json (agent-facing surface)", () => {
       };
     };
     const login = parsed.ls.instances.find((i) => i.id === "login");
-    expect(login?.services).toEqual([
+    expect(login?.services).toMatchObject([
       { name: "web", status: "Running", health: "ready", ports: { WEB_PORT: 20000 } },
       { name: "worker", status: "Running", health: "not_ready", ports: { WORKER_PORT: 20001 } },
     ]);
+  });
+
+  it("`ls --services` prints one row per service; `--help` documents the flag (#226)", async () => {
+    const ls = vi.fn().mockResolvedValue({
+      anchor: "/repo/.git",
+      instances: [
+        {
+          id: "login",
+          kind: "worktree" as const,
+          status: "running" as const,
+          socketPath: "/repo/.git/devtrees/run/login.sock",
+          ports: {},
+          blockBase: 20000,
+          namespaces: ["app"],
+          servicesRead: "ok" as const,
+          services: [
+            {
+              name: "web",
+              status: "Running",
+              health: "ready",
+              ports: {},
+              namespaces: ["app"],
+              tier: "isolated",
+              state: "active",
+              pid: 4242,
+            },
+          ],
+        },
+      ],
+    });
+    const plain = await execute(["ls"], { up: vi.fn(), down: vi.fn(), ls });
+    expect(plain.stdout).toMatch(/^ID\s+KIND\s+STATUS\s+NAMESPACES\s+PORTS$/m);
+    expect(plain.stdout).toMatch(/^login\s+worktree\s+running\s+app\s+\(block 20000\)$/m);
+
+    const services = await execute(["ls", "--services"], { up: vi.fn(), down: vi.fn(), ls });
+    expect(services.code).toBe(0);
+    expect(services.stdout).toMatch(/^INSTANCE\s+SERVICE\s+NAMESPACES\s+TIER\s+STATE\s+PID$/m);
+    expect(services.stdout).toMatch(/^login\s+web\s+app\s+isolated\s+active\s+4242$/m);
+
+    const help = await execute(["ls", "--help"], { up: vi.fn(), down: vi.fn(), ls });
+    expect(help.stdout).toMatch(/--services/);
   });
 });
 

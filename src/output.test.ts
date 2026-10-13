@@ -220,7 +220,9 @@ describe("output formatter — formatLs", () => {
       ports: { WEB: 40129 },
       blockBase: 40129,
     };
-    expect(formatLs([unknown], "human").stdout).toMatch(/gamma\s+worktree\s+unknown\s+WEB=40129/);
+    expect(formatLs([unknown], "human").stdout).toMatch(
+      /gamma\s+worktree\s+unknown\s+\?\s+WEB=40129/,
+    );
     const parsed = JSON.parse(formatLs([unknown], "json").stdout) as {
       ls: { instances: ReadonlyArray<{ id: string; status: string }> };
     };
@@ -258,6 +260,9 @@ describe("output formatter — formatLs", () => {
       kind: "shared",
       status: "running",
       ports: { CACHE: 40001 },
+      namespaces: [],
+      services_read: "skipped",
+      reload_pending: false,
       services: [],
       block_base: 40001,
     });
@@ -266,6 +271,9 @@ describe("output formatter — formatLs", () => {
       kind: "worktree",
       status: "stale",
       ports: { API: 40097 },
+      namespaces: [],
+      services_read: "skipped",
+      reload_pending: false,
       services: [],
       block_base: 40097,
     });
@@ -322,18 +330,25 @@ describe("output formatter — formatLs", () => {
             status: "Running",
             health: "ready",
             ports: { WEB_PORT: 20000 },
+            namespaces: ["app"],
+            tier: "isolated",
+            state: "active",
+            pid: 4242,
           },
           {
             name: "worker",
             status: "Running",
             health: "not_ready",
             ports: { WORKER_PORT: 20001 },
+            namespaces: ["app", "jobs"],
+            tier: "isolated",
+            state: "active",
           },
         ],
       },
     ];
 
-    it("emits one services[] row per service with name, status, health and ports", () => {
+    it("emits one services[] row per service with name, status, health, ports and ADR-0009's fields (#226)", () => {
       const result = formatLs(rowsWithServices, "json");
       const parsed = JSON.parse(result.stdout) as {
         ls: {
@@ -349,8 +364,26 @@ describe("output formatter — formatLs", () => {
         };
       };
       expect(parsed.ls.instances[0]?.services).toEqual([
-        { name: "web", status: "Running", health: "ready", ports: { WEB_PORT: 20000 } },
-        { name: "worker", status: "Running", health: "not_ready", ports: { WORKER_PORT: 20001 } },
+        {
+          name: "web",
+          status: "Running",
+          health: "ready",
+          ports: { WEB_PORT: 20000 },
+          namespaces: ["app"],
+          tier: "isolated",
+          state: "active",
+          pid: 4242,
+        },
+        {
+          name: "worker",
+          status: "Running",
+          health: "not_ready",
+          ports: { WORKER_PORT: 20001 },
+          namespaces: ["app", "jobs"],
+          tier: "isolated",
+          state: "active",
+          pid: null,
+        },
       ]);
     });
 
@@ -392,6 +425,160 @@ describe("output formatter — formatLs", () => {
         "human",
       ).stdout;
       expect(withServices).toBe(withoutServices);
+    });
+  });
+
+  /**
+   * Issue #226 (ADR-0009): `ls` shows each instance's booted namespaces, and
+   * `--services` one row per service, so acting on one service starts from
+   * seeing it. An instance whose read did not answer is shown as unknown.
+   */
+  describe("formatLs — namespaces and --services (#226)", () => {
+    const shared: LsInstanceRow = {
+      id: "shared",
+      kind: "shared",
+      status: "running",
+      ports: { DB_PORT: 30000 },
+      namespaces: ["default"],
+      servicesRead: "ok",
+      services: [
+        {
+          name: "db",
+          status: "Running",
+          health: "unknown",
+          ports: { DB_PORT: 30000 },
+          namespaces: ["default"],
+          tier: "shared",
+          state: "active",
+          pid: 100,
+        },
+      ],
+    };
+    const login: LsInstanceRow = {
+      id: "login",
+      kind: "worktree",
+      status: "running",
+      ports: { WEB_PORT: 20000 },
+      namespaces: ["app", "ios"],
+      servicesRead: "ok",
+      services: [
+        {
+          name: "web",
+          status: "Running",
+          health: "ready",
+          ports: { WEB_PORT: 20000 },
+          namespaces: ["app"],
+          tier: "isolated",
+          state: "active",
+          pid: 200,
+        },
+        {
+          name: "sim",
+          status: "Completed",
+          health: "unknown",
+          ports: {},
+          namespaces: ["ios"],
+          tier: "isolated",
+          state: "dead",
+        },
+      ],
+    };
+    const wedged: LsInstanceRow = {
+      id: "wedged",
+      kind: "worktree",
+      status: "running",
+      ports: { WEB_PORT: 20032 },
+      servicesRead: "unresponsive",
+    };
+    const stale: LsInstanceRow = {
+      id: "gone",
+      kind: "worktree",
+      status: "stale",
+      ports: {},
+      blockBase: 20064,
+      servicesRead: "skipped",
+    };
+
+    it("human ls has a NAMESPACES column: booted namespaces, `?` when unreadable, `-` when stale", () => {
+      const out = formatLs([shared, login, wedged, stale], "human");
+      expect(out.stdout.split("\n")).toEqual([
+        "ID      KIND      STATUS   NAMESPACES  PORTS",
+        "shared  shared    running  default     DB_PORT=30000",
+        "login   worktree  running  app,ios     WEB_PORT=20000",
+        "wedged  worktree  running  ?           WEB_PORT=20032",
+        "gone    worktree  stale    -           (block 20064)",
+        "",
+      ]);
+      expect(out.stderr).toMatch(/wedged did not answer/);
+      expect(out.stderr).not.toMatch(/login|shared|gone/);
+    });
+
+    it("human ls --services prints one row per service, and says why an instance has none", () => {
+      const unknown: LsInstanceRow = { id: "u", kind: "worktree", status: "unknown", ports: {} };
+      const empty: LsInstanceRow = { ...login, id: "empty", services: [], namespaces: [] };
+      const out = formatLs([shared, login, wedged, stale, unknown, empty], "human", {
+        services: true,
+      });
+      expect(out.stdout.split("\n")).toEqual([
+        "INSTANCE  SERVICE         NAMESPACES  TIER      STATE   PID",
+        "shared    db              default     shared    active  100",
+        "login     web             app         isolated  active  200",
+        "login     sim             ios         isolated  dead    -",
+        "wedged    (unresponsive)  ?           isolated  ?       -",
+        "gone      (stale)         -           isolated  -       -",
+        "u         (unknown)       ?           isolated  ?       -",
+        "empty     (none)          -           isolated  -       -",
+        "",
+      ]);
+      expect(out.stderr).toMatch(/wedged did not answer/);
+    });
+
+    it("an instance whose liveness is unknown shows `?`, not `-`", () => {
+      const unknown: LsInstanceRow = { id: "u", kind: "worktree", status: "unknown", ports: {} };
+      expect(formatLs([unknown], "human").stdout).toMatch(/^u\s+worktree\s+unknown\s+\?\s+-$/m);
+    });
+
+    it("namespaces not known (`null`) read `?` in the table and `null` in JSON", () => {
+      const noConfig: LsInstanceRow = { ...login, id: "noconf", namespaces: null };
+      expect(formatLs([noConfig], "human").stdout).toMatch(/^noconf\s+worktree\s+running\s+\?\s/m);
+      const parsed = JSON.parse(formatLs([noConfig], "json").stdout) as {
+        ls: { instances: ReadonlyArray<{ namespaces: unknown }> };
+      };
+      expect(parsed.ls.instances[0]?.namespaces).toBeNull();
+    });
+
+    it("a pending reload is flagged in JSON and noted on stderr", () => {
+      const pending: LsInstanceRow = { ...login, reloadPending: true };
+      const human = formatLs([pending], "human");
+      expect(human.stderr).toMatch(/login has a config reload still pending/);
+      const parsed = JSON.parse(formatLs([pending, stale], "json").stdout) as {
+        ls: { instances: ReadonlyArray<{ reload_pending: unknown }> };
+      };
+      expect(parsed.ls.instances.map((i) => i.reload_pending)).toEqual([true, false]);
+    });
+
+    it("JSON carries namespaces and services_read per instance, whatever --services says", () => {
+      const json = formatLs([login, wedged, stale], "json");
+      expect(formatLs([login, wedged, stale], "json", { services: true }).stdout).toBe(json.stdout);
+      const parsed = JSON.parse(json.stdout) as {
+        ls: { instances: ReadonlyArray<Record<string, unknown>> };
+      };
+      expect(json.stderr).toBe("");
+      expect(parsed.ls.instances.map((i) => [i.id, i.namespaces, i.services_read])).toEqual([
+        ["login", ["app", "ios"], "ok"],
+        ["wedged", null, "unresponsive"],
+        ["gone", [], "skipped"],
+      ]);
+      expect(parsed.ls.instances[0]?.services).toContainEqual({
+        name: "sim",
+        status: "Completed",
+        health: "unknown",
+        ports: {},
+        namespaces: ["ios"],
+        tier: "isolated",
+        state: "dead",
+        pid: null,
+      });
     });
   });
 });

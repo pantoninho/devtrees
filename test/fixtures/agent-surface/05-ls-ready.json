@@ -9,6 +9,9 @@
         "ports": {
           "DB_PORT": 0
         },
+        "namespaces": ["default"],
+        "services_read": "ok",
+        "reload_pending": false,
         "services": [
           {
             "name": "db",
@@ -16,7 +19,11 @@
             "health": "unknown",
             "ports": {
               "DB_PORT": 0
-            }
+            },
+            "namespaces": ["default"],
+            "tier": "shared",
+            "state": "active",
+            "pid": 0
           }
         ],
         "block_base": 0
@@ -29,6 +36,9 @@
           "DB_PORT": 0,
           "WEB_PORT": 0
         },
+        "namespaces": ["default"],
+        "services_read": "ok",
+        "reload_pending": false,
         "services": [
           {
             "name": "web",
@@ -36,7 +46,11 @@
             "health": "ready",
             "ports": {
               "WEB_PORT": 0
-            }
+            },
+            "namespaces": ["default"],
+            "tier": "isolated",
+            "state": "active",
+            "pid": 0
           }
         ],
         "block_base": 0
