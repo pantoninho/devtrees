@@ -202,6 +202,135 @@ describe("runRestart (#222)", () => {
     });
   });
 
+  it("a Pending service is refused with SERVICE_PENDING, as stop refuses it: nothing touched", async () => {
+    // mobile waits on api (process_healthy): it has not started, so its stop
+    // would leave it Terminating with no process for good.
+    const pendingMobile: ServiceStatus = { name: "mobile", status: "Pending", health: "unknown" };
+    const { deps, log, id } = instance({
+      rows: [running("api", 11), pendingMobile, running("worker", 13)],
+    });
+    const err = await failure(runRestart(deps, ["worker", "mobile"]));
+    expect(err).toEqual({
+      code: "SERVICE_PENDING",
+      message:
+        `devtrees restart: mobile is still waiting on its dependencies in '${id}' and has not ` +
+        "started, so there is nothing to restart. Nothing was touched. Wait until it starts " +
+        "(once api is ready), or restart what it waits on: `devtrees restart api`.",
+      details: {
+        services: ["mobile"],
+        waiting_on: ["api"],
+        remedy:
+          "Wait until it starts (once api is ready), or restart what it waits on: " +
+          "`devtrees restart api`.",
+      },
+    });
+    expect(touched(log)).toEqual([]);
+  });
+
+  it("re-checks the last running process before each later service: a one-shot may have finished", async () => {
+    // worker is kept alive by `seed`, a one-shot, until mobile's step is done;
+    // then seed finishes and mobile dies, leaving worker the last one.
+    const seed = running("seed", 14);
+    const dead: ServiceStatus = { ...stopped("mobile", 12), exitCode: 1 };
+    const { deps, log, id, state } = instance({
+      rows: [
+        { name: "api", status: "Completed", health: "unknown", exitCode: 0, running: false },
+        stopped("mobile", 12),
+        running("worker", 13),
+        seed,
+      ],
+      health: async () => {
+        state.set("seed", { ...seed, status: "Completed", exitCode: 0, running: false });
+        state.set("mobile", dead);
+      },
+    });
+    const err = await failure(runRestart(deps, ["mobile", "worker"]));
+    expect(err).toMatchObject({
+      code: "LAST_SERVICES_RUNNING",
+      message:
+        `devtrees restart: worker is the last running process(es) of '${id}'. process-compose ` +
+        "exits once nothing runs, which would take the whole instance down, so devtrees did " +
+        "not restart worker (it had restarted mobile before). Run `devtrees down && " +
+        "devtrees up -n default -n ios` to restart the instance.",
+      details: { services: ["worker"] },
+    });
+    expect(touched(log)).toEqual(["process start mobile"]);
+  });
+
+  it("a refused start re-probes the instance: gone means process-compose exited, not a refusal", async () => {
+    const { deps, id } = instance({ refuse: "start worker" });
+    let gone = false;
+    const err = await failure(
+      runRestart(
+        {
+          ...deps,
+          probeSocket: async (): Promise<InstanceStatus> => (gone ? "stale" : "running"),
+          driver: {
+            ...deps.driver,
+            spawner: (bin, args, options) => {
+              if (args[1] === "start") gone = true;
+              return deps.driver!.spawner!(bin, args, options);
+            },
+          },
+        },
+        ["worker"],
+      ),
+    );
+    expect(err).toMatchObject({
+      code: "INSTANCE_NOT_FOUND",
+      message: expect.stringMatching(
+        new RegExp(
+          `^devtrees restart: process-compose exited while worker was stopping, so '${id}'`,
+        ),
+      ),
+    });
+  });
+
+  it("a refused start with the instance still up is SERVICE_START_FAILED", async () => {
+    const { deps } = instance({ refuse: "start worker" });
+    const err = await failure(runRestart(deps, ["worker"]));
+    expect(err.code).toBe("SERVICE_START_FAILED");
+    expect(err.message).toContain(
+      "FTL failed to start process worker. The services after it were not touched",
+    );
+  });
+
+  it("process-compose exiting during a later service's stop names what was already restarted", async () => {
+    const { deps, id, state } = instance();
+    let exited = false;
+    let started = 0;
+    const err = await failure(
+      runRestart(
+        {
+          ...deps,
+          probeSocket: async (): Promise<InstanceStatus> => (exited ? "stale" : "running"),
+          getServiceStatuses: async () => {
+            if (exited) throw new Error("dial unix: no such file");
+            return [...state.values()];
+          },
+          driver: {
+            ...deps.driver,
+            spawner: (bin, args, options) => {
+              if (args[1] === "start") started++;
+              // mobile's stop, after api restarted: process-compose exits.
+              if (args[1] === "stop" && started > 0) exited = true;
+              return deps.driver!.spawner!(bin, args, options);
+            },
+          },
+        },
+        ["mobile", "api"],
+      ),
+    );
+    expect(err).toEqual({
+      code: "INSTANCE_NOT_FOUND",
+      message:
+        `devtrees restart: process-compose exited while mobile was stopping, so '${id}' is no ` +
+        "longer running: no other process was left running (process-compose exits once nothing " +
+        "runs). devtrees had already restarted api. Run `devtrees up` to start the instance again.",
+      details: { worktree_id: id, services: ["mobile"] },
+    });
+  });
+
   it("reports the restarted services' rows, in restart order and only those", async () => {
     const { deps } = instance({ health: null });
     const result = await runRestart(deps, ["worker", "api"]);

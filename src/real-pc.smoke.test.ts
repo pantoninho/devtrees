@@ -2531,7 +2531,7 @@ describe.skipIf(!ENABLED)("real-pc smoke — stop <service...> (#223)", () => {
     expect(devtrees(wt, ["down", "--json"]).code).toBe(0);
   }, 120_000);
 
-  it("scenario 92c: stopping a Pending service fails SERVICE_PENDING, touches nothing, and it still starts later (B3)", async () => {
+  it("scenario 92c: stopping or restarting a Pending service fails SERVICE_PENDING, touches nothing, and it still starts later (B3, #222)", async () => {
     // `app` waits for `api` to be healthy; api becomes healthy only once
     // `ready` exists. process-compose would accept `process stop app` and
     // leave it Terminating with no process for good; devtrees refuses first.
@@ -2570,6 +2570,21 @@ describe.skipIf(!ENABLED)("real-pc smoke — stop <service...> (#223)", () => {
       .find((i) => i.id === wtId(wt))
       ?.services.find((s) => s.name === "app");
     expect(app?.status).toBe("Pending");
+
+    // `restart` refuses it the same way (#222): its stop would strand it too.
+    const restartStarted = Date.now();
+    const restart = devtrees(wt, ["restart", "app", "--json"]);
+    expect(Date.now() - restartStarted, "refused up front").toBeLessThan(15_000);
+    expect(restart.code, restart.stdout).toBe(1);
+    const restartError = (restart.doc as ErrorDoc).error;
+    expect(restartError.code).toBe("SERVICE_PENDING");
+    expect(restart.stderr).toMatch(/devtrees restart: app is still waiting/);
+    expect(restartError.details).toMatchObject({ services: ["app"], waiting_on: ["api"] });
+    expect(pidsMatching(join(root, "api.py"))).toEqual(apiPids);
+    const after = (devtrees(wt, ["ls", "--json"]).doc as LsDoc).ls.instances
+      .find((i) => i.id === wtId(wt))
+      ?.services.find((s) => s.name === "app");
+    expect(after?.status).toBe("Pending");
 
     // Once its dependency is healthy, app starts as if nothing had happened.
     writeFileSync(join(root, "ready"), "");

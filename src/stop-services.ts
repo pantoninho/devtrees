@@ -125,6 +125,11 @@ export function assertNotPending(
   pending: ReadonlyArray<string>,
   waitingOn: (service: string) => ReadonlyArray<string>,
   worktreeId: string,
+  /**
+   * `restart` (#222) refuses the same way: its stop would leave the service
+   * `Terminating` with no process for good, just as `stop`'s would.
+   */
+  command: "stop" | "restart" = "stop",
 ): void {
   if (pending.length === 0) return;
   const deps = [...new Set(pending.flatMap(waitingOn))];
@@ -133,13 +138,13 @@ export function assertNotPending(
     deps.length === 0
       ? `Wait until ${one ? "it starts" : "they start"}.`
       : `Wait until ${one ? "it starts" : "they start"} (once ${deps.join(", ")} ` +
-        `${deps.length === 1 ? "is" : "are"} ready), or stop what ${one ? "it waits" : "they wait"} ` +
-        `on: \`devtrees stop ${deps.join(" ")}\`.`;
+        `${deps.length === 1 ? "is" : "are"} ready), or ${command} what ${one ? "it waits" : "they wait"} ` +
+        `on: \`devtrees ${command} ${deps.join(" ")}\`.`;
   throw codedError(
     "SERVICE_PENDING",
-    `devtrees stop: ${pending.join(", ")} ${one ? "is" : "are"} still waiting on ` +
+    `devtrees ${command}: ${pending.join(", ")} ${one ? "is" : "are"} still waiting on ` +
       `${one ? "its" : "their"} dependencies in '${worktreeId}' and ` +
-      `${one ? "has" : "have"} not started, so there is nothing to stop. Nothing was ` +
+      `${one ? "has" : "have"} not started, so there is nothing to ${command}. Nothing was ` +
       `touched. ${remedy}`,
     { services: [...pending], waiting_on: deps, remedy },
   );
@@ -172,7 +177,10 @@ export function assertNotLastRunning(
       ? ["stop", "nothing was stopped.", "devtrees down", "stop"]
       : [
           "restart",
-          `nothing was restarted.${alreadyRestarted(restart.done)}`,
+          restart.done.length === 0
+            ? "nothing was restarted."
+            : `devtrees did not restart ${stopping.join(", ")} (it had restarted ` +
+              `${restart.done.join(", ")} before).`,
           restart.remedy,
           "restart",
         ];

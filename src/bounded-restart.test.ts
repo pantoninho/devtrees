@@ -204,6 +204,13 @@ describe("boundedRestart (#222)", () => {
     expect(w.calls).toEqual(["stop mobile"]);
   });
 
+  it("a new run from the restart policy after a force-kill still reports what was force-killed", async () => {
+    const w = world({ policyRestarts: true, ignoresStop: true });
+    const result = await boundedRestart(w.target, w.driver, w.seams);
+    expect(result).toMatchObject({ ok: true, forceKilled: [{ service: "mobile", pid: 201 }] });
+    expect(w.calls).toEqual(["stop mobile"]);
+  });
+
   it("'already running' with a new run listed is a success", async () => {
     const w = world();
     let afterStart = false;

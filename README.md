@@ -98,11 +98,15 @@ Flag highlights (run `devtrees <cmd> --help` for the full per-command surface):
   other service keep running; dependents of a named service are not
   restarted, and a stopped one is simply started. It refuses what `stop`
   refuses before anything is touched (`SHARED_SERVICE_REFUSED`,
-  `CONFIG_DRIFT` for a pending reload, `NAMESPACE_NOT_RUNNING`), and the
+  `CONFIG_DRIFT` for a pending reload, `NAMESPACE_NOT_RUNNING`,
+  `SERVICE_PENDING` for a service still waiting on its dependencies), and the
   instance's last running process (`LAST_SERVICES_RUNNING`: its stop would
   make process-compose exit; `details.remedy` restarts the whole instance
-  with `down` + `up`). Each service's stop and start hold the lifecycle lock,
-  so a concurrent `up` or `down` may wait and fail `LOCK_CONTENTION`. See
+  with `down` + `up`). Each service's stop and start hold the lifecycle lock:
+  about 30s plus the service's `shutdown.timeout_seconds` at worst (an old
+  process that will not exit), plus up to 10s for the start, so a concurrent
+  `up` or `down` may wait about 10s and fail `LOCK_CONTENTION`.
+  `--wait-timeout` covers only the health waits, not the stops and starts. See
   [ADR-0009](docs/adr/0009-per-service-and-per-namespace-lifecycle-control.md).
 - `down`, `attach`, and `logs` accept `--shared` to target the shared instance
   instead of this worktree's.
@@ -288,7 +292,7 @@ footer lists the subset that command can actually emit.
 | `SERVICE_START_FAILED`      | `up` tried to restart a dead service on the running instance, or `restart` a named one, and process-compose refused; `details.services` names each one, `details.remedy` says what to run next. The instance is still running. |
 | `SHARED_SERVICE_REFUSED`    | A per-service command named a shared service; a worktree never stops the shared instance's services. Nothing was touched; `details` has `{services, remedy}`, the remedy being `devtrees down --shared && devtrees up` (for every worktree). |
 | `LAST_SERVICES_RUNNING`     | `stop` or `restart` would leave the instance with no running process (a `Pending` service does not count), and process-compose would then exit and take the instance down; nothing was touched. `details.services` names them, `details.remedy` is `devtrees down` for `stop`, and for `restart` the `down` + `up` that restarts the instance. |
-| `SERVICE_PENDING`           | `stop` named a service still waiting on its dependencies (`Pending`): it has not started, so there is nothing to stop, and nothing was touched. `details` has `{services, waiting_on, remedy}`: wait until it starts, or stop what it waits on. |
+| `SERVICE_PENDING`           | `stop` or `restart` named a service still waiting on its dependencies (`Pending`): it has not started, so there is nothing to stop or restart, and nothing was touched. `details` has `{services, waiting_on, remedy}`: wait until it starts, or stop (restart) what it waits on. |
 | `SERVICE_STOP_INCOMPLETE`   | `stop` stopped the services, but after the bounded stop and the force-kill something is still alive or still holds one of their ports: a listener on a port (not necessarily one they started), a process that survived SIGKILL, or a service process-compose still reports running; `details.survivors` lists each `{service, pid, command, port_name?, port?, port_forwarder?}`, `details.force_killed` what devtrees signalled, `details.remedy` what to do. Rerunning the same `stop` checks the same ports again. |
 | `CONFIG_DRIFT`              | Running config differs from devtrees.yaml and hot-reload failed, or an earlier reload is still pending; `details.reason` is `timeout`, `not_supported`, `error`, or `reload_pending` (nothing was reloaded: kill `details.pids`, then retry; empty `pids` means the old process is gone and process-compose is still starting the new one, so retry shortly). |
 | `SHARED_DRIFT`              | This worktree's shared services diverge from the running shared instance; bring shared down and up again. |
@@ -457,7 +461,7 @@ Branch on `error.code`:
 | `DOWN_INCOMPLETE`           | `down` stopped process-compose, but something the instance started is still alive (`details.survivors`): a listener on a booted service's port (a container whose `shutdown.command` did not remove it, say), or a member of a service's process group that survived SIGKILL. Run `devtrees down` **once more**: with process-compose gone it runs every `shutdown.command` itself, checks the same ports again, and succeeds once they are free. If it fails the same way, **surface the survivors to the human** with `details.remedy`. Never kill a survivor with `port_forwarder: true`; stop the container that publishes its port. |
 | `SHARED_SERVICE_REFUSED`    | You asked `stop` for a shared service. Nothing was touched; a worktree never stops what other worktrees share. Leave it, or stop the shared instance with `devtrees down --shared`. |
 | `LAST_SERVICES_RUNNING`     | `stop` or `restart` would leave nothing running, and process-compose would then exit and take the whole stack down. Nothing was touched. To stop everything, run `devtrees down`; to restart it, run `details.remedy` (`devtrees down && devtrees up …`). |
-| `SERVICE_PENDING`           | You asked `stop` for a service still waiting on its dependencies: it has not started, so nothing was touched. Wait until it starts, or stop what it waits on (`details.waiting_on`, the command is in `details.remedy`). |
+| `SERVICE_PENDING`           | You asked `stop` or `restart` for a service still waiting on its dependencies: it has not started, so nothing was touched. Wait until it starts, or stop what it waits on (`details.waiting_on`, the command is in `details.remedy`). |
 | `SERVICE_STOP_INCOMPLETE`   | `stop` stopped the services, but something they started is still alive (`details.survivors`): usually a listener on one of their ports that left the process group. **Surface the survivors to the human** with `details.remedy`; rerun the same `stop` once they are gone. Never kill a survivor with `port_forwarder: true`. |
 | `PROCESS_COMPOSE_NOT_FOUND` | The `process-compose` binary is missing. **Surface this to the human** — it's an environment setup gap you can't fix.   |
 | `PROCESS_COMPOSE_TOO_OLD`   | The installed `process-compose` is below the minimum (v1.122.0). **Surface this to the human** — they need to upgrade it. |

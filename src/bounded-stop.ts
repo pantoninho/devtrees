@@ -75,11 +75,10 @@ export interface ServiceStopResult {
 export class StopRefusedError extends Error {
   constructor(
     services: ReadonlyArray<string>,
-    /** process-compose's own complaint. */
+    /** process-compose's own complaint (`restart` reports it as is, #222). */
     readonly reason: string,
-    command = "stop",
   ) {
-    super(`devtrees ${command}: process-compose refused to stop ${services.join(", ")}: ${reason}`);
+    super(`devtrees stop: process-compose refused to stop ${services.join(", ")}: ${reason}`);
     this.name = "StopRefusedError";
   }
 }
@@ -131,9 +130,7 @@ export async function boundedStopServices(
   const request = await driver.stopProcesses(target.socketPath, target.services);
   if (!request.ok && !(await settled())) {
     const running = (rows ?? []).filter((r) => names.has(r.name) && r.status === "Running");
-    if (running.length > 0) {
-      throw new StopRefusedError(target.services, request.message, target.command);
-    }
+    if (running.length > 0) throw new StopRefusedError(target.services, request.message);
   }
 
   let killed: ForceKilled[] = [];

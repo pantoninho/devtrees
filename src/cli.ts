@@ -686,7 +686,8 @@ class RestartCommand extends DevtreesCommand {
     // process-compose that does not answer → INSTANCE_UNRESPONSIVE); a shared
     // service → SHARED_SERVICE_REFUSED; an unknown name → SERVICE_NOT_FOUND; a
     // pending hot-reload → CONFIG_DRIFT (reload_pending); a service whose
-    // namespace was not booted → NAMESPACE_NOT_RUNNING; the instance's last running
+    // namespace was not booted → NAMESPACE_NOT_RUNNING; a service still Pending →
+    // SERVICE_PENDING; the instance's last running
     // process → LAST_SERVICES_RUNNING. process-compose refusing
     // the stop or start → SERVICE_START_FAILED; a restarted service that never
     // becomes healthy, or dies → HEALTH_TIMEOUT. No names → INVALID_ARGS (bare
@@ -707,6 +708,7 @@ class RestartCommand extends DevtreesCommand {
         "SHARED_SERVICE_REFUSED",
         "NAMESPACE_NOT_RUNNING",
         "LAST_SERVICES_RUNNING",
+        "SERVICE_PENDING",
         "CONFIG_DRIFT",
         "INSTANCE_NOT_FOUND",
         "INSTANCE_UNRESPONSIVE",

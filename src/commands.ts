@@ -444,7 +444,8 @@ class InstanceUnresponsiveError extends Error {
   ) {
     super(
       `devtrees ${command}: the ${details.instance === SHARED_INSTANCE_ID ? "shared" : `'${details.instance}'`} ` +
-        `instance's control socket did not answer after ${details.attempts} probes ` +
+        `instance's control socket did not answer after ${details.attempts} ` +
+        `probe${details.attempts === 1 ? "" : "s"} ` +
         `(${details.socket_path}); process-compose may be busy or frozen. Nothing was ` +
         `started or stopped and the socket was kept. ${details.remedy}`,
     );
@@ -2937,7 +2938,12 @@ export async function runRestart(
       order ??= [...target.services];
       // Before anything is touched, and again before each later service: a
       // one-shot that finished meanwhile may have left it the last one.
-      assertRestartKeepsInstance(target, order.slice(i), restarted);
+      const ahead = order.slice(i);
+      // A service still `Pending` has not started: `process stop` would leave
+      // it `Terminating` with no process for good (as for `stop`, #223).
+      const { pending } = partitionRunning(target.rows, ahead);
+      assertNotPending(pending, waitingOn(target), anchor.worktreeId, "restart");
+      assertRestartKeepsInstance(target, ahead, restarted);
       const name = order[i] ?? "";
       return { target, name, ...(await restartOne(target, name, driver, deps, restarted)) };
     });
@@ -3096,6 +3102,12 @@ function warnSurvivors(
   }
 }
 
+/** What each service `depends_on`, for `SERVICE_PENDING`'s remedy. */
+function waitingOn(target: NamedServices): (service: string) => ReadonlyArray<string> {
+  const declared = declaredOf(target);
+  return (name) => declared.find((s) => s.name === name)?.dependsOn.map((d) => d.name) ?? [];
+}
+
 /** The instance's isolated services, as its derived config declares them. */
 function declaredOf(target: NamedServices) {
   return declaredServices(target.config?.processes as DerivedProcessMap | undefined);
@@ -3142,11 +3154,11 @@ function restartFailedError(
   const remedy = `devtrees restart ${rest.join(" ")}`;
   const before =
     done.length > 0
-      ? `${done.join(", ")} ${done.length === 1 ? "was" : "were"} restarted before it; `
-      : "";
+      ? `${done.join(", ")} ${done.length === 1 ? "was" : "were"} restarted before it; the`
+      : "The";
   return new ServiceStartFailedError(
     `devtrees restart: process-compose refused to restart '${name}' in '${worktreeId}': ` +
-      `${message}. ${before}the services after it were not touched, and the worktree ` +
+      `${message}. ${before} services after it were not touched, and the worktree ` +
       `instance is still running. Retry with \`${remedy}\`, or read why with ` +
       `\`devtrees logs ${name}\`.`,
     { worktree_id: worktreeId, services: [{ name, message }], remedy },

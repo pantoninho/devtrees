@@ -196,6 +196,7 @@ describe("devtrees CLI", () => {
         "SHARED_SERVICE_REFUSED",
         "NAMESPACE_NOT_RUNNING",
         "LAST_SERVICES_RUNNING",
+        "SERVICE_PENDING",
         "CONFIG_DRIFT",
         "INSTANCE_NOT_FOUND",
         "INSTANCE_UNRESPONSIVE",
