@@ -121,6 +121,14 @@ are. It never stops anything, and never attaches the TUI.
   instance stopped; the next \`down\` checks the same ports again.
 - A dead shared service fails \`up\` with \`SHARED_SERVICE_DEAD\`; run
   \`devtrees down --shared && devtrees up\`.
+- \`devtrees stop <service...>\` stops named services and keeps the rest of
+  the stack running (e.g. give a simulator back while the backend serves).
+  It waits until each one has exited, force-killing it after the same budget
+  as \`down\` (named in \`force_killed\`). The stop is **transient**: the next
+  \`devtrees up\` starts them again, and that is how you bring one back (there
+  is no \`start\`). Stopping a service that is not running succeeds. It refuses
+  a shared service (\`SHARED_SERVICE_REFUSED\`) and a stop that would leave
+  nothing running (\`LAST_SERVICES_RUNNING\`; use \`devtrees down\`).
 
 ### Handling failures
 
@@ -144,6 +152,9 @@ Branch on \`error.code\`:
 | \`INSTANCE_UNRESPONSIVE\`     | The instance may be running but its process-compose did not answer (busy or frozen). Nothing changed. **Retry** in a moment; if it persists, follow \`details.remedy\`. Do not delete the socket by hand. |
 | \`DOWN_TIMEOUT\`              | \`down\` could not finish: process-compose was still running after devtrees force-killed the stuck services (\`details.stuck_services\`; empty when it is waiting on a \`shutdown.command\` that does not exit), or a timed-out hot-reload was still being applied, so \`down\` did not start the stop (\`details.pending_reload\`; \`details.remedy\` names the old process to kill by hand first, which is safe because no stop is running). Nothing was removed. **Retry** \`down\` once; if it fails again, **surface it to the human** with \`details.remedy\`, which names the process-compose pid to stop by hand, or for a pending reload the old process to kill. |
 | \`DOWN_INCOMPLETE\`           | \`down\` stopped process-compose, but something the instance started is still alive (\`details.survivors\`): a listener on a booted service's port (a container whose \`shutdown.command\` did not remove it, say), or a member of a service's process group that survived SIGKILL. Run \`devtrees down\` **once more**: with process-compose gone it runs every \`shutdown.command\` itself, checks the same ports again, and succeeds once they are free. If it fails the same way, **surface the survivors to the human** with \`details.remedy\`. Never kill a survivor with \`port_forwarder: true\`; stop the container that publishes its port. |
+| \`SHARED_SERVICE_REFUSED\`    | You asked \`stop\` for a shared service. Nothing was touched; a worktree never stops what other worktrees share. Leave it, or stop the shared instance with \`devtrees down --shared\`. |
+| \`LAST_SERVICES_RUNNING\`     | \`stop\` would leave nothing running, and process-compose would then exit and take the whole stack down. Nothing was stopped. To stop everything, run \`devtrees down\`. |
+| \`SERVICE_STOP_INCOMPLETE\`   | \`stop\` stopped the services, but something they started is still alive (\`details.survivors\`): usually a listener on one of their ports that left the process group. **Surface the survivors to the human** with \`details.remedy\`; rerun the same \`stop\` once they are gone. Never kill a survivor with \`port_forwarder: true\`. |
 | \`PROCESS_COMPOSE_NOT_FOUND\` | The \`process-compose\` binary is missing. **Surface this to the human** — it's an environment setup gap you can't fix.   |
 | \`PROCESS_COMPOSE_TOO_OLD\`   | The installed \`process-compose\` is below the minimum (v1.122.0). **Surface this to the human** — they need to upgrade it. |
 | \`CONFIG_INVALID\` / \`INVALID_ARGS\` | The config or your arguments are malformed. Fix the input; don't retry blindly.        |

@@ -255,7 +255,10 @@ export function downIncomplete(
 }
 
 /** `  app-db APP_DB_PORT 59073: pid 60274 (OrbStack Helper) accepts connections`. */
-function describeSurvivor(s: DownSurvivor): string {
+export function describeSurvivor(s: DownSurvivor): string {
+  if (s.port === undefined && s.pid === null) {
+    return `  ${s.service}: process-compose still reports it running`;
+  }
   const who =
     s.pid === null
       ? `holder not identified (try \`lsof -nP -iTCP:${s.port ?? ""}\`)`

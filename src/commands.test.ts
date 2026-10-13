@@ -32,6 +32,7 @@ import {
   runDown,
   runEnv,
   runLogs,
+  runStop,
   runUp,
   runUpDryRun,
   type CommandDeps,
@@ -7611,5 +7612,145 @@ describe("STALE_PORT_BLOCK holders that refuse connections (#155)", () => {
     );
     // An accepting port forwarder is labelled too (#217's wildcard probe sees OrbStack forwards).
     expect(first.message).toContain("never this process");
+  });
+});
+
+describe("runStop — stop named services (#223, ADR-0009)", () => {
+  const stack: ResolvedStack = {
+    services: [
+      isolated("web", "node web.js", ["WEB_PORT"]),
+      isolated("api", "node api.js"),
+      isolated("seed", "true"),
+      shared("db", "postgres", ["DB_PORT"]),
+    ],
+  };
+
+  /**
+   * A live instance whose `process list` reads `rows`. `process stop` is
+   * recorded and marks each named service stopped (`Completed`, exit -1),
+   * as process-compose v1.122.0 does; anything else goes to the stub.
+   */
+  async function liveInstance(rows: Record<string, { status: string; exit_code?: number }>) {
+    const deps = stubDeps({ stack, track: { invocations: [], touchSocket: true } });
+    const up = await runUp(deps);
+    const state = new Map(Object.entries(rows));
+    const stops: string[][] = [];
+    const base = deps.driver;
+    const spawner: NonNullable<CommandDeps["driver"]>["spawner"] = (binary, args, options) => {
+      if (args[0] === "process" && args[1] === "stop") {
+        const names = args.slice(2, args.indexOf("-U"));
+        stops.push(names);
+        for (const n of names) state.set(n, { status: "Completed", exit_code: -1 });
+        return spawnedOk();
+      }
+      return base?.spawner?.(binary, args, options) ?? spawnedOk();
+    };
+    const getServiceStatuses = async (): Promise<ServiceStatus[]> =>
+      [...state].map(([name, r]) => ({
+        name,
+        status: r.status,
+        health: "unknown" as const,
+        ...(r.exit_code !== undefined ? { exitCode: r.exit_code } : {}),
+      }));
+    const stopDeps: CommandDeps = {
+      ...deps,
+      driver: { ...base, spawner },
+      getServiceStatuses,
+      stop: { readProcessTable: async () => [], pollMs: 1, baseTimeoutMs: 50, graceMs: 10 },
+    };
+    return {
+      deps: stopDeps,
+      stops,
+      port: (n: string) => Number(up.env[n]),
+      id: deps.expectedWorktreeId,
+    };
+  }
+
+  const running = { web: { status: "Running" }, api: { status: "Running" } };
+
+  it("stops only the named running service and reports it", async () => {
+    const { deps, stops, id } = await liveInstance(running);
+    const result = await runStop(deps, { services: ["web"] });
+    expect(stops).toEqual([["web"]]);
+    expect(result).toEqual({ worktreeId: id, stopped: ["web"], notRunning: [], forceKilled: [] });
+  });
+
+  it("is idempotent: a service already stopped is skipped, and nothing is asked of process-compose", async () => {
+    const { deps, stops } = await liveInstance({
+      web: { status: "Completed", exit_code: -1 },
+      api: { status: "Running" },
+    });
+    const result = await runStop(deps, { services: ["web"] });
+    expect(stops).toEqual([]);
+    expect(result).toMatchObject({ stopped: [], notRunning: ["web"] });
+  });
+
+  it("fails LAST_SERVICES_RUNNING, stopping nothing, when no other process would run", async () => {
+    const { deps, stops } = await liveInstance({
+      web: { status: "Running" },
+      api: { status: "Completed", exit_code: -1 },
+      seed: { status: "Completed", exit_code: 0 },
+    });
+    const err = (await runStop(deps, { services: ["web"] }).catch((e: unknown) => e)) as Error & {
+      code?: string;
+    };
+    expect(err.code).toBe("LAST_SERVICES_RUNNING");
+    expect(stops).toEqual([]);
+  });
+
+  it("refuses a shared service and an unknown one before touching anything", async () => {
+    const { deps, stops } = await liveInstance(running);
+    const shared = (await runStop(deps, { services: ["web", "db"] }).catch((e: unknown) => e)) as {
+      code?: string;
+    };
+    expect(shared.code).toBe("SHARED_SERVICE_REFUSED");
+    const unknown = (await runStop(deps, { services: ["nope"] }).catch((e: unknown) => e)) as {
+      code?: string;
+      details?: unknown;
+    };
+    expect(unknown.code).toBe("SERVICE_NOT_FOUND");
+    expect(unknown.details).toMatchObject({ service: "nope" });
+    expect(stops).toEqual([]);
+  });
+
+  it("fails INSTANCE_NOT_FOUND when no instance is running", async () => {
+    const deps = stubDeps({ stack });
+    const err = (await runStop(deps, { services: ["web"] }).catch((e: unknown) => e)) as {
+      code?: string;
+    };
+    expect(err.code).toBe("INSTANCE_NOT_FOUND");
+  });
+
+  it("fails SERVICE_STOP_INCOMPLETE naming a listener still on a stopped service's port", async () => {
+    const { deps, port } = await liveInstance(running);
+    const webPort = port("WEB_PORT");
+    const err = (await runStop(
+      {
+        ...deps,
+        portAccepts: async (p) => p === webPort,
+        identifyPortHolder: () => ({ pid: 4242, command: "python3 escapee.py" }),
+      },
+      { services: ["web"] },
+    ).catch((e: unknown) => e)) as { code?: string; details?: { survivors?: unknown } };
+    expect(err.code).toBe("SERVICE_STOP_INCOMPLETE");
+    expect(err.details?.survivors).toMatchObject([
+      { service: "web", pid: 4242, port_name: "WEB_PORT", port: webPort },
+    ]);
+  });
+
+  it("runs under the worktree's lifecycle lock", async () => {
+    const { deps, id } = await liveInstance(running);
+    const locked: string[] = [];
+    await runStop(
+      {
+        ...deps,
+        withLifecycleLock: async (_a, instanceId, fn) => {
+          locked.push(instanceId);
+          return fn();
+        },
+      },
+      { services: ["web"] },
+    );
+    expect(locked).toEqual([id]);
   });
 });

@@ -384,7 +384,7 @@ export interface StopSeams {
 }
 
 /** Default grace for process-compose to exit once its stuck services are killed. */
-const DOWN_GRACE_MS = 10_000;
+export const DOWN_GRACE_MS = 10_000;
 const DOWN_POLL_MS = 100;
 /** Floor of the wait for a pending reload to finish before the stop. */
 const PENDING_SETTLE_MS = 5_000;
@@ -860,7 +860,7 @@ interface Snapshot {
   readonly statuses?: ReadonlyArray<ServiceStatus>;
 }
 
-function snapshotOf(
+export function snapshotOf(
   statuses: ReadonlyArray<ServiceStatus>,
   table: ReadonlyArray<ProcessRow>,
   supervisorPid: number | undefined,
@@ -919,7 +919,7 @@ export function treeSurvivors(
  * through. Every process signalled is reported; what is still alive
  * afterwards is a survivor.
  */
-async function sweepServiceGroups(
+export async function sweepServiceGroups(
   tree: ReadonlyArray<ServiceProcess>,
   groups: { readonly led: ReadonlySet<number>; readonly unsignalled: ReadonlySet<string> },
   seams: StopSeams,
@@ -942,7 +942,7 @@ async function sweepServiceGroups(
 }
 
 /** The process groups the services lead. */
-function serviceGroups(services: ReadonlyArray<ServiceProcess>): Set<number> {
+export function serviceGroups(services: ReadonlyArray<ServiceProcess>): Set<number> {
   return new Set(services.filter((p) => p.pgid === p.pid).map((p) => p.pgid));
 }
 
@@ -953,7 +953,7 @@ function dedupe(procs: ReadonlyArray<ForceKilled>): ForceKilled[] {
 }
 
 /** The group sweep's seams, defaulted. */
-function sweepSeams(seams: StopSeams) {
+export function sweepSeams(seams: StopSeams) {
   return {
     readTable: seams.readProcessTable ?? readProcessTable,
     kill: seams.kill ?? process.kill.bind(process),
@@ -996,14 +996,23 @@ function signal(
   }
 }
 
-/** Poll `done` every `pollMs` for up to `ms`; true once it holds. */
-async function pollUntil(done: () => boolean, ms: number, pollMs: number): Promise<boolean> {
+/** `pollUntil` for an asynchronous check: true once it holds, false at `ms`. */
+export async function pollUntilAsync(
+  done: () => Promise<boolean>,
+  ms: number,
+  pollMs: number,
+): Promise<boolean> {
   const deadline = Date.now() + ms;
-  while (!done()) {
+  while (!(await done())) {
     if (Date.now() >= deadline) return false;
     await new Promise((r) => setTimeout(r, pollMs));
   }
   return true;
+}
+
+/** Poll `done` every `pollMs` for up to `ms`; true once it holds. */
+function pollUntil(done: () => boolean, ms: number, pollMs: number): Promise<boolean> {
+  return pollUntilAsync(() => Promise.resolve(done()), ms, pollMs);
 }
 
 /**
@@ -1012,7 +1021,7 @@ async function pollUntil(done: () => boolean, ms: number, pollMs: number): Promi
  * service's children go with it instead of being reparented to PID 1. A
  * process that is already gone is left out of the result.
  */
-function killProcesses(
+export function killProcesses(
   procs: ReadonlyArray<ServiceProcess>,
   kill: (target: number, signal: NodeJS.Signals) => void,
 ): ForceKilled[] {

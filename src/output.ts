@@ -43,6 +43,9 @@ export const ERROR_CODES = [
   "NAMESPACE_NOT_RUNNING",
   "SHARED_SERVICE_DEAD",
   "SERVICE_START_FAILED",
+  "SHARED_SERVICE_REFUSED",
+  "LAST_SERVICES_RUNNING",
+  "SERVICE_STOP_INCOMPLETE",
   "CONFIG_DRIFT",
   "SHARED_DRIFT",
   "SHARED_START_FAILED",
@@ -90,6 +93,12 @@ export const ERROR_CODE_DESCRIPTIONS: Readonly<Record<ErrorCode, string>> = {
     "A shared service in the running shared instance is dead; it is not restarted from a worktree, run `details.remedy` (`devtrees down --shared && devtrees up`).",
   SERVICE_START_FAILED:
     "`up` tried to restart a dead service on the running instance and process-compose refused; `details.services` names each one, `details.remedy` is the `down` + `up` that restarts the stack.",
+  SHARED_SERVICE_REFUSED:
+    "A per-service command named a shared service; a worktree never stops the shared instance's services (`devtrees down --shared` stops the whole shared instance). `details.services` names them; nothing was touched.",
+  LAST_SERVICES_RUNNING:
+    "`stop` would leave the instance with no running process, and process-compose would then exit and take the instance down; nothing was stopped. `details.services` names them, `details.remedy` is `devtrees down`.",
+  SERVICE_STOP_INCOMPLETE:
+    "`stop` stopped the services, but something they started is still alive after the bounded stop and the force-kill: a listener on one of their ports, a process that survived SIGKILL, or a service process-compose still reports running; `details.survivors` lists each `{service, pid, command, port_name?, port?, port_forwarder?}`, `details.force_killed` what devtrees signalled, `details.remedy` what to do.",
   CONFIG_DRIFT:
     "Running config differs from devtrees.yaml and hot-reload failed, or an earlier reload is still pending; `details.reason` is `timeout`, `not_supported`, `error`, or `reload_pending` (nothing was reloaded: kill `details.pids`, then retry; empty `pids` means the old process is gone and process-compose is still starting the new one, so retry shortly).",
   SHARED_DRIFT:
@@ -743,6 +752,58 @@ export function formatDown(payload: DownPayload, mode: FormatMode): OutputResult
     formatForceKilledStderr("down", what, payload.forceKilled ?? []) +
     (warning !== undefined ? formatReapWarningStderr(warning) : "");
   return { stdout: text, stderr };
+}
+
+// --- stop -------------------------------------------------------------------
+
+/** `devtrees stop <service...>` result (ADR-0009, #223). */
+export interface StopPayload {
+  readonly worktreeId: string;
+  readonly stopped: ReadonlyArray<string>;
+  /** Named services that were not running (already stopped, done or not booted). */
+  readonly notRunning: ReadonlyArray<string>;
+  readonly forceKilled?: ReadonlyArray<ForceKilledRow>;
+}
+
+/** The transient-stop caveat both output modes carry (ADR-0009). */
+const STOP_NOTE =
+  "A stop lasts only until the next `devtrees up`, which starts stopped services again.";
+
+/**
+ * Render `devtrees stop` output. Both modes say the stop is transient: the
+ * next `up` brings the services back (ADR-0009).
+ *
+ *   - `json`: `{schema_version, stop: {worktreeId, stopped[], not_running[],
+ *     force_killed[], transient: true, note}}`.
+ *   - `human`: what was stopped, what was not running, and the caveat on
+ *     stdout; a force-kill warning on stderr, as on `down`.
+ */
+export function formatStop(payload: StopPayload, mode: FormatMode): OutputResult {
+  if (mode === "json") {
+    const stop = {
+      worktreeId: payload.worktreeId,
+      stopped: [...payload.stopped],
+      not_running: [...payload.notRunning],
+      force_killed: forceKilledJson(payload.forceKilled),
+      transient: true,
+      note: STOP_NOTE,
+    };
+    return { stdout: `${JSON.stringify({ schema_version: SCHEMA_VERSION, stop })}\n`, stderr: "" };
+  }
+  const lines = [
+    ...(payload.stopped.length > 0
+      ? [`devtrees stop: stopped ${payload.stopped.join(", ")}.`]
+      : []),
+    ...(payload.notRunning.length > 0
+      ? [`devtrees stop: not running, nothing to stop: ${payload.notRunning.join(", ")}.`]
+      : []),
+    STOP_NOTE,
+  ];
+  const what = payload.stopped.join(", ");
+  return {
+    stdout: `${lines.join("\n")}\n`,
+    stderr: formatForceKilledStderr("stop", what, payload.forceKilled ?? []),
+  };
 }
 
 // --- up --dry-run -----------------------------------------------------------
