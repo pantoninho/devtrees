@@ -40,6 +40,7 @@ import {
   type FormatMode,
   type LsInstanceRow,
   type LsServiceRow,
+  type OutputResult,
   type PrunedRow,
   type ReapWarningRow,
   type ForceKilledRow,
@@ -285,6 +286,12 @@ abstract class DevtreesCommand extends Command<DevtreesContext> {
     return this.json ? "json" : "human";
   }
 
+  /** Write a formatter's output: its stdout part to stdout, its stderr part to stderr. */
+  protected emit(out: OutputResult): void {
+    if (out.stdout) this.context.stdout.write(out.stdout);
+    if (out.stderr) this.context.stderr.write(out.stderr);
+  }
+
   /**
    * Run a command body with the documented error envelope. The body returns
    * an exit code (0 for success, non-zero for in-band failure modes such as
@@ -297,8 +304,7 @@ abstract class DevtreesCommand extends Command<DevtreesContext> {
     } catch (err) {
       const payload = classifyError(err as Error);
       const out = formatError(payload, this.mode);
-      if (out.stdout) this.context.stdout.write(out.stdout);
-      if (out.stderr) this.context.stderr.write(out.stderr);
+      this.emit(out);
       return 1;
     }
   }
@@ -312,8 +318,7 @@ abstract class DevtreesCommand extends Command<DevtreesContext> {
   override async catch(error: unknown): Promise<void> {
     const payload = classifyError(error as Error);
     const out = formatError(payload, this.mode);
-    if (out.stdout) this.context.stdout.write(out.stdout);
-    if (out.stderr) this.context.stderr.write(out.stderr);
+    this.emit(out);
   }
 }
 
@@ -419,8 +424,7 @@ class UpCommand extends DevtreesCommand {
       // `restarted`) pass through
       // as-is; `formatUp` defaults whichever a caller left out.
       const out = formatUp({ ...result, sharedStarted: result.sharedStarted ?? false }, this.mode);
-      if (out.stdout) this.context.stdout.write(out.stdout);
-      if (out.stderr) this.context.stderr.write(out.stderr);
+      this.emit(out);
       this.emitInitHint();
       return 0;
     });
@@ -488,16 +492,15 @@ class UpCommand extends DevtreesCommand {
         : {}),
     });
     const out = formatUpDryRun(dryRunPayload(result), this.mode);
-    if (out.stdout) this.context.stdout.write(out.stdout);
-    if (out.stderr) this.context.stderr.write(out.stderr);
+    this.emit(out);
     return 0;
   }
 }
 
+type DryRunResultView = Awaited<ReturnType<NonNullable<ExecuteDeps["upDryRun"]>>>;
+
 /** Map the injected `upDryRun` result onto the formatter's payload. */
-function dryRunPayload(
-  result: Awaited<ReturnType<NonNullable<ExecuteDeps["upDryRun"]>>>,
-): UpDryRunPayload {
+function dryRunPayload(result: DryRunResultView): UpDryRunPayload {
   return {
     worktreeId: result.worktreeId,
     env: result.env,
@@ -507,6 +510,19 @@ function dryRunPayload(
     droppedEdges: result.droppedEdges ?? [],
     droppedNamespaceEdges: result.droppedNamespaceEdges ?? [],
     bracedEnvVars: result.bracedEnvVars ?? [],
+    ...dryRunPlanPayload(result),
+  };
+}
+
+/**
+ * The plan part of the dry-run payload: the selection (#176) and which path
+ * `up` would take, with its reload and restarts (#210). Absent fields default
+ * to a fresh preview.
+ */
+function dryRunPlanPayload(
+  result: DryRunResultView,
+): Pick<UpDryRunPayload, "selection" | "instance" | "wouldReload" | "wouldRestart"> {
+  return {
     ...(result.namespaces !== undefined
       ? {
           selection: {
@@ -571,8 +587,7 @@ class DownCommand extends DevtreesCommand {
             },
         this.mode,
       );
-      if (out.stdout) this.context.stdout.write(out.stdout);
-      if (out.stderr) this.context.stderr.write(out.stderr);
+      this.emit(out);
       return 0;
     });
   }
@@ -590,8 +605,7 @@ class LsCommand extends DevtreesCommand {
       if (!this.context.deps.ls) return 0;
       const result = await this.context.deps.ls();
       const out = formatLs(result.instances, this.mode);
-      if (out.stdout) this.context.stdout.write(out.stdout);
-      if (out.stderr) this.context.stderr.write(out.stderr);
+      this.emit(out);
       return 0;
     });
   }
@@ -642,8 +656,7 @@ class PruneCommand extends DevtreesCommand {
         result.warnings ?? [],
         result.unreclaimed ?? [],
       );
-      if (out.stdout) this.context.stdout.write(out.stdout);
-      if (out.stderr) this.context.stderr.write(out.stderr);
+      this.emit(out);
       return 0;
     });
   }
@@ -664,8 +677,7 @@ class EnvCommand extends DevtreesCommand {
       if (!this.context.deps.env) return 0;
       const result = await this.context.deps.env();
       const out = formatEnv(result.env, this.mode);
-      if (out.stdout) this.context.stdout.write(out.stdout);
-      if (out.stderr) this.context.stderr.write(out.stderr);
+      this.emit(out);
       return 0;
     });
   }
@@ -769,8 +781,7 @@ class InitCommand extends DevtreesCommand {
         { target: result.target, path: result.path, action: result.action },
         this.mode,
       );
-      if (out.stdout) this.context.stdout.write(out.stdout);
-      if (out.stderr) this.context.stderr.write(out.stderr);
+      this.emit(out);
       return 0;
     });
   }

@@ -1053,6 +1053,32 @@ interface AllocatedPortMaps {
 }
 
 /**
+ * The named-port → number resolvers for a worktree block at `blockBase` and,
+ * when the stack has shared services, a shared block at `sharedBase`: each
+ * name resolves to its block's base plus its positional offset. Shared by
+ * `allocateAndBuildPortMaps` (under the registry lock) and `runEnv` (a
+ * lock-free read).
+ */
+function namedPortResolvers(
+  stack: ResolvedStack,
+  options: AllocatorOptions,
+  blockBase: number,
+  sharedBase: number | undefined,
+): Pick<AllocatedPortMaps, "portFor" | "sharedPortFor"> {
+  const isolatedOffsets = buildOffsetMap(stack.services, "isolated", options.blockSize);
+  const sharedOffsets =
+    sharedBase === undefined
+      ? new Map<string, number>()
+      : buildOffsetMap(stack.services, "shared", options.blockSize);
+  const at = (base: number | undefined, offset: number | undefined) =>
+    base === undefined || offset === undefined ? undefined : base + offset;
+  return {
+    portFor: (name) => at(blockBase, isolatedOffsets.get(name)),
+    sharedPortFor: (name) => at(sharedBase, sharedOffsets.get(name)),
+  };
+}
+
+/**
  * Allocate this worktree's port block — and, if the stack declares shared
  * services, the shared block — under one read-modify-write of the registry
  * lock, then build the named-port → number resolvers from the resulting
@@ -1090,20 +1116,7 @@ async function allocateAndBuildPortMaps(args: {
     return next === snapshot ? snapshot : next;
   });
 
-  const isolatedOffsets = buildOffsetMap(stack.services, "isolated", options.blockSize);
-  const sharedOffsets = sharedNeeded
-    ? buildOffsetMap(stack.services, "shared", options.blockSize)
-    : new Map<string, number>();
-
-  const portFor = (name: string): number | undefined => {
-    const offset = isolatedOffsets.get(name);
-    return offset === undefined ? undefined : blockBase + offset;
-  };
-  const sharedPortFor = (name: string): number | undefined => {
-    if (sharedBase === undefined) return undefined;
-    const offset = sharedOffsets.get(name);
-    return offset === undefined ? undefined : sharedBase + offset;
-  };
+  const { portFor, sharedPortFor } = namedPortResolvers(stack, options, blockBase, sharedBase);
 
   return sharedBase === undefined
     ? { blockBase, portFor, sharedPortFor }
@@ -2998,20 +3011,12 @@ export async function runEnv(deps: CommandDeps = {}): Promise<EnvResult> {
     ? await allocateBlock(SHARED_REGISTRY_KEY, snapshot, options, isPortFree)
     : undefined;
 
-  const isolatedOffsets = buildOffsetMap(stack.services, "isolated", options.blockSize);
-  const sharedOffsets = sharedNeeded
-    ? buildOffsetMap(stack.services, "shared", options.blockSize)
-    : new Map<string, number>();
-
-  const portFor = (name: string): number | undefined => {
-    const offset = isolatedOffsets.get(name);
-    return offset === undefined ? undefined : block.base + offset;
-  };
-  const sharedPortFor = (name: string): number | undefined => {
-    if (sharedBlock === undefined) return undefined;
-    const offset = sharedOffsets.get(name);
-    return offset === undefined ? undefined : sharedBlock.base + offset;
-  };
+  const { portFor, sharedPortFor } = namedPortResolvers(
+    stack,
+    options,
+    block.base,
+    sharedBlock?.base,
+  );
 
   // Shared ports come from the running instance, not positional offsets
   // (issue #83): when the shared socket is live and a persisted map exists,
