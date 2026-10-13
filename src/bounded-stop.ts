@@ -47,6 +47,8 @@ export interface ServiceStopTarget {
   readonly unsignalled?: ReadonlySet<string>;
   /** The worktree id, for the error raised when process-compose exits. */
   readonly instance: string;
+  /** The command stopping them, for its errors. Default `stop`; `restart` (#222). */
+  readonly command?: "stop" | "restart";
   /**
    * Has process-compose exited (its control socket no longer answers)? Asked
    * whenever a `process list` read fails. Default: never.
@@ -71,8 +73,12 @@ export interface ServiceStopResult {
  * still reports running. Nothing was escalated.
  */
 export class StopRefusedError extends Error {
-  constructor(services: ReadonlyArray<string>, message: string) {
-    super(`devtrees stop: process-compose refused to stop ${services.join(", ")}: ${message}`);
+  constructor(
+    services: ReadonlyArray<string>,
+    /** process-compose's own complaint (`restart` reports it as is, #222). */
+    readonly reason: string,
+  ) {
+    super(`devtrees stop: process-compose refused to stop ${services.join(", ")}: ${reason}`);
     this.name = "StopRefusedError";
   }
 }
@@ -117,7 +123,7 @@ export async function boundedStopServices(
   const settled = async (): Promise<boolean> => {
     rows = await driver.getServiceStatuses(target.socketPath).catch(() => undefined);
     if (rows === undefined && (await target.instanceGone?.())) {
-      throw instanceExitedError(target.instance, target.services);
+      throw instanceExitedError(target.instance, target.services, target.command);
     }
     return rows !== undefined && activeAmong(rows, target.services).length === 0;
   };
