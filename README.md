@@ -117,7 +117,15 @@ Flag highlights (run `devtrees <cmd> --help` for the full per-command surface):
   about 30s plus the service's `shutdown.timeout_seconds` at worst (an old
   process that will not exit), plus up to 10s for the start, so a concurrent
   `up` or `down` may wait about 10s and fail `LOCK_CONTENTION`.
-  `--wait-timeout` covers only the health waits, not the stops and starts. See
+  `--wait-timeout` covers only the health waits, not the stops and starts.
+  A bare `devtrees restart`, with no names and no `-n`, fails `INVALID_ARGS`
+  and touches nothing: restarting every service in place would have to stop
+  the last running one, and process-compose would exit. Name the services
+  (or `-n <namespace>`), or run the
+  error's `details.remedy`, the `down` + `up` that boots the same namespaces
+  again (`devtrees down && devtrees up -n app`, say). When devtrees cannot
+  read which namespaces are running, the remedy boots every declared one,
+  and the message says so. See
   [ADR-0009](docs/adr/0009-per-service-and-per-namespace-lifecycle-control.md).
 - `down`, `attach`, and `logs` accept `--shared` to target the shared instance
   instead of this worktree's.
@@ -314,7 +322,7 @@ footer lists the subset that command can actually emit.
 | `STALE_PORT_BLOCK`          | Foreign listeners hold ports in this worktree's allocated block (likely orphans); `details.collisions[]` lists each `{port_name, port, pid, command, accepts_connections, port_forwarder}`. Never kill a holder with `accepts_connections: false` or `port_forwarder: true`. |
 | `LOCK_CONTENTION`           | Another devtrees process holds a devtrees lock (allocation registry or an instance's lifecycle lock). |
 | `CONFIG_INVALID`            | devtrees.yaml is malformed or rejected by the deriver.                              |
-| `INVALID_ARGS`              | A flag value or positional argument failed validation before any effect ran.        |
+| `INVALID_ARGS`              | A flag value or positional argument failed validation before any effect ran. A bare `restart` (no names, no `-n`) carries `details.remedy`, the `down` + `up` that restarts the whole instance with its booted namespaces. |
 | `UNKNOWN`                   | Unclassified failure; consult the error envelope's `message` field.                 |
 
 New codes are additive; renames are breaking and require a `schema_version`
@@ -452,7 +460,9 @@ are. It never stops anything, and never attaches the TUI.
   running (`devtrees restart <service>` tries again), `SERVICE_START_FAILED`
   means process-compose refused. It refuses what `stop` refuses, and the
   stack's last running process (`LAST_SERVICES_RUNNING`: use
-  `details.remedy`, a `down` + `up`).
+  `details.remedy`, a `down` + `up`). To restart the whole stack, use that
+  `down` + `up` too: a bare `devtrees restart` fails `INVALID_ARGS` and
+  prints it.
 
 ### Handling failures
 

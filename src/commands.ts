@@ -3156,6 +3156,92 @@ function restartRemedy(target: NamedServices): string {
   return `devtrees down && ${formatUpCommand(declared, booted)}`;
 }
 
+/** What a bare `devtrees restart` points to instead (#225). */
+export interface BareRestartRemedy {
+  /** The `down` + `up` that restarts the whole instance. */
+  readonly remedy: string;
+  /**
+   * Whether the running namespaces were read. When not, `remedy` boots every
+   * namespace the stack declares, the widest boot that brings everything back.
+   */
+  readonly namespacesRead: boolean;
+}
+
+/**
+ * The remedy a bare `devtrees restart` (no names) points to (ADR-0009, #225):
+ * the `down` + `up` that reboots this worktree's instance with the
+ * namespaces it runs now, spelled by `formatUpCommand`.
+ *
+ * A bare `restart` is refused (`INVALID_ARGS`) because it cannot be done in
+ * place: process-compose v1.122.0 exits once its last running process stops,
+ * and no way of restarting that last process keeps the instance and the
+ * port safely. ADR-0009 records the experiments.
+ *
+ * Read-only and best-effort: it takes no lock, leaves a stale socket file in
+ * place, and never fails, so the refusal never fails with another code. When
+ * the running namespaces cannot be read (no running instance, or one that
+ * does not answer), the remedy boots every declared namespace, from the
+ * instance's derived config or else `devtrees.yaml`: a plain `devtrees up`
+ * could drop a booted namespace, or select nothing at all
+ * (`NO_SERVICES_SELECTED`) in a stack without a `default` one.
+ */
+export async function bareRestartRemedy(deps: CommandDeps = {}): Promise<BareRestartRemedy> {
+  let declared: ReadonlyArray<Pick<ResolvedService, "namespace">> = [];
+  try {
+    const { anchor } = resolve(deps);
+    const paths = instancePaths(anchor.anchor, anchor.worktreeId);
+    const configText = existsSync(paths.configPath)
+      ? readFileSync(paths.configPath, "utf8")
+      : undefined;
+    const fromConfig = declaredServices(derivedProcesses(configText));
+    declared = fromConfig.length > 0 ? fromConfig : declaredIsolated(deps, anchor.worktreeRoot);
+    if (fromConfig.length === 0) return everyNamespace(declared);
+    const live = await socketIsLive(
+      paths.socketPath,
+      resolveProbe(deps),
+      { command: "restart", instance: anchor.worktreeId },
+      { readOnly: true },
+    );
+    if (!live) return everyNamespace(declared);
+    const rows = await readStatusesWithin(
+      { getServiceStatuses: statusReader(deps, createDriver(deps.driver)) },
+      paths.socketPath,
+      RESTART_READ_TIMEOUT_MS,
+      { notify: () => {}, probe: probeOf(deps) },
+    );
+    const present = new Set(rows.map((r) => r.name));
+    const booted = resolveRunningSelection(fromConfig, present, undefined).namespaces;
+    if (booted.length === 0) return everyNamespace(declared);
+    return {
+      remedy: `devtrees down && ${formatUpCommand(fromConfig, booted)}`,
+      namespacesRead: true,
+    };
+  } catch {
+    return everyNamespace(declared);
+  }
+}
+
+/** The bare-restart remedy that boots every declared namespace. */
+function everyNamespace(
+  declared: ReadonlyArray<Pick<ResolvedService, "namespace">>,
+): BareRestartRemedy {
+  return { remedy: `devtrees down && ${formatUpCommand(declared, [])}`, namespacesRead: false };
+}
+
+/** The isolated services `devtrees.yaml` declares; none when it cannot be read. */
+function declaredIsolated(
+  deps: CommandDeps,
+  worktreeRoot: string,
+): ReadonlyArray<Pick<ResolvedService, "namespace">> {
+  try {
+    return (deps.readStack ?? loadStack)(worktreeRoot).services.filter(
+      (s) => s.tier === "isolated",
+    );
+  } catch {
+    return [];
+  }
+}
+
 /** The service as the health wait needs it: its name and readiness probe. */
 function restartedService(
   target: NamedServices,

@@ -214,6 +214,11 @@ export interface ExecuteDeps {
     /** Health-wait window in ms (`--wait-timeout=<seconds>`). */
     readonly waitTimeoutMs?: number;
   }) => Promise<RestartPayload>;
+  /**
+   * The remedy a bare `restart` points to (#225): the `down` + `up` that keeps
+   * the booted namespaces. Best-effort; never throws.
+   */
+  bareRestartRemedy?: () => Promise<BareRestartRemedyRow>;
   ls?: () => Promise<{ anchor: string; instances: ReadonlyArray<LsInstanceRow> }>;
   attach?: (options: { shared: boolean }) => Promise<void>;
   prune?: () => Promise<{
@@ -269,13 +274,19 @@ export interface LogsCliOptions {
 // thrown error falls through `classifyError` to `UNKNOWN`), and rendering it
 // last keeps the more interesting codes at the top.
 
-function errorCodeFooter(codes: ReadonlyArray<ErrorCode>): string {
+function errorCodeFooter(
+  codes: ReadonlyArray<ErrorCode>,
+  /** A command's own wording for a code, where the shared one says too little. */
+  overrides: Partial<Readonly<Record<ErrorCode, string>>> = {},
+): string {
   // clipanion's `formatMarkdownish` collapses single newlines into spaces but
   // preserves markdown list items (`- ...`) on their own line. Use a list so
   // each code-description pair survives the markdown reflow as its own row.
   // Double-newline separators are required between paragraphs (the intro
   // line and the first list item) — single newlines would re-flow them.
-  const items = codes.map((code) => `- \`${code}\` — ${ERROR_CODE_DESCRIPTIONS[code]}`);
+  const items = codes.map(
+    (code) => `- \`${code}\` — ${overrides[code] ?? ERROR_CODE_DESCRIPTIONS[code]}`,
+  );
   return [
     "Under `--json`, this command can emit one of these error codes (see ADR-0005):",
     ...items,
@@ -725,8 +736,9 @@ class RestartCommand extends DevtreesCommand {
     // SERVICE_PENDING; the instance's last running
     // process → LAST_SERVICES_RUNNING. process-compose refusing
     // the stop or start → SERVICE_START_FAILED; a restarted service that never
-    // becomes healthy, or dies → HEALTH_TIMEOUT. No names → INVALID_ARGS (bare
-    // `restart` is #225).
+    // becomes healthy, or dies → HEALTH_TIMEOUT. No names → INVALID_ARGS
+    // (#225: no in-place restart of the whole booted set is safe, ADR-0009),
+    // `details.remedy` the `down` + `up` with the booted namespaces.
     details:
       "Usage: `devtrees restart [<service>...] [-n <namespace>]... [--wait-timeout <seconds>] [--json]`.\n\n" +
       "Restarts each named service in `depends_on` order: stops it, waits for the old " +
@@ -742,23 +754,36 @@ class RestartCommand extends DevtreesCommand {
       "namespace; shared services in it are skipped and reported. A namespace the instance " +
       "did not boot fails NAMESPACE_NOT_RUNNING, and one with no isolated service " +
       "NO_SERVICES_SELECTED.\n\n" +
-      errorCodeFooter([
-        "SERVICE_NOT_FOUND",
-        "SHARED_SERVICE_REFUSED",
-        "NO_SERVICES_SELECTED",
-        "NAMESPACE_NOT_RUNNING",
-        "LAST_SERVICES_RUNNING",
-        "SERVICE_PENDING",
-        "CONFIG_DRIFT",
-        "INSTANCE_NOT_FOUND",
-        "INSTANCE_UNRESPONSIVE",
-        "LOCK_CONTENTION",
-        "SERVICE_START_FAILED",
-        "HEALTH_TIMEOUT",
-        "PROCESS_COMPOSE_NOT_FOUND",
-        "INVALID_ARGS",
-        "UNKNOWN",
-      ]),
+      "A bare `devtrees restart`, with no names and no `-n`, fails `INVALID_ARGS`: restarting " +
+      "every service in place would have to stop the last running one, and process-compose " +
+      "exits when nothing runs. Name the services or namespaces, or run the " +
+      "`devtrees down && devtrees up ...` the error prints, which boots the same namespaces " +
+      "again.\n\n" +
+      errorCodeFooter(
+        [
+          "SERVICE_NOT_FOUND",
+          "SHARED_SERVICE_REFUSED",
+          "NO_SERVICES_SELECTED",
+          "NAMESPACE_NOT_RUNNING",
+          "LAST_SERVICES_RUNNING",
+          "SERVICE_PENDING",
+          "CONFIG_DRIFT",
+          "INSTANCE_NOT_FOUND",
+          "INSTANCE_UNRESPONSIVE",
+          "LOCK_CONTENTION",
+          "SERVICE_START_FAILED",
+          "HEALTH_TIMEOUT",
+          "PROCESS_COMPOSE_NOT_FOUND",
+          "INVALID_ARGS",
+          "UNKNOWN",
+        ],
+        {
+          INVALID_ARGS:
+            "No service or namespace named (a bare `restart`), or a flag value failed " +
+            "validation; nothing ran. A bare `restart` carries `details.remedy`, the `down` + " +
+            "`up` that restarts the whole instance with its booted namespaces.",
+        },
+      ),
     examples: [
       ["Restart one service", "devtrees restart mobile"],
       ["Restart two, dependencies first", "devtrees restart api mobile"],
@@ -777,10 +802,12 @@ class RestartCommand extends DevtreesCommand {
     return this.dispatch(async () => {
       const selection = serviceSelection(this.services, this.namespaces);
       if (selection === undefined) {
-        throw invalidArgsError(
-          "name the service(s) to restart, e.g. `devtrees restart web`. " +
-            "To restart the whole stack, run `devtrees down && devtrees up`.",
-        );
+        // Bare `restart` (#225): refused, with the `down` + `up` that keeps the booted namespaces.
+        const found = (await this.context.deps.bareRestartRemedy?.()) ?? {
+          remedy: "devtrees down && devtrees up",
+          namespacesRead: false,
+        };
+        throw invalidArgsError(bareRestartMessage(found), { remedy: found.remedy });
       }
       if (!this.context.deps.restart) return 0;
       const result = await this.context.deps.restart({
@@ -1012,10 +1039,38 @@ class InitCommand extends DevtreesCommand {
  * back to `UNKNOWN`. These fire before any effect runs — the stack is never
  * touched when one is thrown.
  */
-function invalidArgsError(message: string): Error {
+function invalidArgsError(message: string, details?: Readonly<Record<string, unknown>>): Error {
   const err = new Error(message);
   (err as Error & { code?: string }).code = "INVALID_ARGS";
+  if (details !== undefined) Object.assign(err, { details });
   return err;
+}
+
+/** What a bare `restart` points to instead (#225): `bareRestartRemedy`'s answer. */
+interface BareRestartRemedyRow {
+  readonly remedy: string;
+  /** False when the running namespaces could not be read: `remedy` boots every declared one. */
+  readonly namespacesRead: boolean;
+}
+
+/**
+ * Why a bare `devtrees restart` is refused (ADR-0009, #225), and the ways
+ * out: name the services, or run `remedy` (the `down` + `up` with the
+ * namespaces booted now, or every declared one when those could not be read).
+ */
+function bareRestartMessage({ remedy, namespacesRead }: BareRestartRemedyRow): string {
+  const unread = namespacesRead
+    ? ""
+    : " devtrees could not read which namespaces the instance runs, so that command boots " +
+      "every declared namespace.";
+  return (
+    "`devtrees restart` needs at least one service name or `-n <namespace>` " +
+    "(e.g. `devtrees restart web`, or `devtrees restart -n <namespace>`). " +
+    "Restarting every service in place is not supported: process-compose exits once its " +
+    "last running process stops, so the last one cannot be restarted without taking the " +
+    `instance down. Name the services or namespaces to restart, or run \`${remedy}\` to restart the ` +
+    `whole stack.${unread}`
+  );
 }
 
 /**
@@ -1308,6 +1363,7 @@ if (isEntrypoint(import.meta.url, process.argv[1])) {
     runDown,
     runStop,
     runRestart,
+    bareRestartRemedy,
     runEnv,
     runLs,
     runAttach,
@@ -1339,6 +1395,7 @@ if (isEntrypoint(import.meta.url, process.argv[1])) {
         services,
         namespaces,
       ),
+    bareRestartRemedy: () => bareRestartRemedy(),
     ls: () => runLs(),
     attach: ({ shared }) => runAttach({}, { shared }),
     prune: () => runPrune({ stop: stopSeamsFromEnv() }),

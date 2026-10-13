@@ -7,14 +7,14 @@
  */
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import { EventEmitter } from "node:events";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
 import { stringify as stringifyYaml } from "yaml";
 import { deriveWorktreeId } from "./anchor.js";
 import type { ProcessRow } from "./bounded-down.js";
-import { runRestart, type CommandDeps } from "./commands.js";
+import { bareRestartRemedy, runRestart, type CommandDeps } from "./commands.js";
 import type { ServiceStatus, SpawnedProcess } from "./driver.js";
 import type { WaitForHealth } from "./health.js";
 import type { InstanceStatus } from "./instances.js";
@@ -732,5 +732,94 @@ describe("runRestart -n <namespace> (#224)", () => {
     const err = await failure(runRestart(deps, ["db"], ["default"]));
     expect(err.code).toBe("SHARED_SERVICE_REFUSED");
     expect(touched(log)).toEqual([]);
+  });
+});
+
+describe("bareRestartRemedy (#225)", () => {
+  // A bare `restart` is refused (INVALID_ARGS, ADR-0009): this is the remedy it prints.
+  const read = (remedy: string) => ({ remedy, namespacesRead: true });
+  const unread = (remedy: string) => ({ remedy, namespacesRead: false });
+
+  it("a multi-service instance: the down + up that boots the namespaces running now, touching nothing", async () => {
+    const { deps, log } = instance();
+    expect(await bareRestartRemedy(deps)).toEqual(
+      read("devtrees down && devtrees up -n default -n ios"),
+    );
+    expect(log).toEqual([]);
+  });
+
+  it("a one-service instance keeps its one namespace", async () => {
+    const { deps, log, anchor, id } = instance({ rows: [running("web", 11)] });
+    writeFileSync(
+      instancePaths(anchor, id).configPath,
+      stringifyYaml({ processes: { web: proc({ namespace: "app" }) } }),
+    );
+    expect(await bareRestartRemedy(deps)).toEqual(read("devtrees down && devtrees up -n app"));
+    expect(log).toEqual([]);
+  });
+
+  it("only booted namespaces count: an unbooted one stays out of the remedy", async () => {
+    // mobile (ios) is not in the project: the instance booted `-n default` only.
+    const { deps } = instance({ rows: [running("api", 11), running("worker", 13)] });
+    expect(await bareRestartRemedy(deps)).toEqual(read("devtrees down && devtrees up"));
+  });
+
+  it("no running instance: every namespace the derived config declares, and a stale socket file is left in place", async () => {
+    const { deps, socketPath } = instance();
+    const stale: CommandDeps = { ...deps, probeSocket: async () => "stale" };
+    expect(await bareRestartRemedy(stale)).toEqual(
+      unread("devtrees down && devtrees up -n default -n ios"),
+    );
+    expect(existsSync(socketPath)).toBe(true);
+  });
+
+  it("a stack whose services all declare a namespace, with no instance: every one, never a bare `up` that selects nothing", async () => {
+    const { deps, anchor, id } = instance({ live: false });
+    rmSync(instancePaths(anchor, id).configPath);
+    const namespaced: CommandDeps = {
+      ...deps,
+      readStack: () => ({
+        services: [
+          svc("db", "shared"),
+          { ...svc("web"), namespace: "app" },
+          { ...svc("sim"), namespace: "ios" },
+        ],
+      }),
+    };
+    expect(await bareRestartRemedy(namespaced)).toEqual(
+      unread("devtrees down && devtrees up -n app -n ios"),
+    );
+  });
+
+  it("a frozen instance booted `-n app -n default`: its status read times out, and the remedy keeps app", async () => {
+    const { deps, anchor, id } = instance();
+    writeFileSync(
+      instancePaths(anchor, id).configPath,
+      stringifyYaml({ processes: { web: proc({ namespace: "app" }), api: proc() } }),
+    );
+    const frozen: CommandDeps = {
+      ...deps,
+      getServiceStatuses: async () => {
+        throw new Error("timed out");
+      },
+    };
+    expect(await bareRestartRemedy(frozen)).toEqual(
+      unread("devtrees down && devtrees up -n app -n default"),
+    );
+  }, 20_000);
+
+  it("an instance gone between the probe and the status read falls back the same way", async () => {
+    const { deps } = instance();
+    let probes = 0;
+    const gone: CommandDeps = {
+      ...deps,
+      getServiceStatuses: async () => {
+        throw new Error("connect ECONNREFUSED");
+      },
+      probeSocket: async (): Promise<InstanceStatus> => (probes++ === 0 ? "running" : "stale"),
+    };
+    expect(await bareRestartRemedy(gone)).toEqual(
+      unread("devtrees down && devtrees up -n default -n ios"),
+    );
   });
 });
