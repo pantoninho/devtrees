@@ -172,12 +172,24 @@ export function writeDownIncomplete(
   worktreeId: string,
   services: ReadonlyArray<string>,
 ): void {
-  writeAtomic(markerFile(anchor, worktreeId), `${JSON.stringify({ services }, null, 2)}\n`);
+  writeServicesMarker(markerFile(anchor, worktreeId), services);
 }
 
 /** The services an earlier `DOWN_INCOMPLETE` recorded, or `undefined` when none did. */
 export function readDownIncomplete(anchor: string, worktreeId: string): string[] | undefined {
-  const file = markerFile(anchor, worktreeId);
+  return readServicesMarker(markerFile(anchor, worktreeId));
+}
+
+/** Write a `{services}` re-check marker (`down`'s here, `stop`'s in src/stop-services.ts). */
+export function writeServicesMarker(file: string, services: ReadonlyArray<string>): void {
+  writeAtomic(file, `${JSON.stringify({ services }, null, 2)}\n`);
+}
+
+/**
+ * The services a `{services}` re-check marker lists: `undefined` when there
+ * is none, `[]` when it is unreadable.
+ */
+export function readServicesMarker(file: string): string[] | undefined {
   if (!existsSync(file)) return undefined;
   try {
     const parsed = JSON.parse(readFileSync(file, "utf8")) as { services?: unknown } | null;
@@ -255,7 +267,10 @@ export function downIncomplete(
 }
 
 /** `  app-db APP_DB_PORT 59073: pid 60274 (OrbStack Helper) accepts connections`. */
-function describeSurvivor(s: DownSurvivor): string {
+export function describeSurvivor(s: DownSurvivor): string {
+  if (s.port === undefined && s.pid === null) {
+    return `  ${s.service}: process-compose still reports it running`;
+  }
   const who =
     s.pid === null
       ? `holder not identified (try \`lsof -nP -iTCP:${s.port ?? ""}\`)`

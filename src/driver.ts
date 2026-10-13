@@ -238,6 +238,29 @@ export function buildProcessStartArgs(socketPath: string, service: string): stri
 }
 
 /**
+ * Stop processes of a running instance over its UDS (`devtrees stop`, #223).
+ * On v1.122.0 `process stop` takes several names, returns as soon as the
+ * stop is requested (it does not wait for the exit), signals each process's
+ * whole group, and fails ("Failed to stop") for a process that is not
+ * running.
+ */
+export function buildProcessStopArgs(
+  socketPath: string,
+  services: ReadonlyArray<string>,
+): string[] {
+  return ["process", "stop", ...services, "-U", "-u", socketPath];
+}
+
+/**
+ * Outcome of a `stopProcesses` call: `ok:false` carries process-compose's
+ * own complaint (its output, the exit code, or the timeout).
+ */
+type StopRequestResult = { readonly ok: true } | { readonly ok: false; readonly message: string };
+
+/** Budget for one `process stop` call: it returns once the stop is requested. */
+const STOP_REQUEST_TIMEOUT_MS = 10_000;
+
+/**
  * Outcome of a `startProcess` call. `ok:true` with `alreadyRunning` means
  * process-compose refused only because the process was already running, so
  * this call started nothing. `ok:false` carries process-compose's own
@@ -645,6 +668,33 @@ export function createDriver(deps: DriverDeps = {}) {
       });
     },
     /**
+     * Ask the running instance at `socketPath` to stop `services`
+     * (`process-compose process stop <name...>`, #223). Resolves once
+     * process-compose has accepted or refused the request, not when the
+     * processes have exited: the caller waits for that itself.
+     */
+    async stopProcesses(
+      socketPath: string,
+      services: ReadonlyArray<string>,
+    ): Promise<StopRequestResult> {
+      await ensureBinary({ binary, exists });
+      const args = [...prefix, ...buildProcessStopArgs(socketPath, services)];
+      const child = spawner(binary, args, { stdio: ["ignore", "pipe", "pipe"] });
+      const stdout = captureOutput(child.stdout);
+      const stderr = captureOutput(child.stderr);
+      const exit = await waitForExitWithin(child, STOP_REQUEST_TIMEOUT_MS).catch((err: Error) => ({
+        timedOut: false as const,
+        code: -1,
+        error: err.message,
+      }));
+      if (exit.timedOut) {
+        return { ok: false, message: `${binary} process stop did not answer within 10s` };
+      }
+      if (exit.code === 0 || exit.code === null) return { ok: true };
+      const said = "error" in exit ? exit.error : plainText(`${stdout()}\n${stderr()}`);
+      return { ok: false, message: said || `${binary} process stop exited with code ${exit.code}` };
+    },
+    /**
      * Stream a service's logs from the instance at `socketPath` as an async
      * iterable of `LogEvent`s. Spawns `process-compose process logs <service>`
      * with piped stdout, reads it line-by-line, and emits one event per line
@@ -802,9 +852,14 @@ function startOutcome(code: number | null, stderr: string, binary: string): Star
  * ANSI escapes so the message reads cleanly in an error envelope.
  */
 function describeStartFailure(stderr: string, binary: string, code: number): string {
-  // eslint-disable-next-line no-control-regex
-  const plain = stderr.replace(/\x1b\[[0-9;]*m/g, "").trim();
+  const plain = plainText(stderr);
   return plain === "" ? `${binary} process start exited with code ${code}` : plain;
+}
+
+/** process-compose output with its ANSI colour escapes stripped and trimmed. */
+function plainText(output: string): string {
+  // eslint-disable-next-line no-control-regex
+  return output.replace(/\x1b\[[0-9;]*m/g, "").trim();
 }
 
 /**

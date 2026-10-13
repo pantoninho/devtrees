@@ -4,6 +4,7 @@ import {
   dependencyOrder,
   describeDeadServices,
   findDeadServices,
+  isRunning,
 } from "./service-state.js";
 import type { ServiceStatus } from "./driver.js";
 
@@ -11,6 +12,26 @@ const row = (name: string, status: string, exitCode?: number): ServiceStatus =>
   exitCode === undefined
     ? { name, status, health: "unknown" }
     : { name, status, health: "unknown", exitCode };
+
+describe("isRunning — what keeps process-compose alive (#223)", () => {
+  it("is true for running, starting and stopping services", () => {
+    for (const status of ["Running", "Pending", "Restarting", "Terminating", "Launched"]) {
+      expect(isRunning(row("x", status)), status).toBe(true);
+    }
+  });
+
+  it("is false for stopped, done, dead and idle services", () => {
+    for (const r of [
+      row("x", "Completed", -1),
+      row("x", "Completed", 0),
+      row("x", "Error"),
+      row("x", "Disabled"),
+      row("x", "Skipped"),
+    ]) {
+      expect(isRunning(r), r.status).toBe(false);
+    }
+  });
+});
 
 describe("classifyService — dead versus done (ADR-0008)", () => {
   it("Completed with exit 0 is a finished one-shot: done", () => {

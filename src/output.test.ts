@@ -19,6 +19,7 @@ import {
   formatLogLine,
   formatLs,
   formatPrune,
+  formatStop,
   formatUp,
   formatDroppedEdgeWarning,
   formatUpDryRun,
@@ -1438,5 +1439,32 @@ describe("output formatter — braced injected variables (#200)", () => {
     expect(parse({ ...up, bracedEnvVars: [v] }).up.braced_env_vars).toEqual([v]);
     expect(parse(up).up.braced_env_vars).toEqual([]);
     expect(formatUp({ ...up, bracedEnvVars: [v] }, "human")).toEqual(formatUp(up, "human"));
+  });
+});
+
+describe("output formatter — formatStop (#223)", () => {
+  it("in human mode, names what was stopped and what was not running, and that `up` brings it back", () => {
+    const out = formatStop({ worktreeId: "login", stopped: ["web"], notRunning: ["api"] }, "human");
+    expect(out.stdout).toBe(
+      "devtrees stop: stopped web.\n" +
+        "devtrees stop: not running, nothing to stop: api.\n" +
+        "A stop lasts only until the next `devtrees up`, which starts stopped services again.\n",
+    );
+    expect(out.stderr).toBe("");
+  });
+
+  it("in JSON mode, always carries force_killed and the transient flag", () => {
+    const out = formatStop({ worktreeId: "login", stopped: [], notRunning: ["web"] }, "json");
+    expect(JSON.parse(out.stdout)).toEqual({
+      schema_version: SCHEMA_VERSION,
+      stop: {
+        worktreeId: "login",
+        stopped: [],
+        not_running: ["web"],
+        force_killed: [],
+        transient: true,
+        note: "A stop lasts only until the next `devtrees up`, which starts stopped services again.",
+      },
+    });
   });
 });

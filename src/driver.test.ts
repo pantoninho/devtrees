@@ -11,6 +11,7 @@ import {
   buildLogsArgs,
   buildProcessListArgs,
   buildProcessStartArgs,
+  buildProcessStopArgs,
   createDriver,
   downTimeoutMs,
   mergeAsyncIterables,
@@ -399,6 +400,50 @@ describe("process-compose driver — getServiceStatuses", () => {
       "-o",
       "json",
     ]);
+  });
+});
+
+describe("process-compose driver — stopProcesses (#223)", () => {
+  const socket = "/anchor/devtrees/run/login.sock";
+
+  /** A `process stop` child that prints `stdout`, then exits with `code`. */
+  function stopSpawner(code: number, stdout = "", seen: string[][] = []) {
+    return (_b: string, args: ReadonlyArray<string>): SpawnedProcess => {
+      seen.push([...args]);
+      const emitter = new EventEmitter() as EventEmitter & SpawnedProcess;
+      Object.assign(emitter, { stdout: Readable.from(stdout === "" ? [] : [stdout]) });
+      setTimeout(() => emitter.emit("exit", code), 5);
+      return emitter;
+    };
+  }
+
+  it("asks for every name in one `process stop` over the instance's UDS", async () => {
+    const seen: string[][] = [];
+    const driver = createDriver({
+      exists: () => Promise.resolve(true),
+      spawner: stopSpawner(0, "", seen),
+    });
+    expect(await driver.stopProcesses(socket, ["web", "api"])).toEqual({ ok: true });
+    expect(seen).toEqual([["process", "stop", "web", "api", "-U", "-u", socket]]);
+    expect(buildProcessStopArgs(socket, ["web"])).toEqual([
+      "process",
+      "stop",
+      "web",
+      "-U",
+      "-u",
+      socket,
+    ]);
+  });
+
+  it("returns process-compose's complaint on a non-zero exit", async () => {
+    const driver = createDriver({
+      exists: () => Promise.resolve(true),
+      spawner: stopSpawner(1, "Failed to stop: 'web'\n"),
+    });
+    expect(await driver.stopProcesses(socket, ["web"])).toEqual({
+      ok: false,
+      message: "Failed to stop: 'web'",
+    });
   });
 });
 
