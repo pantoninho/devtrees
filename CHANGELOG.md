@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.0](https://github.com/pantoninho/devtrees/compare/v0.1.0...v0.2.0) (2026-10-13)
+
+
+### Features
+
+* stop -n and restart -n act on every isolated service of a namespace ([#231](https://github.com/pantoninho/devtrees/issues/231)) ([86255b7](https://github.com/pantoninho/devtrees/commit/86255b7587882e384c4964e0724a21233a8abbb2))
+
+
+### Bug Fixes
+
+* bare devtrees restart fails INVALID_ARGS with the booted namespaces' down + up ([#225](https://github.com/pantoninho/devtrees/issues/225)) ([#232](https://github.com/pantoninho/devtrees/issues/232)) ([c963423](https://github.com/pantoninho/devtrees/commit/c96342301c6a690838879b5f175c80d2890700af))
+
 ## [0.1.0](https://github.com/pantoninho/devtrees/compare/v0.0.5...v0.1.0) (2026-10-13)
 
 
