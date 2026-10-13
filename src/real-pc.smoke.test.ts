@@ -29,6 +29,7 @@ import { afterEach, beforeAll, describe, expect, it } from "vite-plus/test";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createConnection, createServer, type Server } from "node:net";
+import { request } from "node:http";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { deriveWorktreeId } from "./anchor.js";
@@ -3267,6 +3268,269 @@ describe.skipIf(!ENABLED)("real-pc smoke — stop -n / restart -n (#224)", () =>
     upNs(wt, ["default"]);
     expect(pids("worker").length, "up -n default brings worker back").toBeGreaterThan(0);
   }, 180_000);
+});
+
+describe.skipIf(!ENABLED)("real-pc smoke — bare restart (#225)", () => {
+  // The cleanups `down` instances whose servers drain for seconds, each
+  // `devtrees` call capped at 60s by spawnSync: run them here, before the
+  // file-level hook, with a budget above that cap.
+  afterEach(async () => {
+    await drainCleanups();
+  }, 150_000);
+
+  /** The `--json` error envelope's `error`, or `undefined`. */
+  function errorOf(
+    result: CliResult,
+  ): { code?: string; message?: string; details?: unknown } | undefined {
+    return (result.doc as { error?: { code?: string; message?: string; details?: unknown } })
+      ?.error;
+  }
+
+  /**
+   * A fresh repo whose `web` is an HTTP server that keeps serving, and so
+   * keeps its port, for `drainSeconds` (3 by default) after SIGTERM (scenario 89's). `wrapped` runs it
+   * under a shell that does not exec it, as `npm run dev` does, so the
+   * process process-compose waits on exits before the server has drained.
+   * `extra(root)` is appended to `devtrees.yaml`; `webNamespace` puts web in one.
+   */
+  function drainingRepo(
+    prefix: string,
+    opts: {
+      readonly wrapped?: boolean;
+      readonly drainSeconds?: number;
+      readonly webNamespace?: string;
+      readonly extra?: (root: string) => string[];
+    } = {},
+  ): { wt: string; root: string; server: string } {
+    const repo = buildSmokeRepo(prefix, ["login"]);
+    currentCtx = { pidNeedle: repo.root, root: repo.root };
+    const wt = repo.worktrees.login!;
+    cleanupStack.push(() => reapPids(pidsMatching(repo.root)));
+    const server = join(repo.root, "draining.py");
+    writeFileSync(
+      server,
+      [
+        "import signal, sys, time",
+        "from http.server import HTTPServer, BaseHTTPRequestHandler",
+        "class H(BaseHTTPRequestHandler):",
+        "    def do_GET(self):",
+        "        self.send_response(200); self.end_headers()",
+        "    def log_message(self, *a): pass",
+        "srv = HTTPServer(('127.0.0.1', int(sys.argv[1])), H)  # SO_REUSEADDR",
+        "def drain(*_):",
+        "    srv.timeout = 0.2",
+        `    end = time.time() + ${opts.drainSeconds ?? 3}`,
+        "    while time.time() < end: srv.handle_request()",
+        "    sys.exit(0)",
+        "signal.signal(signal.SIGTERM, drain)",
+        "srv.serve_forever()",
+        "",
+      ].join("\n"),
+    );
+    const command = opts.wrapped
+      ? `python3 ${server} $WEB_PORT; echo web-exited`
+      : `exec python3 ${server} $WEB_PORT`;
+    writeFileSync(
+      join(wt, "devtrees.yaml"),
+      [
+        "services:",
+        "  web:",
+        "    tier: isolated",
+        ...(opts.webNamespace === undefined ? [] : [`    namespace: ${opts.webNamespace}`]),
+        "    ports: [WEB_PORT]",
+        `    command: "${command}"`,
+        "    readiness_probe:",
+        "      exec:",
+        `        command: "curl -fsS --max-time 2 -o /dev/null http://127.0.0.1:$WEB_PORT/"`,
+        "      initial_delay_seconds: 0",
+        "      period_seconds: 1",
+        "      timeout_seconds: 3",
+        "      failure_threshold: 30",
+        ...(opts.extra?.(repo.root) ?? []),
+        "",
+      ].join("\n"),
+    );
+    cleanupStack.push(() => devtrees(wt, ["down"], { DEVTREES_DOWN_BASE_TIMEOUT_MS: "3000" }));
+    return { wt, root: repo.root, server };
+  }
+
+  /** Boot with `up --json` (plus `args`); returns web's port. */
+  async function boot(wt: string, args: ReadonlyArray<string> = []): Promise<number> {
+    const first = devtrees(wt, ["up", "--json", "--wait-timeout", "30", ...args]);
+    expect(first.code, `up failed: ${first.stderr} ${first.stdout}`).toBe(0);
+    const port = Number((first.doc as UpDoc).up.env.WEB_PORT);
+    expect(await httpStatus(port)).toBe(200);
+    return port;
+  }
+
+  /** The worktree instance's process-compose socket. */
+  function socketOf(wt: string): string {
+    const commonDir = execGit(wt, ["rev-parse", "--git-common-dir"]);
+    const absCommon = commonDir.startsWith("/") ? commonDir : join(wt, commonDir);
+    return instancePaths(absCommon, wtId(wt)).socketPath;
+  }
+
+  /** One process-compose REST call over its socket: the status and body. */
+  function pcApi(
+    socketPath: string,
+    method: string,
+    path: string,
+    body?: string,
+  ): Promise<{ status: number; body: string }> {
+    return new Promise((resolve, reject) => {
+      const req = request(
+        { socketPath, method, path, headers: { "Content-Type": "application/json" } },
+        (res) => {
+          let text = "";
+          res.on("data", (c: Buffer) => (text += c.toString("utf8")));
+          res.on("end", () => resolve({ status: res.statusCode ?? 0, body: text }));
+        },
+      );
+      req.on("error", reject);
+      req.setTimeout(30_000, () => req.destroy(new Error("process-compose did not answer")));
+      req.end(body);
+    });
+  }
+
+  it("scenario 105: a bare restart of a multi-service instance fails INVALID_ARGS naming the booted namespaces' down + up, and touches nothing", async () => {
+    const { wt, root, server } = drainingRepo("dt-rpc105-", {
+      webNamespace: "app",
+      extra: (root) => [
+        "  worker:",
+        "    tier: isolated",
+        "    namespace: app",
+        `    command: "python3 ${sleeper(root, "worker")}"`,
+        "  sim:",
+        "    tier: isolated",
+        "    namespace: ios",
+        `    command: "python3 ${sleeper(root, "sim")}"`,
+      ],
+    });
+    const port = await boot(wt, ["-n", "app"]);
+    const pids = pidsMatching(root).sort((a, b) => a - b);
+    expect(pidsMatching(join(root, "sim.py"))).toEqual([]);
+
+    const bare = devtrees(wt, ["restart", "--json"]);
+    expect(bare.code).toBe(1);
+    const err = errorOf(bare);
+    expect(err).toMatchObject({
+      code: "INVALID_ARGS",
+      details: { remedy: "devtrees down && devtrees up -n app" },
+    });
+    expect(err?.message).toContain("`devtrees restart web`");
+    expect(err?.message).toContain("`devtrees down && devtrees up -n app`");
+
+    const human = devtrees(wt, ["restart"]);
+    expect(human.code).toBe(1);
+    expect(human.stdout).toBe("");
+    expect(human.stderr).toContain("devtrees down && devtrees up -n app");
+
+    // Nothing was touched: every process is the one booted, web still serves.
+    expect(pidsMatching(root).sort((a, b) => a - b)).toEqual(pids);
+    expect(await httpStatus(port)).toBe(200);
+
+    // Naming the services is the in-place way: both restart, web on its port.
+    const oldWeb = pidsMatching(server);
+    const named = devtrees(wt, ["restart", "web", "worker", "--json", "--wait-timeout", "60"]);
+    expect(named.code, `named restart failed: ${named.stderr} ${named.stdout}`).toBe(0);
+    expect(pidsMatching(server).some((pid) => oldWeb.includes(pid))).toBe(false);
+    expect(await httpStatus(port)).toBe(200);
+    expect(orphanedServices(root)).toEqual([]);
+  }, 180_000);
+
+  it("scenario 106: a bare restart of a one-service instance fails INVALID_ARGS and touches nothing; its only service is LAST_SERVICES_RUNNING", async () => {
+    const { wt, root, server } = drainingRepo("dt-rpc106-");
+    const port = await boot(wt);
+    const old = pidsMatching(server);
+
+    const bare = devtrees(wt, ["restart", "--json"]);
+    expect(bare.code).toBe(1);
+    expect(errorOf(bare)).toMatchObject({
+      code: "INVALID_ARGS",
+      details: { remedy: "devtrees down && devtrees up" },
+    });
+    expect(errorOf(devtrees(wt, ["restart", "web", "--json"]))).toMatchObject({
+      code: "LAST_SERVICES_RUNNING",
+      details: { services: ["web"] },
+    });
+    expect(pidsMatching(server)).toEqual(old);
+    expect(await httpStatus(port)).toBe(200);
+    const ls = devtrees(wt, ["ls", "--json"]);
+    expect((ls.doc as LsDoc).ls.instances.some((i) => i.id === wtId(wt))).toBe(true);
+
+    // The printed remedy works: the instance comes back, on the same port.
+    const down = devtrees(wt, ["down", "--json"]);
+    expect(down.code, down.stdout).toBe(0);
+    expect(await boot(wt)).toBe(port);
+    expect(orphanedServices(root)).toEqual([]);
+  }, 180_000);
+
+  // Scenarios 107-109 pin the process-compose v1.122.0 behaviour that rules
+  // out restarting an instance's last running process in place (#225,
+  // ADR-0009). They assert on process-compose, not devtrees, and on timing:
+  // the old run drains for 6s so the new run reliably starts while it still
+  // holds the port. A failure means process-compose changed (revisit #225: a
+  // bare restart may have become possible) or the machine is so overloaded
+  // that the drain no longer outlasts the new run's start.
+  it("scenario 107: process-compose `process restart` of a one-service instance starts the new run while the old one drains, and the instance dies", async () => {
+    const { wt, server } = drainingRepo("dt-rpc107-", { drainSeconds: 6 });
+    const port = await boot(wt);
+    const socket = socketOf(wt);
+    const old = pidsMatching(server);
+
+    const restart = await pcApi(socket, "POST", "/process/restart/web");
+    expect(restart.status, restart.body).toBe(200);
+    // The new run fails to bind while the old one still serves; once the old
+    // one exits, nothing runs and process-compose exits.
+    expect(await waitForNoPids(socket, 20_000), "process-compose should exit").toEqual([]);
+    // No run survives it: the old one finishes draining, and no new one serves.
+    expect(await waitForNoPids(server, 15_000)).toEqual([]);
+    expect(old.length).toBeGreaterThan(0);
+    expect(await httpStatus(port)).toBe(0);
+  }, 120_000);
+
+  it("scenario 108: process-compose `POST /process` holds a one-service instance open for the update, but a wrapper that exits before its server drains still loses the port and the instance", async () => {
+    const { wt, server } = drainingRepo("dt-rpc108-", { wrapped: true, drainSeconds: 6 });
+    const port = await boot(wt);
+    const socket = socketOf(wt);
+    const info = await pcApi(socket, "GET", "/process/info/web");
+    expect(info.status, info.body).toBe(200);
+
+    // The update waits for the shell it started, not for the server under it.
+    const update = await pcApi(socket, "POST", "/process", info.body);
+    expect(update.status, update.body).toBe(200);
+    expect(await waitForNoPids(socket, 20_000), "process-compose should exit").toEqual([]);
+    // No run survives it: the old server finishes draining, and no new one serves.
+    expect(await waitForNoPids(server, 15_000)).toEqual([]);
+    expect(await httpStatus(port)).toBe(0);
+  }, 120_000);
+
+  it("scenario 109: process-compose `POST /process` restarts an exec'd server only because the JSON round trip changes its config, so the same request a second time restarts nothing", async () => {
+    const { wt, server } = drainingRepo("dt-rpc109-");
+    const port = await boot(wt);
+    const socket = socketOf(wt);
+    const old = pidsMatching(server);
+    const update = async (): Promise<void> => {
+      const info = await pcApi(socket, "GET", "/process/info/web");
+      expect(info.status, info.body).toBe(200);
+      const posted = await pcApi(socket, "POST", "/process", info.body);
+      expect(posted.status, posted.body).toBe(200);
+    };
+
+    // The first update restarts web after the drain, on its port.
+    await update();
+    expect(await waitForPid(server, 10_000)).toBe(true);
+    const first = pidsMatching(server);
+    expect(first.some((pid) => old.includes(pid))).toBe(false);
+    const ls = devtrees(wt, ["ls", "--json"]);
+    expect((ls.doc as LsDoc).ls.instances.some((i) => i.id === wtId(wt))).toBe(true);
+    expect(await httpStatus(port)).toBe(200);
+
+    // The server now holds the round-tripped config: an identical update is a no-op.
+    await update();
+    await new Promise((r) => setTimeout(r, 1000));
+    expect(pidsMatching(server)).toEqual(first);
+  }, 120_000);
 });
 
 if (!ENABLED) {

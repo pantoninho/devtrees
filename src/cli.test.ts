@@ -388,7 +388,78 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
       const result = await execute(["restart", "--json"], { up: vi.fn(), down: vi.fn(), restart });
       expect(restart).not.toHaveBeenCalled();
       expect(result.code).toBe(1);
-      expect(JSON.parse(result.stdout).error.code).toBe("INVALID_ARGS");
+      expect(JSON.parse(result.stdout).error).toMatchObject({
+        code: "INVALID_ARGS",
+        details: { remedy: "devtrees down && devtrees up" },
+      });
+    });
+
+    it("a bare restart (#225) is refused with the down + up that keeps the booted namespaces", async () => {
+      const restart = vi.fn();
+      const bareRestartRemedy = vi
+        .fn()
+        .mockResolvedValue({ remedy: "devtrees down && devtrees up -n app", namespacesRead: true });
+      const result = await execute(["restart", "--json"], {
+        up: vi.fn(),
+        down: vi.fn(),
+        restart,
+        bareRestartRemedy,
+      });
+      expect(restart).not.toHaveBeenCalled();
+      expect(result.code).toBe(1);
+      expect(JSON.parse(result.stdout).error).toEqual({
+        code: "INVALID_ARGS",
+        message:
+          "`devtrees restart` needs at least one service name or `-n <namespace>` " +
+          "(e.g. `devtrees restart web`, or `devtrees restart -n <namespace>`). " +
+          "Restarting every service in place is not supported: process-compose exits once its " +
+          "last running process stops, so the last one cannot be restarted without taking the " +
+          "instance down. Name the services or namespaces to restart, or run " +
+          "`devtrees down && devtrees up -n app` to restart the whole stack.",
+        details: { remedy: "devtrees down && devtrees up -n app" },
+      });
+    });
+
+    it("a bare restart whose namespaces could not be read says the remedy boots every declared one", async () => {
+      const result = await execute(["restart"], {
+        up: vi.fn(),
+        down: vi.fn(),
+        bareRestartRemedy: async () => ({
+          remedy: "devtrees down && devtrees up -n app -n default",
+          namespacesRead: false,
+        }),
+      });
+      expect(result.code).toBe(1);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toContain("devtrees restart web");
+      expect(result.stderr).toContain("devtrees restart -n <namespace>");
+      expect(result.stderr).toContain("devtrees down && devtrees up -n app -n default");
+      expect(result.stderr).toContain(
+        "devtrees could not read which namespaces the instance runs, so that command boots " +
+          "every declared namespace.",
+      );
+    });
+
+    it("other INVALID_ARGS envelopes carry no details", async () => {
+      const restart = vi.fn();
+      const badTimeout = await execute(["restart", "web", "--wait-timeout", "soon", "--json"], {
+        up: vi.fn(),
+        down: vi.fn(),
+        restart,
+      });
+      expect(JSON.parse(badTimeout.stdout).error.code).toBe("INVALID_ARGS");
+      expect(JSON.parse(badTimeout.stdout).error).not.toHaveProperty("details");
+      const bareStop = await execute(["stop", "--json"], { up: vi.fn(), down: vi.fn() });
+      expect(JSON.parse(bareStop.stdout).error.code).toBe("INVALID_ARGS");
+      expect(JSON.parse(bareStop.stdout).error).not.toHaveProperty("details");
+      expect(restart).not.toHaveBeenCalled();
+    });
+
+    it("`restart --help` says a bare restart's INVALID_ARGS carries details.remedy", async () => {
+      const result = await execute(["restart", "--help"], { up: vi.fn(), down: vi.fn() });
+      expect(result.stdout.replace(/\s+/g, " ")).toContain(
+        "A bare `restart` carries `details.remedy`",
+      );
     });
 
     it("a typed failure keeps its code in the envelope", async () => {

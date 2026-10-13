@@ -144,7 +144,9 @@ are. It never stops anything, and never attaches the TUI.
   running (\`devtrees restart <service>\` tries again), \`SERVICE_START_FAILED\`
   means process-compose refused. It refuses what \`stop\` refuses, and the
   stack's last running process (\`LAST_SERVICES_RUNNING\`: use
-  \`details.remedy\`, a \`down\` + \`up\`).
+  \`details.remedy\`, a \`down\` + \`up\`). To restart the whole stack, use that
+  \`down\` + \`up\` too: a bare \`devtrees restart\` fails \`INVALID_ARGS\` and
+  prints it.
 
 ### Handling failures
 
