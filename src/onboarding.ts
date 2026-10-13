@@ -102,6 +102,18 @@ are. It never stops anything, and never attaches the TUI.
   way) an old process that is still stuck after that same budget. If
   process-compose still does not exit, or the reload never finishes
   (\`details.pending_reload\`), \`down\` fails with \`DOWN_TIMEOUT\`.
+- \`down\` stops each service's whole process tree. process-compose calls a
+  service stopped once its direct child exits, so a grandchild behind a
+  wrapper chain (\`exec pnpm exec … -- uv run … uvicorn --reload\`) that
+  ignores SIGTERM used to outlive it, holding its port. After process-compose
+  stops, devtrees gives each service's leftover descendants 5s, then
+  SIGKILLs them and names them in \`force_killed\`.
+- process-compose skips the \`shutdown.command\` of a daemon
+  (\`is_daemon: true\`) whose launch had already exited (\`Completed\`), so a
+  launch that started containers and then failed left them running. \`down\`
+  now runs those hooks itself. If a booted service's port still accepts
+  connections after the stop, \`down\` fails with \`DOWN_INCOMPLETE\` naming
+  the holder, instead of reporting the instance stopped.
 - A dead shared service fails \`up\` with \`SHARED_SERVICE_DEAD\`; run
   \`devtrees down --shared && devtrees up\`.
 
@@ -118,7 +130,7 @@ Branch on \`error.code\`:
 | \`NAMESPACE_NOT_RUNNING\`     | You asked \`-n\` for a namespace the running stack was not booted with. Run \`details.remedy\` (\`devtrees down && devtrees up -n …\`). |
 | \`SHARED_SERVICE_DEAD\`       | A shared service is dead. devtrees will not restart it from one worktree; run \`devtrees down --shared && devtrees up\`. |
 | \`SERVICE_START_FAILED\`      | \`up\` tried to restart a dead service and process-compose refused. \`details.services\` carries each one with process-compose's message; read it, then run \`details.remedy\` (\`devtrees down && devtrees up …\`). |
-| \`STALE_PORT_BLOCK\`          | Foreign listeners hold this worktree's ports. \`details.collisions[]\` lists \`{port_name, port, pid, command}\`; kill the orphans and retry. |
+| \`STALE_PORT_BLOCK\`          | Foreign listeners hold this worktree's ports. \`details.collisions[]\` lists \`{port_name, port, pid, command, accepts_connections}\` (the message lists them too); kill the holders that accept connections and retry. Never kill one with \`accepts_connections: false\`: that is usually a container runtime's stale port forward (OrbStack's helper), one process serving every instance. Holders that all refuse connections do not fail \`up\`; it warns and goes on. |
 | \`SHARED_DRIFT\`              | This worktree's shared services diverge from the running shared instance. Follow the message: \`devtrees down --shared && devtrees up\`. |
 | \`CONFIG_DRIFT\`              | The running config differs from \`devtrees.yaml\` and hot-reload failed, or an earlier reload is still pending. Branch on \`details.reason\`: \`not_supported\`/\`error\` → \`devtrees down && devtrees up\`. \`timeout\` → a changed service's old process won't stop: kill that process, then run \`devtrees up\` again to resync. Or run \`devtrees down && devtrees up\`: \`down\` force-kills that old process first and lists it in \`force_killed\`. \`reload_pending\` → that earlier reload is still waiting, so \`up\` reloaded nothing (another reload would start an untracked second copy): kill the old process (\`details.pids\`, for \`details.services\`), then run \`devtrees up\` again. Empty \`details.pids\` → the old process is gone and process-compose is still starting the new one: retry shortly; if it persists, follow the message's \`devtrees down && devtrees up …\`. |
 | \`SERVICE_NOT_FOUND\`         | You named a service that isn't in the instance. \`details.valid_services\` lists the real names; pick one. |
@@ -126,6 +138,7 @@ Branch on \`error.code\`:
 | \`INSTANCE_NOT_FOUND\`        | No instance is running for this worktree. Run \`devtrees up\` first.                            |
 | \`INSTANCE_UNRESPONSIVE\`     | The instance may be running but its process-compose did not answer (busy or frozen). Nothing changed. **Retry** in a moment; if it persists, follow \`details.remedy\`. Do not delete the socket by hand. |
 | \`DOWN_TIMEOUT\`              | \`down\` could not finish: process-compose was still running after devtrees force-killed the stuck services (\`details.stuck_services\`; empty when it is waiting on a \`shutdown.command\` that does not exit), or a timed-out hot-reload was still being applied, so \`down\` did not start the stop (\`details.pending_reload\`; \`details.remedy\` names the old process to kill by hand first, which is safe because no stop is running). Nothing was removed. **Retry** \`down\` once; if it fails again, **surface it to the human** with \`details.remedy\`, which names the process-compose pid to stop by hand, or for a pending reload the old process to kill. |
+| \`DOWN_INCOMPLETE\`           | \`down\` stopped process-compose, but something the instance started is still alive (\`details.survivors\`): a listener on a booted service's port (a container whose \`shutdown.command\` did not remove it, say), or a service descendant that survived SIGKILL. Run \`devtrees down\` **once more**: with process-compose gone it runs every \`shutdown.command\` itself. If survivors remain, **surface them to the human** with \`details.remedy\`. Never kill a container runtime's port forwarder (OrbStack Helper, \`com.docker.backend\`); stop the container that publishes the port. |
 | \`PROCESS_COMPOSE_NOT_FOUND\` | The \`process-compose\` binary is missing. **Surface this to the human** — it's an environment setup gap you can't fix.   |
 | \`PROCESS_COMPOSE_TOO_OLD\`   | The installed \`process-compose\` is below the minimum (v1.122.0). **Surface this to the human** — they need to upgrade it. |
 | \`CONFIG_INVALID\` / \`INVALID_ARGS\` | The config or your arguments are malformed. Fix the input; don't retry blindly.        |

@@ -547,12 +547,15 @@ class DownCommand extends DevtreesCommand {
     // A stop that outlives its budget, and whose process-compose is still
     // running after devtrees force-killed the stuck services, or whose
     // pending hot-reload never finished so the stop was not begun →
-    // DOWN_TIMEOUT (#190, #206).
+    // DOWN_TIMEOUT (#190, #206). A stop that finished but left a listener on
+    // a booted service's port, or a service descendant SIGKILL could not
+    // stop → DOWN_INCOMPLETE (#155).
     details: errorCodeFooter([
       "PROCESS_COMPOSE_NOT_FOUND",
       "LOCK_CONTENTION",
       "INSTANCE_UNRESPONSIVE",
       "DOWN_TIMEOUT",
+      "DOWN_INCOMPLETE",
       "UNKNOWN",
     ]),
   });

@@ -37,6 +37,7 @@ export const ERROR_CODES = [
   "INSTANCE_NOT_FOUND",
   "INSTANCE_UNRESPONSIVE",
   "DOWN_TIMEOUT",
+  "DOWN_INCOMPLETE",
   "SERVICE_NOT_FOUND",
   "HEALTH_TIMEOUT",
   "NAMESPACE_NOT_RUNNING",
@@ -77,6 +78,8 @@ export const ERROR_CODE_DESCRIPTIONS: Readonly<Record<ErrorCode, string>> = {
     "The instance's control socket exists but did not answer repeated probes (process-compose busy or frozen); nothing was started or stopped, the socket was kept, `details.remedy` says what to do.",
   DOWN_TIMEOUT:
     "The stop did not finish within its budget and process-compose was still running after devtrees force-killed the stuck services, or a timed-out hot-reload never finished so the stop was not started (`details.pending_reload`); the socket and config were kept, `details` names the stuck services, their pids and the process-compose pid, `details.remedy` says what to do.",
+  DOWN_INCOMPLETE:
+    "process-compose stopped, but something the instance started is still alive: a listener on a booted service's port, or a service descendant that survived SIGKILL; `details.survivors` lists each `{service, pid, command, port_name?, port?}`, `details.remedy` says what to do.",
   SERVICE_NOT_FOUND:
     "The named service does not exist in the target instance; `details.valid_services` lists the known ones.",
   HEALTH_TIMEOUT:
@@ -100,7 +103,7 @@ export const ERROR_CODE_DESCRIPTIONS: Readonly<Record<ErrorCode, string>> = {
   SOCKET_PATH_TOO_LONG:
     "The control socket path exceeds the platform's unix-socket limit; set DEVTREES_RUNTIME_DIR to a shorter directory.",
   STALE_PORT_BLOCK:
-    "Foreign listeners hold ports in this worktree's allocated block (likely orphans).",
+    "Foreign listeners hold ports in this worktree's allocated block (likely orphans); `details.collisions[]` lists each `{port_name, port, pid, command, accepts_connections}`, and a holder that refuses connections (`accepts_connections: false`) is not one to kill.",
   LOCK_CONTENTION:
     "Another devtrees process holds a devtrees lock (allocation registry or an instance's lifecycle lock).",
   CONFIG_INVALID: "devtrees.yaml is malformed or rejected by the deriver.",

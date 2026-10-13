@@ -72,7 +72,21 @@ import {
   type StreamLogsOptions,
 } from "./driver.js";
 import { readRegistry, withLifecycleLock, withRegistryLock, withSharedLock } from "./registry.js";
-import { defaultIsPortFree, defaultPortHolder, type PortHolderReport } from "./port-probe.js";
+import {
+  defaultIsPortFree,
+  defaultPortHolder,
+  identifyHolderViaLsof,
+  type PortHolderReport,
+} from "./port-probe.js";
+import { acceptsConnections, forwarderLabel, isPortForwarder } from "./port-connect.js";
+import {
+  daemonHooksSkipped,
+  downIncomplete,
+  findPortSurvivors,
+  processSurvivor,
+  type DownSurvivor,
+  type PortSurvivorSeams,
+} from "./down-survivors.js";
 import { sharedExtendedFields, sharedStackHash, stackHash } from "./hash.js";
 import {
   readStoredHash as defaultReadStoredHash,
@@ -536,6 +550,13 @@ interface PortCollision {
   readonly port: number;
   readonly pid: number | null;
   readonly command: string | null;
+  /**
+   * Whether the holder accepts a TCP connection (#155). `false` is a holder
+   * that keeps the port but refuses connections, like a container runtime's
+   * stale port forward: it cannot answer the new service's traffic, and it
+   * may be one process serving every instance, so it is not to be killed.
+   */
+  readonly accepts_connections: boolean;
 }
 
 /**
@@ -599,17 +620,58 @@ async function assertBlockPortsFree(args: {
   readonly blockBase: number;
   readonly portFor: (name: string) => number | undefined;
   readonly portHolder: PortHolderProbe;
+  readonly portAccepts: (port: number) => Promise<boolean>;
+  readonly warn: (message: string) => void;
   readonly ownInstanceLive: boolean;
 }): Promise<void> {
   if (args.ownInstanceLive) return;
-  const { stack, worktreeId, blockBase, portFor, portHolder } = args;
-  const collisions = await collectPortCollisions(stack, portFor, portHolder);
+  const { stack, worktreeId, blockBase, portFor, portHolder, portAccepts } = args;
+  const collisions = await collectPortCollisions(stack, portFor, portHolder, portAccepts);
   if (collisions.length === 0) return;
+  // A holder that refuses connections cannot answer the new service's
+  // traffic, so it is not the silent failure this check exists for (#155):
+  // warn about it and go on. If it does block the service's bind, the
+  // service fails loudly (HEALTH_TIMEOUT naming it), never silently.
+  if (collisions.every((c) => !c.accepts_connections)) {
+    args.warn(refusingHoldersWarning(collisions));
+    return;
+  }
   throw new StalePortBlockError(
     `devtrees up: ports in this worktree's allocated block are held by foreign processes — ` +
-      `likely orphaned children from a prior session. Inspect and kill the listed PIDs, then ` +
-      `retry \`devtrees up\`.`,
+      `likely orphaned children from a prior session. Kill each process listed below, except ` +
+      `one labelled not to kill, then retry \`devtrees up\`:\n` +
+      collisions.map(describeCollision).join("\n"),
     { block_base: blockBase, worktree_id: worktreeId, collisions },
+  );
+}
+
+/** `  WEB_PORT 40480: pid 123 (node)`, with a label for a holder not to kill (#155). */
+function describeCollision(c: PortCollision): string {
+  const who =
+    c.pid === null
+      ? `holder not identified (try \`lsof -nP -iTCP:${c.port}\`)`
+      : `pid ${c.pid} (${c.command ?? "unknown command"})`;
+  return `  ${c.port_name} ${c.port}: ${who}${collisionLabel(c)}`;
+}
+
+/** Why a holder is not one to kill, if it is not (#155). */
+function collisionLabel(c: PortCollision): string {
+  if (!c.accepts_connections) return ` — ${REFUSING_LABEL}`;
+  if (isPortForwarder(c.command)) return ` — ${forwarderLabel(c.port)}`;
+  return "";
+}
+
+const REFUSING_LABEL =
+  "refuses connections: likely a container runtime's stale port forward, which may serve " +
+  "other instances too; do not kill it";
+
+/** The warning `up` prints when every holder refuses connections (#155). */
+function refusingHoldersWarning(collisions: ReadonlyArray<PortCollision>): string {
+  return (
+    `devtrees up: ports in this worktree's allocated block are held, but every holder refuses ` +
+    `connections, so none is treated as an orphan. If a service then fails to bind its port, ` +
+    `free it and retry:\n` +
+    collisions.map(describeCollision).join("\n")
   );
 }
 
@@ -623,6 +685,7 @@ async function collectPortCollisions(
   stack: ResolvedStack,
   portFor: (name: string) => number | undefined,
   portHolder: PortHolderProbe,
+  portAccepts: (port: number) => Promise<boolean>,
 ): Promise<PortCollision[]> {
   const collisions: PortCollision[] = [];
   for (const service of stack.services) {
@@ -632,7 +695,13 @@ async function collectPortCollisions(
       if (port === undefined) continue;
       const report = await portHolder(port);
       if (report.free) continue;
-      collisions.push({ port_name: portName, port, pid: report.pid, command: report.command });
+      collisions.push({
+        port_name: portName,
+        port,
+        pid: report.pid,
+        command: report.command,
+        accepts_connections: await portAccepts(port),
+      });
     }
   }
   return collisions;
@@ -751,6 +820,26 @@ export interface CommandDeps {
    * without touching the network.
    */
   readonly portHolder?: PortHolderProbe;
+  /**
+   * Does anything accept a TCP connection on a port (#155)? `up` uses it to
+   * tell a refusing holder (a stale port forward) from an orphan, and `down`
+   * to find a listener that outlived the stop. Default: `acceptsConnections`
+   * (a loopback connect). Injected so unit tests stay off the network.
+   */
+  readonly portAccepts?: (port: number) => Promise<boolean>;
+  /**
+   * Who holds a port, for a listener `down` finds still alive (#155).
+   * Default: `identifyHolderViaLsof`.
+   */
+  readonly identifyPortHolder?: (port: number) => {
+    readonly pid: number | null;
+    readonly command: string | null;
+  };
+  /**
+   * How long `down` lets a booted service's port take to close after the
+   * stop before it counts the listener as a survivor (#155). Default: 3s.
+   */
+  readonly portSettleMs?: number;
   /**
    * Allocator defaults — `port_base` and `block_size`. The stack's `allocator`
    * field overrides these on a field-by-field basis. Default: 20000 / 32.
@@ -1136,12 +1225,20 @@ function resolveUpSeams(deps: CommandDeps) {
     lock: deps.withRegistryLock ?? defaultWithRegistryLock,
     sharedLock: deps.withSharedLock ?? defaultWithSharedLock,
     isPortFree: deps.isPortFree ?? defaultIsPortFree,
-    portHolder: deps.portHolder ?? defaultPortHolder,
+    ...resolvePortSeams(deps),
     warn: deps.warn ?? defaultWarn,
     readHash: deps.readStoredHash ?? defaultReadStoredHash,
     writeHash: deps.writeStoredHash ?? defaultWriteStoredHash,
     probe: resolveProbe(deps),
     ...resolveLifecycleSeams(deps),
+  } as const;
+}
+
+/** The pre-flight's port seams (#58, #155): who holds a port, and does it serve it. */
+function resolvePortSeams(deps: CommandDeps) {
+  return {
+    portHolder: deps.portHolder ?? defaultPortHolder,
+    portAccepts: deps.portAccepts ?? acceptsConnections,
   } as const;
 }
 
@@ -1286,7 +1383,8 @@ function unresponsiveRemedy(socketPath: string, context: LivenessContext): strin
 export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
   const { anchor } = resolve(deps);
   const seams = resolveUpSeams(deps);
-  const { readStack, lock, sharedLock, isPortFree, portHolder, warn, readHash, writeHash } = seams;
+  const { readStack, lock, sharedLock, isPortFree, portHolder, portAccepts, warn } = seams;
+  const { readHash, writeHash } = seams;
 
   const stack = readStack(anchor.worktreeRoot);
 
@@ -1383,6 +1481,8 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
       blockBase,
       portFor,
       portHolder,
+      portAccepts,
+      warn,
       ownInstanceLive,
     });
 
@@ -2364,45 +2464,61 @@ export async function runDown(
   // The stop is bounded (#190), so the lock is never held forever: a
   // concurrent `up` waiting on it fails LOCK_CONTENTION after ~10s while a
   // slow stop runs out its budget.
-  const stop = await lifecycleLock(anchor.anchor, anchor.worktreeId, async () => {
-    // Unknown liveness (#186) throws INSTANCE_UNRESPONSIVE out of the lock:
-    // neither "nothing running" nor the dead-supervisor reap below may run
-    // against an instance that might still be live.
-    const wasLive = await socketIsLive(paths.socketPath, resolveProbe(deps), {
-      command: "down",
-      instance: anchor.worktreeId,
-    });
-    // Live supervisor: a graceful `process-compose down` fires each process's
-    // `shutdown.command` from its `working_dir` (the worktree, which is present
-    // on the normal `down` path). devtrees must NOT also run the hook directly
-    // here — that would double-run it (acceptance #4: no regression).
-    // A reload still pending (#191) waits on old processes process-compose
-    // no longer lists: the bounded stop kills them first, and lets that
-    // reload finish before it stops anything (#206).
-    const stopped = wasLive
-      ? await stopInstance(
-          driver,
-          paths,
-          anchor.worktreeId,
-          "down",
-          deps.stop,
-          readPendingReload(anchor.anchor, anchor.worktreeId),
-        )
-      : undefined;
-    // process-compose exited on its own while the pending reload settled
-    // (#206): its socket file may be left behind, with no listener.
-    if (stopped?.supervisorExited) rmSync(paths.socketPath, { force: true });
-    // The instance is gone either way, and with it any reload still pending
-    // in it (#191). Not reached when the stop throws (DOWN_TIMEOUT keeps it).
-    clearPendingReload(anchor.anchor, anchor.worktreeId);
-    return stopped;
-  });
-  if (stop !== undefined && !stop.supervisorExited) {
+  const stop = await lifecycleLock(
+    anchor.anchor,
+    anchor.worktreeId,
+    async (): Promise<{
+      stopped: StopResult | undefined;
+      warning?: ReapWarning;
+      survivors?: DownSurvivor[];
+    }> => {
+      // Unknown liveness (#186) throws INSTANCE_UNRESPONSIVE out of the lock:
+      // neither "nothing running" nor the dead-supervisor reap below may run
+      // against an instance that might still be live.
+      const wasLive = await socketIsLive(paths.socketPath, resolveProbe(deps), {
+        command: "down",
+        instance: anchor.worktreeId,
+      });
+      // Live supervisor: a graceful `process-compose down` fires each process's
+      // `shutdown.command` from its `working_dir` (the worktree, which is present
+      // on the normal `down` path). devtrees must NOT also run the hook directly
+      // here — that would double-run it (acceptance #4: no regression).
+      // A reload still pending (#191) waits on old processes process-compose
+      // no longer lists: the bounded stop kills them first, and lets that
+      // reload finish before it stops anything (#206).
+      const stopped = wasLive
+        ? await stopInstance(
+            driver,
+            paths,
+            anchor.worktreeId,
+            "down",
+            deps.stop,
+            readPendingReload(anchor.anchor, anchor.worktreeId),
+          )
+        : undefined;
+      // process-compose exited on its own while the pending reload settled
+      // (#206): its socket file may be left behind, with no listener.
+      if (stopped?.supervisorExited) rmSync(paths.socketPath, { force: true });
+      // The instance is gone either way, and with it any reload still pending
+      // in it (#191). Not reached when the stop throws (DOWN_TIMEOUT keeps it).
+      clearPendingReload(anchor.anchor, anchor.worktreeId);
+      // Still under the lock, so a concurrent `up` cannot start listeners that
+      // would pass for survivors (#155).
+      if (stopped === undefined || stopped.supervisorExited) return { stopped };
+      return { stopped, ...(await checkAfterStop(stopped, paths.configPath, anchor, deps)) };
+    },
+  );
+  if (stop.stopped !== undefined && !stop.stopped.supervisorExited) {
+    const forceKilled = stop.stopped.forceKilled;
+    if (stop.survivors !== undefined && stop.survivors.length > 0) {
+      throw downIncomplete(anchor.worktreeId, stop.survivors, forceKilled);
+    }
     return {
       shared: false,
       worktreeId: anchor.worktreeId,
       stopped: true,
-      forceKilled: stop.forceKilled,
+      forceKilled,
+      ...(stop.warning !== undefined ? { warning: stop.warning } : {}),
     };
   }
 
@@ -2419,9 +2535,67 @@ export async function runDown(
   return {
     shared: false,
     worktreeId: anchor.worktreeId,
-    stopped: stop !== undefined,
-    forceKilled: stop?.forceKilled ?? [],
+    stopped: stop.stopped !== undefined,
+    forceKilled: stop.stopped?.forceKilled ?? [],
     ...(warning !== undefined ? { warning } : {}),
+  };
+}
+
+/** `lsof`'s cap when `down` names a surviving listener (#155): hooks may still load the machine. */
+const LSOF_DOWN_TIMEOUT_MS = 5_000;
+
+/**
+ * After a worktree's process-compose has stopped (#155): run the shutdown
+ * hooks it skipped (daemons whose launch had already exited), then look for
+ * anything the instance owned that is still alive: a service descendant the
+ * tree sweep could not kill, or a listener on a booted service's named port.
+ * Without the pre-stop `process list` there is nothing to judge by, and the
+ * check is skipped.
+ */
+async function checkAfterStop(
+  stopped: StopResult,
+  configPath: string,
+  anchor: { readonly anchor: string; readonly worktreeId: string },
+  deps: CommandDeps,
+): Promise<{ warning?: ReapWarning; survivors?: DownSurvivor[] }> {
+  const config = readDerivedConfig(configPath);
+  const processes = (stopped.survivors ?? []).map(processSurvivor);
+  if (config === undefined || stopped.statuses === undefined) return { survivors: processes };
+  const skipped = daemonHooksSkipped(config, stopped.statuses);
+  const warning =
+    skipped === undefined
+      ? undefined
+      : await reapDerivedHooks(skipped, configPath, anchor, deps.reap ?? reapShutdownHooks);
+  const listeners = await findPortSurvivors(config, stopped.statuses, portSurvivorSeams(deps));
+  return {
+    survivors: [...processes, ...listeners],
+    ...(warning !== undefined ? { warning } : {}),
+  };
+}
+
+/** Run `config`'s shutdown hooks from the anchor; a `ReapWarning` when any failed. */
+async function reapDerivedHooks(
+  config: DerivedConfig,
+  configPath: string,
+  anchor: { readonly anchor: string; readonly worktreeId: string },
+  reap: Reaper,
+): Promise<ReapWarning | undefined> {
+  const outcome = await reap(config, { cwd: anchor.anchor });
+  if (outcome.failures.length === 0) return undefined;
+  return {
+    orphanId: anchor.worktreeId,
+    worktreePath: readWorktreePath(configPath),
+    failures: outcome.failures,
+  };
+}
+
+/** The seams `down`'s listener check runs on (#155). */
+function portSurvivorSeams(deps: CommandDeps): PortSurvivorSeams {
+  return {
+    accepts: deps.portAccepts ?? acceptsConnections,
+    identify:
+      deps.identifyPortHolder ?? ((port) => identifyHolderViaLsof(port, LSOF_DOWN_TIMEOUT_MS)),
+    ...(deps.portSettleMs !== undefined ? { waitMs: deps.portSettleMs } : {}),
   };
 }
 

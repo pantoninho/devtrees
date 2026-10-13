@@ -119,11 +119,15 @@ export async function defaultPortHolder(port: number): Promise<PortHolderReport>
 
 /**
  * Best-effort lsof shell-out that returns `{pid, command}` for the listener
- * on `port`, or `{pid: null, command: null}` on any failure. The 1s timeout
- * is generous for a local lsof call but bounds the worst case if the binary
- * hangs on a slow filesystem.
+ * on `port`, or `{pid: null, command: null}` on any failure. The 1s default
+ * timeout is generous for a local lsof call but bounds the worst case if the
+ * binary hangs on a slow filesystem; `down` (#155), which runs it while
+ * shutdown hooks may still load the machine, passes a longer one.
  */
-function identifyHolderViaLsof(port: number): {
+export function identifyHolderViaLsof(
+  port: number,
+  timeoutMs = 1000,
+): {
   readonly pid: number | null;
   readonly command: string | null;
 } {
@@ -131,7 +135,7 @@ function identifyHolderViaLsof(port: number): {
     const result = spawnSync(
       "lsof",
       ["-iTCP:" + String(port), "-sTCP:LISTEN", "-nP", "-F", "pcL"],
-      { encoding: "utf8", timeout: 1000 },
+      { encoding: "utf8", timeout: timeoutMs },
     );
     if (result.error !== undefined || result.status !== 0 || typeof result.stdout !== "string") {
       return { pid: null, command: null };

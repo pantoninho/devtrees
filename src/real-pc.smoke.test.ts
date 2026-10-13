@@ -1849,6 +1849,190 @@ describe.skipIf(!ENABLED)(
   },
 );
 
+// Issue #155: `down` said "worktree instance stopped" and exited 0 while a
+// SIGTERM-ignoring grandchild behind a wrapper chain, or a daemon's
+// out-of-band resources, outlived it; the next `up` then failed
+// STALE_PORT_BLOCK without naming the holder.
+describe.skipIf(!ENABLED)("real-pc smoke — down leaves nothing behind (#155)", () => {
+  /**
+   * `<root>/listener.py`: listens on argv[1] (127.0.0.1) and ignores
+   * SIGTERM, like the uvicorn grandchild in #155. With `detach`, it first
+   * double-forks into a session of its own, so its launcher returns at once
+   * and it is outside every service's process tree (a daemon's resource).
+   */
+  function listenerScript(root: string): string {
+    const path = join(root, "listener.py");
+    writeFileSync(
+      path,
+      [
+        "import os, signal, socket, sys",
+        "if len(sys.argv) > 2 and sys.argv[2] == 'detach':",
+        "    if os.fork() > 0: sys.exit(0)",
+        "    os.setsid()",
+        "    if os.fork() > 0: sys.exit(0)",
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)",
+        "s = socket.socket()",
+        "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)",
+        "s.bind(('127.0.0.1', int(sys.argv[1])))",
+        "s.listen(5)",
+        "while True:",
+        "    c, _ = s.accept()",
+        "    c.close()",
+        "",
+      ].join("\n"),
+    );
+    return path;
+  }
+
+  function scenarioRepo(prefix: string): { wt: string; root: string } {
+    const repo = buildSmokeRepo(prefix, ["login"]);
+    currentCtx = { pidNeedle: repo.root, root: repo.root };
+    // Whatever happens, kill what the scenario started.
+    cleanupStack.push(() => reapPids(pidsMatching(repo.root)));
+    return { wt: repo.worktrees.login!, root: repo.root };
+  }
+
+  it("scenario 80: down stops a SIGTERM-ignoring grandchild behind an exec'd wrapper chain, and the next up starts (#155)", async () => {
+    const { wt, root } = scenarioRepo("dt-rpc80-");
+    const listener = listenerScript(root);
+    // `exec sh wrapper.sh` -> python3: the shape of `exec pnpm exec keyshelf
+    // run ... -- uv run ... uvicorn`, where the listener is a grandchild.
+    const wrapper = join(root, "wrapper.sh");
+    writeFileSync(wrapper, `#!/bin/sh\npython3 ${listener} "$1"\n`);
+    writeFileSync(
+      join(wt, "devtrees.yaml"),
+      [
+        "services:",
+        "  web:",
+        "    tier: isolated",
+        "    ports: [WEB_PORT]",
+        `    command: "exec sh ${wrapper} $WEB_PORT"`,
+        "",
+      ].join("\n"),
+    );
+    const first = up(wt);
+    expect(first.code, first.stdout).toBe(0);
+    const port = Number((first.doc as UpDoc).up.env.WEB_PORT);
+    expect(await waitForListener(port, 10_000), "listener should serve").toBe(true);
+
+    const down = devtrees(wt, ["down", "--json"]);
+    expect(down.code, `down should succeed: ${down.stdout}`).toBe(0);
+    const doc = down.doc as { down: { force_killed: Array<{ service: string; pid: number }> } };
+    expect(doc.down.force_killed).toMatchObject([{ service: "web" }]);
+    expect(await waitForNoPids(listener, 5_000), "the grandchild should be gone").toEqual([]);
+    expect(orphanedServices(root)).toEqual([]);
+
+    // The block is free again: the next up does not fail STALE_PORT_BLOCK.
+    const second = up(wt);
+    expect(second.code, `up after down: ${second.stdout}`).toBe(0);
+    expect(devtrees(wt, ["down", "--json"]).code).toBe(0);
+  }, 120_000);
+
+  it("scenario 81: down runs the shutdown hook process-compose skips for a daemon whose launch failed (#155)", async () => {
+    const { wt, root } = scenarioRepo("dt-rpc81-");
+    // Each daemon "starts a container" (a resource file), and its hook
+    // removes it and logs that it ran. `app`'s launch then fails, as a
+    // `supabase start` that times out on a health check does.
+    const hookLog = join(root, "hooks.log");
+    const daemon = (name: string, ns: string, exit: number) => [
+      `  ${name}:`,
+      "    tier: isolated",
+      `    namespace: ${ns}`,
+      "    is_daemon: true",
+      `    command: "sh -c 'touch ${join(root, `res-${name}`)}; exit ${exit}'"`,
+      "    availability:",
+      '      restart: "no"',
+      "    shutdown:",
+      `      command: "sh -c 'rm -f ${join(root, `res-${name}`)}; echo ${name} >> ${hookLog}'"`,
+    ];
+    writeFileSync(
+      join(wt, "devtrees.yaml"),
+      ["services:", ...daemon("data", "backoffice", 0), ...daemon("app", "app", 1), ""].join("\n"),
+    );
+    // `app`'s failed launch makes this up fail HEALTH_TIMEOUT; the instance stays up.
+    devtrees(wt, ["up", "--json", "--wait-timeout", "5", "-n", "backoffice", "-n", "app"]);
+    expect(existsSync(join(root, "res-app")), "app's launch should have run").toBe(true);
+
+    const down = devtrees(wt, ["down", "--json"]);
+    expect(down.code, `down should succeed: ${down.stdout}`).toBe(0);
+    expect(existsSync(join(root, "res-data")), "process-compose runs data's hook").toBe(false);
+    expect(existsSync(join(root, "res-app")), "devtrees runs app's skipped hook").toBe(false);
+    // Each hook ran exactly once.
+    expect(readFileSync(hookLog, "utf8").trim().split("\n").sort()).toEqual(["app", "data"]);
+  }, 120_000);
+
+  it("scenario 82: down fails DOWN_INCOMPLETE naming a listener that outlived the stop (#155)", async () => {
+    const { wt, root } = scenarioRepo("dt-rpc82-");
+    const listener = listenerScript(root);
+    // A daemon whose resource keeps its port, and whose hook does not stop it.
+    writeFileSync(
+      join(wt, "devtrees.yaml"),
+      [
+        "services:",
+        "  db:",
+        "    tier: isolated",
+        "    ports: [DB_PORT]",
+        "    is_daemon: true",
+        `    command: "python3 ${listener} $DB_PORT detach"`,
+        "    readiness_probe:",
+        "      exec:",
+        '        command: "echo ok"',
+        "      period_seconds: 1",
+        "    shutdown:",
+        '      command: "echo bye"',
+        "",
+      ].join("\n"),
+    );
+    const first = up(wt);
+    expect(first.code, first.stdout).toBe(0);
+    const port = Number((first.doc as UpDoc).up.env.DB_PORT);
+    expect(await waitForListener(port, 10_000), "the daemon's listener should serve").toBe(true);
+    const [pid] = pidsMatching(listener);
+
+    const down = devtrees(wt, ["down", "--json"]);
+    expect(down.code, "down must not report success").toBe(1);
+    const error = (down.doc as { error: { code: string; details: Record<string, unknown> } }).error;
+    expect(error.code).toBe("DOWN_INCOMPLETE");
+    expect(error.details.survivors).toMatchObject([
+      { service: "db", port_name: "DB_PORT", port, pid },
+    ]);
+    // The human message names it too.
+    expect(down.stderr).toContain(`db DB_PORT ${port}: pid ${pid}`);
+  }, 120_000);
+
+  it("scenario 83: STALE_PORT_BLOCK lists each held port with its pid and command in human output (#155)", async () => {
+    const { wt, root } = scenarioRepo("dt-rpc83-");
+    const listener = listenerScript(root);
+    writeFileSync(
+      join(wt, "devtrees.yaml"),
+      [
+        "services:",
+        "  web:",
+        "    tier: isolated",
+        "    ports: [WEB_PORT]",
+        '    command: "sleep 300"',
+        "",
+      ].join("\n"),
+    );
+    // Learn the block, then squat WEB_PORT with an orphan-like listener.
+    const first = up(wt);
+    expect(first.code, first.stdout).toBe(0);
+    const port = Number((first.doc as UpDoc).up.env.WEB_PORT);
+    expect(devtrees(wt, ["down", "--json"]).code).toBe(0);
+    const squatter = spawn("python3", [listener, String(port)], { stdio: "ignore" });
+    cleanupStack.push(() => squatter.kill("SIGKILL"));
+    expect(await waitForListener(port, 10_000)).toBe(true);
+
+    const human = devtrees(wt, ["up", "--no-attach", "--wait-timeout", "10"]);
+    expect(human.code).toBe(1);
+    expect(human.stderr).toContain(`WEB_PORT ${port}: pid ${squatter.pid}`);
+    const json = staleCollisions(devtrees(wt, ["up", "--json", "--wait-timeout", "10"]));
+    expect(json).toMatchObject([
+      { port_name: "WEB_PORT", port, pid: squatter.pid, accepts_connections: true },
+    ]);
+  }, 120_000);
+});
+
 if (!ENABLED) {
   describe("real-pc smoke — gated", () => {
     it.skip(SKIP_REASON, () => {});

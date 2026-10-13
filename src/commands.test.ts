@@ -281,6 +281,10 @@ function stubDeps(opts: {
     // races against concurrent test workers binding the same port range.
     // Tests that exercise stale-port-block detection override this.
     portHolder: async () => ({ free: true as const }),
+    // Nothing listens, as the holder stub says (#155): `down`'s survivor
+    // check finds no listener, and a test that arms a holder arms this too.
+    portAccepts: async () => false,
+    portSettleMs: 0,
     warn: opts.warn,
     attach: false,
     // Tests that don't care about the worktree health-wait (#28) get a no-op
@@ -4752,6 +4756,9 @@ describe("runUp — pending-reload guard (#191)", () => {
     // `process list`, as the bounded `down` reads it through the driver.
     const spawner: NonNullable<CommandDeps["driver"]>["spawner"] = (binary, args, options) => {
       if (args[0] !== "process" || args[1] !== "list") {
+        // `process-compose down` stops every service it lists (#155: the
+        // tree sweep after it then has nothing left to kill).
+        if (args[0] === "down") for (const r of state.rows) if (r.pid) state.alive.delete(r.pid);
         return base.driver?.spawner?.(binary, args, options) ?? spawnedOk();
       }
       const emitter = new EventEmitter() as EventEmitter & { stdout: Readable };
@@ -5841,6 +5848,7 @@ describe("runUp — stale port block detection (#58)", () => {
         initialRegistry: { [loginId]: blockBase },
       }),
       portHolder,
+      portAccepts: async () => true,
     };
 
     const err = await runUp(deps).then(
@@ -5867,7 +5875,10 @@ describe("runUp — stale port block detection (#58)", () => {
       port: blockBase,
       pid: 12345,
       command: "node stale.mjs",
+      accepts_connections: true,
     });
+    // The human message lists the collision too (#155), not just `details`.
+    expect(err.message).toContain(`WEB_PORT ${blockBase}: pid 12345 (node stale.mjs)`);
   });
 
   it("collects every collision (not just the first) so the agent can kill all orphans in one pass", async () => {
@@ -5876,7 +5887,7 @@ describe("runUp — stale port block detection (#58)", () => {
       pid: port, // pid = port for easy assertion
       command: `proc@${port}`,
     });
-    const deps: CommandDeps = { ...stubDeps({ stack }), portHolder };
+    const deps: CommandDeps = { ...stubDeps({ stack }), portHolder, portAccepts: async () => true };
     const err = await runUp(deps).then(
       () => undefined,
       (e: unknown) => e as Error & { details?: unknown },
@@ -5889,7 +5900,7 @@ describe("runUp — stale port block detection (#58)", () => {
 
   it("reports collision even when the holder probe can't identify the pid/command (lsof missing / degraded)", async () => {
     const portHolder = async () => ({ free: false as const, pid: null, command: null }) as const;
-    const deps: CommandDeps = { ...stubDeps({ stack }), portHolder };
+    const deps: CommandDeps = { ...stubDeps({ stack }), portHolder, portAccepts: async () => true };
     const err = await runUp(deps).then(
       () => undefined,
       (e: unknown) => e as Error & { code?: string; details?: unknown },
@@ -5945,7 +5956,7 @@ describe("runUp — stale port block detection (#58)", () => {
       probed.push(port);
       return { free: true as const };
     };
-    const deps: CommandDeps = { ...stubDeps({ stack }), portHolder };
+    const deps: CommandDeps = { ...stubDeps({ stack }), portHolder, portAccepts: async () => true };
     const result = await runUp(deps);
     // The stack declares 2 named ports; the block holds 32. The check must
     // touch only the two.
@@ -6029,6 +6040,7 @@ describe("runUp — crash recovery: stale control socket (#80)", () => {
       }),
       // An orphaned process still squats this worktree's block.
       portHolder: async () => ({ free: false as const, pid: 4242, command: "node orphan.mjs" }),
+      portAccepts: async () => true,
     };
 
     const err = await runUp(deps).then(
@@ -7289,5 +7301,163 @@ describe("bounded down — force-kill and DOWN_TIMEOUT (#190)", () => {
     expect(existsSync(orphan.socketPath)).toBe(true);
     expect(existsSync(orphan.configPath)).toBe(true);
     expect(registryRef.snapshot.removed).toBe(20032);
+  });
+});
+
+// Issue #155: `down` reported "worktree instance stopped" and exited 0 while a
+// daemon's containers (its shutdown hook skipped by process-compose) and a
+// SIGTERM-ignoring grandchild kept their ports.
+describe("runDown after process-compose stops (#155)", () => {
+  const stack: ResolvedStack = {
+    services: [
+      {
+        ...isolated("db", "start-db.sh", ["DB_PORT"]),
+        isDaemon: true,
+        shutdown: { command: "stop-db.sh" },
+      },
+      {
+        ...isolated("cache", "start-cache.sh", ["CACHE_PORT"]),
+        isDaemon: true,
+        shutdown: { command: "stop-cache.sh" },
+      },
+      isolated("web", "node web.js", ["WEB_PORT"]),
+    ],
+  };
+
+  /** A live instance whose `process list` reads `rows`. */
+  async function liveInstance(rows: ReadonlyArray<{ name: string; status: string }>) {
+    const deps = stubDeps({ stack, track: { invocations: [], touchSocket: true } });
+    const up = await runUp(deps);
+    const base = deps.driver;
+    const spawner: NonNullable<CommandDeps["driver"]>["spawner"] = (binary, args, options) => {
+      if (args[0] !== "process" || args[1] !== "list") {
+        return base?.spawner?.(binary, args, options) ?? spawnedOk();
+      }
+      const emitter = new EventEmitter() as EventEmitter & { stdout: Readable };
+      const listed = rows.map((r) => ({ ...r, is_ready: "-", is_running: false }));
+      emitter.stdout = Readable.from([JSON.stringify(listed)]);
+      emitter.stdout.on("end", () => queueMicrotask(() => emitter.emit("exit", 0)));
+      return emitter as unknown as SpawnedProcess;
+    };
+    const reaped: string[][] = [];
+    const reap: CommandDeps["reap"] = async (config) => {
+      reaped.push(Object.keys(config.processes));
+      return { ranCount: Object.keys(config.processes).length, failures: [] };
+    };
+    const port = (name: string): number => Number(up.env[name]);
+    return { deps: { ...deps, driver: { ...base, spawner }, reap }, reaped, port };
+  }
+
+  it("runs the shutdown hook of a daemon whose launch had already exited, and only that one", async () => {
+    const { deps, reaped } = await liveInstance([
+      { name: "db", status: "Completed" },
+      { name: "cache", status: "Launched" },
+      { name: "web", status: "Running" },
+    ]);
+    const result = await runDown(deps);
+    expect(result).toMatchObject({ shared: false, stopped: true });
+    // process-compose ran cache's hook itself; db's it skipped.
+    expect(reaped).toEqual([["db"]]);
+  });
+
+  it("runs no hook when every daemon was still launched", async () => {
+    const { deps, reaped } = await liveInstance([
+      { name: "db", status: "Launched" },
+      { name: "web", status: "Running" },
+    ]);
+    await runDown(deps);
+    expect(reaped).toEqual([]);
+  });
+
+  it("fails DOWN_INCOMPLETE naming a booted service's port that still accepts connections", async () => {
+    const { deps, port } = await liveInstance([
+      { name: "db", status: "Completed" },
+      { name: "web", status: "Running" },
+    ]);
+    const dbPort = port("DB_PORT");
+    const err = (await runDown({
+      ...deps,
+      portAccepts: async (p) => p === dbPort,
+      identifyPortHolder: () => ({ pid: 4242, command: "OrbStack Helper" }),
+    }).catch((e: unknown) => e)) as Error & { code?: string; details?: Record<string, unknown> };
+    expect(err.code).toBe("DOWN_INCOMPLETE");
+    expect(err.details?.survivors).toEqual([
+      { service: "db", pid: 4242, command: "OrbStack Helper", port_name: "DB_PORT", port: dbPort },
+    ]);
+    expect(err.message).toContain(`db DB_PORT ${dbPort}: pid 4242 (OrbStack Helper)`);
+    // A shared port forwarder is never offered up for killing.
+    expect(err.message).toContain(`docker ps --filter publish=${dbPort}`);
+    expect(err.message).toContain("never this process");
+    expect(err.message).not.toMatch(/kill 4242/);
+  });
+
+  it("never checks the ports of a service the instance did not boot", async () => {
+    const { deps, port } = await liveInstance([{ name: "web", status: "Running" }]);
+    const probed: number[] = [];
+    await runDown({
+      ...deps,
+      portAccepts: async (p) => {
+        probed.push(p);
+        return false;
+      },
+    });
+    expect(probed).toEqual([port("WEB_PORT")]);
+  });
+});
+
+describe("STALE_PORT_BLOCK holders that refuse connections (#155)", () => {
+  const stack: ResolvedStack = {
+    services: [isolated("web", "node web.js", ["WEB_PORT"]), isolated("api", "x", ["API_PORT"])],
+  };
+
+  it("does not fail up when every holder refuses connections; it warns instead", async () => {
+    const warnings: string[] = [];
+    const deps: CommandDeps = {
+      ...stubDeps({ stack, warn: (m) => warnings.push(m) }),
+      portHolder: async () => ({ free: false as const, pid: 77, command: "OrbStack Helper" }),
+      portAccepts: async () => false,
+    };
+    await runUp(deps);
+    const warning = warnings.find((w) => w.includes("refuses connections"));
+    expect(warning).toBeDefined();
+    expect(warning).toContain("pid 77 (OrbStack Helper)");
+    expect(warning).toContain("do not kill it");
+  });
+
+  it("fails when one holder accepts, labelling the refusing one and a port forwarder not to kill", async () => {
+    const holders: Record<string, { pid: number; command: string }> = {};
+    const deps: CommandDeps = {
+      ...stubDeps({ stack }),
+      portHolder: async (port) => {
+        const h = holders[String(port)] ?? { pid: port, command: "OrbStack Helper" };
+        return { free: false as const, ...h };
+      },
+      portAccepts: async () => true,
+    };
+    const first = (await runUp(deps).catch((e: unknown) => e)) as Error & {
+      details?: { collisions: Array<{ port: number; port_name: string }> };
+    };
+    const ports = first.details!.collisions;
+    const web = ports.find((c) => c.port_name === "WEB_PORT")!.port;
+    const api = ports.find((c) => c.port_name === "API_PORT")!.port;
+    holders[String(web)] = { pid: 4242, command: "node stale.mjs" };
+    const err = (await runUp({
+      ...deps,
+      portAccepts: async (port) => port === web,
+    }).catch((e: unknown) => e)) as Error & {
+      code?: string;
+      details?: { collisions: Array<{ port: number; accepts_connections: boolean }> };
+    };
+    expect(err.code).toBe("STALE_PORT_BLOCK");
+    expect(err.details?.collisions.map((c) => [c.port, c.accepts_connections])).toEqual([
+      [web, true],
+      [api, false],
+    ]);
+    expect(err.message).toContain(`WEB_PORT ${web}: pid 4242 (node stale.mjs)\n`);
+    expect(err.message).toMatch(
+      new RegExp(`API_PORT ${api}: pid ${api} .*refuses connections.*do not kill it`),
+    );
+    // An accepting port forwarder is labelled too (#217's wildcard probe sees OrbStack forwards).
+    expect(first.message).toContain("never this process");
   });
 });
