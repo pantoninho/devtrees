@@ -33,6 +33,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { deriveWorktreeId } from "./anchor.js";
 import { instancePaths } from "./paths.js";
+import { readPendingReload } from "./reload-pending.js";
 
 // ---------------------------------------------------------------------------
 // Gating: skip the whole file unless the env var is set AND the binary works.
@@ -192,14 +193,14 @@ function writeLogLocationStack(worktreeRoot: string, opts: { marker: string }): 
  */
 function writeReloadStack(
   worktreeRoot: string,
-  opts: { readonly hold: string; readonly shutdownCommand?: string },
+  opts: { readonly hold: string; readonly shutdownCommand?: string; readonly command?: string },
 ): void {
   writeFileSync(opts.hold, "");
   const yaml = [
     "services:",
     "  web:",
     "    tier: isolated",
-    `    command: "tail -f ${opts.hold}"`,
+    `    command: "${opts.command ?? `tail -f ${opts.hold}`}"`,
     "    ports: [WEB_PORT]",
     ...(opts.shutdownCommand ? ["    shutdown:", `      command: "${opts.shutdownCommand}"`] : []),
     "",
@@ -982,9 +983,8 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
     const wt = repo.worktrees.login!;
     const [holdA, holdB] = [join(repo.root, "hold-a"), join(repo.root, "hold-b")];
     writeReloadStack(wt, { hold: holdA, shutdownCommand: "echo bye" });
-    // `devtrees down` cannot force-kill the old process (process-compose no
-    // longer lists it) and would fail DOWN_TIMEOUT after its budget, so tear
-    // down by killing everything this scenario spawned.
+    // The scenario kills the old process by hand; tear down by killing
+    // everything it spawned (scenario 60 covers `down` in this state).
     cleanupStack.push(() => reapPids(pidsMatching(repo.root)));
 
     expect(up(wt).code).toBe(0);
@@ -1484,6 +1484,89 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
     });
   }, 120_000);
 });
+
+// Issue #206: after a hot-reload times out (#188), process-compose no longer
+// lists the changed service's old process, yet its `down` waits on it. The
+// bounded `down` (#190) now force-kills that old run, which the
+// pending-reload marker (#191) recorded, before it stops the instance, and
+// waits for the pending update to start the new copy, so it finishes within
+// budget and the new copy is stopped too.
+describe.skipIf(!ENABLED)("real-pc smoke — down after a timed-out reload (#206)", () => {
+  it("scenario 60: down force-kills the old process a timed-out reload left behind (#206)", async () => {
+    const repo = buildSmokeRepo("dt-rpc60-", ["login"]);
+    currentCtx = { pidNeedle: repo.root, root: repo.root };
+    const wt = repo.worktrees.login!;
+    const [holdA, holdB] = [join(repo.root, "hold-a"), join(repo.root, "hold-b")];
+    writeReloadStack(wt, { hold: holdA, shutdownCommand: "echo bye" });
+    // If the escalation regressed, `down` would fail: kill what we started.
+    cleanupStack.push(() => reapPids(pidsMatching(repo.root)));
+
+    expect(up(wt).code).toBe(0);
+    expect(await waitForPid(holdA, 10_000), "old command should be running").toBe(true);
+    const oldPids = pidsMatching(holdA);
+
+    // The #188 hang shape: the edited service's old process never stops.
+    // The new command logs each start, so a copy started by the pending
+    // update is seen even if it is gone again by the time we look.
+    const starts = join(repo.root, "newstarts");
+    writeReloadStack(wt, {
+      hold: holdB,
+      shutdownCommand: "echo bye",
+      command: `sh -c 'echo started >> ${starts}; exec tail -f ${holdB}'`,
+    });
+    const reload = up(wt);
+    const reloadErr = (
+      reload.doc as { error?: { code?: string; details?: { reason?: string } } } | undefined
+    )?.error;
+    expect(reloadErr?.code, `drifted up should time out: ${reload.stderr}`).toBe("CONFIG_DRIFT");
+    expect(reloadErr?.details?.reason).toBe("timeout");
+
+    const commonDir = execGit(wt, ["rev-parse", "--git-common-dir"]);
+    const anchor = commonDir.startsWith("/") ? commonDir : join(wt, commonDir);
+    const marker = readPendingReload(anchor, wtId(wt));
+    const oldRun = marker?.oldRuns.find((r) => r.name === "web");
+    expect(oldRuns(marker), "the marker records the old run's identity").toEqual(["web"]);
+    expect(oldPids).toContain(oldRun?.pid);
+    expect(oldRun?.identity?.command).toContain(holdA);
+
+    const started = Date.now();
+    const down = devtrees(wt, ["down", "--json"], { DEVTREES_DOWN_BASE_TIMEOUT_MS: "3000" });
+    const elapsed = Date.now() - started;
+    expect(
+      down.code,
+      `down should finish, not fail DOWN_TIMEOUT: ${down.stdout}${down.stderr}`,
+    ).toBe(0);
+    const doc = down.doc as { down: { stopped: boolean; force_killed: unknown[] } };
+    expect(doc.down.stopped).toBe(true);
+    expect(doc.down.force_killed).toContainEqual({ service: "web", pid: oldRun?.pid });
+    // Budget (3s) plus the grace and process-compose's own work.
+    expect(elapsed).toBeLessThan(30_000);
+    expect(await waitForNoPids(repo.root, 10_000), "nothing should survive down").toEqual([]);
+    expect(orphanedServices(repo.root)).toEqual([]);
+    // The old run is killed before the stop, and the stop waits for the
+    // pending update to start the new copy, so `down` stops that copy too,
+    // never leaving it behind with PPID 1.
+    const startCount = existsSync(starts)
+      ? readFileSync(starts, "utf8").split("\n").filter(Boolean).length
+      : 0;
+    expect(
+      startCount,
+      "the pending update started the new copy before the stop",
+    ).toBeGreaterThanOrEqual(1);
+    expect(pidsMatching(holdB), "no copy of the new command survives").toEqual([]);
+    expect(
+      orphanedServices(repo.root).filter((line) => line.includes(holdB)),
+      "no PPID-1 copy of the new command",
+    ).toEqual([]);
+    expect(readPendingReload(anchor, wtId(wt)), "down clears the marker").toBeUndefined();
+    expect(existsSync(instancePaths(anchor, wtId(wt)).socketPath)).toBe(false);
+  }, 120_000);
+});
+
+/** Names of the marker's old runs that carry a recorded identity. */
+function oldRuns(marker: ReturnType<typeof readPendingReload>): string[] {
+  return (marker?.oldRuns ?? []).filter((r) => r.identity).map((r) => r.name);
+}
 
 // Without the gate, log once so a developer running `vp test run` locally
 // knows why no scenarios fired.

@@ -76,7 +76,7 @@ export const ERROR_CODE_DESCRIPTIONS: Readonly<Record<ErrorCode, string>> = {
   INSTANCE_UNRESPONSIVE:
     "The instance's control socket exists but did not answer repeated probes (process-compose busy or frozen); nothing was started or stopped, the socket was kept, `details.remedy` says what to do.",
   DOWN_TIMEOUT:
-    "The stop did not finish within its budget and process-compose was still running after devtrees force-killed the stuck services; the socket and config were kept, `details` names the stuck services, their pids and the process-compose pid, `details.remedy` says what to do.",
+    "The stop did not finish within its budget and process-compose was still running after devtrees force-killed the stuck services, or a timed-out hot-reload never finished so the stop was not started (`details.pending_reload`); the socket and config were kept, `details` names the stuck services, their pids and the process-compose pid, `details.remedy` says what to do.",
   SERVICE_NOT_FOUND:
     "The named service does not exist in the target instance; `details.valid_services` lists the known ones.",
   HEALTH_TIMEOUT:

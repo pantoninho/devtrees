@@ -498,8 +498,9 @@ class DownCommand extends DevtreesCommand {
     // shared one with `--shared`) → LOCK_CONTENTION. A socket whose liveness
     // stays unknown after the probe retries → INSTANCE_UNRESPONSIVE (#186).
     // A stop that outlives its budget, and whose process-compose is still
-    // running after devtrees force-killed the stuck services → DOWN_TIMEOUT
-    // (#190).
+    // running after devtrees force-killed the stuck services, or whose
+    // pending hot-reload never finished so the stop was not begun →
+    // DOWN_TIMEOUT (#190, #206).
     details: errorCodeFooter([
       "PROCESS_COMPOSE_NOT_FOUND",
       "LOCK_CONTENTION",

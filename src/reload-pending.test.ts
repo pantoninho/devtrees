@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { ServiceStatus } from "./driver.js";
 import {
   clearPendingReload,
+  identifyOldRuns,
   isProcessAlive,
   planPendingReload,
   readPendingReload,
@@ -17,6 +18,84 @@ const row = (name: string, pid?: number): ServiceStatus => ({
   status: "Running",
   health: "unknown",
   ...(pid !== undefined ? { pid } : {}),
+});
+
+describe("identifyOldRuns (#206)", () => {
+  const PC = { pid: 9, ppid: 1, pgid: 9, command: "process-compose up -u /s.sock" };
+  const marker = {
+    services: ["web"],
+    oldRuns: [
+      { name: "web", pid: 100 },
+      { name: "api", pid: 200 },
+      { name: "gone", pid: 300 },
+    ],
+  };
+
+  it("records each old run's parent, group and command line when it is a child of the supervisor", () => {
+    const table = [
+      PC,
+      { pid: 100, ppid: 9, pgid: 100, command: "bash -c node a.js" },
+      // Not a child of this instance's process-compose: never identified.
+      { pid: 200, ppid: 1, pgid: 200, command: "vim" },
+    ];
+    expect(identifyOldRuns(marker, table, 9)).toEqual({
+      services: ["web"],
+      oldRuns: [
+        { name: "web", pid: 100, identity: { ppid: 9, pgid: 100, command: "bash -c node a.js" } },
+        { name: "api", pid: 200, identity: null },
+        { name: "gone", pid: 300, identity: null },
+      ],
+    });
+  });
+
+  it("identifies nothing when the supervisor is unknown or `ps` failed", () => {
+    const table = [PC, { pid: 100, ppid: 9, pgid: 100, command: "x" }];
+    const nulls = identifyOldRuns(marker, table, undefined).oldRuns.map((r) => r.identity);
+    expect(nulls).toEqual([null, null, null]);
+    expect(identifyOldRuns(marker, [], 9).oldRuns.map((r) => r.identity)).toEqual([
+      null,
+      null,
+      null,
+    ]);
+  });
+
+  it("stamps unlistedAt on an identified run process-compose no longer lists (its update is stopping it)", () => {
+    const table = [
+      PC,
+      { pid: 100, ppid: 9, pgid: 100, command: "bash -c node a.js" },
+      { pid: 200, ppid: 9, pgid: 200, command: "sleep 300" },
+    ];
+    // web (100) is unlisted: its update began. api (200) is still listed:
+    // queued. gone (300) has no identity, so it gets no stamp either.
+    const listed = {
+      rows: [{ name: "api", status: "Running", health: "unknown", pid: 200 }],
+      at: 1234,
+    };
+    const runs = identifyOldRuns(marker, table, 9, listed as never).oldRuns;
+    expect(runs.map((r) => r.unlistedAt)).toEqual([1234, undefined, undefined]);
+    // Without a `process list` read, nothing is stamped.
+    expect(identifyOldRuns(marker, table, 9).oldRuns.map((r) => r.unlistedAt)).toEqual([
+      undefined,
+      undefined,
+      undefined,
+    ]);
+  });
+
+  it("round-trips through the marker file", () => {
+    const anchor = mkdtempSync(join(tmpdir(), "dt-pr206-"));
+    mkdirSync(join(anchor, "devtrees"), { recursive: true });
+    try {
+      const identified = identifyOldRuns(
+        marker,
+        [PC, { pid: 100, ppid: 9, pgid: 100, command: "x" }],
+        9,
+      );
+      writePendingReload(anchor, "wt", identified);
+      expect(readPendingReload(anchor, "wt")).toEqual(identified);
+    } finally {
+      rmSync(anchor, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("planPendingReload", () => {

@@ -6,7 +6,20 @@
  * ignores SIGTERM and declares no `shutdown.timeout_seconds`. Its `down` then
  * waits forever, and so did `devtrees down` and prune's orphan stop.
  *
- * `boundedDown` stops an instance in three steps:
+ * `boundedDown` stops an instance in four steps:
+ *  0. If a hot-reload is still pending (#206), let it finish first
+ *     (`finishPendingReload`): wait until the update has started every new
+ *     copy. An old run that process-compose no longer lists is being stopped
+ *     by its update; once it has stayed so past a grace period it is stuck,
+ *     and is SIGKILLed. Only the pending-reload marker knows these runs, and
+ *     they are held to the same identity checks as step 3 (see
+ *     `pendingRunsToKill`). Old runs it still lists are queued updates and
+ *     are left to process-compose. If process-compose exits meanwhile, there
+ *     is nothing left to stop. If the update does not finish in time, fail
+ *     with `DOWN_TIMEOUT` before stopping anything: a new copy started after
+ *     `process-compose down` fixed its shutdown order would outlive it as an
+ *     orphan. For the same reason no pending old run is killed once the stop
+ *     has begun.
  *  1. Snapshot each service's pid (`process list`) and its process-table row
  *     (`ps`) before asking process-compose to stop.
  *  2. Run `process-compose down` within a budget (`downTimeoutMs`).
@@ -26,6 +39,7 @@
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import type { DownOutcome, InstanceRef, ServiceStatus } from "./driver.js";
+import { stuckFromMarker, type OldRun, type PendingReload } from "./reload-pending.js";
 
 /** One row of the process table, as `ps -o pid=,ppid=,pgid=,command=` prints it. */
 export interface ProcessRow {
@@ -66,7 +80,7 @@ export function parseProcessTable(stdout: string): ProcessRow[] {
 const PS_TIMEOUT_MS = 5_000;
 
 /** Read the whole process table. Best-effort: any failure is an empty table. */
-function readProcessTable(): Promise<ProcessRow[]> {
+export function readProcessTable(): Promise<ProcessRow[]> {
   return new Promise((resolve) => {
     execFile(
       "ps",
@@ -151,6 +165,50 @@ export function stillRunning(
   });
 }
 
+/**
+ * The old runs of a pending hot-reload (#206) that are stuck: process-compose
+ * dropped them from `process list` and is waiting for them to exit. Runs it
+ * still lists (`listed`, a `process list` read) are not stuck, only queued:
+ * process-compose stops them itself, `shutdown.command` included, when it
+ * reaches their update. A run qualifies only when it is alive in `table` as
+ * a direct child of this instance's process-compose (`supervisorPid`) and
+ * its recorded identity (parent, process group and command line) still
+ * matches, as `stillRunning` requires of the snapshot. A run without an
+ * identity (`identity: null`, or a hand-edited or older marker) is never
+ * killed: on the pid alone it could be anything, including a running
+ * `shutdown.command`.
+ */
+export function pendingRunsToKill(
+  runs: ReadonlyArray<OldRun>,
+  listed: ReadonlyArray<{ readonly pid?: number }>,
+  table: ReadonlyArray<ProcessRow>,
+  supervisorPid: number | undefined,
+): ServiceProcess[] {
+  if (supervisorPid === undefined) return [];
+  const byPid = new Map(table.map((row) => [row.pid, row]));
+  const listedPids = new Set(listed.map((row) => row.pid));
+  const picked = new Set<number>();
+  return runs.flatMap((run) => {
+    const now = byPid.get(run.pid);
+    if (now === undefined || now.ppid !== supervisorPid) return [];
+    if (listedPids.has(run.pid) || picked.has(run.pid)) return [];
+    if (!sameIdentity(run, now)) return [];
+    picked.add(run.pid);
+    return [{ service: run.name, ...now }];
+  });
+}
+
+/**
+ * Does `now` still pass for `run`'s recorded identity? The marker is read
+ * unvalidated, so anything but a well-formed identity that matches field
+ * for field (none, `null`, a hand-edited value) fails safe: no kill.
+ */
+function sameIdentity(run: OldRun, now: ProcessRow): boolean {
+  const id = run.identity;
+  if (id === null || id === undefined || typeof id !== "object") return false;
+  return id.ppid === now.ppid && id.pgid === now.pgid && id.command === now.command;
+}
+
 /** True when `pid` names a live process (EPERM counts: it exists). */
 function isPidAlive(pid: number): boolean {
   try {
@@ -161,46 +219,73 @@ function isPidAlive(pid: number): boolean {
   }
 }
 
+/** The `details` a `DOWN_TIMEOUT` carries. */
+export interface DownTimeoutDetails {
+  readonly instance: string;
+  readonly socket_path: string;
+  readonly timeout_ms: number;
+  readonly process_compose_pid: number | null;
+  readonly stuck_services: ReadonlyArray<ForceKilled>;
+  readonly force_killed: ReadonlyArray<ForceKilled>;
+  /**
+   * Set when a timed-out hot-reload was still applying these services, so
+   * the stop was never begun (#206). `stuck_services` then lists the old
+   * runs it is still waiting on.
+   */
+  readonly pending_reload?: ReadonlyArray<string>;
+  readonly remedy: string;
+}
+
 /**
  * Raised when `process-compose down` did not finish within its budget and
  * the process-compose server was still running after devtrees force-killed
- * the stuck service processes (issue #190). Nothing on disk is removed, so
- * the instance stays visible to `ls` and a retried `down` can finish.
+ * the stuck service processes (issue #190), or when a pending hot-reload did
+ * not finish in time and the stop was never begun (#206). Nothing on disk is
+ * removed, so the instance stays visible to `ls` and a retried `down` can
+ * finish.
  */
 export class DownTimeoutError extends Error {
   readonly code = "DOWN_TIMEOUT" as const;
   constructor(
     command: string,
-    readonly details: {
-      readonly instance: string;
-      readonly socket_path: string;
-      readonly timeout_ms: number;
-      readonly process_compose_pid: number | null;
-      readonly stuck_services: ReadonlyArray<ForceKilled>;
-      readonly force_killed: ReadonlyArray<ForceKilled>;
-      readonly remedy: string;
-    },
+    readonly details: DownTimeoutDetails,
   ) {
-    const who = details.instance === "shared" ? "the shared" : `the '${details.instance}'`;
-    const pc =
-      details.process_compose_pid === null
-        ? "its process-compose"
-        : `its process-compose (pid ${details.process_compose_pid})`;
-    const stuck =
-      details.stuck_services.length === 0
-        ? "No service process devtrees recorded was still running: process-compose may be waiting on a shutdown.command, or on a process it no longer lists (such as a service's old process after a CONFIG_DRIFT timeout)."
-        : `Stuck: ${describeProcesses(details.stuck_services)}.`;
-    const killed =
-      details.force_killed.length === 0
-        ? ""
-        : ` devtrees force-killed ${describeProcesses(details.force_killed)}.`;
-    super(
-      `devtrees ${command}: ${who} instance did not stop within ` +
-        `${Math.round(details.timeout_ms / 1000)}s and ${pc} has not exited. ${stuck}${killed} ` +
-        `The socket and derived config were kept. ${details.remedy}`,
-    );
+    super(downTimeoutMessage(command, details));
     this.name = "DownTimeoutError";
   }
+}
+
+function downTimeoutMessage(command: string, details: DownTimeoutDetails): string {
+  const who = details.instance === "shared" ? "the shared" : `the '${details.instance}'`;
+  const secs = `${Math.round(details.timeout_ms / 1000)}s`;
+  const killed =
+    details.force_killed.length === 0
+      ? ""
+      : ` devtrees force-killed ${describeProcesses(details.force_killed)}.`;
+  if (details.pending_reload !== undefined) {
+    const waiting =
+      details.stuck_services.length === 0
+        ? ""
+        : ` It is still waiting on ${describeProcesses(details.stuck_services)}.`;
+    return (
+      `devtrees ${command}: a timed-out hot-reload of ${who} instance was still applying ` +
+      `${details.pending_reload.join(", ")} after ${secs}, so devtrees did not stop it: ` +
+      "process-compose would start the new copy after its shutdown began, and that copy " +
+      `would outlive it.${waiting}${killed} The instance is still running. ${details.remedy}`
+    );
+  }
+  const pc =
+    details.process_compose_pid === null
+      ? "its process-compose"
+      : `its process-compose (pid ${details.process_compose_pid})`;
+  const stuck =
+    details.stuck_services.length === 0
+      ? "No service process devtrees recorded was still running: process-compose may be waiting on a shutdown.command that does not exit, or on a process it no longer lists."
+      : `Stuck: ${describeProcesses(details.stuck_services)}.`;
+  return (
+    `devtrees ${command}: ${who} instance did not stop within ${secs} and ${pc} has not ` +
+    `exited. ${stuck}${killed} The socket and derived config were kept. ${details.remedy}`
+  );
 }
 
 /** `web (pid 123), worker (pid 456)`. */
@@ -233,11 +318,26 @@ export interface StopSeams {
   readonly graceMs?: number;
   /** Poll interval while waiting for process-compose to exit. Default: 100ms. */
   readonly pollMs?: number;
+  /**
+   * How long to wait for a pending reload to finish before the stop (#206).
+   * When it runs out, the stop is not started. It is extended to cover a
+   * stuck old run's grace period, and again after each kill. Default: the
+   * `down` budget, and at least 5s.
+   */
+  readonly settleMs?: number;
+  /**
+   * How long a pending reload's old run may stay unlisted (its update is
+   * stopping it) before devtrees SIGKILLs it (#206). Default: the `down`
+   * budget, the patience the stop's own escalation gives any process.
+   */
+  readonly stuckGraceMs?: number;
 }
 
 /** Default grace for process-compose to exit once its stuck services are killed. */
 const DOWN_GRACE_MS = 10_000;
 const DOWN_POLL_MS = 100;
+/** Floor of the wait for a pending reload to finish before the stop. */
+const PENDING_SETTLE_MS = 5_000;
 
 /** What `boundedDown` is stopping and how to describe it in a `DOWN_TIMEOUT`. */
 export interface StopTarget {
@@ -248,36 +348,72 @@ export interface StopTarget {
   readonly command: string;
   /** The full `down` budget, from `downTimeoutMs`. */
   readonly timeoutMs: number;
-  /** The `details.remedy` a `DOWN_TIMEOUT` carries, given the supervisor pid if known. */
-  readonly remedy: (processComposePid: number | undefined) => string;
+  /**
+   * The `details.remedy` a `DOWN_TIMEOUT` carries, given the supervisor pid
+   * if known. `pending` is set when a pending reload kept the stop from
+   * starting (#206): `oldRuns` are the old processes the operator should
+   * kill before retrying (stopping process-compose by hand does not help, as
+   * its own shutdown waits on them too).
+   */
+  readonly remedy: (
+    processComposePid: number | undefined,
+    pending?: { readonly oldRuns: ReadonlyArray<ForceKilled> },
+  ) => string;
+  /**
+   * The instance's pending-reload marker (#206): the old runs a timed-out
+   * hot-reload is still waiting on, and the services it brings back.
+   * Default: none.
+   */
+  readonly pendingReload?: PendingReload;
+}
+
+/** What `boundedDown` resolves with. */
+export interface StopResult {
+  readonly forceKilled: ReadonlyArray<ForceKilled>;
+  /**
+   * process-compose exited on its own while a pending reload was settling
+   * (#206), so no `process-compose down` was run. Its control socket may be
+   * left behind: the caller cleans up as it does for a dead supervisor.
+   */
+  readonly supervisorExited?: true;
 }
 
 /**
  * Stop an instance within its budget, force-killing only the service
- * processes that kept it from stopping. Resolves with what was force-killed
- * (empty on a clean stop). Throws `DownTimeoutError` when process-compose is
- * still running after the escalation; rejects as `driver.down` does when
+ * processes that kept it from stopping. A pending reload's stuck old runs
+ * (`target.pendingReload`) are killed before the stop, never during it.
+ * Resolves with what was force-killed (empty on a clean stop with nothing
+ * pending), and `supervisorExited` when process-compose exited before the
+ * stop was needed. Throws `DownTimeoutError` when process-compose is still running
+ * after the escalation, or when the pending reload never finished so the
+ * stop was not started; rejects as `driver.down` does when
  * `process-compose down` itself fails.
  */
 export async function boundedDown(
   target: StopTarget,
   driver: StopDriver,
   seams: StopSeams = {},
-): Promise<{ readonly forceKilled: ReadonlyArray<ForceKilled> }> {
+): Promise<StopResult> {
   const readTable = seams.readProcessTable ?? readProcessTable;
+  const kill = seams.kill ?? process.kill.bind(process);
+  const pending = await finishPendingReload(target, driver, seams);
+  if (pending.supervisorExited) return { forceKilled: pending.killed, supervisorExited: true };
   const { snapshot, supervisorPid } = await snapshotInstance(
     target.inst.socketPath,
     driver,
     readTable,
+    pending.view,
   );
 
   const outcome = await driver.down(target.inst, { timeoutMs: target.timeoutMs });
-  if (outcome.stopped) return { forceKilled: [] };
+  if (outcome.stopped) return { forceKilled: pending.killed };
 
   const table = await readTable();
   const pcPid = supervisorPid ?? findSupervisorPid(table, target.inst.socketPath);
+  // Only the snapshot: a pending reload's old run is never killed once the
+  // stop has begun (see `finishPendingReload`).
   const stuck = stillRunning(snapshot, table);
-  const forceKilled = killProcesses(stuck, seams.kill ?? process.kill.bind(process));
+  const forceKilled = [...pending.killed, ...killProcesses(stuck, kill)];
   const exited = await waitForExit(target.inst.socketPath, pcPid, seams);
   if (exited) return { forceKilled };
   throw new DownTimeoutError(target.command, {
@@ -291,16 +427,332 @@ export async function boundedDown(
   });
 }
 
+/** What a `process list` read and a `ps` read showed together. */
+interface InstanceView {
+  readonly statuses: ReadonlyArray<ServiceStatus>;
+  readonly table: ReadonlyArray<ProcessRow>;
+  readonly supervisorPid: number | undefined;
+}
+
+/** How many times a `ps` read is tried before devtrees gives up on it. */
+const PS_ATTEMPTS = 3;
+
+/**
+ * Read the process table and find this instance's process-compose in it,
+ * retrying (up to `attempts` reads, `delayMs` apart) while the read comes
+ * back empty or without the supervisor: a `ps` that failed or hit its cap
+ * under load. The last read is returned either way.
+ */
+export async function readSupervisedTable(
+  readTable: () => Promise<ProcessRow[]>,
+  socketPath: string,
+  opts: { readonly attempts?: number; readonly delayMs?: number } = {},
+): Promise<{ table: ProcessRow[]; supervisorPid: number | undefined }> {
+  const attempts = opts.attempts ?? PS_ATTEMPTS;
+  for (let i = 1; ; i++) {
+    const table = await readTable();
+    const supervisorPid = findSupervisorPid(table, socketPath);
+    if (supervisorPid !== undefined || i >= attempts) return { table, supervisorPid };
+    await new Promise((r) => setTimeout(r, opts.delayMs ?? DOWN_POLL_MS));
+  }
+}
+
+/**
+ * Step 0 (#206): let a pending hot-reload finish before the stop begins.
+ *
+ * process-compose applies a reload's updates one service at a time. Each
+ * update drops the service from `process list`, stops the old run, waits for
+ * it to exit, then starts the new copy, without checking whether a shutdown
+ * has begun meanwhile. So a new copy that starts after `process-compose down`
+ * fixed its shutdown order is never stopped and outlives process-compose as
+ * a PPID-1 orphan. devtrees therefore never kills a pending old run once the
+ * stop has begun, and never begins the stop while an update is in flight.
+ *
+ * It polls until the update has finished (`stuckFromMarker`: each old run
+ * has exited or been replaced, and each service the update brings back is
+ * listed again). On every poll:
+ *
+ *  - If process-compose has exited (it runs without `--keep-project`, so it
+ *    exits once nothing runs, e.g. when the new copy fails to start), stop
+ *    waiting: nothing is left to orphan, and the caller cleans up as for a
+ *    dead supervisor (`supervisorExited`).
+ *  - An old run process-compose no longer lists, that is still alive and
+ *    whose identity still matches, is being stopped by its update. It is
+ *    SIGKILLed only once it has been in that state for the grace period
+ *    (`stuckGraceMs`, default the `down` budget: the patience the stop's own
+ *    escalation gives any process), counted from when devtrees first saw it
+ *    so, or from the marker's `unlistedAt` when `up` already saw it so. A
+ *    slow graceful stop finishes within it; a stuck one (#188) is killed
+ *    after it. Updates run in turn, so every poll re-checks: the next
+ *    service's old run may be stuck too.
+ *  - An old run process-compose still lists is queued behind another
+ *    update and is left alone: process-compose stops it itself,
+ *    `shutdown.command` included, when it gets to it.
+ *
+ * The wait lasts `settleMs`, extended to cover each stuck run's grace period
+ * plus another `settleMs` for its update to start the new copy. It stays
+ * bounded: each old run extends it at most twice (once while in grace, once
+ * when killed). If the update has not finished by then (an old run devtrees
+ * could not verify, an unreadable `process list`, a slow update), throw
+ * `DOWN_TIMEOUT` without starting the stop, naming what is still pending.
+ *
+ * The first `ps` read is retried while it comes back empty or without the
+ * supervisor. When nothing had to be waited on, the reads are handed back
+ * for the snapshot to reuse.
+ */
+async function finishPendingReload(
+  target: StopTarget,
+  driver: StopDriver,
+  seams: StopSeams,
+): Promise<{ killed: ForceKilled[]; view?: InstanceView; supervisorExited?: true }> {
+  const pending = target.pendingReload;
+  if (!hasPendingWork(pending)) return { killed: [] };
+  const settle = new PendingSettle(target, pending, driver, seams);
+  const statuses = await settle.readStatuses();
+  const { table, supervisorPid } = await readSupervisedTable(
+    settle.readTable,
+    target.inst.socketPath,
+    { delayMs: seams.pollMs },
+  );
+  if (settle.done(statuses)) return { killed: [], view: { statuses, table, supervisorPid } };
+  return settle.run(statuses, table, supervisorPid);
+}
+
+/** One step-0 wait: its seams, budgets and what it has seen and killed so far. */
+class PendingSettle {
+  readonly isAlive: (pid: number) => boolean;
+  readonly readTable: () => Promise<ProcessRow[]>;
+  private readonly exists: (path: string) => boolean;
+  private readonly kill: (target: number, signal: NodeJS.Signals) => void;
+  private readonly pollMs: number;
+  private readonly graceMs: number;
+  private readonly settleMs: number;
+  private readonly startedAt = Date.now();
+  private deadline: number;
+  private everListed = false;
+  private readonly killed: ForceKilled[] = [];
+  /** pid → when its grace period started (unlisted, alive and verified). */
+  private readonly stopping = new Map<number, number>();
+
+  constructor(
+    private readonly target: StopTarget,
+    private readonly pending: PendingReload,
+    private readonly driver: StopDriver,
+    seams: StopSeams,
+  ) {
+    this.isAlive = seams.isAlive ?? isPidAlive;
+    this.readTable = seams.readProcessTable ?? readProcessTable;
+    this.exists = seams.exists ?? existsSync;
+    this.kill = seams.kill ?? process.kill.bind(process);
+    this.pollMs = seams.pollMs ?? DOWN_POLL_MS;
+    this.graceMs = seams.stuckGraceMs ?? target.timeoutMs;
+    this.settleMs = seams.settleMs ?? Math.max(PENDING_SETTLE_MS, target.timeoutMs);
+    this.deadline = this.startedAt + this.settleMs;
+  }
+
+  /** A `process list` read; `undefined` when it fails. */
+  async readStatuses(): Promise<ServiceStatus[] | undefined> {
+    const rows = await this.driver
+      .getServiceStatuses(this.target.inst.socketPath)
+      .catch(() => undefined);
+    this.everListed ||= rows !== undefined;
+    return rows;
+  }
+
+  /** Has the update finished, as `rows` shows it? */
+  done(rows: ServiceStatus[] | undefined): rows is ServiceStatus[] {
+    return rows !== undefined && stuckFromMarker(this.pending, rows, this.isAlive) === undefined;
+  }
+
+  /** Poll until the update finishes, process-compose exits, or the deadline passes. */
+  async run(
+    first: ServiceStatus[] | undefined,
+    firstTable: ReadonlyArray<ProcessRow>,
+    knownPid: number | undefined,
+  ): Promise<{ killed: ForceKilled[]; supervisorExited?: true }> {
+    let statuses = first;
+    let table = firstTable;
+    let supervisorPid = knownPid;
+    for (;;) {
+      if (this.done(statuses)) return { killed: this.killed };
+      if (this.supervisorGone(supervisorPid)) {
+        return { killed: this.killed, supervisorExited: true };
+      }
+      const now = Date.now();
+      this.killDue(stuckRuns(this.pending, statuses, table, supervisorPid), now);
+      if (now >= this.deadline) break;
+      await new Promise((r) => setTimeout(r, this.pollMs));
+      statuses = await this.readStatuses();
+      // Never decide on an older `ps` read: a run it shows alive may have
+      // exited since, and its pid been reused.
+      table = needsTable(this.pending, statuses, this.isAlive) ? await this.readTable() : [];
+      supervisorPid ??= findSupervisorPid(table, this.target.inst.socketPath);
+    }
+    throw pendingTimeout(this.target, {
+      waitedMs: this.deadline - this.startedAt,
+      killed: this.killed,
+      rows: statuses,
+      everListed: this.everListed,
+      table,
+      supervisorPid,
+      isAlive: this.isAlive,
+    });
+  }
+
+  /** Has process-compose exited? By its pid when known, else by its control socket. */
+  private supervisorGone(supervisorPid: number | undefined): boolean {
+    return supervisorPid === undefined
+      ? !this.exists(this.target.inst.socketPath)
+      : !this.isAlive(supervisorPid);
+  }
+
+  /**
+   * SIGKILL each stuck run whose grace period has passed, and stretch the
+   * deadline to cover the grace periods still running and each new copy's
+   * start after a kill.
+   */
+  private killDue(runs: ReadonlyArray<ServiceProcess>, now: number): void {
+    for (const proc of runs) {
+      if (this.killed.some((k) => k.pid === proc.pid)) continue;
+      const since = this.stopping.get(proc.pid) ?? stoppingSince(this.pending, proc.pid, now);
+      this.stopping.set(proc.pid, since);
+      if (now - since < this.graceMs) {
+        this.deadline = Math.max(this.deadline, since + this.graceMs + this.settleMs);
+        continue;
+      }
+      this.killed.push(...killProcesses([proc], this.kill));
+      this.deadline = Math.max(this.deadline, now + this.settleMs);
+    }
+  }
+}
+
+/**
+ * When a stuck old run's grace period started: the marker's `unlistedAt`
+ * when `up` already saw it being stopped (only a plausible past time), else
+ * `now`.
+ */
+function stoppingSince(pending: PendingReload, pid: number, now: number): number {
+  const at = pending.oldRuns.find((run) => run.pid === pid)?.unlistedAt;
+  return typeof at === "number" && Number.isFinite(at) && at <= now ? at : now;
+}
+
+/**
+ * Is a `ps` read worth taking? Only when `process list` was read and an old
+ * run it does not list is still alive: a run that may be stuck.
+ */
+function needsTable(
+  pending: PendingReload,
+  statuses: ReadonlyArray<ServiceStatus> | undefined,
+  isAlive: (pid: number) => boolean,
+): boolean {
+  if (statuses === undefined) return false;
+  const listed = new Set(statuses.map((s) => s.pid));
+  return pending.oldRuns.some((run) => !listed.has(run.pid) && isAlive(run.pid));
+}
+
+/**
+ * The pending old runs their update is stopping: unlisted, alive and
+ * verified (`pendingRunsToKill`). Without a `process list` read
+ * (`statuses`), devtrees cannot tell a stuck run from a queued one, so it
+ * picks none.
+ */
+function stuckRuns(
+  pending: PendingReload,
+  statuses: ReadonlyArray<ServiceStatus> | undefined,
+  table: ReadonlyArray<ProcessRow>,
+  supervisorPid: number | undefined,
+): ServiceProcess[] {
+  if (statuses === undefined) return [];
+  return pendingRunsToKill(pending.oldRuns, statuses, table, supervisorPid);
+}
+
+/** Does the marker record anything to kill or wait on? */
+function hasPendingWork(pending: PendingReload | undefined): pending is PendingReload {
+  return pending !== undefined && (pending.oldRuns.length > 0 || pending.services.length > 0);
+}
+
+/** What a pending reload's `DOWN_TIMEOUT` is built from. */
+interface PendingTimeoutState {
+  readonly waitedMs: number;
+  readonly killed: ReadonlyArray<ForceKilled>;
+  readonly rows: ServiceStatus[] | undefined;
+  readonly everListed: boolean;
+  readonly table: ReadonlyArray<ProcessRow>;
+  readonly supervisorPid: number | undefined;
+  readonly isAlive: (pid: number) => boolean;
+}
+
+/**
+ * The `DOWN_TIMEOUT` for a pending reload that did not finish: the stop was
+ * never begun. It names the old runs still alive, and hands the remedy those
+ * not merely queued (all of them when `process list` could not be read).
+ */
+function pendingTimeout(target: StopTarget, at: PendingTimeoutState): DownTimeoutError {
+  const pending = target.pendingReload ?? { services: [], oldRuns: [] };
+  const stuck = stuckFromMarker(pending, at.rows, at.isAlive);
+  const pids = new Set(stuck?.pids);
+  const alive = pending.oldRuns.filter((run) => pids.has(run.pid));
+  const listed = new Set(at.rows?.map((r) => r.pid));
+  // Without a list, any live old run may be the stuck one.
+  const unlisted = at.rows === undefined ? alive : alive.filter((run) => !listed.has(run.pid));
+  return new DownTimeoutError(target.command, {
+    instance: target.instance,
+    socket_path: target.inst.socketPath,
+    timeout_ms: at.waitedMs,
+    process_compose_pid: at.supervisorPid ?? null,
+    stuck_services: alive.map(processOf),
+    force_killed: at.killed,
+    pending_reload: stuck?.services ?? [...pending.services],
+    remedy:
+      pendingLead(unlisted, at) +
+      target.remedy(at.supervisorPid, { oldRuns: unlisted.map(processOf) }),
+  });
+}
+
+/**
+ * The remedy's lead-in: that `process list` could never be read, or which
+ * runs devtrees could not verify. Unverified means only a missing or
+ * non-matching identity: a verified run is never called that.
+ */
+function pendingLead(unlisted: ReadonlyArray<OldRun>, at: PendingTimeoutState): string {
+  if (!at.everListed) {
+    return (
+      "devtrees could not read process-compose's process list during the whole wait, so " +
+      "it could not tell a stuck old process from a queued one, and killed none. "
+    );
+  }
+  const verified = new Set(
+    pendingRunsToKill(unlisted, [], at.table, at.supervisorPid).map((p) => p.pid),
+  );
+  const unverified = unlisted.filter((run) => !verified.has(run.pid)).map(processOf);
+  if (unverified.length === 0) return "";
+  return (
+    `devtrees could not verify ${describeProcesses(unverified)} as the service's old process ` +
+    "(no recorded identity, or its parent, process group or command line no longer " +
+    "match), so it did not kill it: check it with `ps`. "
+  );
+}
+
+function processOf(run: OldRun): ForceKilled {
+  return { service: run.name, pid: run.pid };
+}
+
 /**
  * Record each service's process before the stop. Best-effort: a wedged
  * instance whose `process list` fails, or a host without `ps`, yields an
  * empty snapshot, and the stop then simply has nothing to escalate on.
+ * `view` is step 0's reads, reused when nothing has changed since.
  */
 async function snapshotInstance(
   socketPath: string,
   driver: StopDriver,
   readTable: () => Promise<ProcessRow[]>,
+  view?: InstanceView,
 ): Promise<{ snapshot: ServiceProcess[]; supervisorPid: number | undefined }> {
+  if (view !== undefined) {
+    const { statuses, table, supervisorPid } = view;
+    return { snapshot: snapshotServiceProcesses(statuses, table, supervisorPid), supervisorPid };
+  }
   let statuses: ServiceStatus[];
   try {
     statuses = await driver.getServiceStatuses(socketPath);

@@ -53,8 +53,11 @@ import { loadStack, type ResolvedService, type ResolvedStack, type Tier } from "
 import {
   boundedDown,
   DownTimeoutError,
+  readProcessTable,
+  readSupervisedTable,
   type ForceKilled,
   type StopDriver,
+  type StopResult,
   type StopSeams,
 } from "./bounded-down.js";
 import {
@@ -104,6 +107,7 @@ import {
 } from "./selection.js";
 import {
   clearPendingReload,
+  identifyOldRuns,
   isProcessAlive,
   planPendingReload,
   readPendingReload,
@@ -135,8 +139,9 @@ export type { WaitForHealth, WaitForSharedHealth } from "./health.js";
  *
  * `details.reason` lets an agent branch without parsing the message:
  * `timeout` means process-compose is still waiting for a changed service's
- * old process to exit (`down` fails with `DOWN_TIMEOUT`: the old process is
- * no longer listed, so it is not force-killed). `not_supported` / `error`
+ * old process to exit (it is no longer listed, but the pending-reload marker
+ * records it, so `down` force-kills it before stopping, #206).
+ * `not_supported` / `error`
  * mean the reload was refused and the instance is untouched.
  * `reload_pending` (#191) means `up` did not reload at all: an earlier
  * reload is still waiting on an old process, and a second one would start an
@@ -2152,15 +2157,28 @@ export async function runDown(
     // `shutdown.command` from its `working_dir` (the worktree, which is present
     // on the normal `down` path). devtrees must NOT also run the hook directly
     // here — that would double-run it (acceptance #4: no regression).
+    // A reload still pending (#191) waits on old processes process-compose
+    // no longer lists: the bounded stop kills them first, and lets that
+    // reload finish before it stops anything (#206).
     const stopped = wasLive
-      ? await stopInstance(driver, paths, anchor.worktreeId, "down", deps.stop)
+      ? await stopInstance(
+          driver,
+          paths,
+          anchor.worktreeId,
+          "down",
+          deps.stop,
+          readPendingReload(anchor.anchor, anchor.worktreeId),
+        )
       : undefined;
+    // process-compose exited on its own while the pending reload settled
+    // (#206): its socket file may be left behind, with no listener.
+    if (stopped?.supervisorExited) rmSync(paths.socketPath, { force: true });
     // The instance is gone either way, and with it any reload still pending
     // in it (#191). Not reached when the stop throws (DOWN_TIMEOUT keeps it).
     clearPendingReload(anchor.anchor, anchor.worktreeId);
     return stopped;
   });
-  if (stop !== undefined) {
+  if (stop !== undefined && !stop.supervisorExited) {
     return {
       shared: false,
       worktreeId: anchor.worktreeId,
@@ -2174,15 +2192,16 @@ export async function runDown(
   // `shutdown.command`. The hook never fired → out-of-band resources leak. Run
   // it ourselves, socket-free, from the anchor (a directory that exists), so the
   // reap happens even when the supervisor is gone. Idempotent: an already-gone
-  // stack's hook reaps nothing.
+  // stack's hook reaps nothing. A supervisor that exited on its own during
+  // the stop (#206) is reaped the same way, and the instance was stopped.
   const reap = deps.reap ?? reapShutdownHooks;
   const warning = await reapDerivedConfig(paths.configPath, anchor.worktreeId, anchor.anchor, reap);
 
   return {
     shared: false,
     worktreeId: anchor.worktreeId,
-    stopped: false,
-    forceKilled: [],
+    stopped: stop !== undefined,
+    forceKilled: stop?.forceKilled ?? [],
     ...(warning !== undefined ? { warning } : {}),
   };
 }
@@ -2190,8 +2209,11 @@ export async function runDown(
 /**
  * Stop a live instance with the bounded `down` (#190): a budget of 30s plus
  * every `shutdown.timeout_seconds` in its derived config, then a surgical
- * SIGKILL of the service processes that kept it from stopping. Throws
- * `DOWN_TIMEOUT` (nothing removed) when process-compose still has not exited.
+ * SIGKILL of the service processes that kept it from stopping. The old runs
+ * a pending reload is stuck on (`pendingReload`, #206) are killed before
+ * the stop, which begins only once that reload has finished. Throws
+ * `DOWN_TIMEOUT` (nothing removed) when process-compose still has not
+ * exited, or when the reload never finished and the stop was not begun.
  */
 function stopInstance(
   driver: StopDriver,
@@ -2199,14 +2221,17 @@ function stopInstance(
   instance: string,
   command: "down" | "prune",
   seams: StopSeams | undefined,
-): Promise<{ readonly forceKilled: ReadonlyArray<ForceKilled> }> {
+  pendingReload?: PendingReload,
+): Promise<StopResult> {
   return boundedDown(
     {
       inst: { configPath: paths.configPath, socketPath: paths.socketPath },
       instance,
       command,
       timeoutMs: downTimeoutMs(readDerivedConfig(paths.configPath), seams?.baseTimeoutMs),
-      remedy: (pid) => downTimeoutRemedy(instance, command, paths.socketPath, pid),
+      remedy: (pid, pending) =>
+        downTimeoutRemedy(instance, command, paths.socketPath, pid, pending),
+      pendingReload,
     },
     driver,
     seams,
@@ -2223,10 +2248,23 @@ function downTimeoutRemedy(
   command: "down" | "prune",
   socketPath: string,
   processComposePid: number | undefined,
+  pending?: { readonly oldRuns: ReadonlyArray<ForceKilled> },
 ): string {
   const shared = instance === SHARED_INSTANCE_ID;
   const retry =
     command === "prune" ? "devtrees prune" : shared ? "devtrees down --shared" : "devtrees down";
+  // A pending reload (#206): process-compose's own shutdown waits on the
+  // same old process, so stopping process-compose by hand does not help.
+  // Killing the old process does, and is safe while no stop is running.
+  if (pending !== undefined) {
+    if (pending.oldRuns.length === 0) return `Retry \`${retry}\` in a moment.`;
+    const pids = pending.oldRuns.map((r) => r.pid).join(" ");
+    return (
+      `Kill the old process first (\`kill ${pids}\`, then \`kill -9 ${pids}\` if it ignores ` +
+      `that; safe now, as no stop is running), then retry \`${retry}\`. Stopping ` +
+      "process-compose by hand does not help: its own shutdown waits on the same process."
+    );
+  }
   const pid = processComposePid === undefined ? "<pid>" : String(processComposePid);
   const find =
     processComposePid === undefined
@@ -2588,7 +2626,13 @@ async function reapAndCleanupOrphan(
   // able to reclaim it.
   const socketPath = orphan.socketPath;
   const warning = await reapDerivedConfig(paths.configPath, orphan.id, anchor, reap);
-  const stop = await stopOrphanSupervisor(orphan, paths.configPath, driver, seams);
+  const stop = await stopOrphanSupervisor(
+    orphan,
+    paths.configPath,
+    driver,
+    seams,
+    readPendingReload(anchor, orphan.id),
+  );
   const reapPart = warning === undefined ? {} : { warning };
   // An `unknown` orphan (#186) whose `down` failed may still be a live
   // supervisor, and one whose bounded `down` timed out (#190) certainly is:
@@ -2619,6 +2663,7 @@ async function stopOrphanSupervisor(
   configPath: string,
   driver: ReturnType<typeof createDriver>,
   seams: StopSeams | undefined,
+  pendingReload: PendingReload | undefined,
 ): Promise<{
   forceKilled: ReadonlyArray<ForceKilled>;
   failure?: { readonly message: string; readonly timedOut: boolean };
@@ -2626,7 +2671,7 @@ async function stopOrphanSupervisor(
   if (orphan.status === "stale") return { forceKilled: [] };
   try {
     const paths = { configPath, socketPath: orphan.socketPath };
-    return await stopInstance(driver, paths, orphan.id, "prune", seams);
+    return await stopInstance(driver, paths, orphan.id, "prune", seams, pendingReload);
   } catch (err) {
     if (err instanceof DownTimeoutError) {
       return {
@@ -3027,21 +3072,20 @@ const RELOAD_FAILED_REMEDIATION =
   ". The instance is still running — run `devtrees down && devtrees up` to apply the new config.";
 
 /**
- * A timed-out reload means process-compose is still waiting for an old process
- * to exit, and `down` would wait on the same process until its budget runs
- * out, then fail with `DOWN_TIMEOUT`. Killing that process
- * unblocks process-compose, which then finishes applying the new config. A
- * second reload before then would start a new copy next to the old process,
- * and the pending update would later start another one, orphaning the first
+ * A timed-out reload means process-compose is still waiting for an old
+ * process to exit. `down` force-kills that process before stopping, since
+ * the pending-reload marker records it (#206). Killing it unblocks
+ * process-compose, which then finishes applying the new config. A second
+ * reload before then would start a new copy next to the old process, and
+ * the pending update would later start another one, orphaning the first
  * copy; `up` therefore refuses with `reload_pending` until then (#191).
  */
 const RELOAD_TIMEOUT_REMEDIATION =
   ". The instance is still running, but process-compose stays blocked until the old " +
-  "process exits, and `devtrees down` cannot force-kill it either (process-compose no " +
-  "longer lists it), so it fails with `DOWN_TIMEOUT` after its budget. Kill the service's old process " +
-  "to let the reload finish, then run `devtrees up` again to resync the on-disk config and " +
-  "stored hash; until that process has exited, `devtrees up` refuses with " +
-  "`reload_pending` instead of reloading again (a second reload would start an untracked " +
+  "process exits (`devtrees down` force-kills it before stopping). Kill the " +
+  "service's old process to let the reload finish, then run `devtrees up` again to " +
+  "resync the on-disk config and stored hash; until that process has exited, " +
+  "`devtrees up` refuses with `reload_pending` instead of reloading again (a second reload would start an untracked " +
   "copy of the service). To prevent this, give the service a `shutdown.command` that really " +
   "stops the process; `shutdown.timeout_seconds` does not help when a `shutdown.command` " +
   "exits 0 without stopping it (it only bounds the command itself, and only the plain " +
@@ -3126,6 +3170,7 @@ async function applyReload(args: {
   readonly derived: ReturnType<typeof deriveWorktreeConfig>;
   readonly inst: { readonly configPath: string; readonly socketPath: string };
   readonly driver: ReturnType<typeof createDriver>;
+  readonly deps: CommandDeps;
   readonly previousConfig: string | undefined;
   readonly rows: ServiceStatus[] | undefined;
   readonly writeHash: (anchor: string, id: string, hash: string) => void;
@@ -3140,14 +3185,7 @@ async function applyReload(args: {
   if (previousConfig === undefined) rmSync(paths.configPath, { force: true });
   else writeFileSync(paths.configPath, previousConfig, "utf8");
   if (reload.reason === "timeout") {
-    // Both sides read back from YAML, so the per-service diff compares like
-    // with like.
-    const marker = planPendingReload(
-      derivedProcesses(previousConfig),
-      derivedProcesses(nextConfig) ?? {},
-      args.rows,
-    );
-    writePendingReload(anchor.anchor, anchor.worktreeId, marker);
+    await persistPendingReload({ ...args, nextConfig });
     // process-compose will end up running the NEW config, while the restored
     // on-disk config and the stored hash still describe the old one. Forget
     // the hash so the first `up` after the reload converges sees drift and
@@ -3162,6 +3200,47 @@ async function applyReload(args: {
       (reload.reason === "timeout" ? RELOAD_TIMEOUT_REMEDIATION : RELOAD_FAILED_REMEDIATION),
     { reason: reload.reason },
   );
+}
+
+/**
+ * Persist the pending-reload marker for a timed-out reload (#191). The old
+ * runs' identity is read from `ps` while they still run (#206), so a later
+ * `down` can force-kill them without risking a reused pid.
+ */
+async function persistPendingReload(args: {
+  readonly anchor: { readonly anchor: string; readonly worktreeId: string };
+  readonly inst: { readonly socketPath: string };
+  readonly deps: CommandDeps;
+  readonly previousConfig: string | undefined;
+  readonly nextConfig: string;
+  readonly rows: ServiceStatus[] | undefined;
+  readonly driver: { getServiceStatuses(socketPath: string): Promise<ServiceStatus[]> };
+}): Promise<void> {
+  // Both sides read back from YAML, so the per-service diff compares like
+  // with like.
+  const plan = planPendingReload(
+    derivedProcesses(args.previousConfig),
+    derivedProcesses(args.nextConfig) ?? {},
+    args.rows,
+  );
+  const readTable = args.deps.stop?.readProcessTable ?? readProcessTable;
+  // Retried while empty or without the supervisor (a `ps` that failed under
+  // load): a run without an identity is one `down` can never kill.
+  if (plan.oldRuns.length === 0) {
+    writePendingReload(args.anchor.anchor, args.anchor.worktreeId, plan);
+    return;
+  }
+  // Which old runs process-compose has already dropped: their update is
+  // stopping them now, so `down` counts their grace period from here.
+  const listed = await args.driver
+    .getServiceStatuses(args.inst.socketPath)
+    .then((rows) => ({ rows, at: Date.now() }))
+    .catch(() => undefined);
+  const { table, supervisorPid } = await readSupervisedTable(readTable, args.inst.socketPath, {
+    delayMs: args.deps.stop?.pollMs,
+  });
+  const marker = identifyOldRuns(plan, table, supervisorPid, listed);
+  writePendingReload(args.anchor.anchor, args.anchor.worktreeId, marker);
 }
 
 type DerivedProcessMap = Readonly<Record<string, Readonly<Record<string, unknown>>>>;

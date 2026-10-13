@@ -10,6 +10,8 @@ import {
   DownTimeoutError,
   findSupervisorPid,
   parseProcessTable,
+  pendingRunsToKill,
+  readSupervisedTable,
   snapshotServiceProcesses,
   stillRunning,
   type ProcessRow,
@@ -17,6 +19,7 @@ import {
   type StopTarget,
 } from "./bounded-down.js";
 import type { DownOutcome, ServiceStatus } from "./driver.js";
+import type { OldRun, PendingReload } from "./reload-pending.js";
 
 const SOCK = "/tmp/devtrees-501/abc/login-1234.sock";
 const PC: ProcessRow = {
@@ -119,6 +122,53 @@ describe("stillRunning (pid-reuse protection)", () => {
     expect(stillRunning(snapshot, [{ ...WEB, command: "vim notes" }])).toEqual([]);
     expect(stillRunning(snapshot, [{ ...WEB, ppid: 1 }])).toEqual([]);
     expect(stillRunning(snapshot, [{ ...WEB, pgid: 7 }])).toEqual([]);
+  });
+});
+
+/** The old `web` run a timed-out reload left behind: process-compose no longer lists it. */
+const OLD: ProcessRow = { pid: 301, ppid: 100, pgid: 301, command: "bash -c tail -f hold-a" };
+const OLD_RUN: OldRun = {
+  name: "web",
+  pid: 301,
+  identity: { ppid: 100, pgid: 301, command: OLD.command },
+};
+
+describe("pendingRunsToKill (#206)", () => {
+  it("keeps an old run that is still the same child of the supervisor", () => {
+    expect(pendingRunsToKill([OLD_RUN], [], [PC, OLD], 100)).toEqual([{ service: "web", ...OLD }]);
+  });
+
+  it("drops a reused pid: another command, process group or parent", () => {
+    for (const now of [
+      { ...OLD, command: "vim notes" },
+      { ...OLD, pgid: 999 },
+      { ...OLD, ppid: 1 },
+    ]) {
+      expect(pendingRunsToKill([OLD_RUN], [], [PC, now], 100)).toEqual([]);
+    }
+  });
+
+  it("drops a run that has exited, or any run when the supervisor is unknown", () => {
+    expect(pendingRunsToKill([OLD_RUN], [], [PC], 100)).toEqual([]);
+    expect(pendingRunsToKill([OLD_RUN], [], [PC, OLD], undefined)).toEqual([]);
+  });
+
+  it("never kills a run without a verified identity: null, missing (older marker) or malformed", () => {
+    // On the pid alone it could be anything, even a running shutdown.command.
+    for (const identity of [null, undefined, "x", { ppid: 100 }]) {
+      const run = { name: "web", pid: 301, identity } as unknown as OldRun;
+      expect(pendingRunsToKill([run], [], [PC, OLD], 100)).toEqual([]);
+    }
+  });
+
+  it("never kills a run process-compose still lists (its update is only queued)", () => {
+    // It is not stuck: process-compose stops it, shutdown.command included.
+    expect(pendingRunsToKill([OLD_RUN], [status("web", 301)], [PC, OLD], 100)).toEqual([]);
+    expect(pendingRunsToKill([OLD_RUN], [{ pid: 301 }], [PC, OLD], 100)).toEqual([]);
+  });
+
+  it("lists each pid once", () => {
+    expect(pendingRunsToKill([OLD_RUN, OLD_RUN], [], [PC, OLD], 100)).toHaveLength(1);
   });
 });
 
@@ -300,5 +350,490 @@ describe("boundedDown", () => {
       down: () => Promise.reject(new Error("process-compose down exited with code 1")),
     };
     await expect(boundedDown(target, driver, w.seams)).rejects.toThrow(/exited with code 1/);
+  });
+});
+
+describe("boundedDown with a pending reload (#206)", () => {
+  /** The new `web` copy process-compose starts once the old run is gone. */
+  const NEW: ProcessRow = { pid: 401, ppid: 100, pgid: 401, command: "bash -c tail -f hold-b" };
+  /** The new `api` copy, started once process-compose has stopped API itself. */
+  const API_NEW: ProcessRow = { pid: 402, ppid: 100, pgid: 402, command: "sleep 301" };
+  /** `api`'s old run: changed too, but its update is still queued, so it is still listed. */
+  const API_RUN: OldRun = {
+    name: "api",
+    pid: 202,
+    identity: { ppid: 100, pgid: 202, command: API.command },
+  };
+  const PENDING = { services: ["web"], oldRuns: [OLD_RUN] };
+  const BOTH = { services: ["web", "api"], oldRuns: [OLD_RUN, API_RUN] };
+
+  /**
+   * process-compose applying a reload's updates one at a time. `web`'s
+   * update is blocked on its old run (OLD: alive, unlisted). Once OLD dies,
+   * `web` is listed again as NEW `lag` `process list` polls later. With
+   * `apiQueued`, `api`'s update comes next: API stays listed for `lag` more
+   * polls, then process-compose stops it itself (`graceful 202`), drops it
+   * from the list, and lists API_NEW `lag` polls later (`apiLag`, when
+   * given). With `apiHangs`, api's stop does not take either: API is
+   * unlisted but stays alive until killed (`api stopping`), the #188 shape
+   * twice over. `oldSurvives` keeps OLD alive (a kill that does not take);
+   * `oldExitsAfter` makes OLD exit on its own after that many polls (a slow
+   * graceful stop); `pcExitsOnKill` makes process-compose exit once OLD is
+   * killed (its new copy failed to start and nothing else ran): `process
+   * list` then fails and its socket is gone. `psFails` empties that many
+   * `ps` reads. The grace period is 0 unless `stuckGraceMs` is given.
+   */
+  function pendingWorld(
+    opts: {
+      outcome?: DownOutcome;
+      pcExits?: boolean;
+      oldSurvives?: boolean;
+      oldExitsAfter?: number;
+      pcExitsOnKill?: boolean;
+      lag?: number;
+      apiQueued?: boolean;
+      apiHangs?: boolean;
+      apiLag?: number;
+      psFails?: number;
+      stuckGraceMs?: number;
+      settleMs?: number;
+    } = {},
+  ) {
+    const events: string[] = [];
+    const alive = new Set([100, 202, 301]);
+    const lag = opts.lag ?? 0;
+    let webIn = -1;
+    let apiQueuedFor = 0;
+    let apiIn = -1;
+    let apiStopping = false;
+    let downCalled = false;
+    let psFails = opts.psFails ?? 0;
+    let tableReads = 0;
+    let polls = 0;
+    const advanceWeb = (): void => {
+      if (opts.oldExitsAfter !== undefined && polls >= opts.oldExitsAfter && alive.has(301)) {
+        alive.delete(301);
+        events.push("301 exited");
+      }
+      if (!alive.has(301) && webIn === -1) webIn = lag;
+      else if (webIn > 0) webIn--;
+      if (webIn === 0 && !alive.has(401)) {
+        alive.add(401);
+        events.push("web listed as 401");
+      }
+    };
+    /** api's update has begun; with `apiHangs`, its old run stays alive. True while it does. */
+    const apiStuck = (): boolean => {
+      if (opts.apiHangs && !apiStopping) {
+        apiStopping = true;
+        events.push("api stopping");
+      }
+      return apiStopping && alive.has(202);
+    };
+    const advanceApi = (): void => {
+      if (apiQueuedFor < lag) {
+        apiQueuedFor++;
+        return;
+      }
+      if (apiStuck()) return;
+      if (apiIn === -1) {
+        apiIn = opts.apiLag ?? lag;
+        if (alive.has(202)) {
+          alive.delete(202);
+          events.push("graceful 202");
+        }
+      } else if (apiIn > 0) apiIn--;
+      if (apiIn === 0 && !alive.has(402)) {
+        alive.add(402);
+        events.push("api listed as 402");
+      }
+    };
+    const advance = (): void => {
+      polls++;
+      advanceWeb();
+      if (opts.apiQueued && alive.has(401)) advanceApi();
+    };
+    const driver: StopDriver = {
+      getServiceStatuses: async () => {
+        if (!alive.has(100)) throw new Error("connect ENOENT");
+        advance();
+        const web = alive.has(401) ? [status("web", 401)] : [];
+        const api = alive.has(402)
+          ? [status("api", 402)]
+          : alive.has(202) && !apiStopping
+            ? [status("api", 202)]
+            : [];
+        return [...web, ...api];
+      },
+      down: async () => {
+        events.push("down");
+        downCalled = true;
+        return opts.outcome ?? { stopped: true };
+      },
+    };
+    const rows = [PC, API, OLD, NEW, API_NEW];
+    const seams = {
+      readProcessTable: async () => {
+        tableReads++;
+        if (psFails > 0) {
+          psFails--;
+          return [];
+        }
+        return rows.filter((row) => alive.has(row.pid));
+      },
+      kill: (target: number) => {
+        events.push(`kill ${target}`);
+        if (target === -301 && !opts.oldSurvives) alive.delete(301);
+        if (target === -301 && opts.pcExitsOnKill) alive.delete(100);
+        if (target === -202) alive.delete(202);
+      },
+      isAlive: (pid: number) =>
+        pid === 100 ? alive.has(100) && !(downCalled && opts.pcExits) : alive.has(pid),
+      // The control socket goes with process-compose.
+      exists: () => alive.has(100),
+      graceMs: 30,
+      pollMs: 2,
+      settleMs: opts.settleMs ?? 200,
+      stuckGraceMs: opts.stuckGraceMs ?? 0,
+    };
+    /** What each `DOWN_TIMEOUT` passed `target.remedy` (see `downTimeout`). */
+    const remedies: Array<{ pid: number | undefined; oldRuns: unknown }> = [];
+    return { driver, seams, events, remedies, tableReads: () => tableReads };
+  }
+
+  /** Run `boundedDown` and return the `DOWN_TIMEOUT` it throws. */
+  async function downTimeout(
+    pending: PendingReload,
+    w: ReturnType<typeof pendingWorld>,
+  ): Promise<DownTimeoutError> {
+    const remedy: StopTarget["remedy"] = (pid, p) => {
+      w.remedies.push({ pid, oldRuns: p?.oldRuns });
+      return target.remedy(pid);
+    };
+    const err: unknown = await boundedDown(
+      { ...target, remedy, pendingReload: pending },
+      w.driver,
+      w.seams,
+    )
+      .then(() => undefined)
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(DownTimeoutError);
+    return err as DownTimeoutError;
+  }
+
+  it("kills the stuck old run before the stop, by process group, and reports it", async () => {
+    const w = pendingWorld();
+    const result = await boundedDown({ ...target, pendingReload: PENDING }, w.driver, w.seams);
+    expect(result).toEqual({ forceKilled: [{ service: "web", pid: 301 }] });
+    expect(w.events).toEqual(["kill -301", "web listed as 401", "down"]);
+  });
+
+  it("starts the stop only once the update lists the new copy, however long that takes", async () => {
+    const w = pendingWorld({ lag: 5 });
+    await boundedDown({ ...target, pendingReload: PENDING }, w.driver, w.seams);
+    expect(w.events).toEqual(["kill -301", "web listed as 401", "down"]);
+  });
+
+  it("leaves a queued service's listed old run to process-compose, and waits for its update", async () => {
+    // `api` changed too, but process-compose has not reached its update: its
+    // old run is listed and healthy, and must get its shutdown.command.
+    const w = pendingWorld({ apiQueued: true, lag: 3 });
+    const result = await boundedDown({ ...target, pendingReload: BOTH }, w.driver, w.seams);
+    expect(result).toEqual({ forceKilled: [{ service: "web", pid: 301 }] });
+    expect(w.events).not.toContain("kill -202");
+    expect(w.events).toEqual([
+      "kill -301",
+      "web listed as 401",
+      "graceful 202",
+      "api listed as 402",
+      "down",
+    ]);
+  });
+
+  it("waits on a service whose old run it did not kill, even with nothing to kill", async () => {
+    // web's stuck run already exited on its own; api's update is still queued.
+    const w = pendingWorld({ apiQueued: true, lag: 3 });
+    w.seams.kill(-301);
+    w.events.length = 0;
+    await boundedDown({ ...target, pendingReload: BOTH }, w.driver, w.seams);
+    expect(w.events).toEqual(["web listed as 401", "graceful 202", "api listed as 402", "down"]);
+  });
+
+  it("does not start the stop when the update does not finish within settleMs", async () => {
+    const w = pendingWorld({ oldSurvives: true });
+    const err = await downTimeout(PENDING, w);
+    expect(w.events).toEqual(["kill -301"]);
+    expect(err.details.pending_reload).toEqual(["web"]);
+    expect(err.details.stuck_services).toEqual([{ service: "web", pid: 301 }]);
+    expect(err.details.force_killed).toEqual([{ service: "web", pid: 301 }]);
+    // settleMs, restarted at the kill.
+    expect(err.details.timeout_ms).toBeGreaterThanOrEqual(200);
+    expect(err.message).toMatch(/still applying web after 0s, so devtrees did not stop it/);
+    // A verified run that survived its kill is not "unverified".
+    expect(err.details.remedy).not.toMatch(/could not verify/);
+    expect(w.remedies).toEqual([{ pid: 100, oldRuns: [{ service: "web", pid: 301 }] }]);
+  });
+
+  it("does not start the stop while a queued update is still running at the deadline", async () => {
+    const w = pendingWorld({ apiQueued: true, apiLag: 1_000_000 });
+    const err = await downTimeout(BOTH, w);
+    expect(w.events).toEqual(["kill -301", "web listed as 401", "graceful 202"]);
+    expect(err.details.pending_reload).toEqual(["api"]);
+    expect(err.details.stuck_services).toEqual([]);
+  });
+
+  it("retries an empty ps read before deciding what to kill", async () => {
+    const w = pendingWorld({ psFails: 2 });
+    const result = await boundedDown({ ...target, pendingReload: PENDING }, w.driver, w.seams);
+    expect(result.forceKilled).toEqual([{ service: "web", pid: 301 }]);
+    expect(w.events).toEqual(["kill -301", "web listed as 401", "down"]);
+  });
+
+  it("when ps keeps failing, kills nothing, never starts the stop, and names the old run", async () => {
+    const w = pendingWorld({ psFails: 1_000_000 });
+    const err = await downTimeout(PENDING, w);
+    expect(w.events).toEqual([]);
+    expect(err.details.force_killed).toEqual([]);
+    expect(err.details.stuck_services).toEqual([{ service: "web", pid: 301 }]);
+    expect(err.details.remedy).toMatch(
+      /could not verify web \(pid 301\) as the service.s old process/,
+    );
+  });
+
+  it("never kills an old run it cannot verify, and names it instead", async () => {
+    const w = pendingWorld();
+    const legacy = { services: ["web"], oldRuns: [{ name: "web", pid: 301 }] };
+    const err = await downTimeout(legacy, w);
+    expect(w.events).toEqual([]);
+    expect(err.details.remedy).toMatch(/could not verify web \(pid 301\)/);
+    expect(err.message).toContain("web (pid 301)");
+  });
+
+  it("never kills a pending old run once the stop has begun", async () => {
+    // Even one that shows up stuck again at the escalation: killing it then
+    // lets the update start a new copy after the shutdown order was fixed.
+    const w = pendingWorld({ outcome: { stopped: false, reason: "timeout" }, pcExits: true });
+    let downSeen = false;
+    const driver: StopDriver = {
+      ...w.driver,
+      down: async (inst, o) => {
+        downSeen = true;
+        return w.driver.down(inst, o);
+      },
+    };
+    const seams = {
+      ...w.seams,
+      readProcessTable: async () => (downSeen ? [PC, API, NEW, OLD] : w.seams.readProcessTable()),
+    };
+    const result = await boundedDown({ ...target, pendingReload: PENDING }, driver, seams);
+    expect(w.events.filter((e) => e === "kill -301")).toHaveLength(1);
+    expect(w.events.indexOf("kill -301")).toBeLessThan(w.events.indexOf("down"));
+    expect(result.forceKilled).toContainEqual({ service: "web", pid: 401 });
+  });
+
+  it("the stop's own escalation then covers the new copies", async () => {
+    const w = pendingWorld({ outcome: { stopped: false, reason: "timeout" }, pcExits: true });
+    const result = await boundedDown({ ...target, pendingReload: PENDING }, w.driver, w.seams);
+    expect(result.forceKilled).toEqual([
+      { service: "web", pid: 301 },
+      { service: "web", pid: 401 },
+      { service: "api", pid: 202 },
+    ]);
+  });
+
+  it("never kills a pending old pid once it is reused", async () => {
+    const w = pendingWorld();
+    const reused = {
+      ...w.seams,
+      readProcessTable: async () => [PC, API, NEW, { ...OLD, command: "vim notes" }],
+      isAlive: (pid: number) => pid === 100 || pid === 202 || pid === 401,
+    };
+    const relisted: StopDriver = {
+      ...w.driver,
+      getServiceStatuses: async () => [status("web", 401), status("api", 202)],
+    };
+    const result = await boundedDown({ ...target, pendingReload: PENDING }, relisted, reused);
+    expect(result).toEqual({ forceKilled: [] });
+    expect(w.events).toEqual(["down"]);
+  });
+
+  it("does not wait for a service the reload removed to come back", async () => {
+    const w = pendingWorld({ lag: 1_000_000 });
+    const removed = { services: [], oldRuns: [OLD_RUN] };
+    const result = await boundedDown({ ...target, pendingReload: removed }, w.driver, w.seams);
+    expect(result.forceKilled).toEqual([{ service: "web", pid: 301 }]);
+    expect(w.events).toEqual(["kill -301", "down"]);
+  });
+
+  describe("two services stuck in one reload (finding 1)", () => {
+    it("kills each stuck old run as the updates reach it, then stops", async () => {
+      // Both web and api have the #188 shape. Only web is unlisted at first:
+      // api's update starts once web's new copy is up, and hangs too.
+      const w = pendingWorld({ apiQueued: true, apiHangs: true, lag: 2 });
+      const result = await boundedDown({ ...target, pendingReload: BOTH }, w.driver, w.seams);
+      expect(result).toEqual({
+        forceKilled: [
+          { service: "web", pid: 301 },
+          { service: "api", pid: 202 },
+        ],
+      });
+      expect(w.events).toEqual([
+        "kill -301",
+        "web listed as 401",
+        "api stopping",
+        "kill -202",
+        "api listed as 402",
+        "down",
+      ]);
+    });
+
+    it("calls a run unverified only when its identity is missing or does not match", async () => {
+      // api's second hang, but the marker has no identity for it.
+      const w = pendingWorld({ apiQueued: true, apiHangs: true, lag: 2 });
+      const noId = { services: BOTH.services, oldRuns: [OLD_RUN, { name: "api", pid: 202 }] };
+      const err = await downTimeout(noId, w);
+      expect(w.events).not.toContain("kill -202");
+      expect(err.details.force_killed).toEqual([{ service: "web", pid: 301 }]);
+      expect(err.details.remedy).toMatch(/could not verify api \(pid 202\)/);
+      expect(err.details.remedy).not.toMatch(/verify web/);
+      expect(w.remedies).toEqual([{ pid: 100, oldRuns: [{ service: "api", pid: 202 }] }]);
+    });
+  });
+
+  describe("process-compose exits during the settle wait (finding 2)", () => {
+    it("stops waiting and reports supervisorExited, without running process-compose down", async () => {
+      // The new copy failed to start and nothing else ran: process-compose
+      // exits as soon as the old run is gone. `process list` fails from then on.
+      const w = pendingWorld({ pcExitsOnKill: true });
+      const result = await boundedDown({ ...target, pendingReload: PENDING }, w.driver, w.seams);
+      expect(result).toEqual({
+        forceKilled: [{ service: "web", pid: 301 }],
+        supervisorExited: true,
+      });
+      expect(w.events).toEqual(["kill -301"]);
+    });
+
+    it("notices by the socket when the supervisor pid is unknown", async () => {
+      const w = pendingWorld({ psFails: 1_000_000, pcExitsOnKill: true });
+      let reads = 0;
+      const driver: StopDriver = {
+        ...w.driver,
+        getServiceStatuses: async (sock) => {
+          // The old run exits on its own (nothing could verify it), and
+          // process-compose with it.
+          if (++reads === 3) w.seams.kill(-301);
+          return w.driver.getServiceStatuses(sock);
+        },
+      };
+      const result = await boundedDown({ ...target, pendingReload: PENDING }, driver, w.seams);
+      expect(result).toEqual({ forceKilled: [], supervisorExited: true });
+      expect(w.events).not.toContain("down");
+    });
+  });
+
+  describe("the grace period before a stuck run is killed (finding 3)", () => {
+    it("lets a slow graceful stop finish: no kill, the update completes, then the stop", async () => {
+      const w = pendingWorld({ stuckGraceMs: 60_000, oldExitsAfter: 10 });
+      const result = await boundedDown({ ...target, pendingReload: PENDING }, w.driver, w.seams);
+      expect(result).toEqual({ forceKilled: [] });
+      expect(w.events).toEqual(["301 exited", "web listed as 401", "down"]);
+    });
+
+    it("kills a stuck run only once it has stayed unlisted for the grace period, past settleMs", async () => {
+      // settleMs alone (20ms) is shorter than the grace (150ms): the wait
+      // must stretch to cover it, or the stuck run would never be killed.
+      const w = pendingWorld({ stuckGraceMs: 150, settleMs: 20 });
+      const started = Date.now();
+      let killedAfter = -1;
+      const kill = (t: number): void => {
+        killedAfter = Date.now() - started;
+        w.seams.kill(t);
+      };
+      const result = await boundedDown({ ...target, pendingReload: PENDING }, w.driver, {
+        ...w.seams,
+        kill,
+      });
+      expect(result).toEqual({ forceKilled: [{ service: "web", pid: 301 }] });
+      expect(killedAfter).toBeGreaterThanOrEqual(150);
+      expect(w.events).toEqual(["kill -301", "web listed as 401", "down"]);
+    });
+
+    it("counts the grace from the marker's unlistedAt when up already saw the run being stopped", async () => {
+      const w = pendingWorld({ stuckGraceMs: 60_000 });
+      const since = { ...OLD_RUN, unlistedAt: Date.now() - 61_000 };
+      const result = await boundedDown(
+        { ...target, pendingReload: { services: ["web"], oldRuns: [since] } },
+        w.driver,
+        w.seams,
+      );
+      expect(result).toEqual({ forceKilled: [{ service: "web", pid: 301 }] });
+    });
+
+    it("ignores an unlistedAt in the future", async () => {
+      const w = pendingWorld({ stuckGraceMs: 100 });
+      const future = { ...OLD_RUN, unlistedAt: Date.now() + 3_600_000 };
+      const started = Date.now();
+      await boundedDown(
+        { ...target, pendingReload: { services: ["web"], oldRuns: [future] } },
+        w.driver,
+        w.seams,
+      );
+      expect(Date.now() - started).toBeGreaterThanOrEqual(100);
+      expect(w.events).toEqual(["kill -301", "web listed as 401", "down"]);
+    });
+  });
+
+  it("says so when process list could not be read during the whole wait", async () => {
+    const w = pendingWorld();
+    const driver: StopDriver = {
+      ...w.driver,
+      getServiceStatuses: async () => {
+        throw new Error("timed out");
+      },
+    };
+    const err = (await boundedDown({ ...target, pendingReload: PENDING }, driver, w.seams).catch(
+      (e: unknown) => e,
+    )) as DownTimeoutError;
+    expect(err).toBeInstanceOf(DownTimeoutError);
+    expect(w.events).toEqual([]);
+    expect(err.details.remedy).toMatch(/could not read process-compose's process list/);
+    expect(err.details.remedy).not.toMatch(/could not verify/);
+  });
+
+  it("with nothing pending, shares one ps read between step 0 and the snapshot", async () => {
+    const w = pendingWorld();
+    w.seams.kill(-301);
+    await w.driver.getServiceStatuses(SOCK); // the update lists web again
+    w.events.length = 0;
+    const result = await boundedDown({ ...target, pendingReload: PENDING }, w.driver, w.seams);
+    expect(result).toEqual({ forceKilled: [] });
+    expect(w.events).toEqual(["down"]);
+    expect(w.tableReads()).toBe(1);
+  });
+});
+
+describe("readSupervisedTable", () => {
+  it("retries a read that is empty or lacks the supervisor, up to its attempts", async () => {
+    const reads = [[], [API], [PC, API]];
+    let i = 0;
+    const read = async () => reads[i++] ?? [];
+    expect(await readSupervisedTable(read, SOCK, { delayMs: 0 })).toEqual({
+      table: [PC, API],
+      supervisorPid: 100,
+    });
+    expect(i).toBe(3);
+  });
+
+  it("returns the last read once the attempts run out", async () => {
+    let i = 0;
+    const read = async () => {
+      i++;
+      return [];
+    };
+    expect(await readSupervisedTable(read, SOCK, { attempts: 2, delayMs: 0 })).toEqual({
+      table: [],
+      supervisorPid: undefined,
+    });
+    expect(i).toBe(2);
   });
 });

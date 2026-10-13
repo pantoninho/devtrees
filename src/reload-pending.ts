@@ -23,6 +23,13 @@
  * Once a read shows nothing pending, the marker is cleared. `down` and a fresh
  * start clear it too: the instance it describes is gone.
  *
+ * The marker also lets `down` finish (#206). process-compose no longer lists
+ * the old runs, yet its `down` waits on them, so the bounded `down` kills
+ * them before it stops the instance. To make that
+ * safe against pid reuse, the marker records each old run's parent, process
+ * group and command line, read from `ps` when the reload times out
+ * (`identifyOldRuns`).
+ *
  * There is deliberately no stateless fallback (reading the project's shape
  * against the on-disk config): the restored on-disk config is stale after a
  * timed-out rename or removal, and an empty project is legitimate after
@@ -36,16 +43,44 @@
 
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import type { ProcessRow } from "./bounded-down.js";
 import type { ServiceStatus } from "./driver.js";
 import { stateDir } from "./paths.js";
 import { writeAtomic } from "./registry.js";
 import { namespaceSelected, serviceNamespaces } from "./selection.js";
 import type { Namespace } from "./stack.js";
 
+/**
+ * The old run's process-table identity when the reload timed out (#206):
+ * its parent (this instance's process-compose), process group and command
+ * line. `down` kills the run only while all three still match, so a reused
+ * pid is never hit.
+ */
+export interface OldRunIdentity {
+  readonly ppid: number;
+  readonly pgid: number;
+  readonly command: string;
+}
+
 /** One old run a pending reload is waiting on. */
-interface OldRun {
+export interface OldRun {
   readonly name: string;
   readonly pid: number;
+  /**
+   * Set by `identifyOldRuns` when the marker is written (#206). `null`: the
+   * run could not be identified as a child of the instance's process-compose
+   * then (already gone, or `ps` failed). `down` kills a run only with a
+   * matching identity, so `null` or a missing one means never.
+   */
+  readonly identity?: OldRunIdentity | null;
+  /**
+   * When the marker was written (epoch ms), if process-compose no longer
+   * listed this run then: its update had already begun stopping it. `down`
+   * measures the run's grace period from here (#206), since it has been
+   * stopping at least that long. Absent when it was still listed (its update
+   * was queued) or the `process list` read failed.
+   */
+  readonly unlistedAt?: number;
 }
 
 /** What a timed-out reload leaves behind (persisted, see the module doc). */
@@ -99,7 +134,12 @@ function markerFile(anchor: string, worktreeId: string): string {
   return join(stateDir(anchor), `${worktreeId}.reload-pending.json`);
 }
 
-/** Read the marker, or `undefined` when there is none (or it is unreadable). */
+/**
+ * Read the marker, or `undefined` when there is none (or it is unreadable).
+ * The `oldRuns` entries are not validated: every reader fails safe on a
+ * malformed one (a hand-edited `identity` never matches, so `down` does not
+ * kill on it).
+ */
 export function readPendingReload(anchor: string, worktreeId: string): PendingReload | undefined {
   const file = markerFile(anchor, worktreeId);
   if (!existsSync(file)) return undefined;
@@ -166,6 +206,40 @@ export function planPendingReload(
       .map((r) => r.name)
       .filter((name) => after[name] !== undefined && staysBooted(name)),
     oldRuns: snapshot.flatMap((r) => (r.pid !== undefined ? [{ name: r.name, pid: r.pid }] : [])),
+  };
+}
+
+/**
+ * Record each old run's process-table identity (#206), from a `ps` read
+ * taken when the reload timed out. The old run is still running then (it is
+ * what the reload is waiting on), as a direct child of the instance's
+ * process-compose (`supervisorPid`). A run that is not such a child in
+ * `table` (it exited, or the read failed) gets `identity: null`: `down`
+ * must never kill it on the pid alone. `listed` is a `process list` read
+ * taken at the same time, `at` epoch ms: an identified run it does not list
+ * is already being stopped by its update, and gets `unlistedAt: at`.
+ */
+export function identifyOldRuns(
+  marker: PendingReload,
+  table: ReadonlyArray<ProcessRow>,
+  supervisorPid: number | undefined,
+  listed?: { readonly rows: ReadonlyArray<ServiceStatus>; readonly at: number },
+): PendingReload {
+  const byPid = new Map(table.map((row) => [row.pid, row]));
+  const listedPids = new Set(listed?.rows.map((r) => r.pid));
+  return {
+    ...marker,
+    oldRuns: marker.oldRuns.map((run) => {
+      const row = byPid.get(run.pid);
+      const child = supervisorPid !== undefined && row !== undefined && row.ppid === supervisorPid;
+      const unlisted = child && listed !== undefined && !listedPids.has(run.pid);
+      return {
+        name: run.name,
+        pid: run.pid,
+        identity: child ? { ppid: row.ppid, pgid: row.pgid, command: row.command } : null,
+        ...(unlisted ? { unlistedAt: listed.at } : {}),
+      };
+    }),
   };
 }
 
