@@ -29,6 +29,9 @@ import { parse as parseYaml } from "yaml";
 import { DEVTREES_METADATA_KEY } from "./deriver.js";
 import type { ServiceStatus } from "./driver.js";
 import { readRegistry } from "./registry.js";
+import { resolveRunningSelection, serviceNamespaces } from "./selection.js";
+import { classifyService, type ServiceVerdict } from "./service-state.js";
+import type { Namespace } from "./stack.js";
 import {
   SHARED_INSTANCE_ID,
   SHARED_REGISTRY_KEY,
@@ -74,6 +77,38 @@ export interface Service {
   readonly ports: Readonly<Record<string, number>>;
 }
 
+/**
+ * One service as `ls` lists it (#226): the runtime row plus what acting on
+ * one service needs to see (ADR-0009).
+ */
+export interface ListedService extends Service {
+  /**
+   * The namespaces the service belongs to (#226): its declared ones from the
+   * derived config, `default` when it declares none, or what process-compose
+   * reports when the derived config is not on disk.
+   */
+  readonly namespaces: ReadonlyArray<string>;
+  /** The instance's tier: a worktree instance runs isolated services, the shared one shared. */
+  readonly tier: "isolated" | "shared";
+  /** Dead versus done (ADR-0008, `classifyService`): `active`, `dead` or `done`. */
+  readonly state: ServiceVerdict;
+  /**
+   * The running process's pid, only while the service is `active`. A dead or
+   * done row keeps the pid of the run that ended, which may since have been
+   * reused by an unrelated process, so it is not published.
+   */
+  readonly pid?: number;
+}
+
+/**
+ * Whether `ls` could read an instance's services (#226): `ok` (the read
+ * answered), `unresponsive` (a running instance whose `process list` did not
+ * answer within the bound, or failed), or `skipped` (no read was attempted:
+ * the instance is stale or its liveness unknown, or no reader was given).
+ * Only `ok` makes `services` and `namespaces` authoritative.
+ */
+export type ServicesRead = "ok" | "unresponsive" | "skipped";
+
 export interface InstanceInfo {
   /** Worktree id, or the well-known shared id (`SHARED_INSTANCE_ID`). */
   readonly id: string;
@@ -101,7 +136,18 @@ export interface InstanceInfo {
    * driver call for this instance failed (we don't fail the whole `ls` for
    * one flaky instance).
    */
-  readonly services: ReadonlyArray<Service>;
+  readonly services: ReadonlyArray<ListedService>;
+  /**
+   * The namespaces the instance booted (#226), read back from the project as
+   * a running `up` does (ADR-0008, `resolveRunningSelection`). Empty unless
+   * `servicesRead` is `ok`. Discovery always sets it; absent reads as `[]`.
+   */
+  readonly namespaces?: ReadonlyArray<string>;
+  /**
+   * Whether `services` and `namespaces` come from a successful read (#226).
+   * Discovery always sets it; absent reads as `skipped`.
+   */
+  readonly servicesRead?: ServicesRead;
 }
 
 /**
@@ -336,7 +382,7 @@ function readPortsByProcess(doc: DerivedConfigDoc): Record<string, Record<string
   const byProc: Record<string, Record<string, number>> = {};
   for (const [name, proc] of Object.entries(doc.processes ?? {})) {
     const ports: Record<string, number> = {};
-    for (const entry of proc.environment ?? []) {
+    for (const entry of proc?.environment ?? []) {
       const parsed = parsePortEnvEntry(entry);
       if (parsed) ports[parsed[0]] = parsed[1];
     }
@@ -347,7 +393,10 @@ function readPortsByProcess(doc: DerivedConfigDoc): Record<string, Record<string
 
 /** The loose shape discovery reads a derived config back as. */
 interface DerivedConfigDoc {
-  readonly processes?: Record<string, { environment?: ReadonlyArray<unknown> }>;
+  readonly processes?: Record<
+    string,
+    { environment?: ReadonlyArray<unknown>; namespace?: unknown } | null
+  >;
   readonly [DEVTREES_METADATA_KEY]?: { ports_by_service?: unknown };
 }
 
@@ -436,19 +485,48 @@ export interface DiscoverDeps {
 }
 
 /**
- * Best-effort fetch of a single instance's runtime services. A driver error
- * for one instance must not abort the whole `ls` — agents and operators both
- * want a partial answer (the other instances) over a fatal exception.
+ * Best-effort fetch of a single instance's runtime services, `undefined` when
+ * it failed. A driver error (or a read that ran out of time) for one instance
+ * must not abort the whole `ls` — agents and operators both want a partial
+ * answer (the other instances) over a fatal exception.
  */
 async function safeGetServiceStatuses(
   socketPath: string,
   fetch: (socketPath: string) => Promise<ServiceStatus[]>,
-): Promise<ServiceStatus[]> {
+): Promise<ServiceStatus[] | undefined> {
   try {
     return await fetch(socketPath);
   } catch {
-    return [];
+    return undefined;
   }
+}
+
+/** What one instance's service read contributes to its `InstanceInfo`. */
+type ServicesView = Required<Pick<InstanceInfo, "services" | "namespaces" | "servicesRead">>;
+
+const NO_SERVICES: ServicesView = { services: [], namespaces: [], servicesRead: "skipped" };
+
+/**
+ * Read one instance's services and booted namespaces (#226), when it is
+ * running and a reader was given. A failed or timed-out read is
+ * `unresponsive`, never fatal.
+ */
+async function readServicesView(
+  stem: string,
+  socketPath: string,
+  status: InstanceStatus,
+  configDoc: DerivedConfigDoc,
+  fetch: ((socketPath: string) => Promise<ServiceStatus[]>) | undefined,
+): Promise<ServicesView> {
+  if (status !== "running" || fetch === undefined) return NO_SERVICES;
+  const rows = await safeGetServiceStatuses(socketPath, fetch);
+  if (rows === undefined) return { ...NO_SERVICES, servicesRead: "unresponsive" };
+  const declared = readDeclaredNamespaces(configDoc);
+  return {
+    services: buildServices(rows, readPortsByService(configDoc), declared, kindFor(stem)),
+    namespaces: bootedNamespaces(rows, declared),
+    servicesRead: "ok",
+  };
 }
 
 /**
@@ -483,13 +561,13 @@ export async function discoverInstances(
       );
       const blockBase = registry[registryKeyFor(stem)];
       const configDoc = readDerivedConfig(paths.configPath);
-      const services =
-        status === "running" && deps.getServiceStatuses
-          ? buildServices(
-              await safeGetServiceStatuses(socketPath, deps.getServiceStatuses),
-              readPortsByService(configDoc),
-            )
-          : [];
+      const view = await readServicesView(
+        stem,
+        socketPath,
+        status,
+        configDoc,
+        deps.getServiceStatuses,
+      );
       return {
         id: stem,
         kind: kindFor(stem),
@@ -497,7 +575,7 @@ export async function discoverInstances(
         socketPath,
         ports: flattenPorts(readPortsByProcess(configDoc)),
         blockBase,
-        services,
+        ...view,
       };
     }),
   );
@@ -516,11 +594,62 @@ export async function discoverInstances(
 function buildServices(
   statuses: ReadonlyArray<ServiceStatus>,
   portsByService: Record<string, Record<string, number>> | undefined,
-): Service[] {
-  return statuses.map((s) => ({
-    name: s.name,
-    status: s.status,
-    health: s.health,
-    ports: portsByService?.[s.name] ?? {},
-  }));
+  declared: ReadonlyMap<string, DeclaredService> | undefined,
+  kind: InstanceKind,
+): ListedService[] {
+  return statuses.map((s) => {
+    const state = classifyService(s);
+    const own = declared?.get(s.name);
+    return {
+      name: s.name,
+      status: s.status,
+      health: s.health,
+      ports: portsByService?.[s.name] ?? {},
+      namespaces: own !== undefined ? serviceNamespaces(own) : [...(s.namespaces ?? [])],
+      tier: kind === "shared" ? "shared" : "isolated",
+      state,
+      ...(state === "active" && s.pid !== undefined ? { pid: s.pid } : {}),
+    };
+  });
+}
+
+/** One process of a derived config, as namespace selection reads it. */
+interface DeclaredService {
+  readonly name: string;
+  readonly namespace?: Namespace;
+}
+
+/**
+ * The derived config's processes with their declared `namespace` (#226), or
+ * `undefined` when the config is not on disk. A malformed `namespace` reads
+ * as none, i.e. `default`, as process-compose would place it.
+ */
+function readDeclaredNamespaces(
+  doc: DerivedConfigDoc,
+): ReadonlyMap<string, DeclaredService> | undefined {
+  if (!isPlainRecord(doc.processes)) return undefined;
+  const declared = new Map<string, DeclaredService>();
+  for (const [name, proc] of Object.entries(doc.processes)) {
+    const ns = proc?.namespace;
+    const valid =
+      typeof ns === "string" ||
+      (Array.isArray(ns) && ns.length > 0 && ns.every((n) => typeof n === "string"));
+    declared.set(name, valid ? { name, namespace: ns as Namespace } : { name });
+  }
+  return declared;
+}
+
+/**
+ * The namespaces the instance booted (#226), read back the way a running `up`
+ * reads them (ADR-0008): a namespace is booted when every service the derived
+ * config declares in it is in the project. Without a derived config, the
+ * union of the namespaces process-compose reports is the best answer left.
+ */
+function bootedNamespaces(
+  rows: ReadonlyArray<ServiceStatus>,
+  declared: ReadonlyMap<string, DeclaredService> | undefined,
+): string[] {
+  if (declared === undefined) return [...new Set(rows.flatMap((r) => r.namespaces ?? []))].sort();
+  const present = new Set(rows.map((r) => r.name));
+  return [...resolveRunningSelection([...declared.values()], present, undefined).namespaces];
 }

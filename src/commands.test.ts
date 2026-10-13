@@ -3043,6 +3043,69 @@ describe("runLs — instance enumeration", () => {
     // even when no instance ends up exercising it.
     expect(typeof receivedFetch).toBe("function");
   });
+
+  it("bounds each instance's service read: a wedged instance fails within the budget, in parallel with the rest (#226)", async () => {
+    const tmp = tmpAnchor();
+    const git: CommandDeps["git"] = (args) => {
+      const flag = args[1];
+      if (flag === "--git-common-dir") return tmp.anchor;
+      if (flag === "--show-toplevel") return join(tmp.worktreeRoot, "login");
+      if (flag === "--is-bare-repository") return "false";
+      throw new Error("unexpected");
+    };
+    const killed: string[] = [];
+    // `process list` against `wedged.sock` never answers, like a SIGSTOPped
+    // process-compose; against any other socket it answers at once.
+    const spawner: NonNullable<CommandDeps["driver"]>["spawner"] = (_binary, args) => {
+      const socket = String(args[args.indexOf("-u") + 1]);
+      const emitter = new EventEmitter() as EventEmitter & {
+        stdout: Readable;
+        kill: () => boolean;
+      };
+      emitter.kill = () => {
+        killed.push(socket);
+        return true;
+      };
+      if (socket.endsWith("wedged.sock")) {
+        emitter.stdout = new Readable({ read() {} });
+        return emitter as unknown as SpawnedProcess;
+      }
+      emitter.stdout = Readable.from([JSON.stringify([{ name: "web", status: "Running" }])]);
+      emitter.stdout.on("end", () => queueMicrotask(() => emitter.emit("exit", 0)));
+      return emitter as unknown as SpawnedProcess;
+    };
+    const reads: Array<{ socket: string; ms: number; ok: boolean }> = [];
+    const { runLs } = await import("./commands.js");
+    const started = Date.now();
+    await runLs({
+      cwd: join(tmp.worktreeRoot, "login"),
+      git,
+      driver: { exists: () => Promise.resolve(true), spawner },
+      readTimeoutMs: 300,
+      probeSocket: async () => "running",
+      discover: async (_anchor, deps) => {
+        await Promise.all(
+          ["/x/wedged.sock", "/x/login.sock"].map(async (socket) => {
+            const t0 = Date.now();
+            const ok = await deps.getServiceStatuses!(socket).then(
+              () => true,
+              () => false,
+            );
+            reads.push({ socket, ms: Date.now() - t0, ok });
+          }),
+        );
+        return [];
+      },
+    });
+    const wedged = reads.find((r) => r.socket === "/x/wedged.sock");
+    expect(reads.find((r) => r.socket === "/x/login.sock")?.ok).toBe(true);
+    expect(wedged?.ok).toBe(false);
+    // Retried within the budget, every hung client killed, never waited on past it.
+    expect(wedged?.ms).toBeLessThan(2_000);
+    expect(killed.length).toBeGreaterThan(0);
+    expect(killed.every((s) => s === "/x/wedged.sock")).toBe(true);
+    expect(Date.now() - started).toBeLessThan(2_000);
+  });
 });
 
 /**

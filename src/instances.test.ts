@@ -73,15 +73,20 @@ function writeRegistry(anchor: string, snapshot: Record<string, number>): void {
 function writeDerivedConfig(
   anchor: string,
   id: string,
-  processes: Record<string, { ports: ReadonlyArray<[string, number]> }>,
+  processes: Record<
+    string,
+    { ports: ReadonlyArray<[string, number]>; namespace?: string | ReadonlyArray<string> }
+  >,
   opts: { metadata?: boolean } = {},
 ): void {
   const allPorts = Object.values(processes).flatMap((p) => p.ports);
   const lines = ["processes:"];
-  for (const name of Object.keys(processes)) {
+  for (const [name, proc] of Object.entries(processes)) {
     lines.push(`  ${name}:`);
     lines.push("    command: noop");
     lines.push(`    working_dir: /tmp`);
+    if (proc.namespace !== undefined)
+      lines.push(`    namespace: ${JSON.stringify(proc.namespace)}`);
     if (allPorts.length > 0) {
       lines.push("    environment:");
       for (const [k, v] of allPorts) lines.push(`      - ${k}=${v}`);
@@ -305,11 +310,11 @@ describe("discoverInstances", () => {
     const byId = new Map(instances.map((i) => [i.id, i]));
     const login = byId.get("login");
     const billing = byId.get("billing");
-    expect(login?.services).toEqual([
+    expect(login?.services).toMatchObject([
       { name: "web", status: "Running", health: "ready", ports: { WEB_PORT: 20000 } },
       { name: "worker", status: "Running", health: "not_ready", ports: { WORKER_PORT: 20001 } },
     ]);
-    expect(billing?.services).toEqual([
+    expect(billing?.services).toMatchObject([
       { name: "web", status: "Running", health: "ready", ports: { WEB_PORT: 21000 } },
     ]);
   });
@@ -332,7 +337,7 @@ describe("discoverInstances", () => {
     ];
 
     const [instance] = await discoverInstances(anchor, { getServiceStatuses });
-    expect(instance?.services).toEqual([
+    expect(instance?.services).toMatchObject([
       { name: "web", status: "Running", health: "ready", ports: { WEB_PORT: 20000 } },
       { name: "worker", status: "Running", health: "unknown", ports: {} },
     ]);
@@ -361,7 +366,7 @@ describe("discoverInstances", () => {
     ];
 
     const [instance] = await discoverInstances(anchor, { getServiceStatuses });
-    expect(instance?.services).toEqual([
+    expect(instance?.services).toMatchObject([
       { name: "web", status: "Running", health: "ready", ports: {} },
     ]);
     expect(instance?.ports).toEqual({ WEB_PORT: 20000 });
@@ -415,7 +420,7 @@ describe("discoverInstances", () => {
     const login = instances.find((i) => i.id === "login");
     const billing = instances.find((i) => i.id === "billing");
     expect(login?.services).toEqual([]);
-    expect(billing?.services).toEqual([
+    expect(billing?.services).toMatchObject([
       { name: "web", status: "Running", health: "ready", ports: { WEB_PORT: 21000 } },
     ]);
   });
@@ -677,5 +682,153 @@ describe("discoverInstances — unknown liveness (#186)", () => {
     expect(fetched).toEqual([]);
     // Discovery is read-only: the socket file is never removed.
     expect(existsSync(instancePaths(anchor, "login").socketPath)).toBe(true);
+  });
+});
+
+/**
+ * Issue #226 (ADR-0009): discovery reads back each instance's booted
+ * namespaces and lists every service with its namespaces, tier, dead-versus-
+ * done state and pid. A read that fails is `unresponsive`, never fatal.
+ */
+describe("discoverInstances — namespaces and per-service state (#226)", () => {
+  it("reads the booted namespaces back as `up` does: one whose services are all present", async () => {
+    const anchor = tmpAnchor();
+    writeRegistry(anchor, { login: 20000 });
+    // Booted with `-n app`: `shared-ui` is in app and ios, `sim` only in ios.
+    writeDerivedConfig(anchor, "login", {
+      web: { ports: [["WEB_PORT", 20000]], namespace: "app" },
+      "shared-ui": { ports: [], namespace: ["app", "ios"] },
+      sim: { ports: [], namespace: "ios" },
+      plain: { ports: [] },
+    });
+    await bindSocketServer(anchor, "login");
+
+    const [instance] = await discoverInstances(anchor, {
+      getServiceStatuses: async () => [
+        { name: "web", status: "Running", health: "ready", pid: 11 },
+        { name: "shared-ui", status: "Running", health: "unknown", pid: 12 },
+        { name: "plain", status: "Running", health: "unknown", pid: 13 },
+      ],
+    });
+
+    expect(instance?.servicesRead).toBe("ok");
+    // `ios` is not booted: `sim` is missing, even though `shared-ui` runs.
+    expect(instance?.namespaces).toEqual(["app", "default"]);
+    expect(instance?.services.map((s) => [s.name, s.namespaces, s.tier])).toEqual([
+      ["web", ["app"], "isolated"],
+      ["shared-ui", ["app", "ios"], "isolated"],
+      ["plain", ["default"], "isolated"],
+    ]);
+  });
+
+  it("classifies each service active, dead or done, and publishes a pid only while active", async () => {
+    const anchor = tmpAnchor();
+    writeRegistry(anchor, { login: 20000 });
+    writeDerivedConfig(anchor, "login", {
+      web: { ports: [] },
+      stopped: { ports: [] },
+      migrate: { ports: [] },
+      crashed: { ports: [] },
+    });
+    await bindSocketServer(anchor, "login");
+
+    const [instance] = await discoverInstances(anchor, {
+      getServiceStatuses: async () => [
+        { name: "web", status: "Running", health: "unknown", pid: 21 },
+        // `process stop` and a crash look the same on v1.122.0 (ADR-0009).
+        { name: "stopped", status: "Completed", health: "unknown", exitCode: -1, pid: 22 },
+        { name: "migrate", status: "Completed", health: "unknown", exitCode: 0, pid: 23 },
+        { name: "crashed", status: "Error", health: "unknown", exitCode: 1, pid: 24 },
+      ],
+    });
+
+    expect(instance?.services.map((s) => [s.name, s.state, s.pid])).toEqual([
+      ["web", "active", 21],
+      ["stopped", "dead", undefined],
+      ["migrate", "done", undefined],
+      ["crashed", "dead", undefined],
+    ]);
+    expect(instance?.services[1]?.status).toBe("Completed");
+  });
+
+  it("lists the shared instance's services with tier `shared`", async () => {
+    const anchor = tmpAnchor();
+    writeRegistry(anchor, { [SHARED_REGISTRY_KEY]: 30000 });
+    writeDerivedConfig(anchor, SHARED_INSTANCE_ID, { db: { ports: [["DB_PORT", 30000]] } });
+    await bindSocketServer(anchor, SHARED_INSTANCE_ID);
+
+    const [instance] = await discoverInstances(anchor, {
+      getServiceStatuses: async () => [{ name: "db", status: "Running", health: "unknown" }],
+    });
+
+    expect(instance?.kind).toBe("shared");
+    expect(instance?.namespaces).toEqual(["default"]);
+    expect(instance?.services).toEqual([
+      {
+        name: "db",
+        status: "Running",
+        health: "unknown",
+        ports: { DB_PORT: 30000 },
+        namespaces: ["default"],
+        tier: "shared",
+        state: "active",
+      },
+    ]);
+  });
+
+  it("falls back to process-compose's namespaces when the derived config is gone", async () => {
+    const anchor = tmpAnchor();
+    writeRegistry(anchor, { login: 20000 });
+    await bindSocketServer(anchor, "login");
+
+    const [instance] = await discoverInstances(anchor, {
+      getServiceStatuses: async () => [
+        { name: "web", status: "Running", health: "unknown", namespaces: ["app"] },
+        { name: "api", status: "Running", health: "unknown", namespaces: ["app", "backend"] },
+      ],
+    });
+
+    expect(instance?.namespaces).toEqual(["app", "backend"]);
+    expect(instance?.services.map((s) => s.namespaces)).toEqual([["app"], ["app", "backend"]]);
+  });
+
+  it("marks a running instance whose read fails as unresponsive, and keeps listing the others", async () => {
+    const anchor = tmpAnchor();
+    writeRegistry(anchor, { login: 20000, billing: 21000 });
+    writeDerivedConfig(anchor, "login", { web: { ports: [] } });
+    writeDerivedConfig(anchor, "billing", { web: { ports: [] } });
+    await bindSocketServer(anchor, "login");
+    await bindSocketServer(anchor, "billing");
+
+    const instances = await discoverInstances(anchor, {
+      getServiceStatuses: async (socketPath) => {
+        if (socketPath.endsWith("login.sock")) throw new Error("timed out after 5000ms");
+        return [{ name: "web", status: "Running", health: "unknown" }];
+      },
+    });
+
+    const login = instances.find((i) => i.id === "login");
+    const billing = instances.find((i) => i.id === "billing");
+    expect(login).toMatchObject({
+      status: "running",
+      servicesRead: "unresponsive",
+      namespaces: [],
+      services: [],
+    });
+    expect(billing).toMatchObject({ servicesRead: "ok", namespaces: ["default"] });
+  });
+
+  it("does not read a stale instance: services_read is skipped", async () => {
+    const anchor = tmpAnchor();
+    writeRegistry(anchor, { login: 20000 });
+    touchSocketMarker(anchor, "login");
+
+    const [instance] = await discoverInstances(anchor, {
+      getServiceStatuses: async () => {
+        throw new Error("must not be called");
+      },
+    });
+
+    expect(instance).toMatchObject({ status: "stale", servicesRead: "skipped", namespaces: [] });
   });
 });

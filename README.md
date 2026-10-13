@@ -37,7 +37,7 @@ Commands (from the exported `COMMANDS` manifest in [`src/cli.ts`](src/cli.ts)):
 | ------------------- | ------------------------------------------------------------------------- |
 | `devtrees up`       | Bring up this worktree's stack                                            |
 | `devtrees down`     | Stop this worktree's stack (`--shared` tears down the shared instance)    |
-| `devtrees ls`       | List every instance across the repo with status and ports                 |
+| `devtrees ls`       | List every instance with status, namespaces and ports (`--services`)     |
 | `devtrees attach`   | Attach a TUI to this worktree's instance (`--shared` for the shared one)  |
 | `devtrees prune`    | Reconcile against `git worktree list` and clean up orphaned instances     |
 | `devtrees env`      | Print this worktree's injected env (KEY=value, or `--json` for a map)     |
@@ -53,6 +53,21 @@ Flag highlights (run `devtrees <cmd> --help` for the full per-command surface):
   `--all` to interleave every service; `--follow`/`-f` keeps streaming,
   `--tail <N>` prints the last N lines, `--since <DUR>` filters by age
   (e.g. `30s`, `5m`, `1h`).
+- `devtrees ls` shows each instance's booted namespaces (NAMESPACES column,
+  read back from the running project as `up` does). `--services` prints one
+  row per service instead, the shared instance's included: its namespaces,
+  tier (`isolated` or `shared`), status and pid. Status is `active`, `dead` or
+  `done` (a one-shot that exited 0); a service stopped with `process-compose
+  process stop` reads `dead`, like a crashed one, because process-compose
+  reports both the same way. The pid is shown only for an `active` service.
+  `ls --json` always carries the instance's `namespaces` and, per service,
+  `namespaces`, `tier`, `state` (the same `active`/`dead`/`done`) and `pid`
+  (`null` unless active), next to process-compose's own `status` string.
+  `ls` only reads: each instance gets at most 5s to answer, all of them in
+  parallel. One that does not answer (busy or frozen) is still listed, with
+  `?` for its namespaces and services, `"services_read": "unresponsive"` under
+  `--json` (`"ok"` when read, `"skipped"` for a stale or unknown instance),
+  and a note on stderr.
 - `down`, `attach`, and `logs` accept `--shared` to target the shared instance
   instead of this worktree's.
 - Every command accepts `--json` (see below).
