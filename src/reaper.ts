@@ -47,8 +47,12 @@ export interface HookRun {
   readonly cwd: string;
   /** devtrees' process env merged with the process's embedded `environment:` lines. */
   readonly env: Readonly<Record<string, string>>;
-  /** `shutdown.timeout_seconds` in milliseconds, or `undefined` when none was declared. */
-  readonly timeoutMs?: number;
+  /**
+   * `shutdown.timeout_seconds` in milliseconds, or, when none was declared,
+   * process-compose's own default (`DEFAULT_HOOK_TIMEOUT_MS`). Always set:
+   * an unbounded hook would hold `down`'s lifecycle lock forever (#155).
+   */
+  readonly timeoutMs: number;
 }
 
 /** Performs one hook run. Injected so the orchestration is exercisable without a real subprocess. */
@@ -90,12 +94,19 @@ function shutdownCommand(
   return typeof command === "string" && command !== "" ? command : undefined;
 }
 
-/** Read `shutdown.timeout_seconds` as a positive millisecond budget, or `undefined`. */
-function timeoutMs(shutdown: Readonly<Record<string, unknown>> | undefined): number | undefined {
+/**
+ * process-compose's budget for a `shutdown.command` with no
+ * `shutdown.timeout_seconds` (v1.122.0: it kills the hook after 10s). The
+ * reaper uses the same, so a hook it runs is never unbounded (#155).
+ */
+export const DEFAULT_HOOK_TIMEOUT_MS = 10_000;
+
+/** Read `shutdown.timeout_seconds` as a positive millisecond budget, else the default. */
+function timeoutMs(shutdown: Readonly<Record<string, unknown>> | undefined): number {
   const seconds = shutdown?.timeout_seconds;
   return typeof seconds === "number" && Number.isFinite(seconds) && seconds > 0
     ? seconds * 1000
-    : undefined;
+    : DEFAULT_HOOK_TIMEOUT_MS;
 }
 
 /** Build a process's hook env: the base env plus its embedded `KEY=VALUE` lines. */
@@ -134,13 +145,12 @@ export async function reapShutdownHooks(
     const command = shutdownCommand(process_.shutdown);
     if (command === undefined) continue;
     ranCount++;
-    const ms = timeoutMs(process_.shutdown);
     const hookRun: HookRun = {
       process: name,
       command,
       cwd: deps.cwd,
       env: hookEnv(base, process_.environment),
-      ...(ms !== undefined ? { timeoutMs: ms } : {}),
+      timeoutMs: timeoutMs(process_.shutdown),
     };
     const result = await run(hookRun);
     if (!result.ok) {
@@ -158,9 +168,11 @@ export async function reapShutdownHooks(
 
 /**
  * Default hook runner: spawn the command through `/bin/sh -c` from `run.cwd`
- * with `run.env`, kill it (SIGKILL) if it overruns `run.timeoutMs`, and classify
- * the outcome. A spawn error is `launch`, a timeout is `timeout`, a non-zero exit
- * is `exit`; exit 0 (or a null code from a clean signal) is success.
+ * with `run.env`, in a process group of its own, and SIGKILL that whole group
+ * if it overruns `run.timeoutMs`, so nothing the hook started outlives the
+ * budget (#155). A spawn error is `launch`, a timeout is `timeout`, a
+ * non-zero exit is `exit`; exit 0 (or a null code from a clean signal) is
+ * success.
  */
 function defaultHookRunner(run: HookRun): Promise<HookResult> {
   return new Promise<HookResult>((resolve) => {
@@ -168,23 +180,25 @@ function defaultHookRunner(run: HookRun): Promise<HookResult> {
       cwd: run.cwd,
       env: { ...run.env },
       stdio: "ignore",
+      detached: true,
     });
-    let timer: NodeJS.Timeout | undefined;
     let timedOut = false;
-    if (run.timeoutMs !== undefined) {
-      timer = setTimeout(() => {
-        timedOut = true;
-        child.kill("SIGKILL");
-      }, run.timeoutMs);
-    }
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killGroup(child.pid);
+    }, run.timeoutMs);
     child.on("error", (err) => {
-      if (timer) clearTimeout(timer);
+      clearTimeout(timer);
       resolve({ ok: false, reason: "launch", message: err.message });
     });
     child.on("exit", (code) => {
-      if (timer) clearTimeout(timer);
+      clearTimeout(timer);
       if (timedOut) {
-        resolve({ ok: false, reason: "timeout", message: `timed out after ${run.timeoutMs}ms` });
+        resolve({
+          ok: false,
+          reason: "timeout",
+          message: `timed out after ${run.timeoutMs}ms; devtrees killed it`,
+        });
         return;
       }
       if (code === 0 || code === null) {
@@ -194,4 +208,14 @@ function defaultHookRunner(run: HookRun): Promise<HookResult> {
       resolve({ ok: false, reason: "exit", message: `exited with code ${code}` });
     });
   });
+}
+
+/** SIGKILL a hook's process group (it leads one: it was spawned detached). */
+function killGroup(pid: number | undefined): void {
+  if (pid === undefined) return;
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch {
+    // Already gone.
+  }
 }

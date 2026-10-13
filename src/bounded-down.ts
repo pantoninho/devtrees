@@ -28,6 +28,23 @@
  *     line, so a reused pid is never hit). process-compose then sees them
  *     exit and finishes its own shutdown. If it still has not exited after a
  *     short grace period, fail with `DOWN_TIMEOUT`.
+ *  4. Once process-compose has stopped, sweep each service's process group
+ *     (#155). process-compose calls a service stopped as soon as its direct
+ *     child exits, so a grandchild that ignores SIGTERM (`exec pnpm exec
+ *     keyshelf run ... -- uv run ... uvicorn --reload`) outlived it, holding
+ *     its port. The snapshot also records the other members of each
+ *     service's process group (process-compose starts every service as a
+ *     group leader). Members still alive and still the same process (pid,
+ *     group, command line and start time) get a grace period
+ *     (`treeGraceMs`), then SIGKILL. A service whose group process-compose
+ *     did not signal (a `shutdown.command`, or `shutdown.parent_only`) gets
+ *     SIGTERM first. Every process signalled is reported in `force_killed`;
+ *     those still alive after SIGKILL are returned as `survivors`. Only the
+ *     group is swept: a descendant that left it on purpose (`setsid`, a
+ *     detached daemon other instances may share) is never signalled. If it
+ *     keeps one of the instance's ports, `down`'s port check reports it.
+ *     A pending reload's old runs lead groups of their own, not a snapshot
+ *     service's, so the sweep never touches them (#208).
  *
  * devtrees never kills the process-compose supervisor itself, nor a
  * `shutdown.command` it is running: killing the supervisor would skip the
@@ -41,12 +58,18 @@ import { existsSync } from "node:fs";
 import type { DownOutcome, InstanceRef, ServiceStatus } from "./driver.js";
 import { stuckFromMarker, type OldRun, type PendingReload } from "./reload-pending.js";
 
-/** One row of the process table, as `ps -o pid=,ppid=,pgid=,command=` prints it. */
+/** One row of the process table, as `ps -o pid=,ppid=,pgid=,lstart=,command=` prints it. */
 export interface ProcessRow {
   readonly pid: number;
   readonly ppid: number;
   readonly pgid: number;
   readonly command: string;
+  /**
+   * When the process started (`lstart`, e.g. `Tue Oct 13 14:06:00 2026`), so
+   * a pid reused with identical argv is still told apart (#155). Absent from
+   * a row read without it.
+   */
+  readonly started?: string;
 }
 
 /** A service process recorded before the stop, with the identity checked before a kill. */
@@ -54,23 +77,35 @@ export interface ServiceProcess extends ProcessRow {
   readonly service: string;
 }
 
-/** A service process devtrees had to SIGKILL. */
+/**
+ * A service process devtrees signalled to finish the stop: SIGKILL, or the
+ * SIGTERM the group sweep sends a group process-compose did not signal.
+ */
 export interface ForceKilled {
   readonly service: string;
   readonly pid: number;
 }
 
-/** Parse `ps -A -ww -o pid=,ppid=,pgid=,command=` output. Malformed lines are skipped. */
+/** `lstart` as `ps` prints it under the C locale: `Tue Oct 13 14:06:00 2026` (day space-padded). */
+const LSTART = String.raw`[A-Z][a-z]{2} [A-Z][a-z]{2} [ \d]\d \d{2}:\d{2}:\d{2} \d{4}`;
+const ROW = new RegExp(String.raw`^\s*(\d+)\s+(\d+)\s+(\d+)\s+(?:(${LSTART})\s+)?(.*)$`);
+
+/**
+ * Parse `ps -A -ww -o pid=,ppid=,pgid=,lstart=,command=` output; the start
+ * time is optional, so a read without it parses too. Malformed lines are
+ * skipped.
+ */
 export function parseProcessTable(stdout: string): ProcessRow[] {
   const rows: ProcessRow[] = [];
   for (const line of stdout.split("\n")) {
-    const m = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.*)$/.exec(line);
+    const m = ROW.exec(line);
     if (m === null) continue;
     rows.push({
       pid: Number(m[1]),
       ppid: Number(m[2]),
       pgid: Number(m[3]),
-      command: (m[4] ?? "").trimEnd(),
+      command: (m[5] ?? "").trimEnd(),
+      ...(m[4] !== undefined ? { started: m[4].replace(/\s+/g, " ") } : {}),
     });
   }
   return rows;
@@ -84,8 +119,13 @@ export function readProcessTable(): Promise<ProcessRow[]> {
   return new Promise((resolve) => {
     execFile(
       "ps",
-      ["-A", "-ww", "-o", "pid=,ppid=,pgid=,command="],
-      { timeout: PS_TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024 },
+      ["-A", "-ww", "-o", "pid=,ppid=,pgid=,lstart=,command="],
+      {
+        timeout: PS_TIMEOUT_MS,
+        maxBuffer: 64 * 1024 * 1024,
+        // `lstart` in a fixed format the parser knows.
+        env: { ...process.env, LC_ALL: "C" },
+      },
       (err, stdout) => resolve(err === null ? parseProcessTable(stdout) : []),
     );
   });
@@ -156,13 +196,17 @@ export function stillRunning(
   const byPid = new Map(table.map((row) => [row.pid, row]));
   return snapshot.filter((proc) => {
     const now = byPid.get(proc.pid);
-    return (
-      now !== undefined &&
-      now.ppid === proc.ppid &&
-      now.pgid === proc.pgid &&
-      now.command === proc.command
-    );
+    return now !== undefined && now.ppid === proc.ppid && sameProcess(proc, now);
   });
+}
+
+/**
+ * Is `now` still the process `then` recorded: same process group, command
+ * line and start time? The parent is left to the caller: a reparented
+ * process is still the same process.
+ */
+function sameProcess(then: ProcessRow, now: ProcessRow): boolean {
+  return now.pgid === then.pgid && now.command === then.command && now.started === then.started;
 }
 
 /**
@@ -331,6 +375,12 @@ export interface StopSeams {
    * budget, the patience the stop's own escalation gives any process.
    */
   readonly stuckGraceMs?: number;
+  /**
+   * How long a service's leftover process-group members get to exit after
+   * process-compose has stopped, before devtrees SIGKILLs them (#155).
+   * Default: 5s.
+   */
+  readonly treeGraceMs?: number;
 }
 
 /** Default grace for process-compose to exit once its stuck services are killed. */
@@ -338,6 +388,10 @@ const DOWN_GRACE_MS = 10_000;
 const DOWN_POLL_MS = 100;
 /** Floor of the wait for a pending reload to finish before the stop. */
 const PENDING_SETTLE_MS = 5_000;
+/** Default grace for a service's leftover group members once process-compose has stopped (#155). */
+const TREE_GRACE_MS = 5_000;
+/** How long a SIGKILLed descendant gets to disappear before it counts as a survivor. */
+const TREE_REAP_MS = 1_000;
 
 /** What `boundedDown` is stopping and how to describe it in a `DOWN_TIMEOUT`. */
 export interface StopTarget {
@@ -365,6 +419,13 @@ export interface StopTarget {
    * Default: none.
    */
   readonly pendingReload?: PendingReload;
+  /**
+   * Services whose process group process-compose does not signal on the
+   * stop: those with a `shutdown.command` (it runs that instead) or
+   * `shutdown.parent_only` (#155). Their leftover group members get SIGTERM
+   * from the sweep before its grace period. Default: none.
+   */
+  readonly unsignalled?: ReadonlySet<string>;
 }
 
 /** What `boundedDown` resolves with. */
@@ -376,6 +437,17 @@ export interface StopResult {
    * left behind: the caller cleans up as it does for a dead supervisor.
    */
   readonly supervisorExited?: true;
+  /**
+   * The `process list` read before the stop, when one succeeded. The caller
+   * uses it to tell which services were booted and which had already exited
+   * (#155).
+   */
+  readonly statuses?: ReadonlyArray<ServiceStatus>;
+  /**
+   * Service processes or members of their process groups still alive after the stop and
+   * the SIGKILL sweep (#155). Present only when non-empty.
+   */
+  readonly survivors?: ReadonlyArray<ServiceProcess>;
 }
 
 /**
@@ -398,15 +470,28 @@ export async function boundedDown(
   const kill = seams.kill ?? process.kill.bind(process);
   const pending = await finishPendingReload(target, driver, seams);
   if (pending.supervisorExited) return { forceKilled: pending.killed, supervisorExited: true };
-  const { snapshot, supervisorPid } = await snapshotInstance(
+  const { snapshot, supervisorPid, statuses, tree } = await snapshotInstance(
     target.inst.socketPath,
     driver,
     readTable,
     pending.view,
   );
+  // Step 4 (#155), once process-compose has stopped. A process the
+  // escalation already killed is not signalled again.
+  const stopped = async (killed: ForceKilled[]): Promise<StopResult> => {
+    const already = new Set(killed.map((k) => k.pid));
+    const rest = tree.filter((p) => !already.has(p.pid));
+    const groups = { led: serviceGroups(snapshot), unsignalled: target.unsignalled ?? new Set() };
+    const swept = await sweepServiceGroups(rest, groups, seams);
+    return {
+      forceKilled: [...killed, ...swept.killed.filter((k) => !already.has(k.pid))],
+      ...(statuses !== undefined ? { statuses } : {}),
+      ...(swept.survivors.length > 0 ? { survivors: swept.survivors } : {}),
+    };
+  };
 
   const outcome = await driver.down(target.inst, { timeoutMs: target.timeoutMs });
-  if (outcome.stopped) return { forceKilled: pending.killed };
+  if (outcome.stopped) return stopped(pending.killed);
 
   const table = await readTable();
   const pcPid = supervisorPid ?? findSupervisorPid(table, target.inst.socketPath);
@@ -415,7 +500,7 @@ export async function boundedDown(
   const stuck = stillRunning(snapshot, table);
   const forceKilled = [...pending.killed, ...killProcesses(stuck, kill)];
   const exited = await waitForExit(target.inst.socketPath, pcPid, seams);
-  if (exited) return { forceKilled };
+  if (exited) return stopped(forceKilled);
   throw new DownTimeoutError(target.command, {
     instance: target.instance,
     socket_path: target.inst.socketPath,
@@ -748,24 +833,177 @@ async function snapshotInstance(
   driver: StopDriver,
   readTable: () => Promise<ProcessRow[]>,
   view?: InstanceView,
-): Promise<{ snapshot: ServiceProcess[]; supervisorPid: number | undefined }> {
-  if (view !== undefined) {
-    const { statuses, table, supervisorPid } = view;
-    return { snapshot: snapshotServiceProcesses(statuses, table, supervisorPid), supervisorPid };
-  }
+): Promise<Snapshot> {
+  if (view !== undefined) return snapshotOf(view.statuses, view.table, view.supervisorPid);
   let statuses: ServiceStatus[];
   try {
     statuses = await driver.getServiceStatuses(socketPath);
   } catch {
-    return { snapshot: [], supervisorPid: undefined };
+    return { snapshot: [], tree: [], supervisorPid: undefined };
   }
   // No pid to protect: skip the process-table read on the common path.
   if (!statuses.some((s) => s.pid !== undefined)) {
-    return { snapshot: [], supervisorPid: undefined };
+    return { snapshot: [], tree: [], supervisorPid: undefined, statuses };
   }
   const table = await readTable();
-  const supervisorPid = findSupervisorPid(table, socketPath);
-  return { snapshot: snapshotServiceProcesses(statuses, table, supervisorPid), supervisorPid };
+  return snapshotOf(statuses, table, findSupervisorPid(table, socketPath));
+}
+
+/** What the pre-stop snapshot recorded. */
+interface Snapshot {
+  /** The service processes: direct children of process-compose. */
+  readonly snapshot: ServiceProcess[];
+  /** The service processes plus every descendant and process-group member (#155). */
+  readonly tree: ServiceProcess[];
+  readonly supervisorPid: number | undefined;
+  /** The `process list` read, when it succeeded. */
+  readonly statuses?: ReadonlyArray<ServiceStatus>;
+}
+
+function snapshotOf(
+  statuses: ReadonlyArray<ServiceStatus>,
+  table: ReadonlyArray<ProcessRow>,
+  supervisorPid: number | undefined,
+): Snapshot {
+  const snapshot = snapshotServiceProcesses(statuses, table, supervisorPid);
+  return { snapshot, tree: serviceTrees(snapshot, table), supervisorPid, statuses };
+}
+
+/**
+ * Each service process together with the other members of the process group
+ * it leads, labelled with the service (#155). process-compose starts every
+ * service as the leader of a new group, so a member is the service's even
+ * after its parent died and it was reparented to PID 1. A process that left
+ * the group (`setsid`, a detached daemon) is deliberately not included: it
+ * may be shared with other instances. A service process that leads no group
+ * is recorded alone.
+ */
+export function serviceTrees(
+  services: ReadonlyArray<ServiceProcess>,
+  table: ReadonlyArray<ProcessRow>,
+): ServiceProcess[] {
+  const byPid = new Map<number, ServiceProcess>();
+  for (const svc of services) {
+    const members = svc.pgid === svc.pid ? table.filter((row) => row.pgid === svc.pgid) : [];
+    for (const row of [svc, ...members]) {
+      if (!byPid.has(row.pid)) byPid.set(row.pid, { ...row, service: svc.service });
+    }
+  }
+  return [...byPid.values()];
+}
+
+/**
+ * The recorded processes that are still alive and still the same process:
+ * same pid, process group, command line and start time. Unlike
+ * `stillRunning`, the parent may have changed: a member whose parent exited
+ * is reparented, and that is exactly the leftover the sweep is for.
+ */
+export function treeSurvivors(
+  tree: ReadonlyArray<ServiceProcess>,
+  table: ReadonlyArray<ProcessRow>,
+): ServiceProcess[] {
+  const byPid = new Map(table.map((row) => [row.pid, row]));
+  return tree.filter((proc) => {
+    const now = byPid.get(proc.pid);
+    return now !== undefined && sameProcess(proc, now);
+  });
+}
+
+/**
+ * Step 4 (#155): once process-compose has stopped, give each service's
+ * leftover group members `treeGraceMs` to exit, then SIGKILL them.
+ * process-compose sent SIGTERM to each service's group unless the service
+ * is `unsignalled`; those members get SIGTERM from devtrees first. A group
+ * that still has a verified member is killed as a group, so a process that
+ * forks a replacement (a reloader respawning its worker) cannot slip
+ * through. Every process signalled is reported; what is still alive
+ * afterwards is a survivor.
+ */
+async function sweepServiceGroups(
+  tree: ReadonlyArray<ServiceProcess>,
+  groups: { readonly led: ReadonlySet<number>; readonly unsignalled: ReadonlySet<string> },
+  seams: StopSeams,
+): Promise<{ killed: ForceKilled[]; survivors: ServiceProcess[] }> {
+  if (tree.length === 0) return { killed: [], survivors: [] };
+  const { readTable, kill, isAlive, pollMs, graceMs } = sweepSeams(seams);
+  const gone = (procs: ReadonlyArray<ServiceProcess>) => () => procs.every((p) => !isAlive(p.pid));
+  const left = treeSurvivors(tree, await readTable());
+  const termed = left.filter(
+    (p) => groups.unsignalled.has(p.service) && signal(kill, p.pid, "SIGTERM"),
+  );
+  const signalled = (more: ReadonlyArray<ForceKilled>): ForceKilled[] =>
+    dedupe([...termed.map(({ service, pid }) => ({ service, pid })), ...more]);
+  if (await pollUntil(gone(left), graceMs, pollMs)) return { killed: signalled([]), survivors: [] };
+  // Re-verify on a fresh read: never kill a pid reused during the grace.
+  const stuck = treeSurvivors(left, await readTable());
+  const killed = killGroupLeftovers(stuck, groups.led, kill);
+  await pollUntil(gone(stuck), TREE_REAP_MS, pollMs);
+  return { killed: signalled(killed), survivors: treeSurvivors(stuck, await readTable()) };
+}
+
+/** The process groups the services lead. */
+function serviceGroups(services: ReadonlyArray<ServiceProcess>): Set<number> {
+  return new Set(services.filter((p) => p.pgid === p.pid).map((p) => p.pgid));
+}
+
+/** `procs` with each pid once, first occurrence kept. */
+function dedupe(procs: ReadonlyArray<ForceKilled>): ForceKilled[] {
+  const seen = new Set<number>();
+  return procs.filter((p) => !seen.has(p.pid) && seen.add(p.pid) !== undefined);
+}
+
+/** The group sweep's seams, defaulted. */
+function sweepSeams(seams: StopSeams) {
+  return {
+    readTable: seams.readProcessTable ?? readProcessTable,
+    kill: seams.kill ?? process.kill.bind(process),
+    isAlive: seams.isAlive ?? isPidAlive,
+    pollMs: seams.pollMs ?? DOWN_POLL_MS,
+    graceMs: seams.treeGraceMs ?? TREE_GRACE_MS,
+  } as const;
+}
+
+/**
+ * SIGKILL each leftover: by its process group (one signal per group) when
+ * it is in a group its service leads, else (a service process that leads
+ * none) by pid. Reports those a signal reached.
+ */
+function killGroupLeftovers(
+  stuck: ReadonlyArray<ServiceProcess>,
+  groups: ReadonlySet<number>,
+  kill: (target: number, signal: NodeJS.Signals) => void,
+): ForceKilled[] {
+  const sent = new Map<number, boolean>();
+  return stuck.flatMap((proc) => {
+    const target = groups.has(proc.pgid) ? -proc.pgid : proc.pid;
+    if (!sent.has(target)) sent.set(target, signal(kill, target, "SIGKILL"));
+    return sent.get(target) === true ? [{ service: proc.service, pid: proc.pid }] : [];
+  });
+}
+
+/** Send a signal; false when the target is already gone. */
+function signal(
+  kill: (target: number, signal: NodeJS.Signals) => void,
+  target: number,
+  sig: NodeJS.Signals,
+): boolean {
+  try {
+    kill(target, sig);
+    return true;
+  } catch {
+    // Exited on its own between the read and the signal.
+    return false;
+  }
+}
+
+/** Poll `done` every `pollMs` for up to `ms`; true once it holds. */
+async function pollUntil(done: () => boolean, ms: number, pollMs: number): Promise<boolean> {
+  const deadline = Date.now() + ms;
+  while (!done()) {
+    if (Date.now() >= deadline) return false;
+    await new Promise((r) => setTimeout(r, pollMs));
+  }
+  return true;
 }
 
 /**
@@ -803,11 +1041,5 @@ async function waitForExit(
   const exists = seams.exists ?? existsSync;
   const gone = (): boolean =>
     supervisorPid === undefined ? !exists(socketPath) : !isAlive(supervisorPid);
-  const deadline = Date.now() + (seams.graceMs ?? DOWN_GRACE_MS);
-  const poll = seams.pollMs ?? DOWN_POLL_MS;
-  while (!gone()) {
-    if (Date.now() >= deadline) return false;
-    await new Promise((r) => setTimeout(r, poll));
-  }
-  return true;
+  return pollUntil(gone, seams.graceMs ?? DOWN_GRACE_MS, seams.pollMs ?? DOWN_POLL_MS);
 }

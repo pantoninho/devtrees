@@ -12,8 +12,10 @@ import {
   parseProcessTable,
   pendingRunsToKill,
   readSupervisedTable,
+  serviceTrees,
   snapshotServiceProcesses,
   stillRunning,
+  treeSurvivors,
   type ProcessRow,
   type StopDriver,
   type StopTarget,
@@ -204,6 +206,7 @@ function world(opts: {
     exists: () => false,
     graceMs: 50,
     pollMs: 5,
+    treeGraceMs: 20,
   };
   return { driver, seams, kills, downs, tableReads: () => tableReads };
 }
@@ -223,7 +226,7 @@ describe("boundedDown", () => {
       tables: [[PC, WEB]],
       outcome: { stopped: true },
     });
-    expect(await boundedDown(target, w.driver, w.seams)).toEqual({ forceKilled: [] });
+    expect((await boundedDown(target, w.driver, w.seams)).forceKilled).toEqual([]);
     expect(w.downs).toEqual([31_000]);
     expect(w.kills).toEqual([]);
   });
@@ -246,7 +249,7 @@ describe("boundedDown", () => {
       outcome: { stopped: false, reason: "timeout" },
     });
     const result = await boundedDown(target, w.driver, w.seams);
-    expect(result).toEqual({ forceKilled: [{ service: "web", pid: 201 }] });
+    expect(result.forceKilled).toEqual([{ service: "web", pid: 201 }]);
     expect(w.kills).toEqual([[-201, "SIGKILL"]]);
   });
 
@@ -270,7 +273,7 @@ describe("boundedDown", () => {
       ],
       outcome: { stopped: false, reason: "timeout" },
     });
-    expect(await boundedDown(target, w.driver, w.seams)).toEqual({ forceKilled: [] });
+    expect((await boundedDown(target, w.driver, w.seams)).forceKilled).toEqual([]);
     expect(w.kills).toEqual([]);
   });
 
@@ -281,7 +284,7 @@ describe("boundedDown", () => {
       outcome: { stopped: false, reason: "timeout" },
       killThrows: true,
     });
-    expect(await boundedDown(target, w.driver, w.seams)).toEqual({ forceKilled: [] });
+    expect((await boundedDown(target, w.driver, w.seams)).forceKilled).toEqual([]);
   });
 
   it("throws DOWN_TIMEOUT naming the stuck services and the process-compose pid when it never exits", async () => {
@@ -339,7 +342,7 @@ describe("boundedDown", () => {
       ...w.seams,
       exists: () => ++polls < 3,
     });
-    expect(result).toEqual({ forceKilled: [] });
+    expect(result.forceKilled).toEqual([]);
     expect(polls).toBe(3);
   });
 
@@ -468,7 +471,11 @@ describe("boundedDown with a pending reload (#206)", () => {
       down: async () => {
         events.push("down");
         downCalled = true;
-        return opts.outcome ?? { stopped: true };
+        const outcome = opts.outcome ?? { stopped: true };
+        // A clean stop stops every service it lists (#155: the tree sweep
+        // that follows then finds nothing left).
+        if (outcome.stopped) for (const pid of [202, 401, 402]) alive.delete(pid);
+        return outcome;
       },
     };
     const rows = [PC, API, OLD, NEW, API_NEW];
@@ -493,6 +500,7 @@ describe("boundedDown with a pending reload (#206)", () => {
       exists: () => alive.has(100),
       graceMs: 30,
       pollMs: 2,
+      treeGraceMs: 30,
       settleMs: opts.settleMs ?? 200,
       stuckGraceMs: opts.stuckGraceMs ?? 0,
     };
@@ -524,7 +532,7 @@ describe("boundedDown with a pending reload (#206)", () => {
   it("kills the stuck old run before the stop, by process group, and reports it", async () => {
     const w = pendingWorld();
     const result = await boundedDown({ ...target, pendingReload: PENDING }, w.driver, w.seams);
-    expect(result).toEqual({ forceKilled: [{ service: "web", pid: 301 }] });
+    expect(result.forceKilled).toEqual([{ service: "web", pid: 301 }]);
     expect(w.events).toEqual(["kill -301", "web listed as 401", "down"]);
   });
 
@@ -539,7 +547,7 @@ describe("boundedDown with a pending reload (#206)", () => {
     // old run is listed and healthy, and must get its shutdown.command.
     const w = pendingWorld({ apiQueued: true, lag: 3 });
     const result = await boundedDown({ ...target, pendingReload: BOTH }, w.driver, w.seams);
-    expect(result).toEqual({ forceKilled: [{ service: "web", pid: 301 }] });
+    expect(result.forceKilled).toEqual([{ service: "web", pid: 301 }]);
     expect(w.events).not.toContain("kill -202");
     expect(w.events).toEqual([
       "kill -301",
@@ -645,15 +653,21 @@ describe("boundedDown with a pending reload (#206)", () => {
     const w = pendingWorld();
     const reused = {
       ...w.seams,
-      readProcessTable: async () => [PC, API, NEW, { ...OLD, command: "vim notes" }],
-      isAlive: (pid: number) => pid === 100 || pid === 202 || pid === 401,
+      // The clean stop takes api and web's new copy down with it.
+      readProcessTable: async () => [
+        PC,
+        ...(w.events.includes("down") ? [] : [API, NEW]),
+        { ...OLD, command: "vim notes" },
+      ],
+      isAlive: (pid: number) =>
+        pid === 100 || (!w.events.includes("down") && (pid === 202 || pid === 401)),
     };
     const relisted: StopDriver = {
       ...w.driver,
       getServiceStatuses: async () => [status("web", 401), status("api", 202)],
     };
     const result = await boundedDown({ ...target, pendingReload: PENDING }, relisted, reused);
-    expect(result).toEqual({ forceKilled: [] });
+    expect(result.forceKilled).toEqual([]);
     expect(w.events).toEqual(["down"]);
   });
 
@@ -671,12 +685,10 @@ describe("boundedDown with a pending reload (#206)", () => {
       // api's update starts once web's new copy is up, and hangs too.
       const w = pendingWorld({ apiQueued: true, apiHangs: true, lag: 2 });
       const result = await boundedDown({ ...target, pendingReload: BOTH }, w.driver, w.seams);
-      expect(result).toEqual({
-        forceKilled: [
-          { service: "web", pid: 301 },
-          { service: "api", pid: 202 },
-        ],
-      });
+      expect(result.forceKilled).toEqual([
+        { service: "web", pid: 301 },
+        { service: "api", pid: 202 },
+      ]);
       expect(w.events).toEqual([
         "kill -301",
         "web listed as 401",
@@ -726,7 +738,7 @@ describe("boundedDown with a pending reload (#206)", () => {
         },
       };
       const result = await boundedDown({ ...target, pendingReload: PENDING }, driver, w.seams);
-      expect(result).toEqual({ forceKilled: [], supervisorExited: true });
+      expect(result).toMatchObject({ forceKilled: [], supervisorExited: true });
       expect(w.events).not.toContain("down");
     });
   });
@@ -735,7 +747,7 @@ describe("boundedDown with a pending reload (#206)", () => {
     it("lets a slow graceful stop finish: no kill, the update completes, then the stop", async () => {
       const w = pendingWorld({ stuckGraceMs: 60_000, oldExitsAfter: 10 });
       const result = await boundedDown({ ...target, pendingReload: PENDING }, w.driver, w.seams);
-      expect(result).toEqual({ forceKilled: [] });
+      expect(result.forceKilled).toEqual([]);
       expect(w.events).toEqual(["301 exited", "web listed as 401", "down"]);
     });
 
@@ -753,7 +765,7 @@ describe("boundedDown with a pending reload (#206)", () => {
         ...w.seams,
         kill,
       });
-      expect(result).toEqual({ forceKilled: [{ service: "web", pid: 301 }] });
+      expect(result.forceKilled).toEqual([{ service: "web", pid: 301 }]);
       expect(killedAfter).toBeGreaterThanOrEqual(150);
       expect(w.events).toEqual(["kill -301", "web listed as 401", "down"]);
     });
@@ -766,7 +778,7 @@ describe("boundedDown with a pending reload (#206)", () => {
         w.driver,
         w.seams,
       );
-      expect(result).toEqual({ forceKilled: [{ service: "web", pid: 301 }] });
+      expect(result.forceKilled).toEqual([{ service: "web", pid: 301 }]);
     });
 
     it("ignores an unlistedAt in the future", async () => {
@@ -806,9 +818,10 @@ describe("boundedDown with a pending reload (#206)", () => {
     await w.driver.getServiceStatuses(SOCK); // the update lists web again
     w.events.length = 0;
     const result = await boundedDown({ ...target, pendingReload: PENDING }, w.driver, w.seams);
-    expect(result).toEqual({ forceKilled: [] });
+    expect(result.forceKilled).toEqual([]);
     expect(w.events).toEqual(["down"]);
-    expect(w.tableReads()).toBe(1);
+    // One read shared before the stop, one for the tree sweep after it (#155).
+    expect(w.tableReads()).toBe(2);
   });
 });
 
@@ -835,5 +848,162 @@ describe("readSupervisedTable", () => {
       supervisorPid: undefined,
     });
     expect(i).toBe(2);
+  });
+});
+
+// Issue #155: process-compose calls a service stopped once its direct child
+// exits, so a grandchild that ignores SIGTERM (`exec pnpm exec keyshelf run
+// ... -- uv run ... uvicorn --reload`) outlived `down`, holding its port.
+describe("service process groups (#155)", () => {
+  const T0 = "Tue Oct 13 14:06:00 2026";
+  /** `web`'s wrapper chain: WEB (sh) -> UV -> UVICORN, all in WEB's group. */
+  const UV: ProcessRow = { pid: 501, ppid: 201, pgid: 201, command: "uv run uvicorn", started: T0 };
+  const UVICORN: ProcessRow = {
+    pid: 502,
+    ppid: 501,
+    pgid: 201,
+    command: "python uvicorn",
+    started: T0,
+  };
+  /** A descendant that left the group on purpose (setsid): maybe shared by other instances. */
+  const DETACHED: ProcessRow = {
+    pid: 503,
+    ppid: 502,
+    pgid: 503,
+    command: "python shared-daemon",
+    started: T0,
+  };
+  /** UVICORN after its parents died: reparented to PID 1, still in WEB's group. */
+  const ORPHAN: ProcessRow = { ...UVICORN, ppid: 1 };
+  const svc = (row: ProcessRow) => ({ service: "web", ...row });
+
+  it("parseProcessTable reads the start time when ps prints lstart", () => {
+    const rows = parseProcessTable(
+      [
+        "  502   501   201 Tue Oct 13 14:06:00 2026 python uvicorn",
+        "  503     1   503 Sat Oct  3 09:01:02 2026 python worker --x",
+      ].join("\n"),
+    );
+    expect(rows).toEqual([
+      { pid: 502, ppid: 501, pgid: 201, command: "python uvicorn", started: T0 },
+      {
+        pid: 503,
+        ppid: 1,
+        pgid: 503,
+        command: "python worker --x",
+        started: "Sat Oct 3 09:01:02 2026",
+      },
+    ]);
+  });
+
+  it("serviceTrees: each service with its process-group members, never a process that left the group", () => {
+    const stray: ProcessRow = { pid: 600, ppid: 1, pgid: 201, command: "python reloader" };
+    const other: ProcessRow = { pid: 700, ppid: 1, pgid: 700, command: "vim" };
+    const tree = serviceTrees([svc(WEB)], [PC, WEB, UV, UVICORN, DETACHED, stray, other, OLD]);
+    expect(tree.map((p) => p.pid)).toEqual([201, 501, 502, 600]);
+    expect(tree.every((p) => p.service === "web")).toBe(true);
+  });
+
+  it("serviceTrees never includes process-compose's other children, such as a pending reload's old run", () => {
+    const tree = serviceTrees([svc(WEB)], [PC, WEB, UV, OLD, HOOK]);
+    expect(tree.map((p) => p.pid)).toEqual([201, 501]);
+  });
+
+  it("treeSurvivors accepts a reparented process", () => {
+    expect(treeSurvivors([svc(UVICORN)], [ORPHAN])).toEqual([svc(UVICORN)]);
+  });
+
+  it("treeSurvivors rejects a reused pid: another command, process group or start time", () => {
+    const tree = [svc(UVICORN)];
+    expect(treeSurvivors(tree, [{ ...ORPHAN, command: "vim" }])).toEqual([]);
+    expect(treeSurvivors(tree, [{ ...ORPHAN, pgid: 900 }])).toEqual([]);
+    expect(treeSurvivors(tree, [{ ...ORPHAN, started: "Wed Oct 14 08:00:00 2026" }])).toEqual([]);
+  });
+
+  /** A clean stop of `web`, after which `left` is what the process table still shows. */
+  function sweepWorld(
+    left: ProcessRow[],
+    opts: { exitsOnTerm?: boolean; killTakes?: boolean } = {},
+  ) {
+    const alive = new Set(left.map((r) => r.pid));
+    const signals: Array<[number, string]> = [];
+    let reads = 0;
+    const w = world({ statuses: [status("web", 201)], tables: [], outcome: { stopped: true } });
+    const seams = {
+      ...w.seams,
+      readProcessTable: async () =>
+        reads++ === 0 ? [PC, WEB, UV, UVICORN, DETACHED] : left.filter((r) => alive.has(r.pid)),
+      kill: (target: number, sig: NodeJS.Signals) => {
+        signals.push([target, sig]);
+        const hit = left.filter((r) => (target < 0 ? r.pgid === -target : r.pid === target));
+        const takes = sig === "SIGTERM" ? opts.exitsOnTerm === true : opts.killTakes !== false;
+        if (takes) for (const r of hit) alive.delete(r.pid);
+      },
+      isAlive: (pid: number) => alive.has(pid),
+    };
+    return { driver: w.driver, seams, signals };
+  }
+
+  it("SIGKILLs a SIGTERM-ignoring grandchild's group after the grace, and reports it", async () => {
+    const w = sweepWorld([ORPHAN]);
+    const result = await boundedDown(target, w.driver, w.seams);
+    expect(w.signals).toEqual([[-201, "SIGKILL"]]);
+    expect(result.forceKilled).toEqual([{ service: "web", pid: 502 }]);
+    expect(result.survivors).toBeUndefined();
+  });
+
+  it("never signals a descendant that left the service's group (a detached, maybe shared daemon)", async () => {
+    const w = sweepWorld([{ ...DETACHED, ppid: 1 }]);
+    const result = await boundedDown(target, w.driver, w.seams);
+    expect(w.signals).toEqual([]);
+    expect(result.forceKilled).toEqual([]);
+  });
+
+  it("sends SIGTERM first when process-compose did not signal the group, and reports it", async () => {
+    const w = sweepWorld([ORPHAN], { exitsOnTerm: true });
+    const result = await boundedDown(
+      { ...target, unsignalled: new Set(["web"]) },
+      w.driver,
+      w.seams,
+    );
+    expect(w.signals).toEqual([[502, "SIGTERM"]]);
+    expect(result.forceKilled).toEqual([{ service: "web", pid: 502 }]);
+  });
+
+  it("then SIGKILLs the group when SIGTERM did not take, reporting the process once", async () => {
+    const w = sweepWorld([ORPHAN]);
+    const result = await boundedDown(
+      { ...target, unsignalled: new Set(["web"]) },
+      w.driver,
+      w.seams,
+    );
+    expect(w.signals).toEqual([
+      [502, "SIGTERM"],
+      [-201, "SIGKILL"],
+    ]);
+    expect(result.forceKilled).toEqual([{ service: "web", pid: 502 }]);
+  });
+
+  it("returns what SIGKILL could not stop as survivors", async () => {
+    const w = sweepWorld([ORPHAN], { killTakes: false });
+    const result = await boundedDown(target, w.driver, w.seams);
+    expect(result.survivors).toEqual([svc(UVICORN)]);
+  });
+
+  it("never kills a pid reused during the grace, even with the same command line", async () => {
+    const reused = { ...ORPHAN, started: "Wed Oct 14 08:00:00 2026" };
+    const w = sweepWorld([ORPHAN]);
+    let n = 0;
+    const tables = [[PC, WEB, UV, UVICORN], [ORPHAN], [reused]];
+    const seams = { ...w.seams, readProcessTable: async () => tables[Math.min(n++, 2)] ?? [] };
+    const result = await boundedDown(target, w.driver, seams);
+    expect(w.signals).toEqual([]);
+    expect(result.forceKilled).toEqual([]);
+  });
+
+  it("returns the pre-stop process list for the caller", async () => {
+    const w = sweepWorld([]);
+    const result = await boundedDown(target, w.driver, w.seams);
+    expect(result.statuses).toEqual([status("web", 201)]);
   });
 });
