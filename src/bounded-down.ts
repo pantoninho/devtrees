@@ -507,65 +507,123 @@ async function finishPendingReload(
 ): Promise<{ killed: ForceKilled[]; view?: InstanceView; supervisorExited?: true }> {
   const pending = target.pendingReload;
   if (!hasPendingWork(pending)) return { killed: [] };
-  const isAlive = seams.isAlive ?? isPidAlive;
-  const exists = seams.exists ?? existsSync;
-  const readTable = seams.readProcessTable ?? readProcessTable;
-  const kill = seams.kill ?? process.kill.bind(process);
-  const socketPath = target.inst.socketPath;
-  const readStatuses = (): Promise<ServiceStatus[] | undefined> =>
-    driver.getServiceStatuses(socketPath).catch(() => undefined);
-  const done = (rows: ServiceStatus[] | undefined): rows is ServiceStatus[] =>
-    rows !== undefined && stuckFromMarker(pending, rows, isAlive) === undefined;
+  const settle = new PendingSettle(target, pending, driver, seams);
+  const statuses = await settle.readStatuses();
+  const { table, supervisorPid } = await readSupervisedTable(
+    settle.readTable,
+    target.inst.socketPath,
+    { delayMs: seams.pollMs },
+  );
+  if (settle.done(statuses)) return { killed: [], view: { statuses, table, supervisorPid } };
+  return settle.run(statuses, table, supervisorPid);
+}
 
-  const startedAt = Date.now();
-  let statuses = await readStatuses();
-  let { table, supervisorPid } = await readSupervisedTable(readTable, socketPath, {
-    delayMs: seams.pollMs,
-  });
-  if (done(statuses)) return { killed: [], view: { statuses, table, supervisorPid } };
-
-  const graceMs = seams.stuckGraceMs ?? target.timeoutMs;
-  const settleMs = seams.settleMs ?? Math.max(PENDING_SETTLE_MS, target.timeoutMs);
-  const killed: ForceKilled[] = [];
+/** One step-0 wait: its seams, budgets and what it has seen and killed so far. */
+class PendingSettle {
+  readonly isAlive: (pid: number) => boolean;
+  readonly readTable: () => Promise<ProcessRow[]>;
+  private readonly exists: (path: string) => boolean;
+  private readonly kill: (target: number, signal: NodeJS.Signals) => void;
+  private readonly pollMs: number;
+  private readonly graceMs: number;
+  private readonly settleMs: number;
+  private readonly startedAt = Date.now();
+  private deadline: number;
+  private everListed = false;
+  private readonly killed: ForceKilled[] = [];
   /** pid → when its grace period started (unlisted, alive and verified). */
-  const stopping = new Map<number, number>();
-  let deadline = startedAt + settleMs;
-  let everListed = statuses !== undefined;
-  for (;;) {
-    if (done(statuses)) return { killed };
-    if (supervisorGone(socketPath, supervisorPid, isAlive, exists)) {
-      return { killed, supervisorExited: true };
+  private readonly stopping = new Map<number, number>();
+
+  constructor(
+    private readonly target: StopTarget,
+    private readonly pending: PendingReload,
+    private readonly driver: StopDriver,
+    seams: StopSeams,
+  ) {
+    this.isAlive = seams.isAlive ?? isPidAlive;
+    this.readTable = seams.readProcessTable ?? readProcessTable;
+    this.exists = seams.exists ?? existsSync;
+    this.kill = seams.kill ?? process.kill.bind(process);
+    this.pollMs = seams.pollMs ?? DOWN_POLL_MS;
+    this.graceMs = seams.stuckGraceMs ?? target.timeoutMs;
+    this.settleMs = seams.settleMs ?? Math.max(PENDING_SETTLE_MS, target.timeoutMs);
+    this.deadline = this.startedAt + this.settleMs;
+  }
+
+  /** A `process list` read; `undefined` when it fails. */
+  async readStatuses(): Promise<ServiceStatus[] | undefined> {
+    const rows = await this.driver
+      .getServiceStatuses(this.target.inst.socketPath)
+      .catch(() => undefined);
+    this.everListed ||= rows !== undefined;
+    return rows;
+  }
+
+  /** Has the update finished, as `rows` shows it? */
+  done(rows: ServiceStatus[] | undefined): rows is ServiceStatus[] {
+    return rows !== undefined && stuckFromMarker(this.pending, rows, this.isAlive) === undefined;
+  }
+
+  /** Poll until the update finishes, process-compose exits, or the deadline passes. */
+  async run(
+    first: ServiceStatus[] | undefined,
+    firstTable: ReadonlyArray<ProcessRow>,
+    knownPid: number | undefined,
+  ): Promise<{ killed: ForceKilled[]; supervisorExited?: true }> {
+    let statuses = first;
+    let table = firstTable;
+    let supervisorPid = knownPid;
+    for (;;) {
+      if (this.done(statuses)) return { killed: this.killed };
+      if (this.supervisorGone(supervisorPid)) {
+        return { killed: this.killed, supervisorExited: true };
+      }
+      const now = Date.now();
+      this.killDue(stuckRuns(this.pending, statuses, table, supervisorPid), now);
+      if (now >= this.deadline) break;
+      await new Promise((r) => setTimeout(r, this.pollMs));
+      statuses = await this.readStatuses();
+      // Never decide on an older `ps` read: a run it shows alive may have
+      // exited since, and its pid been reused.
+      table = needsTable(this.pending, statuses, this.isAlive) ? await this.readTable() : [];
+      supervisorPid ??= findSupervisorPid(table, this.target.inst.socketPath);
     }
-    const now = Date.now();
-    for (const proc of stuckRuns(pending, statuses, table, supervisorPid)) {
-      if (killed.some((k) => k.pid === proc.pid)) continue;
-      const since = stopping.get(proc.pid) ?? stoppingSince(pending, proc.pid, now);
-      stopping.set(proc.pid, since);
-      if (now - since < graceMs) {
-        deadline = Math.max(deadline, since + graceMs + settleMs);
+    throw pendingTimeout(this.target, {
+      waitedMs: this.deadline - this.startedAt,
+      killed: this.killed,
+      rows: statuses,
+      everListed: this.everListed,
+      table,
+      supervisorPid,
+      isAlive: this.isAlive,
+    });
+  }
+
+  /** Has process-compose exited? By its pid when known, else by its control socket. */
+  private supervisorGone(supervisorPid: number | undefined): boolean {
+    return supervisorPid === undefined
+      ? !this.exists(this.target.inst.socketPath)
+      : !this.isAlive(supervisorPid);
+  }
+
+  /**
+   * SIGKILL each stuck run whose grace period has passed, and stretch the
+   * deadline to cover the grace periods still running and each new copy's
+   * start after a kill.
+   */
+  private killDue(runs: ReadonlyArray<ServiceProcess>, now: number): void {
+    for (const proc of runs) {
+      if (this.killed.some((k) => k.pid === proc.pid)) continue;
+      const since = this.stopping.get(proc.pid) ?? stoppingSince(this.pending, proc.pid, now);
+      this.stopping.set(proc.pid, since);
+      if (now - since < this.graceMs) {
+        this.deadline = Math.max(this.deadline, since + this.graceMs + this.settleMs);
         continue;
       }
-      killed.push(...killProcesses([proc], kill));
-      deadline = Math.max(deadline, now + settleMs);
+      this.killed.push(...killProcesses([proc], this.kill));
+      this.deadline = Math.max(this.deadline, now + this.settleMs);
     }
-    if (now >= deadline) break;
-    await new Promise((r) => setTimeout(r, seams.pollMs ?? DOWN_POLL_MS));
-    statuses = await readStatuses();
-    everListed ||= statuses !== undefined;
-    // Never decide on an older `ps` read: a run it shows alive may have
-    // exited since, and its pid been reused.
-    table = needsTable(pending, statuses, isAlive) ? await readTable() : [];
-    supervisorPid ??= findSupervisorPid(table, socketPath);
   }
-  throw pendingTimeout(target, {
-    waitedMs: deadline - startedAt,
-    killed,
-    rows: statuses,
-    everListed,
-    table,
-    supervisorPid,
-    isAlive,
-  });
 }
 
 /**
@@ -576,16 +634,6 @@ async function finishPendingReload(
 function stoppingSince(pending: PendingReload, pid: number, now: number): number {
   const at = pending.oldRuns.find((run) => run.pid === pid)?.unlistedAt;
   return typeof at === "number" && Number.isFinite(at) && at <= now ? at : now;
-}
-
-/** Has process-compose exited? By its pid when known, else by its control socket. */
-function supervisorGone(
-  socketPath: string,
-  supervisorPid: number | undefined,
-  isAlive: (pid: number) => boolean,
-  exists: (path: string) => boolean,
-): boolean {
-  return supervisorPid === undefined ? !exists(socketPath) : !isAlive(supervisorPid);
 }
 
 /**
@@ -623,40 +671,30 @@ function hasPendingWork(pending: PendingReload | undefined): pending is PendingR
   return pending !== undefined && (pending.oldRuns.length > 0 || pending.services.length > 0);
 }
 
+/** What a pending reload's `DOWN_TIMEOUT` is built from. */
+interface PendingTimeoutState {
+  readonly waitedMs: number;
+  readonly killed: ReadonlyArray<ForceKilled>;
+  readonly rows: ServiceStatus[] | undefined;
+  readonly everListed: boolean;
+  readonly table: ReadonlyArray<ProcessRow>;
+  readonly supervisorPid: number | undefined;
+  readonly isAlive: (pid: number) => boolean;
+}
+
 /**
  * The `DOWN_TIMEOUT` for a pending reload that did not finish: the stop was
- * never begun. It names the old runs still alive. A run is called
- * unverified only when its recorded identity is missing or no longer
- * matches; a run process-compose still lists is queued, not stuck; and when
- * `process list` could never be read, that is what the message says.
+ * never begun. It names the old runs still alive, and hands the remedy those
+ * not merely queued (all of them when `process list` could not be read).
  */
-function pendingTimeout(
-  target: StopTarget,
-  at: {
-    readonly waitedMs: number;
-    readonly killed: ReadonlyArray<ForceKilled>;
-    readonly rows: ServiceStatus[] | undefined;
-    readonly everListed: boolean;
-    readonly table: ReadonlyArray<ProcessRow>;
-    readonly supervisorPid: number | undefined;
-    readonly isAlive: (pid: number) => boolean;
-  },
-): DownTimeoutError {
+function pendingTimeout(target: StopTarget, at: PendingTimeoutState): DownTimeoutError {
   const pending = target.pendingReload ?? { services: [], oldRuns: [] };
   const stuck = stuckFromMarker(pending, at.rows, at.isAlive);
-  const pids = new Set(stuck?.pids ?? []);
+  const pids = new Set(stuck?.pids);
   const alive = pending.oldRuns.filter((run) => pids.has(run.pid));
   const listed = new Set(at.rows?.map((r) => r.pid));
   // Without a list, any live old run may be the stuck one.
   const unlisted = at.rows === undefined ? alive : alive.filter((run) => !listed.has(run.pid));
-  const verified = new Set(
-    pendingRunsToKill(unlisted, [], at.table, at.supervisorPid).map((p) => p.pid),
-  );
-  const unverified = at.everListed ? unlisted.filter((run) => !verified.has(run.pid)) : [];
-  const lead = at.everListed
-    ? unverifiedLead(unverified.map(processOf))
-    : "devtrees could not read process-compose's process list during the whole wait, so " +
-      "it could not tell a stuck old process from a queued one, and killed none. ";
   return new DownTimeoutError(target.command, {
     instance: target.instance,
     socket_path: target.inst.socketPath,
@@ -665,22 +703,38 @@ function pendingTimeout(
     stuck_services: alive.map(processOf),
     force_killed: at.killed,
     pending_reload: stuck?.services ?? [...pending.services],
-    remedy: lead + target.remedy(at.supervisorPid, { oldRuns: unlisted.map(processOf) }),
+    remedy:
+      pendingLead(unlisted, at) +
+      target.remedy(at.supervisorPid, { oldRuns: unlisted.map(processOf) }),
   });
+}
+
+/**
+ * The remedy's lead-in: that `process list` could never be read, or which
+ * runs devtrees could not verify. Unverified means only a missing or
+ * non-matching identity: a verified run is never called that.
+ */
+function pendingLead(unlisted: ReadonlyArray<OldRun>, at: PendingTimeoutState): string {
+  if (!at.everListed) {
+    return (
+      "devtrees could not read process-compose's process list during the whole wait, so " +
+      "it could not tell a stuck old process from a queued one, and killed none. "
+    );
+  }
+  const verified = new Set(
+    pendingRunsToKill(unlisted, [], at.table, at.supervisorPid).map((p) => p.pid),
+  );
+  const unverified = unlisted.filter((run) => !verified.has(run.pid)).map(processOf);
+  if (unverified.length === 0) return "";
+  return (
+    `devtrees could not verify ${describeProcesses(unverified)} as the service's old process ` +
+    "(no recorded identity, or its parent, process group or command line no longer " +
+    "match), so it did not kill it: check it with `ps`. "
+  );
 }
 
 function processOf(run: OldRun): ForceKilled {
   return { service: run.name, pid: run.pid };
-}
-
-/** The remedy's lead-in naming pending old runs whose identity did not check out. */
-function unverifiedLead(runs: ReadonlyArray<ForceKilled>): string {
-  if (runs.length === 0) return "";
-  return (
-    `devtrees could not verify ${describeProcesses(runs)} as the service's old process ` +
-    "(no recorded identity, or its parent, process group or command line no longer " +
-    "match), so it did not kill it: check it with `ps`. "
-  );
 }
 
 /**

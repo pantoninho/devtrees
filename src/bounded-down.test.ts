@@ -422,16 +422,20 @@ describe("boundedDown with a pending reload (#206)", () => {
         events.push("web listed as 401");
       }
     };
+    /** api's update has begun; with `apiHangs`, its old run stays alive. True while it does. */
+    const apiStuck = (): boolean => {
+      if (opts.apiHangs && !apiStopping) {
+        apiStopping = true;
+        events.push("api stopping");
+      }
+      return apiStopping && alive.has(202);
+    };
     const advanceApi = (): void => {
       if (apiQueuedFor < lag) {
         apiQueuedFor++;
         return;
       }
-      if (opts.apiHangs && !apiStopping) {
-        apiStopping = true;
-        events.push("api stopping");
-      }
-      if (apiStopping && alive.has(202)) return;
+      if (apiStuck()) return;
       if (apiIn === -1) {
         apiIn = opts.apiLag ?? lag;
         if (alive.has(202)) {
