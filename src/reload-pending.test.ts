@@ -59,6 +59,28 @@ describe("identifyOldRuns (#206)", () => {
     ]);
   });
 
+  it("stamps unlistedAt on an identified run process-compose no longer lists (its update is stopping it)", () => {
+    const table = [
+      PC,
+      { pid: 100, ppid: 9, pgid: 100, command: "bash -c node a.js" },
+      { pid: 200, ppid: 9, pgid: 200, command: "sleep 300" },
+    ];
+    // web (100) is unlisted: its update began. api (200) is still listed:
+    // queued. gone (300) has no identity, so it gets no stamp either.
+    const listed = {
+      rows: [{ name: "api", status: "Running", health: "unknown", pid: 200 }],
+      at: 1234,
+    };
+    const runs = identifyOldRuns(marker, table, 9, listed as never).oldRuns;
+    expect(runs.map((r) => r.unlistedAt)).toEqual([1234, undefined, undefined]);
+    // Without a `process list` read, nothing is stamped.
+    expect(identifyOldRuns(marker, table, 9).oldRuns.map((r) => r.unlistedAt)).toEqual([
+      undefined,
+      undefined,
+      undefined,
+    ]);
+  });
+
   it("round-trips through the marker file", () => {
     const anchor = mkdtempSync(join(tmpdir(), "dt-pr206-"));
     mkdirSync(join(anchor, "devtrees"), { recursive: true });

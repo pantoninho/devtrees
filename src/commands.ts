@@ -57,6 +57,7 @@ import {
   readSupervisedTable,
   type ForceKilled,
   type StopDriver,
+  type StopResult,
   type StopSeams,
 } from "./bounded-down.js";
 import {
@@ -2169,12 +2170,15 @@ export async function runDown(
           readPendingReload(anchor.anchor, anchor.worktreeId),
         )
       : undefined;
+    // process-compose exited on its own while the pending reload settled
+    // (#206): its socket file may be left behind, with no listener.
+    if (stopped?.supervisorExited) rmSync(paths.socketPath, { force: true });
     // The instance is gone either way, and with it any reload still pending
     // in it (#191). Not reached when the stop throws (DOWN_TIMEOUT keeps it).
     clearPendingReload(anchor.anchor, anchor.worktreeId);
     return stopped;
   });
-  if (stop !== undefined) {
+  if (stop !== undefined && !stop.supervisorExited) {
     return {
       shared: false,
       worktreeId: anchor.worktreeId,
@@ -2188,15 +2192,16 @@ export async function runDown(
   // `shutdown.command`. The hook never fired → out-of-band resources leak. Run
   // it ourselves, socket-free, from the anchor (a directory that exists), so the
   // reap happens even when the supervisor is gone. Idempotent: an already-gone
-  // stack's hook reaps nothing.
+  // stack's hook reaps nothing. A supervisor that exited on its own during
+  // the stop (#206) is reaped the same way, and the instance was stopped.
   const reap = deps.reap ?? reapShutdownHooks;
   const warning = await reapDerivedConfig(paths.configPath, anchor.worktreeId, anchor.anchor, reap);
 
   return {
     shared: false,
     worktreeId: anchor.worktreeId,
-    stopped: false,
-    forceKilled: [],
+    stopped: stop !== undefined,
+    forceKilled: stop?.forceKilled ?? [],
     ...(warning !== undefined ? { warning } : {}),
   };
 }
@@ -2217,14 +2222,15 @@ function stopInstance(
   command: "down" | "prune",
   seams: StopSeams | undefined,
   pendingReload?: PendingReload,
-): Promise<{ readonly forceKilled: ReadonlyArray<ForceKilled> }> {
+): Promise<StopResult> {
   return boundedDown(
     {
       inst: { configPath: paths.configPath, socketPath: paths.socketPath },
       instance,
       command,
       timeoutMs: downTimeoutMs(readDerivedConfig(paths.configPath), seams?.baseTimeoutMs),
-      remedy: (pid) => downTimeoutRemedy(instance, command, paths.socketPath, pid),
+      remedy: (pid, pending) =>
+        downTimeoutRemedy(instance, command, paths.socketPath, pid, pending),
       pendingReload,
     },
     driver,
@@ -2242,10 +2248,23 @@ function downTimeoutRemedy(
   command: "down" | "prune",
   socketPath: string,
   processComposePid: number | undefined,
+  pending?: { readonly oldRuns: ReadonlyArray<ForceKilled> },
 ): string {
   const shared = instance === SHARED_INSTANCE_ID;
   const retry =
     command === "prune" ? "devtrees prune" : shared ? "devtrees down --shared" : "devtrees down";
+  // A pending reload (#206): process-compose's own shutdown waits on the
+  // same old process, so stopping process-compose by hand does not help.
+  // Killing the old process does, and is safe while no stop is running.
+  if (pending !== undefined) {
+    if (pending.oldRuns.length === 0) return `Retry \`${retry}\` in a moment.`;
+    const pids = pending.oldRuns.map((r) => r.pid).join(" ");
+    return (
+      `Kill the old process first (\`kill ${pids}\`, then \`kill -9 ${pids}\` if it ignores ` +
+      `that; safe now, as no stop is running), then retry \`${retry}\`. Stopping ` +
+      "process-compose by hand does not help: its own shutdown waits on the same process."
+    );
+  }
   const pid = processComposePid === undefined ? "<pid>" : String(processComposePid);
   const find =
     processComposePid === undefined
@@ -3195,6 +3214,7 @@ async function persistPendingReload(args: {
   readonly previousConfig: string | undefined;
   readonly nextConfig: string;
   readonly rows: ServiceStatus[] | undefined;
+  readonly driver: { getServiceStatuses(socketPath: string): Promise<ServiceStatus[]> };
 }): Promise<void> {
   // Both sides read back from YAML, so the per-service diff compares like
   // with like.
@@ -3206,13 +3226,20 @@ async function persistPendingReload(args: {
   const readTable = args.deps.stop?.readProcessTable ?? readProcessTable;
   // Retried while empty or without the supervisor (a `ps` that failed under
   // load): a run without an identity is one `down` can never kill.
-  const { table, supervisorPid } =
-    plan.oldRuns.length > 0
-      ? await readSupervisedTable(readTable, args.inst.socketPath, {
-          delayMs: args.deps.stop?.pollMs,
-        })
-      : { table: [], supervisorPid: undefined };
-  const marker = identifyOldRuns(plan, table, supervisorPid);
+  if (plan.oldRuns.length === 0) {
+    writePendingReload(args.anchor.anchor, args.anchor.worktreeId, plan);
+    return;
+  }
+  // Which old runs process-compose has already dropped: their update is
+  // stopping them now, so `down` counts their grace period from here.
+  const listed = await args.driver
+    .getServiceStatuses(args.inst.socketPath)
+    .then((rows) => ({ rows, at: Date.now() }))
+    .catch(() => undefined);
+  const { table, supervisorPid } = await readSupervisedTable(readTable, args.inst.socketPath, {
+    delayMs: args.deps.stop?.pollMs,
+  });
+  const marker = identifyOldRuns(plan, table, supervisorPid, listed);
   writePendingReload(args.anchor.anchor, args.anchor.worktreeId, marker);
 }
 

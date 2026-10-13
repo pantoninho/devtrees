@@ -73,6 +73,14 @@ export interface OldRun {
    * matching identity, so `null` or a missing one means never.
    */
   readonly identity?: OldRunIdentity | null;
+  /**
+   * When the marker was written (epoch ms), if process-compose no longer
+   * listed this run then: its update had already begun stopping it. `down`
+   * measures the run's grace period from here (#206), since it has been
+   * stopping at least that long. Absent when it was still listed (its update
+   * was queued) or the `process list` read failed.
+   */
+  readonly unlistedAt?: number;
 }
 
 /** What a timed-out reload leaves behind (persisted, see the module doc). */
@@ -207,23 +215,29 @@ export function planPendingReload(
  * what the reload is waiting on), as a direct child of the instance's
  * process-compose (`supervisorPid`). A run that is not such a child in
  * `table` (it exited, or the read failed) gets `identity: null`: `down`
- * must never kill it on the pid alone.
+ * must never kill it on the pid alone. `listed` is a `process list` read
+ * taken at the same time, `at` epoch ms: an identified run it does not list
+ * is already being stopped by its update, and gets `unlistedAt: at`.
  */
 export function identifyOldRuns(
   marker: PendingReload,
   table: ReadonlyArray<ProcessRow>,
   supervisorPid: number | undefined,
+  listed?: { readonly rows: ReadonlyArray<ServiceStatus>; readonly at: number },
 ): PendingReload {
   const byPid = new Map(table.map((row) => [row.pid, row]));
+  const listedPids = new Set(listed?.rows.map((r) => r.pid));
   return {
     ...marker,
     oldRuns: marker.oldRuns.map((run) => {
       const row = byPid.get(run.pid);
       const child = supervisorPid !== undefined && row !== undefined && row.ppid === supervisorPid;
+      const unlisted = child && listed !== undefined && !listedPids.has(run.pid);
       return {
         name: run.name,
         pid: run.pid,
         identity: child ? { ppid: row.ppid, pgid: row.pgid, command: row.command } : null,
+        ...(unlisted ? { unlistedAt: listed.at } : {}),
       };
     }),
   };
