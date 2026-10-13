@@ -1194,7 +1194,13 @@ describe("output formatter — formatRestart (#222)", () => {
     expect(result.stderr).toBe("");
     expect(JSON.parse(result.stdout)).toEqual({
       schema_version: SCHEMA_VERSION,
-      restart: { worktree_id: "login", restarted: ["mobile"], services: [], force_killed: [] },
+      restart: {
+        worktree_id: "login",
+        restarted: ["mobile"],
+        services: [],
+        force_killed: [],
+        skipped_shared: [],
+      },
     });
   });
 });
@@ -1492,6 +1498,7 @@ describe("output formatter — formatStop (#223)", () => {
         stopped: [],
         not_running: ["web"],
         force_killed: [],
+        skipped_shared: [],
         transient: true,
         note: "A stop lasts only until the next `devtrees up`, which starts stopped services again.",
       },

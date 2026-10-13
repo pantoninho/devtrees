@@ -766,6 +766,24 @@ export interface StopPayload {
   /** Named services that were not running (already stopped, done or not booted). */
   readonly notRunning: ReadonlyArray<string>;
   readonly forceKilled?: ReadonlyArray<ForceKilledRow>;
+  /** Shared services in a `-n` namespace, not stopped (#224). Defaults to `[]`. */
+  readonly skippedShared?: ReadonlyArray<string>;
+}
+
+/**
+ * The line reporting shared services a `-n` expansion skipped (#224): a
+ * worktree's verb never acts on the shared instance (ADR-0008, ADR-0009).
+ */
+function skippedSharedLines(
+  command: "restart" | "stop",
+  skipped: ReadonlyArray<string> | undefined,
+): string[] {
+  if (skipped === undefined || skipped.length === 0) return [];
+  return [
+    `devtrees ${command}: skipped shared ${skipped.length === 1 ? "service" : "services"} ` +
+      `${skipped.join(", ")}: the shared instance serves every worktree, so devtrees does ` +
+      `not ${command} its services from a worktree.`,
+  ];
 }
 
 /** The transient-stop caveat both output modes carry (ADR-0009). */
@@ -777,8 +795,9 @@ const STOP_NOTE =
  * next `up` brings the services back (ADR-0009).
  *
  *   - `json`: `{schema_version, stop: {worktreeId, stopped[], not_running[],
- *     force_killed[], transient: true, note}}`.
- *   - `human`: what was stopped, what was not running, and the caveat on
+ *     force_killed[], skipped_shared[], transient: true, note}}`.
+ *   - `human`: what was stopped, what was not running, the shared services a
+ *     `-n` skipped, and the caveat on
  *     stdout; a force-kill warning on stderr, as on `down`.
  */
 export function formatStop(payload: StopPayload, mode: FormatMode): OutputResult {
@@ -788,6 +807,7 @@ export function formatStop(payload: StopPayload, mode: FormatMode): OutputResult
       stopped: [...payload.stopped],
       not_running: [...payload.notRunning],
       force_killed: forceKilledJson(payload.forceKilled),
+      skipped_shared: [...(payload.skippedShared ?? [])],
       transient: true,
       note: STOP_NOTE,
     };
@@ -800,6 +820,7 @@ export function formatStop(payload: StopPayload, mode: FormatMode): OutputResult
     ...(payload.notRunning.length > 0
       ? [`devtrees stop: not running, nothing to stop: ${payload.notRunning.join(", ")}.`]
       : []),
+    ...skippedSharedLines("stop", payload.skippedShared),
     STOP_NOTE,
   ];
   const what = payload.stopped.join(", ");
@@ -820,15 +841,19 @@ export interface RestartPayload {
   readonly services?: ReadonlyArray<LsServiceRow>;
   /** Old-run processes devtrees signalled because they outlived the restart. */
   readonly forceKilled?: ReadonlyArray<ForceKilledRow>;
+  /** Shared services in a `-n` namespace, not restarted (#224). Defaults to `[]`. */
+  readonly skippedShared?: ReadonlyArray<string>;
 }
 
 /**
  * Render `devtrees restart`.
  *
- *   - `human`: one line naming what was restarted, in the shape of `up`'s;
- *     a restart that had to force-kill an old run adds a stderr warning.
+ *   - `human`: one line naming what was restarted, in the shape of `up`'s,
+ *     and one naming the shared services a `-n` skipped; a restart that had
+ *     to force-kill an old run adds a stderr warning.
  *   - `json`: `{schema_version, restart: {worktree_id, restarted[],
- *     services[], force_killed[]}}`; every list is always present.
+ *     services[], force_killed[], skipped_shared[]}}`; every list is always
+ *     present.
  */
 export function formatRestart(payload: RestartPayload, mode: FormatMode): OutputResult {
   const forceKilled = payload.forceKilled ?? [];
@@ -838,6 +863,7 @@ export function formatRestart(payload: RestartPayload, mode: FormatMode): Output
       restarted: payload.restarted,
       services: (payload.services ?? []).map(lsServiceJson),
       force_killed: forceKilledJson(forceKilled),
+      skipped_shared: [...(payload.skippedShared ?? [])],
     };
     return {
       stdout: `${JSON.stringify({ schema_version: SCHEMA_VERSION, restart })}\n`,
@@ -849,10 +875,11 @@ export function formatRestart(payload: RestartPayload, mode: FormatMode): Output
       ? ""
       : `devtrees restart: WARNING — the old run outlived the restart; devtrees ` +
         `force-killed ${forceKilled.map((k) => `${k.service} (pid ${k.pid})`).join(", ")}.\n`;
-  return {
-    stdout: `devtrees restart: restarted ${payload.restarted.join(", ")} in '${payload.worktreeId}'.\n`,
-    stderr,
-  };
+  const lines = [
+    `devtrees restart: restarted ${payload.restarted.join(", ")} in '${payload.worktreeId}'.`,
+    ...skippedSharedLines("restart", payload.skippedShared),
+  ];
+  return { stdout: `${lines.join("\n")}\n`, stderr };
 }
 
 // --- up --dry-run -----------------------------------------------------------

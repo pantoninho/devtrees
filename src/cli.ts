@@ -195,15 +195,22 @@ export interface ExecuteDeps {
     forceKilled?: ReadonlyArray<ForceKilledRow>;
   } | void>;
   /** `devtrees stop <service...>` (#223). Optional like the other non-core commands. */
-  stop?: (options: { readonly services: ReadonlyArray<string> }) => Promise<{
+  stop?: (options: {
+    readonly services: ReadonlyArray<string>;
+    /** `-n` namespaces, expanded to their isolated services (#224). */
+    readonly namespaces?: ReadonlyArray<string>;
+  }) => Promise<{
     worktreeId: string;
     stopped: ReadonlyArray<string>;
     notRunning: ReadonlyArray<string>;
     forceKilled?: ReadonlyArray<ForceKilledRow>;
+    skippedShared?: ReadonlyArray<string>;
   }>;
   /** `restart <service...>` (ADR-0009, #222). Optional, like the other non-core commands. */
   restart?: (options: {
     readonly services: ReadonlyArray<string>;
+    /** `-n` namespaces, expanded to their isolated services (#224). */
+    readonly namespaces?: ReadonlyArray<string>;
     /** Health-wait window in ms (`--wait-timeout=<seconds>`). */
     readonly waitTimeoutMs?: number;
   }) => Promise<RestartPayload>;
@@ -633,6 +640,10 @@ class StopCommand extends DevtreesCommand {
         "succeeds. Shared services are refused, and so is a service still waiting on its " +
         "dependencies (it has not started), and a stop that would leave the instance with no " +
         "running process (use `devtrees down`).",
+      "`-n <namespace>` (repeatable, mixable with names) adds every isolated service of the " +
+        "namespace; shared services in it are skipped and reported. A namespace the instance " +
+        "did not boot fails NAMESPACE_NOT_RUNNING, and one with no isolated service " +
+        "NO_SERVICES_SELECTED.",
       "The stop is transient: process-compose reports a stopped service like a crashed one, " +
         "so the next `devtrees up` starts it again. There is no `start`; `up` is the way back.",
       errorCodeFooter([
@@ -640,6 +651,7 @@ class StopCommand extends DevtreesCommand {
         "INSTANCE_NOT_FOUND",
         "SERVICE_NOT_FOUND",
         "SHARED_SERVICE_REFUSED",
+        "NO_SERVICES_SELECTED",
         "NAMESPACE_NOT_RUNNING",
         "CONFIG_DRIFT",
         "LAST_SERVICES_RUNNING",
@@ -655,22 +667,31 @@ class StopCommand extends DevtreesCommand {
     examples: [
       ["Stop one service", "devtrees stop web"],
       ["Stop two, with the JSON envelope", "devtrees stop web worker --json"],
-      ["Bring them back", "devtrees up"],
+      ["Stop every isolated service of a namespace", "devtrees stop -n ios"],
+      ["Bring them back", "devtrees up -n ios"],
     ],
   });
 
   services = Option.Rest({ name: "service" });
+  namespaces = Option.Array("--namespace,-n", {
+    description:
+      "Also stop every isolated service of this namespace. Repeatable; shared services are skipped.",
+  });
 
   override async execute(): Promise<number> {
     return this.dispatch(async () => {
-      if (this.services.length === 0) {
+      const namespaces = this.namespaces ?? [];
+      if (this.services.length === 0 && namespaces.length === 0) {
         throw invalidArgsError(
-          "`devtrees stop` needs at least one service name (e.g. `devtrees stop web`). " +
-            "To stop the whole instance, run `devtrees down`.",
+          "`devtrees stop` needs at least one service name or `-n <namespace>` " +
+            "(e.g. `devtrees stop web`). To stop the whole instance, run `devtrees down`.",
         );
       }
       if (!this.context.deps.stop) return 0;
-      const result = await this.context.deps.stop({ services: this.services });
+      const result = await this.context.deps.stop({
+        services: this.services,
+        ...(namespaces.length > 0 ? { namespaces } : {}),
+      });
       this.emit(formatStop(result, this.mode));
       return 0;
     });
@@ -693,7 +714,7 @@ class RestartCommand extends DevtreesCommand {
     // becomes healthy, or dies → HEALTH_TIMEOUT. No names → INVALID_ARGS (bare
     // `restart` is #225).
     details:
-      "Usage: `devtrees restart <service>... [--wait-timeout <seconds>] [--json]`.\n\n" +
+      "Usage: `devtrees restart [<service>...] [-n <namespace>]... [--wait-timeout <seconds>] [--json]`.\n\n" +
       "Restarts each named service in `depends_on` order: stops it, waits for the old " +
       "process to exit, starts it, and waits for it to be healthy before restarting the " +
       "services that depend on it. The instance, its ports and every other service keep " +
@@ -703,9 +724,14 @@ class RestartCommand extends DevtreesCommand {
       "`shutdown.command` is honoured; " +
       "an old process that does not exit within its grace is force-killed, as `down` does, " +
       "and reported. Succeeds once the named services are healthy, as `up` does.\n\n" +
+      "`-n <namespace>` (repeatable, mixable with names) adds every isolated service of the " +
+      "namespace; shared services in it are skipped and reported. A namespace the instance " +
+      "did not boot fails NAMESPACE_NOT_RUNNING, and one with no isolated service " +
+      "NO_SERVICES_SELECTED.\n\n" +
       errorCodeFooter([
         "SERVICE_NOT_FOUND",
         "SHARED_SERVICE_REFUSED",
+        "NO_SERVICES_SELECTED",
         "NAMESPACE_NOT_RUNNING",
         "LAST_SERVICES_RUNNING",
         "SERVICE_PENDING",
@@ -722,18 +748,24 @@ class RestartCommand extends DevtreesCommand {
     examples: [
       ["Restart one service", "devtrees restart mobile"],
       ["Restart two, dependencies first", "devtrees restart api mobile"],
+      ["Restart every isolated service of a namespace", "devtrees restart -n app"],
       ["Restart and emit the JSON envelope", "devtrees restart mobile --json"],
     ],
   });
 
   services = Option.Rest({ name: "service" });
+  namespaces = Option.Array("--namespace,-n", {
+    description:
+      "Also restart every isolated service of this namespace. Repeatable; shared services are skipped.",
+  });
   waitTimeout = Option.String("--wait-timeout", {
     description: "Health-wait timeout in seconds for the restarted services. Default 120.",
   });
 
   override async execute(): Promise<number> {
     return this.dispatch(async () => {
-      if (this.services.length === 0) {
+      const namespaces = this.namespaces ?? [];
+      if (this.services.length === 0 && namespaces.length === 0) {
         throw invalidArgsError(
           "name the service(s) to restart, e.g. `devtrees restart web`. " +
             "To restart the whole stack, run `devtrees down && devtrees up`.",
@@ -742,6 +774,7 @@ class RestartCommand extends DevtreesCommand {
       if (!this.context.deps.restart) return 0;
       const result = await this.context.deps.restart({
         services: this.services,
+        ...(namespaces.length > 0 ? { namespaces } : {}),
         ...(this.waitTimeout !== undefined
           ? { waitTimeoutMs: parseWaitTimeoutSecondsToMs(this.waitTimeout) }
           : {}),
@@ -1285,11 +1318,16 @@ if (isEntrypoint(import.meta.url, process.argv[1])) {
         ...(options?.waitTimeoutMs !== undefined ? { waitTimeoutMs: options.waitTimeoutMs } : {}),
       }),
     down: ({ shared }) => runDown({ stop: stopSeamsFromEnv() }, { shared }),
-    stop: ({ services }) => runStop({ stop: stopSeamsFromEnv() }, { services }),
-    restart: ({ services, waitTimeoutMs }) =>
+    stop: ({ services, namespaces }) =>
+      runStop(
+        { stop: stopSeamsFromEnv() },
+        { services, ...(namespaces !== undefined ? { namespaces } : {}) },
+      ),
+    restart: ({ services, namespaces, waitTimeoutMs }) =>
       runRestart(
         { stop: stopSeamsFromEnv(), ...(waitTimeoutMs !== undefined ? { waitTimeoutMs } : {}) },
         services,
+        namespaces,
       ),
     ls: () => runLs(),
     attach: ({ shared }) => runAttach({}, { shared }),

@@ -175,6 +175,7 @@ describe("devtrees CLI", () => {
         "INSTANCE_NOT_FOUND",
         "SERVICE_NOT_FOUND",
         "SHARED_SERVICE_REFUSED",
+        "NO_SERVICES_SELECTED",
         "NAMESPACE_NOT_RUNNING",
         "CONFIG_DRIFT",
         "LAST_SERVICES_RUNNING",
@@ -194,6 +195,7 @@ describe("devtrees CLI", () => {
       [
         "SERVICE_NOT_FOUND",
         "SHARED_SERVICE_REFUSED",
+        "NO_SERVICES_SELECTED",
         "NAMESPACE_NOT_RUNNING",
         "LAST_SERVICES_RUNNING",
         "SERVICE_PENDING",
@@ -347,8 +349,38 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
           restarted: ["api", "mobile"],
           services: [{ name: "mobile", status: "Running", health: "ready", ports: {} }],
           force_killed: [{ service: "mobile", pid: 42 }],
+          skipped_shared: [],
         },
       });
+    });
+
+    it("routes repeatable -n, mixed with names, and reports skipped shared services (#224)", async () => {
+      const restart = vi
+        .fn()
+        .mockResolvedValue({ ...restarted, forceKilled: [], skippedShared: ["db"] });
+      const result = await execute(["restart", "-n", "app", "worker", "-n", "ios"], {
+        up: vi.fn(),
+        down: vi.fn(),
+        restart,
+      });
+      expect(restart).toHaveBeenCalledWith({ services: ["worker"], namespaces: ["app", "ios"] });
+      expect(result.code).toBe(0);
+      expect(result.stdout).toBe(
+        "devtrees restart: restarted api, mobile in 'login'.\n" +
+          "devtrees restart: skipped shared service db: the shared instance serves every " +
+          "worktree, so devtrees does not restart its services from a worktree.\n",
+      );
+    });
+
+    it("-n alone is enough: no INVALID_ARGS (#224)", async () => {
+      const restart = vi.fn().mockResolvedValue(restarted);
+      const result = await execute(["restart", "--namespace", "app", "--json"], {
+        up: vi.fn(),
+        down: vi.fn(),
+        restart,
+      });
+      expect(restart).toHaveBeenCalledWith({ services: [], namespaces: ["app"] });
+      expect(result.code).toBe(0);
     });
 
     it("no names fails INVALID_ARGS without calling restart", async () => {
@@ -1970,6 +2002,20 @@ describe("devtrees CLI — stop <service...> (#223)", () => {
     });
     expect(String(doc.stop.note)).toContain("devtrees up");
     expect(out.stderr).toBe("");
+  });
+
+  it("passes repeatable -n through, alone or mixed with names, and reports skipped shared (#224)", async () => {
+    const stop = vi.fn().mockResolvedValue({ ...result, skippedShared: ["db"] });
+    const out = await execute(["stop", "-n", "ios", "--json"], {
+      up: vi.fn(),
+      down: vi.fn(),
+      stop,
+    });
+    expect(out.code).toBe(0);
+    expect(stop).toHaveBeenCalledWith({ services: [], namespaces: ["ios"] });
+    expect(JSON.parse(out.stdout).stop.skipped_shared).toEqual(["db"]);
+    await execute(["stop", "web", "-n", "ios", "-n", "app"], { up: vi.fn(), down: vi.fn(), stop });
+    expect(stop).toHaveBeenLastCalledWith({ services: ["web"], namespaces: ["ios", "app"] });
   });
 
   it("in human mode says `up` brings the service back, and warns about force-kills on stderr", async () => {
