@@ -1,7 +1,21 @@
 /**
- * Default port-free probe. Binds an ephemeral listener on `127.0.0.1:port` and
- * uses the bind outcome as the answer: `EADDRINUSE` → port taken; any other bind
- * error bubbles up (we don't want `EACCES` etc. to be silently reported as "free").
+ * Default port-free probe. Binds an ephemeral listener on `port` once per
+ * {@link PROBE_HOSTS} entry and uses the bind outcomes as the answer:
+ * `EADDRINUSE` on any host → port taken; any other bind error bubbles up (we
+ * don't want `EACCES` etc. to be silently reported as "free").
+ *
+ * Why several hosts (#163): libuv sets `SO_REUSEADDR` on listeners, and on macOS
+ * that makes a bind collide only with a holder on the *same* address. A probe on
+ * `127.0.0.1` alone reports a port held on `0.0.0.0`, `::1` or the dual-stack
+ * `::` wildcard (`python3 -m http.server`, Docker/OrbStack published ports, most
+ * dev servers left at their default host) as free. Probing each of the four
+ * local listen addresses closes that gap; the dual-stack `::` probe also catches
+ * an IPv6-only `::` holder. The probes run one after another because they would
+ * collide with each other.
+ *
+ * A host with no IPv6 (`EADDRNOTAVAIL` / `EAFNOSUPPORT` on an IPv6 address) is
+ * not a collision: nothing can hold a port on an address family the host lacks,
+ * so that probe is skipped.
  *
  * Stateless and dependency-free — the allocator injects this seam (`PortFreeProbe`),
  * and tests stub it. Replaces an older `lsof` shell-out so probes are sub-millisecond
@@ -12,23 +26,57 @@ import { spawnSync } from "node:child_process";
 import { createServer } from "node:net";
 
 export function defaultIsPortFree(port: number): Promise<boolean> {
-  return new Promise((resolve, reject) => {
+  return isPortFreeOnAllHosts(port, bindProbe);
+}
+
+/**
+ * The local listen addresses a holder can occupy: IPv4 loopback and wildcard,
+ * IPv6 loopback, and the (dual-stack) IPv6 wildcard.
+ */
+const PROBE_HOSTS = ["127.0.0.1", "0.0.0.0", "::1", "::"] as const;
+
+/** One bind attempt: resolves `true` when the bind succeeded, else the bind error. */
+export type BindProbe = (port: number, host: string) => Promise<true | NodeJS.ErrnoException>;
+
+/** Bind errors meaning "this host lacks the address family", not "taken". */
+const ABSENT_FAMILY_CODES: ReadonlySet<string> = new Set(["EADDRNOTAVAIL", "EAFNOSUPPORT"]);
+
+/**
+ * Probe `port` on every {@link PROBE_HOSTS} entry with `bind`, stopping at the
+ * first collision. Exported with the bind seam so the no-IPv6 handling is
+ * testable on a host that has IPv6.
+ */
+export async function isPortFreeOnAllHosts(port: number, bind: BindProbe): Promise<boolean> {
+  for (const host of PROBE_HOSTS) {
+    const outcome = await bind(port, host);
+    if (outcome === true) continue;
+    if (outcome.code === "EADDRINUSE") return false;
+    if (host.includes(":") && ABSENT_FAMILY_CODES.has(outcome.code ?? "")) continue;
+    throw outcome;
+  }
+  return true;
+}
+
+/**
+ * Bind a throwaway listener on `host:port` and close it again, on every path.
+ * `ipv6Only: false` makes the `::` probe dual-stack.
+ */
+function bindProbe(port: number, host: string): Promise<true | NodeJS.ErrnoException> {
+  return new Promise((resolve) => {
     const server = createServer();
     let settled = false;
-    const finish = (result: boolean | Error) => {
+    const finish = (result: true | NodeJS.ErrnoException) => {
       if (settled) return;
       settled = true;
-      server.close(() => {
-        if (result instanceof Error) reject(result);
-        else resolve(result);
-      });
+      server.close(() => resolve(result));
     };
-    server.once("error", (err: NodeJS.ErrnoException) => {
-      if (err.code === "EADDRINUSE") finish(false);
-      else finish(err);
-    });
+    server.once("error", (err: NodeJS.ErrnoException) => finish(err));
     server.once("listening", () => finish(true));
-    server.listen(port, "127.0.0.1");
+    try {
+      server.listen({ port, host, ipv6Only: false });
+    } catch (err) {
+      finish(err as NodeJS.ErrnoException);
+    }
   });
 }
 
