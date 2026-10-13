@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import { createServer, type Server } from "node:net";
-import { defaultIsPortFree, defaultPortHolder } from "./port-probe.js";
+import {
+  type BindProbe,
+  defaultIsPortFree,
+  defaultPortHolder,
+  isPortFreeOnAllHosts,
+} from "./port-probe.js";
 
 const ephemeral = (): Promise<{ port: number; server: Server }> =>
   new Promise((resolve, reject) => {
@@ -95,4 +100,102 @@ describe("defaultIsPortFree", () => {
       }
     }
   }, 30_000);
+});
+
+/** Listen on an ephemeral port on `host`; `null` when the host lacks that family. */
+const holdOn = (
+  host: string,
+  ipv6Only: boolean,
+): Promise<{ port: number; server: Server } | null> =>
+  new Promise((resolve, reject) => {
+    const server = createServer();
+    server.once("error", (err: NodeJS.ErrnoException) => {
+      if (err.code === "EADDRNOTAVAIL" || err.code === "EAFNOSUPPORT") resolve(null);
+      else reject(err);
+    });
+    server.listen({ port: 0, host, ipv6Only }, () => {
+      const address = server.address();
+      if (address === null || typeof address === "string") {
+        reject(new Error(`unexpected listen address: ${String(address)}`));
+        return;
+      }
+      resolve({ port: address.port, server });
+    });
+  });
+
+describe("defaultIsPortFree sees holders on every local listen address (#163)", () => {
+  // On macOS, SO_REUSEADDR (which libuv sets) lets a bind on 127.0.0.1 succeed
+  // while another process holds the same port on 0.0.0.0, ::1 or ::. A
+  // loopback-only probe therefore called those ports free, and the service
+  // then died on the taken port.
+  const holders: ReadonlyArray<readonly [string, string, boolean]> = [
+    ["IPv4 loopback", "127.0.0.1", false],
+    ["IPv4 wildcard", "0.0.0.0", false],
+    ["IPv6 loopback", "::1", false],
+    ["dual-stack wildcard", "::", false],
+    ["IPv6-only wildcard", "::", true],
+  ];
+
+  for (const [label, host, ipv6Only] of holders) {
+    it(`reports a port held on the ${label} (${host}) as taken`, async (ctx) => {
+      const held = await holdOn(host, ipv6Only);
+      if (held === null) {
+        ctx.skip();
+        return;
+      }
+      try {
+        expect(await defaultIsPortFree(held.port)).toBe(false);
+        const holder = await defaultPortHolder(held.port);
+        expect(holder.free).toBe(false);
+      } finally {
+        await closeServer(held.server);
+      }
+      expect(await defaultIsPortFree(held.port)).toBe(true);
+    });
+  }
+});
+
+describe("isPortFreeOnAllHosts", () => {
+  const err = (code: string): NodeJS.ErrnoException =>
+    Object.assign(new Error(code), { code }) as NodeJS.ErrnoException;
+
+  it("probes 127.0.0.1, 0.0.0.0, ::1 and :: and reports free when every bind succeeds", async () => {
+    const hosts: string[] = [];
+    const free = await isPortFreeOnAllHosts(4000, async (_port, host) => {
+      hosts.push(host);
+      return true;
+    });
+    expect(free).toBe(true);
+    expect(hosts).toEqual(["127.0.0.1", "0.0.0.0", "::1", "::"]);
+  });
+
+  it("reports taken when any host returns EADDRINUSE", async () => {
+    const bind: BindProbe = async (_port, host) => (host === "::" ? err("EADDRINUSE") : true);
+    expect(await isPortFreeOnAllHosts(4000, bind)).toBe(false);
+  });
+
+  it.each(["EADDRNOTAVAIL", "EAFNOSUPPORT"])(
+    "treats %s on an IPv6 address as no collision (host without IPv6)",
+    async (code) => {
+      const bind: BindProbe = async (_port, host) => (host.includes(":") ? err(code) : true);
+      expect(await isPortFreeOnAllHosts(4000, bind)).toBe(true);
+    },
+  );
+
+  it("still sees an IPv4 collision on a host without IPv6", async () => {
+    const bind: BindProbe = async (_port, host) =>
+      host.includes(":") ? err("EAFNOSUPPORT") : host === "0.0.0.0" ? err("EADDRINUSE") : true;
+    expect(await isPortFreeOnAllHosts(4000, bind)).toBe(false);
+  });
+
+  it("bubbles up EADDRNOTAVAIL on an IPv4 address and any other bind error", async () => {
+    await expect(
+      isPortFreeOnAllHosts(4000, async (_port, host) =>
+        host === "0.0.0.0" ? err("EADDRNOTAVAIL") : true,
+      ),
+    ).rejects.toThrow("EADDRNOTAVAIL");
+    await expect(
+      isPortFreeOnAllHosts(4000, async (_port, host) => (host === "::" ? err("EACCES") : true)),
+    ).rejects.toThrow("EACCES");
+  });
 });

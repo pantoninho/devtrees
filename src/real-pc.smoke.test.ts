@@ -28,7 +28,7 @@
 import { afterEach, beforeAll, describe, expect, it } from "vite-plus/test";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { createServer } from "node:net";
+import { createConnection, createServer, type Server } from "node:net";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { deriveWorktreeId } from "./anchor.js";
@@ -1726,6 +1726,129 @@ function oldRuns(marker: ReturnType<typeof readPendingReload>): string[] {
 
 // Without the gate, log once so a developer running `vp test run` locally
 // knows why no scenarios fired.
+/**
+ * A stack whose `web` binds `WEB_PORT` with `python3 -m http.server` (which
+ * listens on the dual-stack `::` wildcard), plus a `keeper` so process-compose
+ * keeps the project alive if `web` dies. Returns the allocated `WEB_PORT`.
+ */
+function writeHttpServerStack(wt: string): number {
+  writeFileSync(
+    join(wt, "devtrees.yaml"),
+    [
+      "services:",
+      "  web:",
+      "    tier: isolated",
+      '    command: "python3 -m http.server $WEB_PORT"',
+      "    ports: [WEB_PORT]",
+      "  keeper:",
+      "    tier: isolated",
+      '    command: "sleep 300"',
+      "",
+    ].join("\n"),
+  );
+  const dry = devtrees(wt, ["up", "--dry-run", "--json"]);
+  expect(dry.code, `up --dry-run failed: ${dry.stderr}`).toBe(0);
+  const port = Number(
+    (dry.doc as { up_dry_run: { env: { WEB_PORT: string } } }).up_dry_run.env.WEB_PORT,
+  );
+  expect(port).toBeGreaterThan(0);
+  return port;
+}
+
+/** Poll until something accepts TCP connections on `127.0.0.1:port`. */
+async function waitForListener(port: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const ok = await new Promise<boolean>((resolve) => {
+      const sock = createConnection({ port, host: "127.0.0.1" });
+      sock.once("connect", () => {
+        sock.destroy();
+        resolve(true);
+      });
+      sock.once("error", () => resolve(false));
+    });
+    if (ok) return true;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return false;
+}
+
+type Collision = { port_name: string; port: number; pid: number | null };
+
+/** The `STALE_PORT_BLOCK` collisions of a failed `up --json`. */
+function staleCollisions(r: CliResult): Collision[] {
+  expect(r.code, `up should fail: ${r.stdout}`).toBe(1);
+  const error = (r.doc as { error?: { code?: string; details?: { collisions?: Collision[] } } })
+    .error;
+  expect(error?.code).toBe("STALE_PORT_BLOCK");
+  return error?.details?.collisions ?? [];
+}
+
+describe.skipIf(!ENABLED)(
+  "real-pc smoke — stale-port preflight on every local address (#163)",
+  () => {
+    it("scenario 75: a python3 -m http.server holder on the dual-stack wildcard fails STALE_PORT_BLOCK, before anything starts (#163)", async () => {
+      const repo = buildSmokeRepo("dt-rpc75-", ["login"]);
+      currentCtx = { pidNeedle: repo.root, root: repo.root };
+      const wt = repo.worktrees.login!;
+      const port = writeHttpServerStack(wt);
+      cleanupStack.push(() => devtrees(wt, ["down"]));
+
+      // Before #163 the preflight bound 127.0.0.1 only, missed this holder,
+      // and `web` died on the taken port after boot.
+      const holder = spawn("python3", ["-m", "http.server", String(port)], { stdio: "ignore" });
+      cleanupStack.push(() => reapPids(holder.pid === undefined ? [] : [holder.pid]));
+      expect(await waitForListener(port, 10_000), "python holder never listened").toBe(true);
+
+      const collisions = staleCollisions(up(wt));
+      expect(collisions).toMatchObject([{ port_name: "WEB_PORT", port }]);
+      const pid = collisions[0]?.pid ?? null;
+      if (pid !== null) expect(pid).toBe(holder.pid);
+      // The preflight runs before process-compose is spawned: no instance.
+      const ls = devtrees(wt, ["ls", "--json"]);
+      expect((ls.doc as { ls: { instances: unknown[] } }).ls.instances).toEqual([]);
+    }, 90_000);
+
+    it("scenario 76: holders on 0.0.0.0, ::1 and an IPv6-only :: each fail STALE_PORT_BLOCK (#163)", async () => {
+      const repo = buildSmokeRepo("dt-rpc76-", ["login"]);
+      currentCtx = { pidNeedle: repo.root, root: repo.root };
+      const wt = repo.worktrees.login!;
+      const port = writeHttpServerStack(wt);
+      cleanupStack.push(() => devtrees(wt, ["down"]));
+
+      const holders: ReadonlyArray<readonly [string, boolean]> = [
+        ["0.0.0.0", false],
+        ["::1", false],
+        ["::", true],
+      ];
+      for (const [host, ipv6Only] of holders) {
+        const server: Server | null = await new Promise((resolve, reject) => {
+          const s = createServer();
+          s.once("error", (err: NodeJS.ErrnoException) =>
+            // A runner without IPv6 cannot host this holder; nothing to test.
+            err.code === "EADDRNOTAVAIL" || err.code === "EAFNOSUPPORT"
+              ? resolve(null)
+              : reject(err),
+          );
+          s.listen({ port, host, ipv6Only }, () => resolve(s));
+        });
+        if (server === null) continue;
+        try {
+          const collisions = staleCollisions(up(wt));
+          expect(collisions, `holder on ${host}`).toMatchObject([{ port_name: "WEB_PORT", port }]);
+        } finally {
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        }
+      }
+
+      // With every holder gone, the same stack comes up and `web` serves.
+      const ok = up(wt);
+      expect(ok.code, `up failed once the port was free: ${ok.stderr} ${ok.stdout}`).toBe(0);
+      expect(await waitForListener(port, 10_000), "web never listened").toBe(true);
+    }, 120_000);
+  },
+);
+
 if (!ENABLED) {
   describe("real-pc smoke — gated", () => {
     it.skip(SKIP_REASON, () => {});
