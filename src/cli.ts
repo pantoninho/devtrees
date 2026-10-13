@@ -627,6 +627,26 @@ class DownCommand extends DevtreesCommand {
   }
 }
 
+/** `stop` and `restart`'s repeatable `-n` (#224, ADR-0009). */
+function namespaceOption(verb: "restart" | "stop") {
+  return Option.Array("--namespace,-n", {
+    description: `Also ${verb} every isolated service of this namespace. Repeatable; shared services are skipped.`,
+  });
+}
+
+/**
+ * What a per-service verb was asked to act on: its names and `-n`
+ * namespaces (#224), or `undefined` when it was given neither.
+ */
+function serviceSelection(
+  services: ReadonlyArray<string>,
+  namespaces: ReadonlyArray<string> | undefined,
+): { services: ReadonlyArray<string>; namespaces?: ReadonlyArray<string> } | undefined {
+  const ns = namespaces ?? [];
+  if (services.length === 0 && ns.length === 0) return undefined;
+  return { services, ...(ns.length > 0 ? { namespaces: ns } : {}) };
+}
+
 class StopCommand extends DevtreesCommand {
   static override paths = [["stop"]];
   static override usage = Command.Usage({
@@ -673,25 +693,19 @@ class StopCommand extends DevtreesCommand {
   });
 
   services = Option.Rest({ name: "service" });
-  namespaces = Option.Array("--namespace,-n", {
-    description:
-      "Also stop every isolated service of this namespace. Repeatable; shared services are skipped.",
-  });
+  namespaces = namespaceOption("stop");
 
   override async execute(): Promise<number> {
     return this.dispatch(async () => {
-      const namespaces = this.namespaces ?? [];
-      if (this.services.length === 0 && namespaces.length === 0) {
+      const selection = serviceSelection(this.services, this.namespaces);
+      if (selection === undefined) {
         throw invalidArgsError(
           "`devtrees stop` needs at least one service name or `-n <namespace>` " +
             "(e.g. `devtrees stop web`). To stop the whole instance, run `devtrees down`.",
         );
       }
       if (!this.context.deps.stop) return 0;
-      const result = await this.context.deps.stop({
-        services: this.services,
-        ...(namespaces.length > 0 ? { namespaces } : {}),
-      });
+      const result = await this.context.deps.stop(selection);
       this.emit(formatStop(result, this.mode));
       return 0;
     });
@@ -754,18 +768,15 @@ class RestartCommand extends DevtreesCommand {
   });
 
   services = Option.Rest({ name: "service" });
-  namespaces = Option.Array("--namespace,-n", {
-    description:
-      "Also restart every isolated service of this namespace. Repeatable; shared services are skipped.",
-  });
+  namespaces = namespaceOption("restart");
   waitTimeout = Option.String("--wait-timeout", {
     description: "Health-wait timeout in seconds for the restarted services. Default 120.",
   });
 
   override async execute(): Promise<number> {
     return this.dispatch(async () => {
-      const namespaces = this.namespaces ?? [];
-      if (this.services.length === 0 && namespaces.length === 0) {
+      const selection = serviceSelection(this.services, this.namespaces);
+      if (selection === undefined) {
         throw invalidArgsError(
           "name the service(s) to restart, e.g. `devtrees restart web`. " +
             "To restart the whole stack, run `devtrees down && devtrees up`.",
@@ -773,8 +784,7 @@ class RestartCommand extends DevtreesCommand {
       }
       if (!this.context.deps.restart) return 0;
       const result = await this.context.deps.restart({
-        services: this.services,
-        ...(namespaces.length > 0 ? { namespaces } : {}),
+        ...selection,
         ...(this.waitTimeout !== undefined
           ? { waitTimeoutMs: parseWaitTimeoutSecondsToMs(this.waitTimeout) }
           : {}),

@@ -116,6 +116,7 @@ import {
   sharedAmong,
   unbootedServices,
   unknownService,
+  type DeclaredService,
 } from "./service-targets.js";
 import {
   readStoredHash as defaultReadStoredHash,
@@ -4049,33 +4050,13 @@ async function resolveNamedServices(
     : undefined;
   const processes = derivedProcesses(configText);
   const declared = declaredServices(processes);
-  const repoShared = sharedServices(deps, anchor);
-  const shared = sharedAmong(
-    repoShared.map((s) => s.name),
+  const { names, skippedShared } = checkedSelection(
+    deps,
+    anchor,
     declared,
-    named,
+    { named, namespaces },
+    command,
   );
-  if (shared.length > 0) throw sharedServiceRefusedError(shared, command);
-  const unknown = unknownService(declared, named);
-  if (unknown !== undefined) {
-    throw serviceNotFoundError(
-      unknown,
-      declared.map((s) => s.name),
-      false,
-      command,
-    );
-  }
-  const expansion = expandNamespaces(declared, repoShared, namespaces);
-  if (expansion.empty.length > 0) {
-    throw new NoServicesSelectedError(
-      anchor.worktreeId,
-      declaredNamespaces(declared),
-      expansion.empty,
-      true,
-      command,
-    );
-  }
-  const names = [...new Set([...named, ...expansion.services])];
   const rows = await readStatusesWithin(
     { getServiceStatuses: statusReader(deps, createDriver(deps.driver)) },
     paths.socketPath,
@@ -4114,6 +4095,52 @@ async function resolveNamedServices(
     config: readDerivedConfig(paths.configPath),
     services: targets.map((s) => s.name),
     rows,
+    skippedShared,
+  };
+}
+
+/**
+ * Checks 3 and 4 of `resolveNamedServices` on the named services, then the
+ * `-n` expansion (#224): a namespace with no isolated service fails
+ * `NO_SERVICES_SELECTED`. Returns the union of the names and the expansion,
+ * each once, and the shared services the expansion skipped.
+ */
+function checkedSelection(
+  deps: CommandDeps,
+  anchor: { readonly anchor: string; readonly worktreeId: string; readonly worktreeRoot: string },
+  declared: ReadonlyArray<DeclaredService>,
+  selection: { readonly named: ReadonlyArray<string>; readonly namespaces: ReadonlyArray<string> },
+  command: NamedServiceCommand,
+): { names: string[]; skippedShared: ReadonlyArray<string> } {
+  const { named, namespaces } = selection;
+  const repoShared = sharedServices(deps, anchor);
+  const shared = sharedAmong(
+    repoShared.map((s) => s.name),
+    declared,
+    named,
+  );
+  if (shared.length > 0) throw sharedServiceRefusedError(shared, command);
+  const unknown = unknownService(declared, named);
+  if (unknown !== undefined) {
+    throw serviceNotFoundError(
+      unknown,
+      declared.map((s) => s.name),
+      false,
+      command,
+    );
+  }
+  const expansion = expandNamespaces(declared, repoShared, namespaces);
+  if (expansion.empty.length > 0) {
+    throw new NoServicesSelectedError(
+      anchor.worktreeId,
+      declaredNamespaces(declared),
+      expansion.empty,
+      true,
+      command,
+    );
+  }
+  return {
+    names: [...new Set([...named, ...expansion.services])],
     skippedShared: expansion.skippedShared,
   };
 }
