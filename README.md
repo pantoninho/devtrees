@@ -56,18 +56,28 @@ Flag highlights (run `devtrees <cmd> --help` for the full per-command surface):
 - `devtrees ls` shows each instance's booted namespaces (NAMESPACES column,
   read back from the running project as `up` does). `--services` prints one
   row per service instead, the shared instance's included: its namespaces,
-  tier (`isolated` or `shared`), status and pid. Status is `active`, `dead` or
+  tier (`isolated` or `shared`), state and pid. State is `active`, `dead` or
   `done` (a one-shot that exited 0); a service stopped with `process-compose
   process stop` reads `dead`, like a crashed one, because process-compose
-  reports both the same way. The pid is shown only for an `active` service.
-  `ls --json` always carries the instance's `namespaces` and, per service,
-  `namespaces`, `tier`, `state` (the same `active`/`dead`/`done`) and `pid`
-  (`null` unless active), next to process-compose's own `status` string.
+  reports both the same way. The pid is shown only while process-compose
+  reports the process running, so not for a service waiting out a restart
+  backoff (`Restarting`, still `active`).
+  `ls --json` always carries the instance's `namespaces`, `services_read` and
+  `reload_pending` and, per service, `namespaces`, `tier`, `state` (the same
+  `active`/`dead`/`done`) and `pid` (`null` when not running), next to
+  process-compose's own `status` string.
   `ls` only reads: each instance gets at most 5s to answer, all of them in
   parallel. One that does not answer (busy or frozen) is still listed, with
-  `?` for its namespaces and services, `"services_read": "unresponsive"` under
-  `--json` (`"ok"` when read, `"skipped"` for a stale or unknown instance),
-  and a note on stderr.
+  `"services_read": "unresponsive"` under `--json` (`"ok"` when read,
+  `"skipped"` when stale or of unknown liveness) and a note on stderr. One
+  found gone during the read (a racing `down`) is listed as `stale`.
+  In the tables, `?` means not known (an instance that did not answer, of
+  unknown liveness, or whose derived config is gone; `namespaces: null` under
+  `--json`) and `-` means none (no pid, no namespaces, a stale instance). An
+  instance with no service rows gets one `--services` row whose SERVICE cell
+  says why: `(unresponsive)`, `(unknown)`, `(stale)` or `(none)`. While a
+  timed-out hot-reload is still pending, `ls` counts its services as booted,
+  sets `reload_pending: true`, and notes it on stderr.
 - `down`, `attach`, and `logs` accept `--shared` to target the shared instance
   instead of this worktree's.
 - Every command accepts `--json` (see below).

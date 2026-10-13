@@ -144,7 +144,7 @@ export interface LsListedServiceRow extends LsServiceRow {
   readonly tier: "isolated" | "shared";
   /** Dead versus done (ADR-0008): `active`, `dead` or `done` (#226). */
   readonly state: "active" | "dead" | "done";
-  /** The running process's pid; absent unless `state` is `active`. */
+  /** The pid; absent unless process-compose reports the process running. */
   readonly pid?: number;
 }
 
@@ -152,9 +152,9 @@ export interface LsListedServiceRow extends LsServiceRow {
  * One row in the `ls` table. Kept loose so it doesn't pin the formatter to
  * `InstanceInfo` — `cli.ts` adapts both the test-injected stub shape and the
  * real discovery output into this row before calling `formatLs`. `services`,
- * `namespaces` and `servicesRead` are optional so callers that don't
- * populate them keep working: JSON output defaults them to `[]`, `[]` and
- * `skipped`.
+ * `namespaces`, `servicesRead` and `reloadPending` are optional so callers
+ * that don't populate them keep working: JSON output defaults them to `[]`,
+ * `[]` (`null` for an instance of unknown liveness), `skipped` and `false`.
  */
 export interface LsInstanceRow {
   readonly id: string;
@@ -163,14 +163,16 @@ export interface LsInstanceRow {
   readonly ports: Readonly<Record<string, number>>;
   readonly blockBase?: number;
   readonly services?: ReadonlyArray<LsListedServiceRow>;
-  /** The namespaces the instance booted (#226, ADR-0008). */
-  readonly namespaces?: ReadonlyArray<string>;
+  /** The namespaces the instance booted (#226, ADR-0008); `null` when not known. */
+  readonly namespaces?: ReadonlyArray<string> | null;
   /**
    * Whether `services` and `namespaces` come from a read that answered
    * (`ok`), from one that did not (`unresponsive`), or no read was made
    * (`skipped`: a stale or unknown instance) (#226).
    */
   readonly servicesRead?: "ok" | "unresponsive" | "skipped";
+  /** A timed-out hot-reload of the instance is still pending (#191, #226). */
+  readonly reloadPending?: boolean;
 }
 
 /** `ls` rendering options beyond the mode. */
@@ -199,27 +201,40 @@ function renderTable(rows: ReadonlyArray<ReadonlyArray<string>>): string {
   return `${lines.join("\n")}\n`;
 }
 
-/**
- * The human NAMESPACES cell (#226): the booted namespaces, `-` when there is
- * nothing to show (a stale instance, or nothing booted), and `?` when a live
- * instance could not be read.
- */
-function namespacesCell(i: LsInstanceRow): string {
-  const read = i.servicesRead ?? "skipped";
-  if (read === "ok") return (i.namespaces ?? []).join(",") || "-";
-  if (read === "unresponsive" || i.status === "unknown") return "?";
-  return "-";
+/** The row's namespaces, `null` when not known (#226). */
+function namespacesOf(i: LsInstanceRow): ReadonlyArray<string> | null {
+  if (i.servicesRead === "unresponsive") return null;
+  return i.namespaces === undefined ? (i.status === "unknown" ? null : []) : i.namespaces;
 }
 
-/** One stderr note per running instance whose services could not be read (#226). */
-function unresponsiveNotes(instances: ReadonlyArray<LsInstanceRow>): string {
+/**
+ * The human NAMESPACES cell (#226): the booted namespaces, `?` when they are
+ * not known (an instance that did not answer, of unknown liveness, or whose
+ * derived config is gone), and `-` when there are none (a stale instance).
+ */
+function namespacesCell(i: LsInstanceRow): string {
+  const namespaces = namespacesOf(i);
+  if (namespaces === null) return "?";
+  return namespaces.join(",") || "-";
+}
+
+/** The stderr notes for instances `ls` could not fully read (#226). */
+function lsNotes(instances: ReadonlyArray<LsInstanceRow>): string {
   return instances
-    .filter((i) => i.servicesRead === "unresponsive")
-    .map(
-      (i) =>
-        `devtrees ls: ${i.id} did not answer \`process-compose process list\` in time; ` +
-        "its namespaces and services are unknown (shown as `?`).\n",
-    )
+    .flatMap((i) => [
+      ...(i.servicesRead === "unresponsive"
+        ? [
+            `devtrees ls: ${i.id} did not answer \`process-compose process list\` in time; ` +
+              "its namespaces and services are unknown (shown as `?`).\n",
+          ]
+        : []),
+      ...(i.reloadPending === true
+        ? [
+            `devtrees ls: ${i.id} has a config reload still pending; a service it is ` +
+              "reloading may be missing from the list. `devtrees up` names what it waits on.\n",
+          ]
+        : []),
+    ])
     .join("");
 }
 
@@ -236,12 +251,28 @@ function formatLsHuman(instances: ReadonlyArray<LsInstanceRow>): string {
 }
 
 /**
+ * Why an instance has no service rows, in `--services`' SERVICE column
+ * (#226), and whether its services are unknown (`?`) or simply absent (`-`).
+ */
+function noServicesReason(i: LsInstanceRow): {
+  readonly reason: string;
+  readonly unknown: boolean;
+} {
+  if (i.servicesRead === "unresponsive") return { reason: "(unresponsive)", unknown: true };
+  if (i.status === "stale") return { reason: "(stale)", unknown: false };
+  if (i.servicesRead === "ok") return { reason: "(none)", unknown: false };
+  return { reason: "(unknown)", unknown: true };
+}
+
+/**
  * `ls --services` (#226): one row per service, under its instance. An
  * instance with no service rows still gets one row, so a stale or
- * unresponsive instance is never silently missing from the listing.
+ * unresponsive instance is never silently missing from the listing: its
+ * SERVICE cell says why in parentheses, and the per-service columns read `?`
+ * (not known) or `-` (none).
  */
 function formatLsServicesHuman(instances: ReadonlyArray<LsInstanceRow>): string {
-  const header = ["INSTANCE", "SERVICE", "NAMESPACES", "TIER", "STATUS", "PID"];
+  const header = ["INSTANCE", "SERVICE", "NAMESPACES", "TIER", "STATE", "PID"];
   const rows = instances.flatMap((i): string[][] => {
     const services = i.services ?? [];
     if (services.length > 0) {
@@ -254,10 +285,9 @@ function formatLsServicesHuman(instances: ReadonlyArray<LsInstanceRow>): string 
         s.pid === undefined ? "-" : String(s.pid),
       ]);
     }
-    const tier = i.kind === "shared" ? "shared" : "isolated";
-    const unknown = i.servicesRead === "unresponsive" || i.status === "unknown";
-    const status = i.servicesRead === "unresponsive" ? "unresponsive" : i.status;
-    return [[i.id, unknown ? "?" : "-", unknown ? "?" : "-", tier, status, "-"]];
+    const { reason, unknown } = noServicesReason(i);
+    const mark = unknown ? "?" : "-";
+    return [[i.id, reason, mark, i.kind === "shared" ? "shared" : "isolated", mark, "-"]];
   });
   return renderTable([header, ...rows]);
 }
@@ -282,8 +312,9 @@ interface LsInstanceJson {
   readonly kind: "worktree" | "shared";
   readonly status: "running" | "stale" | "unknown";
   readonly ports: Readonly<Record<string, number>>;
-  readonly namespaces: ReadonlyArray<string>;
+  readonly namespaces: ReadonlyArray<string> | null;
   readonly services_read: "ok" | "unresponsive" | "skipped";
+  readonly reload_pending: boolean;
   readonly services: ReadonlyArray<LsListedServiceJson>;
   readonly block_base?: number;
 }
@@ -308,8 +339,9 @@ function lsInstanceJson(row: LsInstanceRow): LsInstanceJson {
     kind: row.kind,
     status: row.status,
     ports: row.ports,
-    namespaces: row.namespaces ?? [],
+    namespaces: namespacesOf(row),
     services_read: row.servicesRead ?? "skipped",
+    reload_pending: row.reloadPending ?? false,
     services: (row.services ?? []).map(lsListedServiceJson),
   };
   return row.blockBase === undefined ? base : { ...base, block_base: row.blockBase };
@@ -320,7 +352,8 @@ function lsInstanceJson(row: LsInstanceRow): LsInstanceJson {
  *
  *   - `human`: one row per instance (`id/kind/status/namespaces/ports`), or
  *     with `--services` one row per service (#226). An instance whose
- *     services could not be read shows `?` and gets a note on stderr.
+ *     services could not be read shows `?` and gets a note on stderr, as
+ *     does one with a pending reload.
  *   - `json`: `{schema_version, ls: {instances: [<lsInstanceJson>, ...]}}`.
  *     The payload is wrapped under an `ls` key so it matches the convention
  *     every other JSON-emitting command follows (`up`, `down`, `prune`, `env`):
@@ -345,7 +378,7 @@ export function formatLs(
     return { stdout: "devtrees ls: no devtrees instances running.\n", stderr: "" };
   }
   const stdout = options.services ? formatLsServicesHuman(instances) : formatLsHuman(instances);
-  return { stdout, stderr: unresponsiveNotes(instances) };
+  return { stdout, stderr: lsNotes(instances) };
 }
 
 // --- prune ------------------------------------------------------------------

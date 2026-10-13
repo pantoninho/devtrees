@@ -1726,7 +1726,7 @@ describe.skipIf(!ENABLED)("real-pc smoke — up --dry-run on a running instance 
       readonly instances: ReadonlyArray<{
         readonly id: string;
         readonly kind: string;
-        readonly namespaces: ReadonlyArray<string>;
+        readonly namespaces: ReadonlyArray<string> | null;
         readonly services_read: string;
         readonly services: ReadonlyArray<{
           readonly name: string;
@@ -1801,12 +1801,14 @@ describe.skipIf(!ENABLED)("real-pc smoke — up --dry-run on a running instance 
     return { wt, id: wtId(wt), scripts };
   }
 
-  /** Poll `ls --json` until `service` in instance `id` reads `state`; the last document. */
+  type LsServiceJsonRow = LsServicesDoc["ls"]["instances"][number]["services"][number];
+
+  /** Poll `ls --json` until `service` in instance `id` `matches`; the last document. */
   async function pollServiceState(
     wt: string,
     id: string,
     service: string,
-    state: string,
+    matches: (row: LsServiceJsonRow) => boolean,
   ): Promise<LsServicesDoc> {
     const deadline = Date.now() + 15_000;
     for (;;) {
@@ -1816,7 +1818,7 @@ describe.skipIf(!ENABLED)("real-pc smoke — up --dry-run on a running instance 
       const row = doc.ls.instances
         .find((i) => i.id === id)
         ?.services.find((s) => s.name === service);
-      if (row?.state === state || Date.now() >= deadline) return doc;
+      if ((row !== undefined && matches(row)) || Date.now() >= deadline) return doc;
       await new Promise((r) => setTimeout(r, 250));
     }
   }
@@ -1834,7 +1836,7 @@ describe.skipIf(!ENABLED)("real-pc smoke — up --dry-run on a running instance 
 
     // process-compose reports the stop like a crash (`Completed`, exit -1):
     // `ls` classifies it `dead`, as ADR-0009 says it will.
-    const doc = await pollServiceState(wt, id, "worker", "dead");
+    const doc = await pollServiceState(wt, id, "worker", (s) => s.state === "dead");
     const worktree = doc.ls.instances.find((i) => i.id === id)!;
     // `ios` was not booted: its `sim` is not in the project.
     expect(worktree).toMatchObject({ services_read: "ok", namespaces: ["backend"] });
@@ -1862,6 +1864,7 @@ describe.skipIf(!ENABLED)("real-pc smoke — up --dry-run on a running instance 
     expect(table).toMatch(/^ID\s+KIND\s+STATUS\s+NAMESPACES\s+PORTS$/m);
     expect(table).toMatch(new RegExp(`^${id}\\s+worktree\\s+running\\s+backend\\s`, "m"));
     const rows = devtrees(wt, ["ls", "--services"]).stdout;
+    expect(rows).toMatch(/^INSTANCE\s+SERVICE\s+NAMESPACES\s+TIER\s+STATE\s+PID$/m);
     expect(rows).toMatch(new RegExp(`^${id}\\s+worker\\s+backend\\s+isolated\\s+dead\\s+-$`, "m"));
     expect(rows).toMatch(
       new RegExp(`^${id}\\s+api\\s+backend\\s+isolated\\s+active\\s+${apiPid}$`, "m"),
@@ -1896,7 +1899,7 @@ describe.skipIf(!ENABLED)("real-pc smoke — up --dry-run on a running instance 
     expect(doc.ls.instances.find((i) => i.id === id)).toMatchObject({
       status: "running",
       services_read: "unresponsive",
-      namespaces: [],
+      namespaces: null,
       services: [],
     });
     expect(doc.ls.instances.find((i) => i.kind === "shared")).toMatchObject({
@@ -1907,9 +1910,45 @@ describe.skipIf(!ENABLED)("real-pc smoke — up --dry-run on a running instance 
     const human = await devtreesAsync(wt, ["ls", "--services"]);
     expect(human.code).toBe(0);
     expect(human.stdout).toMatch(
-      new RegExp(`^${id}\\s+\\?\\s+\\?\\s+isolated\\s+unresponsive\\s+-$`, "m"),
+      new RegExp(`^${id}\\s+\\(unresponsive\\)\\s+\\?\\s+isolated\\s+\\?\\s+-$`, "m"),
     );
     expect(human.stderr).toMatch(/did not answer/);
+  }, 120_000);
+
+  it("scenario 97: a service in its restart backoff reads active with no pid, not the dead run's (#226)", async () => {
+    const repo = buildSmokeRepo("dt-rpc97-", ["login"]);
+    currentCtx = { pidNeedle: repo.root, root: repo.root };
+    const wt = repo.worktrees.login!;
+    const keeper = sleeper(repo.root, "keeper");
+    const flaky = join(repo.root, "flaky.py");
+    writeFileSync(flaky, "import sys, time\ntime.sleep(1)\nsys.exit(3)\n");
+    writeFileSync(
+      join(wt, "devtrees.yaml"),
+      [
+        "services:",
+        "  keeper:",
+        "    tier: isolated",
+        `    command: "python3 ${keeper}"`,
+        "  flaky:",
+        "    tier: isolated",
+        `    command: "python3 ${flaky}"`,
+        "    availability:",
+        "      restart: always",
+        "      backoff_seconds: 20",
+        "",
+      ].join("\n"),
+    );
+    cleanupStack.push(() => devtrees(wt, ["down"]));
+    // `up` may or may not call flaky healthy; only `ls` is under test here.
+    devtrees(wt, ["up", "--json", "--wait-timeout", "5"]);
+    const id = wtId(wt);
+
+    const doc = await pollServiceState(wt, id, "flaky", (s) => s.status === "Restarting");
+    const row = doc.ls.instances.find((i) => i.id === id)?.services.find((s) => s.name === "flaky");
+    expect(row).toMatchObject({ status: "Restarting", state: "active", pid: null });
+    expect(pidsMatching(flaky)).toEqual([]);
+    const rows = devtrees(wt, ["ls", "--services"]).stdout;
+    expect(rows).toMatch(new RegExp(`^${id}\\s+flaky\\s+default\\s+isolated\\s+active\\s+-$`, "m"));
   }, 120_000);
 });
 

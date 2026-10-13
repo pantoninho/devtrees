@@ -307,6 +307,12 @@ export interface ServiceStatus {
    * state, and one with a NEW pid is the restarted run dying again.
    */
   readonly pid?: number;
+  /**
+   * process-compose's `is_running`, when the row carries it (#226). `false`
+   * while a service waits out a restart backoff (`Restarting`): its `pid` is
+   * then the run that died. Not published in `ls`/`up --json` rows.
+   */
+  readonly running?: boolean;
 }
 
 interface RawProc {
@@ -377,6 +383,7 @@ export function parseServiceStatuses(stdout: string): ServiceStatus[] {
       ...(typeof raw.exit_code === "number" ? { exitCode: raw.exit_code } : {}),
       ...(namespaces !== undefined ? { namespaces } : {}),
       ...(typeof raw.pid === "number" && raw.pid > 0 ? { pid: raw.pid } : {}),
+      ...(typeof raw.is_running === "boolean" ? { running: raw.is_running } : {}),
     });
   }
   return out;

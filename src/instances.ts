@@ -29,6 +29,7 @@ import { parse as parseYaml } from "yaml";
 import { DEVTREES_METADATA_KEY } from "./deriver.js";
 import type { ServiceStatus } from "./driver.js";
 import { readRegistry } from "./registry.js";
+import { readPendingReload } from "./reload-pending.js";
 import { resolveRunningSelection, serviceNamespaces } from "./selection.js";
 import { classifyService, type ServiceVerdict } from "./service-state.js";
 import type { Namespace } from "./stack.js";
@@ -93,8 +94,9 @@ export interface ListedService extends Service {
   /** Dead versus done (ADR-0008, `classifyService`): `active`, `dead` or `done`. */
   readonly state: ServiceVerdict;
   /**
-   * The running process's pid, only while the service is `active`. A dead or
-   * done row keeps the pid of the run that ended, which may since have been
+   * The process's pid, only while process-compose reports it running
+   * (`is_running`). A dead or done row, and a `Restarting` one waiting out its
+   * backoff, keep the pid of the run that ended, which may since have been
    * reused by an unrelated process, so it is not published.
    */
   readonly pid?: number;
@@ -104,7 +106,8 @@ export interface ListedService extends Service {
  * Whether `ls` could read an instance's services (#226): `ok` (the read
  * answered), `unresponsive` (a running instance whose `process list` did not
  * answer within the bound, or failed), or `skipped` (no read was attempted:
- * the instance is stale or its liveness unknown, or no reader was given).
+ * the instance is stale, or found gone by the read, or its liveness unknown,
+ * or no reader was given).
  * Only `ok` makes `services` and `namespaces` authoritative.
  */
 export type ServicesRead = "ok" | "unresponsive" | "skipped";
@@ -139,15 +142,25 @@ export interface InstanceInfo {
   readonly services: ReadonlyArray<ListedService>;
   /**
    * The namespaces the instance booted (#226), read back from the project as
-   * a running `up` does (ADR-0008, `resolveRunningSelection`). Empty unless
-   * `servicesRead` is `ok`. Discovery always sets it; absent reads as `[]`.
+   * a running `up` does (ADR-0008, `resolveRunningSelection`). `null` when
+   * they are not known: the read did not answer, the instance's liveness is
+   * unknown, or its derived config (which declares the namespaces) is gone.
+   * `[]` for a stale instance: nothing is booted. Discovery always sets it;
+   * absent reads as `[]`.
    */
-  readonly namespaces?: ReadonlyArray<string>;
+  readonly namespaces?: ReadonlyArray<string> | null;
   /**
    * Whether `services` and `namespaces` come from a successful read (#226).
    * Discovery always sets it; absent reads as `skipped`.
    */
   readonly servicesRead?: ServicesRead;
+  /**
+   * A timed-out hot-reload of this instance is still pending (#191, #226):
+   * its marker is on disk. The marker's services count as booted while it is
+   * there, since their old runs may still be alive though process-compose no
+   * longer lists them.
+   */
+  readonly reloadPending?: boolean;
 }
 
 /**
@@ -484,47 +497,81 @@ export interface DiscoverDeps {
   readonly probeRetryDelaysMs?: ReadonlyArray<number>;
 }
 
+/** What one instance's `process list` read came back with (#226). */
+type ReadOutcome =
+  | { readonly kind: "ok"; readonly rows: ReadonlyArray<ServiceStatus> }
+  | { readonly kind: "gone" }
+  | { readonly kind: "failed" };
+
 /**
- * Best-effort fetch of a single instance's runtime services, `undefined` when
- * it failed. A driver error (or a read that ran out of time) for one instance
- * must not abort the whole `ls` — agents and operators both want a partial
- * answer (the other instances) over a fatal exception.
+ * A failed read followed by a definitively stale probe: `readStatusesWithin`
+ * throws `INSTANCE_NOT_FOUND` (#205). The instance stopped (a racing `down`,
+ * or a start that did not come up); no time limit was hit.
+ */
+function isInstanceGone(err: unknown): boolean {
+  return (err as { readonly code?: unknown } | null)?.code === "INSTANCE_NOT_FOUND";
+}
+
+/**
+ * Best-effort fetch of a single instance's runtime services. A driver error
+ * (or a read that ran out of time) for one instance must not abort the whole
+ * `ls` — agents and operators both want a partial answer (the other
+ * instances) over a fatal exception.
  */
 async function safeGetServiceStatuses(
   socketPath: string,
   fetch: (socketPath: string) => Promise<ServiceStatus[]>,
-): Promise<ServiceStatus[] | undefined> {
+): Promise<ReadOutcome> {
   try {
-    return await fetch(socketPath);
-  } catch {
-    return undefined;
+    return { kind: "ok", rows: await fetch(socketPath) };
+  } catch (err) {
+    return isInstanceGone(err) ? { kind: "gone" } : { kind: "failed" };
   }
 }
 
 /** What one instance's service read contributes to its `InstanceInfo`. */
-type ServicesView = Required<Pick<InstanceInfo, "services" | "namespaces" | "servicesRead">>;
+type ServicesView = Pick<InstanceInfo, "status"> &
+  Required<Pick<InstanceInfo, "services" | "namespaces" | "servicesRead">>;
 
-const NO_SERVICES: ServicesView = { services: [], namespaces: [], servicesRead: "skipped" };
+/** Nothing read: nothing booted when stale, not known otherwise. */
+function unreadView(status: InstanceStatus, servicesRead: ServicesRead): ServicesView {
+  return { status, services: [], namespaces: status === "stale" ? [] : null, servicesRead };
+}
+
+/** Per-instance inputs to `readServicesView` beyond its socket. */
+interface ViewInputs {
+  readonly configDoc: DerivedConfigDoc;
+  /** Services of a pending reload's marker, counted as booted (#226). */
+  readonly pendingServices: ReadonlyArray<string>;
+  readonly fetch: ((socketPath: string) => Promise<ServiceStatus[]>) | undefined;
+}
 
 /**
  * Read one instance's services and booted namespaces (#226), when it is
  * running and a reader was given. A failed or timed-out read is
- * `unresponsive`, never fatal.
+ * `unresponsive`, never fatal; one that finds the instance gone lists it as
+ * `stale`.
  */
 async function readServicesView(
   stem: string,
   socketPath: string,
   status: InstanceStatus,
-  configDoc: DerivedConfigDoc,
-  fetch: ((socketPath: string) => Promise<ServiceStatus[]>) | undefined,
+  inputs: ViewInputs,
 ): Promise<ServicesView> {
-  if (status !== "running" || fetch === undefined) return NO_SERVICES;
-  const rows = await safeGetServiceStatuses(socketPath, fetch);
-  if (rows === undefined) return { ...NO_SERVICES, servicesRead: "unresponsive" };
-  const declared = readDeclaredNamespaces(configDoc);
+  if (status !== "running" || inputs.fetch === undefined) return unreadView(status, "skipped");
+  const read = await safeGetServiceStatuses(socketPath, inputs.fetch);
+  if (read.kind === "gone") return unreadView("stale", "skipped");
+  if (read.kind === "failed") return unreadView(status, "unresponsive");
+  const declared = readDeclaredNamespaces(inputs.configDoc);
   return {
-    services: buildServices(rows, readPortsByService(configDoc), declared, kindFor(stem)),
-    namespaces: bootedNamespaces(rows, declared),
+    status,
+    services: buildServices(
+      read.rows,
+      readPortsByService(inputs.configDoc),
+      declared,
+      kindFor(stem),
+    ),
+    namespaces: bootedNamespaces(read.rows, declared, inputs.pendingServices),
     servicesRead: "ok",
   };
 }
@@ -561,20 +608,20 @@ export async function discoverInstances(
       );
       const blockBase = registry[registryKeyFor(stem)];
       const configDoc = readDerivedConfig(paths.configPath);
-      const view = await readServicesView(
-        stem,
-        socketPath,
-        status,
+      // Read-only, like the rest of discovery: `up` and `down` clear it.
+      const pending = readPendingReload(anchor, stem);
+      const view = await readServicesView(stem, socketPath, status, {
         configDoc,
-        deps.getServiceStatuses,
-      );
+        pendingServices: pending?.services ?? [],
+        fetch: deps.getServiceStatuses,
+      });
       return {
         id: stem,
         kind: kindFor(stem),
-        status,
         socketPath,
         ports: flattenPorts(readPortsByProcess(configDoc)),
         blockBase,
+        reloadPending: pending !== undefined,
         ...view,
       };
     }),
@@ -608,7 +655,7 @@ function buildServices(
       namespaces: own !== undefined ? serviceNamespaces(own) : [...(s.namespaces ?? [])],
       tier: kind === "shared" ? "shared" : "isolated",
       state,
-      ...(state === "active" && s.pid !== undefined ? { pid: s.pid } : {}),
+      ...(s.running === true && s.pid !== undefined ? { pid: s.pid } : {}),
     };
   });
 }
@@ -642,14 +689,19 @@ function readDeclaredNamespaces(
 /**
  * The namespaces the instance booted (#226), read back the way a running `up`
  * reads them (ADR-0008): a namespace is booted when every service the derived
- * config declares in it is in the project. Without a derived config, the
- * union of the namespaces process-compose reports is the best answer left.
+ * config declares in it is in the project. A pending reload's services count
+ * as present (ADR-0005, #191): process-compose stops listing a service the
+ * moment its update begins, while its old run may still be alive. Without a
+ * derived config the namespaces are not known (`null`): what process-compose
+ * reports per service cannot tell a booted namespace from one a multi-
+ * namespace service only shares with it.
  */
 function bootedNamespaces(
   rows: ReadonlyArray<ServiceStatus>,
   declared: ReadonlyMap<string, DeclaredService> | undefined,
-): string[] {
-  if (declared === undefined) return [...new Set(rows.flatMap((r) => r.namespaces ?? []))].sort();
-  const present = new Set(rows.map((r) => r.name));
+  pendingServices: ReadonlyArray<string>,
+): string[] | null {
+  if (declared === undefined) return null;
+  const present = new Set([...rows.map((r) => r.name), ...pendingServices]);
   return [...resolveRunningSelection([...declared.values()], present, undefined).namespaces];
 }

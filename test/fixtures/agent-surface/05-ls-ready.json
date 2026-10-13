@@ -11,6 +11,7 @@
         },
         "namespaces": ["default"],
         "services_read": "ok",
+        "reload_pending": false,
         "services": [
           {
             "name": "db",
@@ -37,6 +38,7 @@
         },
         "namespaces": ["default"],
         "services_read": "ok",
+        "reload_pending": false,
         "services": [
           {
             "name": "web",

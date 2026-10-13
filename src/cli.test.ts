@@ -769,7 +769,7 @@ describe("devtrees CLI — --json (agent-facing surface)", () => {
 
     const services = await execute(["ls", "--services"], { up: vi.fn(), down: vi.fn(), ls });
     expect(services.code).toBe(0);
-    expect(services.stdout).toMatch(/^INSTANCE\s+SERVICE\s+NAMESPACES\s+TIER\s+STATUS\s+PID$/m);
+    expect(services.stdout).toMatch(/^INSTANCE\s+SERVICE\s+NAMESPACES\s+TIER\s+STATE\s+PID$/m);
     expect(services.stdout).toMatch(/^login\s+web\s+app\s+isolated\s+active\s+4242$/m);
 
     const help = await execute(["ls", "--help"], { up: vi.fn(), down: vi.fn(), ls });

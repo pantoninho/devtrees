@@ -262,6 +262,7 @@ describe("output formatter — formatLs", () => {
       ports: { CACHE: 40001 },
       namespaces: [],
       services_read: "skipped",
+      reload_pending: false,
       services: [],
       block_base: 40001,
     });
@@ -272,6 +273,7 @@ describe("output formatter — formatLs", () => {
       ports: { API: 40097 },
       namespaces: [],
       services_read: "skipped",
+      reload_pending: false,
       services: [],
       block_base: 40097,
     });
@@ -511,15 +513,21 @@ describe("output formatter — formatLs", () => {
       expect(out.stderr).not.toMatch(/login|shared|gone/);
     });
 
-    it("human ls --services prints one row per service, shared ones included, with status and pid", () => {
-      const out = formatLs([shared, login, wedged, stale], "human", { services: true });
+    it("human ls --services prints one row per service, and says why an instance has none", () => {
+      const unknown: LsInstanceRow = { id: "u", kind: "worktree", status: "unknown", ports: {} };
+      const empty: LsInstanceRow = { ...login, id: "empty", services: [], namespaces: [] };
+      const out = formatLs([shared, login, wedged, stale, unknown, empty], "human", {
+        services: true,
+      });
       expect(out.stdout.split("\n")).toEqual([
-        "INSTANCE  SERVICE  NAMESPACES  TIER      STATUS        PID",
-        "shared    db       default     shared    active        100",
-        "login     web      app         isolated  active        200",
-        "login     sim      ios         isolated  dead          -",
-        "wedged    ?        ?           isolated  unresponsive  -",
-        "gone      -        -           isolated  stale         -",
+        "INSTANCE  SERVICE         NAMESPACES  TIER      STATE   PID",
+        "shared    db              default     shared    active  100",
+        "login     web             app         isolated  active  200",
+        "login     sim             ios         isolated  dead    -",
+        "wedged    (unresponsive)  ?           isolated  ?       -",
+        "gone      (stale)         -           isolated  -       -",
+        "u         (unknown)       ?           isolated  ?       -",
+        "empty     (none)          -           isolated  -       -",
         "",
       ]);
       expect(out.stderr).toMatch(/wedged did not answer/);
@@ -528,6 +536,25 @@ describe("output formatter — formatLs", () => {
     it("an instance whose liveness is unknown shows `?`, not `-`", () => {
       const unknown: LsInstanceRow = { id: "u", kind: "worktree", status: "unknown", ports: {} };
       expect(formatLs([unknown], "human").stdout).toMatch(/^u\s+worktree\s+unknown\s+\?\s+-$/m);
+    });
+
+    it("namespaces not known (`null`) read `?` in the table and `null` in JSON", () => {
+      const noConfig: LsInstanceRow = { ...login, id: "noconf", namespaces: null };
+      expect(formatLs([noConfig], "human").stdout).toMatch(/^noconf\s+worktree\s+running\s+\?\s/m);
+      const parsed = JSON.parse(formatLs([noConfig], "json").stdout) as {
+        ls: { instances: ReadonlyArray<{ namespaces: unknown }> };
+      };
+      expect(parsed.ls.instances[0]?.namespaces).toBeNull();
+    });
+
+    it("a pending reload is flagged in JSON and noted on stderr", () => {
+      const pending: LsInstanceRow = { ...login, reloadPending: true };
+      const human = formatLs([pending], "human");
+      expect(human.stderr).toMatch(/login has a config reload still pending/);
+      const parsed = JSON.parse(formatLs([pending, stale], "json").stdout) as {
+        ls: { instances: ReadonlyArray<{ reload_pending: unknown }> };
+      };
+      expect(parsed.ls.instances.map((i) => i.reload_pending)).toEqual([true, false]);
     });
 
     it("JSON carries namespaces and services_read per instance, whatever --services says", () => {
@@ -539,7 +566,7 @@ describe("output formatter — formatLs", () => {
       expect(json.stderr).toBe("");
       expect(parsed.ls.instances.map((i) => [i.id, i.namespaces, i.services_read])).toEqual([
         ["login", ["app", "ios"], "ok"],
-        ["wedged", [], "unresponsive"],
+        ["wedged", null, "unresponsive"],
         ["gone", [], "skipped"],
       ]);
       expect(parsed.ls.instances[0]?.services).toContainEqual({

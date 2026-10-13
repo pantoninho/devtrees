@@ -603,16 +603,19 @@ class LsCommand extends DevtreesCommand {
       "List every devtrees instance across the repo with status, booted namespaces and ports.",
     details:
       "With `--services`, print one row per service instead: its instance, namespaces, " +
-      "tier (isolated or shared), status (active, dead or done) and pid. A stopped " +
-      "service reads `dead`, like a crashed one. `--json` always carries each " +
-      "instance's `namespaces` and `services[]`. Each instance is read for at most 5s; " +
-      "one that does not answer is listed with its namespaces and services unknown " +
-      "(`?`, `services_read: unresponsive`).\n\n" +
+      "tier (isolated or shared), state (active, dead or done) and pid (shown only while " +
+      "the process is running). A stopped service reads `dead`, like a crashed one. " +
+      "`--json` always carries each instance's `namespaces`, `services_read` and " +
+      "`reload_pending`, and each service's `namespaces`, `tier`, `state` and `pid` next " +
+      "to process-compose's own `status`. Each instance is read for at most 5s; one that " +
+      "does not answer is listed with its namespaces and services unknown " +
+      "(`services_read: unresponsive`). In the tables `?` means not known and `-` means " +
+      "none.\n\n" +
       errorCodeFooter(["UNKNOWN"]),
   });
 
   services = Option.Boolean("--services", false, {
-    description: "One row per service: namespaces, tier, status (active|dead|done) and pid.",
+    description: "One row per service: namespaces, tier, state (active|dead|done) and pid.",
   });
 
   override async execute(): Promise<number> {
