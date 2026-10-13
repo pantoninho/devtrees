@@ -62,6 +62,7 @@ import {
 import { sharedStackHash, stackHash } from "./hash.js";
 import { readSharedState } from "./shared-state.js";
 import { readPendingReload, writePendingReload, type PendingReload } from "./reload-pending.js";
+import { readStopIncomplete, updateStopIncomplete } from "./stop-services.js";
 import type { ResolvedStack, ServiceDependency } from "./stack.js";
 
 const cleanups: Array<() => void> = [];
@@ -7280,6 +7281,7 @@ describe("bounded down — force-kill and DOWN_TIMEOUT (#190)", () => {
         { name: "api", pid: 77, identity: { ppid: PC_PID, pgid: 77, command: old.command } },
       ],
     });
+    updateStopIncomplete(tmp.anchor, "removed", { passed: [], failed: ["api"] });
     const { runPrune } = await import("./commands.js");
     const result = await runPrune({
       ...pruneInputs(tmp, orphan.socketPath),
@@ -7287,6 +7289,8 @@ describe("bounded down — force-kill and DOWN_TIMEOUT (#190)", () => {
       withRegistryLock: async (_anchor, mutate) => mutate({}),
       stop: seams,
     });
+    // The orphan's stop re-check marker goes with it (#223).
+    expect(readStopIncomplete(tmp.anchor, "removed")).toEqual([]);
     expect(kills[0]).toEqual([-77, "SIGKILL"]);
     expect(result.pruned).toEqual([
       expect.objectContaining({
@@ -7896,6 +7900,103 @@ describe("runStop — stop named services (#223, ADR-0009)", () => {
       worktree_id: id,
       survivors: [{ service: "web", pid: 201, command: null }],
     });
+  });
+
+  it("refuses a Pending service with SERVICE_PENDING, touching nothing (B3)", async () => {
+    const { deps, stops } = await liveInstance(
+      {
+        web: { status: "Running" },
+        api: { status: "Pending", running: false },
+        seed: { status: "Completed", exit_code: 0 },
+      },
+      {
+        services: stack.services.map((s) =>
+          s.name === "api"
+            ? { ...s, dependsOn: [{ name: "web", condition: "process_healthy" }] }
+            : s,
+        ),
+      },
+    );
+    const err = await failure(runStop(deps, { services: ["api"] }));
+    expect(err?.code).toBe("SERVICE_PENDING");
+    expect(err?.details).toMatchObject({ services: ["api"], waiting_on: ["web"] });
+    expect(String(err?.details?.remedy)).toContain("devtrees stop web");
+    expect(err?.message).toContain("nothing to stop");
+    expect(stops).toEqual([]);
+  });
+
+  it("re-checks only marker entries among the named services it found stopped", async () => {
+    const { deps, port, anchor, id } = await liveInstance(running);
+    // An earlier incomplete stop of api left it to re-check; this call names only web.
+    updateStopIncomplete(anchor, id, { passed: [], failed: ["api"] });
+    const apiPort = port("API_PORT");
+    const checked: number[] = [];
+    const result = await runStop(
+      {
+        ...deps,
+        portAccepts: async (p) => {
+          checked.push(p);
+          return p === apiPort;
+        },
+      },
+      { services: ["web"] },
+    );
+    expect(result).toMatchObject({ stopped: ["web"] });
+    expect(checked).not.toContain(apiPort);
+    expect(readStopIncomplete(anchor, id)).toEqual(["api"]);
+  });
+
+  it("the reload_pending remedy reruns the same stop, not up", async () => {
+    const { deps, anchor, id } = await liveInstance(running);
+    writePendingReload(anchor, id, { services: ["web"], oldRuns: [{ name: "web", pid: 100 }] });
+    const err = await failure(
+      runStop({ ...deps, isProcessAlive: (pid) => pid === 100 }, { services: ["web", "api"] }),
+    );
+    expect(err?.message).toContain("then run `devtrees stop web api` again");
+    expect(err?.message).not.toContain("`devtrees up` again");
+    expect(err?.message).toContain("would undo this command");
+  });
+
+  it("names each unbooted service once, even in two unbooted namespaces", async () => {
+    const twoNs: ResolvedStack = {
+      services: stack.services.map((s) =>
+        s.name === "sim" ? { ...s, namespace: ["mobile", "tablet"] } : s,
+      ),
+    };
+    const { deps } = await liveInstance(running, twoNs);
+    const err = await failure(runStop(deps, { services: ["sim"] }));
+    expect(err?.code).toBe("NAMESPACE_NOT_RUNNING");
+    expect(err?.details).toMatchObject({ namespaces: ["mobile", "tablet"], services: ["sim"] });
+  });
+
+  it("INSTANCE_UNRESPONSIVE's remedy retries the same stop with its services", async () => {
+    const { deps } = await liveInstance(running);
+    const err = await failure(
+      runStop(
+        { ...deps, probeSocket: async () => "unknown" as const, probeRetryDelaysMs: [] },
+        { services: ["web", "api"] },
+      ),
+    );
+    expect(err?.code).toBe("INSTANCE_UNRESPONSIVE");
+    expect(String(err?.details?.remedy)).toContain("Retry `devtrees stop web api`");
+  });
+
+  it("SERVICE_NOT_FOUND says it is stop's", async () => {
+    const { deps } = await liveInstance(running);
+    const err = await failure(runStop(deps, { services: ["nope"] }));
+    expect(err?.message).toMatch(/^devtrees stop: unknown service 'nope'/);
+  });
+
+  it("a down, and a fresh up, clear what an incomplete stop left to re-check", async () => {
+    const { deps, anchor, id } = await liveInstance(running);
+    updateStopIncomplete(anchor, id, { passed: [], failed: ["web"] });
+    await runDown(deps);
+    expect(readStopIncomplete(anchor, id)).toEqual([]);
+    updateStopIncomplete(anchor, id, { passed: [], failed: ["web"] });
+    // The instance is gone; the next up boots a fresh one.
+    rmSync(instancePaths(anchor, id).socketPath, { force: true });
+    await runUp({ ...deps, probeSocket: async () => "stale" as const });
+    expect(readStopIncomplete(anchor, id)).toEqual([]);
   });
 
   it("fails INSTANCE_NOT_FOUND when no instance is running", async () => {

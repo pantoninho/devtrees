@@ -45,6 +45,7 @@ export const ERROR_CODES = [
   "SERVICE_START_FAILED",
   "SHARED_SERVICE_REFUSED",
   "LAST_SERVICES_RUNNING",
+  "SERVICE_PENDING",
   "SERVICE_STOP_INCOMPLETE",
   "CONFIG_DRIFT",
   "SHARED_DRIFT",
@@ -97,6 +98,8 @@ export const ERROR_CODE_DESCRIPTIONS: Readonly<Record<ErrorCode, string>> = {
     "A per-service command named a shared service; a worktree never stops the shared instance's services. Nothing was touched; `details` has `{services, remedy}`, the remedy being `devtrees down --shared && devtrees up` (for every worktree).",
   LAST_SERVICES_RUNNING:
     "`stop` would leave the instance with no running process (a `Pending` service does not count), and process-compose would then exit and take the instance down; nothing was stopped. `details.services` names them, `details.remedy` is `devtrees down`.",
+  SERVICE_PENDING:
+    "`stop` named a service still waiting on its dependencies (`Pending`): it has not started, so there is nothing to stop, and nothing was touched. `details` has `{services, waiting_on, remedy}`: wait until it starts, or stop what it waits on.",
   SERVICE_STOP_INCOMPLETE:
     "`stop` stopped the services, but after the bounded stop and the force-kill something is still alive or still holds one of their ports: a listener on a port (not necessarily one they started), a process that survived SIGKILL, or a service process-compose still reports running; `details.survivors` lists each `{service, pid, command, port_name?, port?, port_forwarder?}`, `details.force_killed` what devtrees signalled, `details.remedy` what to do. Rerunning the same `stop` checks the same ports again.",
   CONFIG_DRIFT:

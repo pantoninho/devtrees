@@ -12,6 +12,7 @@ import type { ServiceStatus } from "./driver.js";
 import { stateDir } from "./paths.js";
 import {
   assertNotLastRunning,
+  assertNotPending,
   partitionRunning,
   readStopIncomplete,
   serviceStopIncomplete,
@@ -40,6 +41,32 @@ function thrown(fn: () => unknown): Coded {
   throw new Error("expected a throw");
 }
 
+describe("partitionRunning / assertNotPending (B3)", () => {
+  it("splits a Pending service out: it has not started, so it is neither stopped nor stoppable", () => {
+    const rows = [row("web", "Running"), row("app", "Pending", 0, false)];
+    expect(partitionRunning(rows, ["web", "app"])).toEqual({
+      running: ["web"],
+      pending: ["app"],
+      notRunning: [],
+    });
+  });
+
+  it("refuses Pending services with SERVICE_PENDING naming what they wait on", () => {
+    const err = thrown(() =>
+      assertNotPending(["app", "ios"], (s) => (s === "app" ? ["api"] : ["api", "db"]), "login"),
+    );
+    expect(err.code).toBe("SERVICE_PENDING");
+    expect(err.details).toEqual({
+      services: ["app", "ios"],
+      waiting_on: ["api", "db"],
+      remedy:
+        "Wait until they start (once api, db are ready), or stop what they wait on: " +
+        "`devtrees stop api db`.",
+    });
+    expect(() => assertNotPending([], () => [], "login")).not.toThrow();
+  });
+});
+
 describe("partitionRunning", () => {
   it("acts on running and stopping services; skips stopped, done, dead and unbooted ones", () => {
     const rows = [
@@ -51,6 +78,7 @@ describe("partitionRunning", () => {
     ];
     expect(partitionRunning(rows, ["web", "hook", "gone", "seed", "bad", "unbooted"])).toEqual({
       running: ["web", "hook"],
+      pending: [],
       notRunning: ["gone", "seed", "bad", "unbooted"],
     });
   });

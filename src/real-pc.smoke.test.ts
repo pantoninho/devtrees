@@ -2531,6 +2531,52 @@ describe.skipIf(!ENABLED)("real-pc smoke — stop <service...> (#223)", () => {
     expect(devtrees(wt, ["down", "--json"]).code).toBe(0);
   }, 120_000);
 
+  it("scenario 92c: stopping a Pending service fails SERVICE_PENDING, touches nothing, and it still starts later (B3)", async () => {
+    // `app` waits for `api` to be healthy; api becomes healthy only once
+    // `ready` exists. process-compose would accept `process stop app` and
+    // leave it Terminating with no process for good; devtrees refuses first.
+    const { wt, root, socketPath } = stopRepo("dt-rpc92c-", (r) => [
+      "  api:",
+      "    tier: isolated",
+      `    command: "python3 ${sleeper(r, "api")}"`,
+      "    readiness_probe:",
+      "      exec:",
+      `        command: "test -f ${join(r, "ready")}"`,
+      "      period_seconds: 1",
+      "      failure_threshold: 100000",
+      "  app:",
+      "    tier: isolated",
+      `    command: "python3 ${sleeper(r, "app")}"`,
+      "    depends_on:",
+      "      api:",
+      "        condition: process_healthy",
+    ]);
+    devtrees(wt, ["up", "--json", "--wait-timeout", "5"]);
+    expect(existsSync(socketPath), "the instance should be running").toBe(true);
+    const apiPids = pidsMatching(join(root, "api.py"));
+    expect(apiPids.length).toBeGreaterThan(0);
+
+    const started = Date.now();
+    const refused = devtrees(wt, ["stop", "app", "--json"]);
+    expect(Date.now() - started, "refused up front, not after the budget").toBeLessThan(15_000);
+    expect(refused.code, refused.stdout).toBe(1);
+    const error = (refused.doc as ErrorDoc).error;
+    expect(error.code).toBe("SERVICE_PENDING");
+    expect(error.details).toMatchObject({ services: ["app"], waiting_on: ["api"] });
+    // Nothing was touched: api is the same process, app is still Pending.
+    expect(pidsMatching(join(root, "api.py"))).toEqual(apiPids);
+    const ls = devtrees(wt, ["ls", "--json"]).doc as LsDoc;
+    const app = ls.ls.instances
+      .find((i) => i.id === wtId(wt))
+      ?.services.find((s) => s.name === "app");
+    expect(app?.status).toBe("Pending");
+
+    // Once its dependency is healthy, app starts as if nothing had happened.
+    writeFileSync(join(root, "ready"), "");
+    expect(await waitForPid(join(root, "app.py"), 20_000), "app should start").toBe(true);
+    expect(devtrees(wt, ["down", "--json"]).code).toBe(0);
+  }, 120_000);
+
   it("scenario 93: stopping twice is idempotent; bad names fail before anything is touched", async () => {
     const { wt, root } = stopRepo("dt-rpc93-", (r) => [
       "  db:",

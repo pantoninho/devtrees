@@ -57,21 +57,71 @@ export function instanceNotRunningError(command: string, worktreeId: string): Er
   );
 }
 
+/** Is the row a service still waiting on its dependencies, never started? */
+function isPending(row: Pick<ServiceStatus, "status">): boolean {
+  return row.status.toLowerCase() === "pending";
+}
+
 /**
  * Split the named services (each booted: the caller checked) into those
- * still running or stopping, which the stop acts on, and the rest: already
- * stopped, done or dead. Order of `names` is kept.
+ * still running or stopping, which the stop acts on; those still `Pending`
+ * (waiting on their dependencies, never started: `assertNotPending` refuses
+ * them); and the rest: already stopped, done or dead. Order of `names` is
+ * kept.
  */
 export function partitionRunning(
   rows: ReadonlyArray<ServiceStatus>,
   names: ReadonlyArray<string>,
-): { readonly running: string[]; readonly notRunning: string[] } {
+): {
+  readonly running: string[];
+  readonly pending: string[];
+  readonly notRunning: string[];
+} {
   const byName = new Map(rows.map((r) => [r.name, r]));
-  const running = names.filter((n) => {
-    const row = byName.get(n);
-    return row !== undefined && isRunning(row);
-  });
-  return { running, notRunning: names.filter((n) => !running.includes(n)) };
+  const pick = (test: (row: ServiceStatus) => boolean) =>
+    names.filter((n) => {
+      const row = byName.get(n);
+      return row !== undefined && test(row);
+    });
+  const pending = pick(isPending);
+  const running = pick((row) => isRunning(row) && !isPending(row));
+  return {
+    running,
+    pending,
+    notRunning: names.filter((n) => !running.includes(n) && !pending.includes(n)),
+  };
+}
+
+/**
+ * Refuse to stop a service still `Pending` (#223, B3): it is waiting on its
+ * dependencies and has not started, so there is nothing to stop.
+ * process-compose v1.122.0 would accept the request and leave it
+ * `Terminating` with no process for good: it never starts, not even once its
+ * dependency is healthy, and `up` cannot bring it back. Nothing is touched.
+ * `waitingOn` maps each pending service to what it `depends_on`.
+ */
+export function assertNotPending(
+  pending: ReadonlyArray<string>,
+  waitingOn: (service: string) => ReadonlyArray<string>,
+  worktreeId: string,
+): void {
+  if (pending.length === 0) return;
+  const deps = [...new Set(pending.flatMap(waitingOn))];
+  const one = pending.length === 1;
+  const remedy =
+    deps.length === 0
+      ? `Wait until ${one ? "it starts" : "they start"}.`
+      : `Wait until ${one ? "it starts" : "they start"} (once ${deps.join(", ")} ` +
+        `${deps.length === 1 ? "is" : "are"} ready), or stop what ${one ? "it waits" : "they wait"} ` +
+        `on: \`devtrees stop ${deps.join(" ")}\`.`;
+  throw codedError(
+    "SERVICE_PENDING",
+    `devtrees stop: ${pending.join(", ")} ${one ? "is" : "are"} still waiting on ` +
+      `${one ? "its" : "their"} dependencies in '${worktreeId}' and ` +
+      `${one ? "has" : "have"} not started, so there is nothing to stop. Nothing was ` +
+      `touched. ${remedy}`,
+    { services: [...pending], waiting_on: deps, remedy },
+  );
 }
 
 /**
@@ -170,6 +220,14 @@ export function readStopIncomplete(anchor: string, worktreeId: string): string[]
 }
 
 /**
+ * Remove the marker: the instance it describes is gone (a `down`, a fresh
+ * boot, a `prune` of the orphan). No-op when absent.
+ */
+export function clearStopIncomplete(anchor: string, worktreeId: string): void {
+  rmSync(markerFile(anchor, worktreeId), { force: true });
+}
+
+/**
  * Record the outcome of a stop's check: `failed` services are added to the
  * marker, `passed` ones removed from it. The file goes when it is empty.
  */
@@ -183,7 +241,7 @@ export function updateStopIncomplete(
     (s) => outcome.failed.includes(s) || !passed.has(s),
   );
   if (left.length === 0) {
-    rmSync(markerFile(anchor, worktreeId), { force: true });
+    clearStopIncomplete(anchor, worktreeId);
     return;
   }
   writeServicesMarker(markerFile(anchor, worktreeId), left);

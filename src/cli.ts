@@ -618,8 +618,9 @@ class StopCommand extends DevtreesCommand {
     details: [
       "Waits until each service has exited, force-killing (SIGKILL) what is still running " +
         "after the grace period, as `down` does. Stopping a service that is not running " +
-        "succeeds. Shared services are refused, and so is a stop that would leave the " +
-        "instance with no running process (use `devtrees down`).",
+        "succeeds. Shared services are refused, and so is a service still waiting on its " +
+        "dependencies (it has not started), and a stop that would leave the instance with no " +
+        "running process (use `devtrees down`).",
       "The stop is transient: process-compose reports a stopped service like a crashed one, " +
         "so the next `devtrees up` starts it again. There is no `start`; `up` is the way back.",
       errorCodeFooter([
@@ -630,6 +631,7 @@ class StopCommand extends DevtreesCommand {
         "NAMESPACE_NOT_RUNNING",
         "CONFIG_DRIFT",
         "LAST_SERVICES_RUNNING",
+        "SERVICE_PENDING",
         "SERVICE_STOP_INCOMPLETE",
         "HEALTH_TIMEOUT",
         "LOCK_CONTENTION",
