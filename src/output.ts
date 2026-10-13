@@ -637,14 +637,40 @@ export interface UpDryRunPayload {
     readonly namespaces: ReadonlyArray<string>;
     readonly services: ReadonlyArray<string>;
   };
+  /**
+   * Which path the previewed `up` takes (#210): `"fresh"` (spawn a new
+   * instance) or `"running"` (verify, reload and repair the live one).
+   * Defaults to `"fresh"`.
+   */
+  readonly instance?: "fresh" | "running";
+  /** Running only (#210): the real `up` would hot-reload the changed config. */
+  readonly wouldReload?: boolean;
+  /** Running only (#210): dead selected services the real `up` would restart. */
+  readonly wouldRestart?: ReadonlyArray<string>;
 }
 
-/** Stderr line naming what a fresh `up` would start (issue #176). */
-function formatSelectionNotice(selection: NonNullable<UpDryRunPayload["selection"]>): string {
-  const services = selection.services.length > 0 ? selection.services.join(", ") : "(none)";
-  return (
-    `devtrees: up would start namespace(s) [${selection.namespaces.join(", ")}]: ` + `${services}\n`
-  );
+/**
+ * Stderr lines naming what `up` would do: start the selection on a fresh
+ * instance (issue #176), or check it on a running one, plus any reload and
+ * restarts (#210).
+ */
+function formatPlanNotice(payload: UpDryRunPayload): string {
+  const selection = payload.selection;
+  const running = payload.instance === "running";
+  let out = "";
+  if (selection !== undefined) {
+    const services = selection.services.length > 0 ? selection.services.join(", ") : "(none)";
+    const verb = running ? "check running" : "start";
+    out += `devtrees: up would ${verb} namespace(s) [${selection.namespaces.join(", ")}]: ${services}\n`;
+  }
+  if (running && payload.wouldReload === true) {
+    out += `devtrees: up would hot-reload the running instance (config changed since it was last synced)\n`;
+  }
+  const restart = payload.wouldRestart ?? [];
+  if (restart.length > 0) {
+    out += `devtrees: up would restart dead service(s): ${restart.join(", ")}\n`;
+  }
+  return out;
 }
 
 /**
@@ -733,8 +759,9 @@ function droppedEdgeJson(edge: DroppedEdge): Record<string, string> {
  * Render `devtrees up --dry-run` output.
  *
  *   - `json`: `{schema_version, up_dry_run: {worktree_id, env, config,
- *     dropped_edges, dropped_namespace_edges, braced_env_vars, namespaces?,
- *     selected_services?, shared_env?, shared_config?}}` — one byte-clean document
+ *     dropped_edges, dropped_namespace_edges, braced_env_vars, instance,
+ *     namespaces?, selected_services?, would_reload, would_restart,
+ *     shared_env?, shared_config?}}` — one byte-clean document
  *     on stdout, the agent-readable preview of what `up` would run. `shared_*`
  *     keys are omitted when the stack has no shared services; `dropped_edges`
  *     and `dropped_namespace_edges` (#179) are always present (possibly
@@ -745,8 +772,9 @@ function droppedEdgeJson(edge: DroppedEdge): Record<string, string> {
  *     developer can eyeball it or pipe it into `process-compose -f -`. Any
  *     dropped cross-tier `depends_on` edge is reported on **stderr** (issue
  *     #168) so stdout stays byte-identical to the document alone; so is the
- *     namespace selection a fresh `up` would start (issue #176), and each
- *     `depends_on` edge that selection would drop (issue #179).
+ *     namespace selection `up` would start or, on a running instance, check
+ *     (issues #176, #210), any reload or restarts it would make (#210), and
+ *     each `depends_on` edge that selection would drop (issue #179).
  */
 export function formatUpDryRun(payload: UpDryRunPayload, mode: FormatMode): OutputResult {
   const droppedEdges = payload.droppedEdges ?? [];
@@ -769,14 +797,23 @@ export function formatUpDryRun(payload: UpDryRunPayload, mode: FormatMode): Outp
       // Same always-present contract for braced injected variables (#200).
       braced_env_vars: braced.map(bracedEnvVarJson),
     };
+    // Which path the previewed `up` takes (#210). Always present, like the
+    // two below: `"fresh"` previews a new instance, `"running"` the live one.
+    dry.instance = payload.instance ?? "fresh";
     if (payload.selection !== undefined) {
-      // What a fresh `up` with the same flags would start (issue #176): the
+      // The effective selection (issues #176, #210): on a fresh preview the
       // `-n` values forwarded to process-compose (`["default"]` for a bare
-      // `up`) and the isolated services they select. `config` still lists
-      // every service — process-compose applies `-n` at launch.
+      // `up`), on a running one the `-n` values or the booted namespaces read
+      // back from process-compose; and the isolated services they select.
+      // `config` still lists every service — process-compose applies `-n` at
+      // launch.
       dry.namespaces = payload.selection.namespaces;
       dry.selected_services = payload.selection.services;
     }
+    // What the real `up` would do to a running instance (#210); `false` and
+    // `[]` on a fresh preview.
+    dry.would_reload = payload.wouldReload ?? false;
+    dry.would_restart = payload.wouldRestart ?? [];
     if (payload.sharedConfig !== undefined) {
       dry.shared_env = payload.sharedEnv ?? {};
       dry.shared_config = payload.sharedConfig;
@@ -794,9 +831,8 @@ export function formatUpDryRun(payload: UpDryRunPayload, mode: FormatMode): Outp
   // Warnings go to stderr so stdout stays the previewed document verbatim —
   // `devtrees up --dry-run > stack.yaml` (or a pipe into `process-compose -f -`)
   // must not pick up prose.
-  const selection = payload.selection !== undefined ? formatSelectionNotice(payload.selection) : "";
   const stderr =
-    selection +
+    formatPlanNotice(payload) +
     droppedEdges.map((e) => `${formatDroppedEdgeWarning(e)}\n`).join("") +
     nsEdges.map((e) => `${formatDroppedNamespaceEdgeWarning(e)}\n`).join("") +
     braced.map((v) => `${formatBracedEnvVarWarning(v)}\n`).join("");

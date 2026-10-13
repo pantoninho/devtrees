@@ -163,6 +163,14 @@ export interface ExecuteDeps {
      */
     namespaces?: ReadonlyArray<string>;
     selectedServices?: ReadonlyArray<string>;
+    /**
+     * Which path the previewed `up` takes, and on a running instance whether
+     * it would hot-reload and which dead services it would restart (#210).
+     * Optional so a test stub can omit them; absent reads as a fresh start.
+     */
+    instance?: "fresh" | "running";
+    wouldReload?: boolean;
+    wouldRestart?: ReadonlyArray<string>;
   }>;
   down: (options: { shared: boolean }) => Promise<{
     worktreeId?: string;
@@ -314,7 +322,12 @@ class UpCommand extends DevtreesCommand {
     // `--dry-run` runs only the derivation pipeline (load devtrees.yaml →
     // CONFIG_INVALID; allocate ports under the registry lock → LOCK_CONTENTION)
     // and stops before any side effect, so it can only emit the allocation
-    // subset of the codes below (#124), plus NO_SERVICES_SELECTED (#176).
+    // subset of the codes below (#124), plus NO_SERVICES_SELECTED (#176). On a
+    // running instance it previews that path with read-only probes (#210), so
+    // it also emits the decisions `up` makes before acting:
+    // NAMESPACE_NOT_RUNNING, CONFIG_DRIFT (`reload_pending`),
+    // INSTANCE_UNRESPONSIVE, and HEALTH_TIMEOUT / INSTANCE_NOT_FOUND when the
+    // project cannot be read.
     // NO_SERVICES_SELECTED: a bare fresh `up` whose `default` namespace has no
     // services, or an explicit `-n` naming only namespaces with none
     // (namespaces are opt-in, ADR-0008; #203).
@@ -382,10 +395,12 @@ class UpCommand extends DevtreesCommand {
   dryRun = Option.Boolean("--dry-run", false, {
     description:
       "Derive and print the config(s) + allocated env to stdout WITHOUT side effects: " +
-      "no process-compose spawn, no config file written, no socket, no instance registered, " +
+      "no process-compose spawn, reload or restart, no config file written, no socket, no instance registered, " +
       "no health wait. With `--json`, emits the `up_dry_run` envelope so an agent reads the " +
-      "allocated ports and the full process-compose document off stdout. (Port allocation may " +
-      "briefly take the registry lock to pick a non-colliding block.)",
+      "allocated ports and the full process-compose document off stdout. If this worktree's instance " +
+      "is running, previews what `up` would do to it (read-only): the namespaces it targets, whether it " +
+      "would hot-reload, which dead services it would restart, and the same errors (e.g. NAMESPACE_NOT_RUNNING). " +
+      "(Port allocation may briefly take the registry lock to pick a non-colliding block.)",
   });
 
   override async execute(): Promise<number> {
@@ -487,6 +502,9 @@ function dryRunPayload(
           },
         }
       : {}),
+    instance: result.instance ?? "fresh",
+    wouldReload: result.wouldReload ?? false,
+    wouldRestart: result.wouldRestart ?? [],
   };
 }
 

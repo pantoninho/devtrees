@@ -1563,6 +1563,100 @@ describe.skipIf(!ENABLED)("real-pc smoke — down after a timed-out reload (#206
   }, 120_000);
 });
 
+describe.skipIf(!ENABLED)("real-pc smoke — up --dry-run on a running instance (#210)", () => {
+  it("scenario 70: a bare up --dry-run on a running instance with no default services previews what the bare up does (#210)", () => {
+    const repo = buildSmokeRepo("dt-rpc70-", ["login"]);
+    currentCtx = { pidNeedle: repo.root, root: repo.root };
+    const wt = repo.worktrees.login!;
+    writeNamespacedStack(wt, { withDefault: false });
+    cleanupStack.push(() => devtrees(wt, ["down"]));
+
+    const booted = devtrees(wt, ["up", "-n", "local-backend", "--json", "--wait-timeout", "30"]);
+    expect(booted.code, `up -n local-backend failed: ${booted.stderr}`).toBe(0);
+
+    // Before #210 this previewed a fresh start and failed NO_SERVICES_SELECTED.
+    const dry = devtrees(wt, ["up", "--dry-run", "--json"]);
+    expect(dry.code, `bare dry run failed: ${dry.stderr} ${dry.stdout}`).toBe(0);
+    const preview = (dry.doc as { up_dry_run: Record<string, unknown> }).up_dry_run;
+    expect(preview).toMatchObject({
+      instance: "running",
+      namespaces: ["local-backend"],
+      selected_services: ["api"],
+      would_reload: false,
+      would_restart: [],
+    });
+
+    // The real bare `up` gives the same answer.
+    const bare = up(wt);
+    expect(bare.code, `bare up failed: ${bare.stderr} ${bare.stdout}`).toBe(0);
+    expect((bare.doc as UpDoc).up.services.map((s) => s.name)).toEqual(preview.selected_services);
+  }, 120_000);
+
+  it("scenario 71: up --dry-run names a dead service without restarting it, and an unbooted -n fails like the real up (#210)", async () => {
+    const repo = buildSmokeRepo("dt-rpc71-", ["login"]);
+    currentCtx = { pidNeedle: repo.root, root: repo.root };
+    const wt = repo.worktrees.login!;
+    const api = sleeper(repo.root, "api");
+    writeFileSync(
+      join(wt, "devtrees.yaml"),
+      [
+        "services:",
+        "  api:",
+        "    tier: isolated",
+        "    namespace: local-backend",
+        `    command: "python3 ${api}"`,
+        // Keeps the project alive once api is killed: process-compose exits
+        // when every process has finished.
+        "  db:",
+        "    tier: isolated",
+        "    namespace: local-backend",
+        '    command: "sleep 300"',
+        "  worker:",
+        "    tier: isolated",
+        "    namespace: jobs",
+        '    command: "sleep 300"',
+        "",
+      ].join("\n"),
+    );
+    cleanupStack.push(() => devtrees(wt, ["down"]));
+
+    const booted = devtrees(wt, ["up", "-n", "local-backend", "--json", "--wait-timeout", "30"]);
+    expect(booted.code, `up -n local-backend failed: ${booted.stderr}`).toBe(0);
+
+    // An unbooted namespace: the dry run fails exactly as the real `up` does.
+    const widenDry = devtrees(wt, ["up", "--dry-run", "--json", "-n", "jobs"]);
+    const widenReal = devtrees(wt, ["up", "--json", "--wait-timeout", "20", "-n", "jobs"]);
+    const errOf = (r: CliResult) =>
+      (r.doc as { error?: { code?: string; details?: unknown } }).error;
+    expect(widenDry.code).toBe(1);
+    expect(errOf(widenDry)?.code).toBe("NAMESPACE_NOT_RUNNING");
+    expect(errOf(widenDry)?.details).toEqual(errOf(widenReal)?.details);
+
+    // Kill api; process-compose (no restart policy) reports it dead.
+    reapPids(pidsMatching(api));
+    let preview: Record<string, unknown> = {};
+    const deadline = Date.now() + 15_000;
+    while (Date.now() < deadline) {
+      const dry = devtrees(wt, ["up", "--dry-run", "--json"]);
+      expect(dry.code, `dry run failed: ${dry.stderr} ${dry.stdout}`).toBe(0);
+      preview = (dry.doc as { up_dry_run: Record<string, unknown> }).up_dry_run;
+      if ((preview.would_restart as string[]).length > 0) break;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    expect(preview).toMatchObject({ instance: "running", would_restart: ["api"] });
+    // The dry run restarted nothing.
+    expect(pidsMatching(api)).toEqual([]);
+
+    // The real bare `up` restarts exactly what the preview named.
+    const real = up(wt);
+    expect(real.code, `bare up failed: ${real.stderr} ${real.stdout}`).toBe(0);
+    expect((real.doc as { up: { restarted: string[] } }).up.restarted).toEqual(
+      preview.would_restart,
+    );
+    expect(await waitForPid(api, 10_000), "api should be running again").toBe(true);
+  }, 120_000);
+});
+
 /** Names of the marker's old runs that carry a recorded identity. */
 function oldRuns(marker: ReturnType<typeof readPendingReload>): string[] {
   return (marker?.oldRuns ?? []).filter((r) => r.identity).map((r) => r.name);

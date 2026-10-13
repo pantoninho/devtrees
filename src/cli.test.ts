@@ -1284,6 +1284,61 @@ describe("devtrees CLI — up --dry-run (#124)", () => {
       expect(result.stdout).not.toContain("would start");
     });
 
+    // #210: a dry run on a running instance previews that path instead.
+    const runningPreview = {
+      ...dryResult,
+      instance: "running" as const,
+      namespaces: ["local-backend"],
+      selectedServices: ["api", "db"],
+      wouldReload: true,
+      wouldRestart: ["db"],
+    };
+
+    it("--json carries instance, would_reload and would_restart (#210)", async () => {
+      const fresh = await execute(["up", "--dry-run", "--json"], {
+        up: vi.fn(),
+        down: vi.fn(),
+        upDryRun: vi.fn().mockResolvedValue(withSelection),
+      });
+      expect(JSON.parse(fresh.stdout).up_dry_run).toMatchObject({
+        instance: "fresh",
+        would_reload: false,
+        would_restart: [],
+      });
+      const running = await execute(["up", "--dry-run", "--json"], {
+        up: vi.fn(),
+        down: vi.fn(),
+        upDryRun: vi.fn().mockResolvedValue(runningPreview),
+      });
+      expect(running.stderr).toBe("");
+      expect(JSON.parse(running.stdout).up_dry_run).toMatchObject({
+        instance: "running",
+        namespaces: ["local-backend"],
+        selected_services: ["api", "db"],
+        would_reload: true,
+        would_restart: ["db"],
+      });
+    });
+
+    it("human mode names the running-instance plan on stderr (#210)", async () => {
+      const result = await execute(["up", "--dry-run"], {
+        up: vi.fn(),
+        down: vi.fn(),
+        upDryRun: vi.fn().mockResolvedValue(runningPreview),
+      });
+      expect(result.stderr).toContain(
+        "up would check running namespace(s) [local-backend]: api, db",
+      );
+      expect(result.stderr).toContain("up would hot-reload the running instance");
+      expect(result.stderr).toContain("up would restart dead service(s): db");
+      expect(result.stdout).not.toContain("would");
+    });
+
+    it("`up --help` says --dry-run previews a running instance (#210)", async () => {
+      const help = (await run(["up", "--help"])).stdout.replace(/\s+/g, " ");
+      expect(help).toContain("If this worktree's instance is running, previews what `up` would do");
+    });
+
     const noneSelected = Object.assign(new Error("devtrees up: no services selected"), {
       code: "NO_SERVICES_SELECTED" as const,
       details: { worktree_id: "login", selected_namespaces: ["default"], namespaces: ["app"] },
