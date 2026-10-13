@@ -1487,8 +1487,10 @@ describe.skipIf(!ENABLED)("real-pc smoke — canonical agent surface", () => {
 
 // Issue #206: after a hot-reload times out (#188), process-compose no longer
 // lists the changed service's old process, yet its `down` waits on it. The
-// bounded `down` (#190) now also force-kills the old runs the pending-reload
-// marker (#191) recorded, so it finishes within budget.
+// bounded `down` (#190) now force-kills that old run, which the
+// pending-reload marker (#191) recorded, before it stops the instance, and
+// waits for the pending update to start the new copy, so it finishes within
+// budget and the new copy is stopped too.
 describe.skipIf(!ENABLED)("real-pc smoke — down after a timed-out reload (#206)", () => {
   it("scenario 60: down force-kills the old process a timed-out reload left behind (#206)", async () => {
     const repo = buildSmokeRepo("dt-rpc60-", ["login"]);
@@ -1541,8 +1543,16 @@ describe.skipIf(!ENABLED)("real-pc smoke — down after a timed-out reload (#206
     expect(elapsed).toBeLessThan(30_000);
     expect(await waitForNoPids(repo.root, 10_000), "nothing should survive down").toEqual([]);
     expect(orphanedServices(repo.root)).toEqual([]);
-    // The old run is killed before the stop, so the pending update's new copy
-    // (if it started) is stopped by `down` too, never left behind with PPID 1.
+    // The old run is killed before the stop, and the stop waits for the
+    // pending update to start the new copy, so `down` stops that copy too,
+    // never leaving it behind with PPID 1.
+    const startCount = existsSync(starts)
+      ? readFileSync(starts, "utf8").split("\n").filter(Boolean).length
+      : 0;
+    expect(
+      startCount,
+      "the pending update started the new copy before the stop",
+    ).toBeGreaterThanOrEqual(1);
     expect(pidsMatching(holdB), "no copy of the new command survives").toEqual([]);
     expect(
       orphanedServices(repo.root).filter((line) => line.includes(holdB)),

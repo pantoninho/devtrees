@@ -53,8 +53,8 @@ import { loadStack, type ResolvedService, type ResolvedStack, type Tier } from "
 import {
   boundedDown,
   DownTimeoutError,
-  findSupervisorPid,
   readProcessTable,
+  readSupervisedTable,
   type ForceKilled,
   type StopDriver,
   type StopSeams,
@@ -2157,7 +2157,8 @@ export async function runDown(
     // on the normal `down` path). devtrees must NOT also run the hook directly
     // here — that would double-run it (acceptance #4: no regression).
     // A reload still pending (#191) waits on old processes process-compose
-    // no longer lists: the bounded stop kills them first (#206).
+    // no longer lists: the bounded stop kills them first, and lets that
+    // reload finish before it stops anything (#206).
     const stopped = wasLive
       ? await stopInstance(
           driver,
@@ -2204,9 +2205,10 @@ export async function runDown(
  * Stop a live instance with the bounded `down` (#190): a budget of 30s plus
  * every `shutdown.timeout_seconds` in its derived config, then a surgical
  * SIGKILL of the service processes that kept it from stopping. The old runs
- * a pending reload is waiting on (`pendingReload`, #206) are killed before
- * the stop. Throws
- * `DOWN_TIMEOUT` (nothing removed) when process-compose still has not exited.
+ * a pending reload is stuck on (`pendingReload`, #206) are killed before
+ * the stop, which begins only once that reload has finished. Throws
+ * `DOWN_TIMEOUT` (nothing removed) when process-compose still has not
+ * exited, or when the reload never finished and the stop was not begun.
  */
 function stopInstance(
   driver: StopDriver,
@@ -3202,8 +3204,15 @@ async function persistPendingReload(args: {
     args.rows,
   );
   const readTable = args.deps.stop?.readProcessTable ?? readProcessTable;
-  const table = plan.oldRuns.length > 0 ? await readTable() : [];
-  const marker = identifyOldRuns(plan, table, findSupervisorPid(table, args.inst.socketPath));
+  // Retried while empty or without the supervisor (a `ps` that failed under
+  // load): a run without an identity is one `down` can never kill.
+  const { table, supervisorPid } =
+    plan.oldRuns.length > 0
+      ? await readSupervisedTable(readTable, args.inst.socketPath, {
+          delayMs: args.deps.stop?.pollMs,
+        })
+      : { table: [], supervisorPid: undefined };
+  const marker = identifyOldRuns(plan, table, supervisorPid);
   writePendingReload(args.anchor.anchor, args.anchor.worktreeId, marker);
 }
 

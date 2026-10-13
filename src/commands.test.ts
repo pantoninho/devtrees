@@ -4350,6 +4350,8 @@ describe("runUp — pending-reload guard (#191)", () => {
       alive: new Set(rows.flatMap((r) => (r.pid !== undefined ? [r.pid] : []))),
       reload: 200 as 200 | "hang",
       reloads: 0,
+      /** What process-compose does once devtrees SIGKILLs `pid`. */
+      onKill: undefined as ((pid: number) => void) | undefined,
     };
     const track: StubSpawn = { invocations: [], touchSocket: true };
     const base = stubDeps({ stack, track });
@@ -4371,16 +4373,30 @@ describe("runUp — pending-reload guard (#191)", () => {
       { pid: 9, ppid: 1, pgid: 9, command: `process-compose up -u ${worktreeSpawn().socketPath}` },
       ...[...state.alive].map((pid) => ({ pid, ppid: 9, pgid: pid, command: `cmd-${pid}` })),
     ];
+    // `process list`, as the bounded `down` reads it through the driver.
+    const spawner: NonNullable<CommandDeps["driver"]>["spawner"] = (binary, args, options) => {
+      if (args[0] !== "process" || args[1] !== "list") {
+        return base.driver?.spawner?.(binary, args, options) ?? spawnedOk();
+      }
+      const emitter = new EventEmitter() as EventEmitter & { stdout: Readable };
+      const listed = state.rows.map((r) => ({ ...r, is_ready: "-", is_running: true }));
+      emitter.stdout = Readable.from([JSON.stringify(listed)]);
+      emitter.stdout.on("end", () => queueMicrotask(() => emitter.emit("exit", 0)));
+      return emitter as unknown as SpawnedProcess;
+    };
     const deps: CommandDeps = {
       ...base,
       readStack: () => state.stack,
-      driver: { ...base.driver, controlRequest, reloadTimeoutMs: 50 },
+      driver: { ...base.driver, spawner, controlRequest, reloadTimeoutMs: 50 },
       getServiceStatuses: async () => state.rows,
       isProcessAlive: (pid) => state.alive.has(pid),
       // Never the real `process.kill`: a SIGKILL drops the pid from the fake table.
       stop: {
         readProcessTable,
-        kill: (target) => void state.alive.delete(Math.abs(target)),
+        kill: (target) => {
+          state.alive.delete(Math.abs(target));
+          state.onKill?.(Math.abs(target));
+        },
         isAlive: (pid) => state.alive.has(pid),
         settleMs: 20,
         pollMs: 2,
@@ -4476,15 +4492,55 @@ describe("runUp — pending-reload guard (#191)", () => {
     expect(state.reloads).toBe(2);
   });
 
-  it("down clears the marker", async () => {
+  it("retries an empty ps read when it records the old runs' identity", async () => {
+    const { state, deps, marker } = fixture(stackA, [row("web", 100), row("api", 200)]);
+    await runUp(deps);
+    state.stack = stackB;
+    state.reload = "hang";
+    let reads = 0;
+    const read = deps.stop?.readProcessTable;
+    const flaky = async () => (reads++ === 0 || read === undefined ? [] : read());
+    await upError({ ...deps, stop: { ...deps.stop, readProcessTable: flaky } });
+    expect(reads).toBe(2);
+    expect(marker()?.oldRuns).toEqual([
+      { name: "web", pid: 100, identity: { ppid: 9, pgid: 100, command: "cmd-100" } },
+    ]);
+  });
+
+  it("down kills the stuck old run, waits for the new copy, stops, and clears the marker", async () => {
     const { state, deps, marker } = fixture(stackA, [row("web", 100), row("api", 200)]);
     await runUp(deps);
     state.stack = stackB;
     state.reload = "hang";
     await upError(deps);
     expect(marker()).toBeDefined();
-    await runDown(deps);
+    // process-compose dropped `web` and waits on pid 100. Once it dies, the
+    // pending update lists `web` again as 101.
+    state.rows = [row("api", 200)];
+    state.onKill = (pid) => {
+      if (pid !== 100) return;
+      state.alive.add(101);
+      state.rows = [row("web", 101), row("api", 200)];
+    };
+    const result = await runDown(deps);
+    expect(result.forceKilled).toEqual([{ service: "web", pid: 100 }]);
     expect(marker()).toBeUndefined();
+  });
+
+  it("down does not stop the instance while the pending update never finishes, and keeps the marker", async () => {
+    const { state, deps, marker } = fixture(stackA, [row("web", 100), row("api", 200)]);
+    await runUp(deps);
+    state.stack = stackB;
+    state.reload = "hang";
+    await upError(deps);
+    state.rows = [row("api", 200)];
+    const err = await runDown(deps).then(
+      () => undefined,
+      (e: unknown) => e as Error & { code?: string; details?: Record<string, unknown> },
+    );
+    expect(err?.code).toBe("DOWN_TIMEOUT");
+    expect(err?.details).toMatchObject({ pending_reload: ["web"], stuck_services: [] });
+    expect(marker()).toBeDefined();
   });
 
   it("a fresh start clears a marker left by an instance that is gone", async () => {

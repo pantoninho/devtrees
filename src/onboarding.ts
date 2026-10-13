@@ -98,8 +98,10 @@ are. It never stops anything, and never attaches the TUI.
   budget (30s plus every \`shutdown.timeout_seconds\`) devtrees force-kills
   that service, and \`down\` names it (\`force_killed\` in the \`--json\`
   envelope). The old process of a timed-out hot-reload is force-killed up
-  front and named the same way. If process-compose still does not exit,
-  \`down\` fails with \`DOWN_TIMEOUT\`.
+  front and named the same way, and \`down\` waits for that reload to finish
+  before it stops anything. If process-compose still does not exit, or the
+  reload never finishes (\`details.pending_reload\`), \`down\` fails with
+  \`DOWN_TIMEOUT\`.
 - A dead shared service fails \`up\` with \`SHARED_SERVICE_DEAD\`; run
   \`devtrees down --shared && devtrees up\`.
 
@@ -123,7 +125,7 @@ Branch on \`error.code\`:
 | \`NO_SERVICES_SELECTED\`      | The selection has no services: a bare \`up\` starts only services with no \`namespace:\` and there are none, or \`-n\` names only namespaces with none. \`details.namespaces\` lists the namespaces; retry with \`devtrees up -n <ns>\`. |
 | \`INSTANCE_NOT_FOUND\`        | No instance is running for this worktree. Run \`devtrees up\` first.                            |
 | \`INSTANCE_UNRESPONSIVE\`     | The instance may be running but its process-compose did not answer (busy or frozen). Nothing changed. **Retry** in a moment; if it persists, follow \`details.remedy\`. Do not delete the socket by hand. |
-| \`DOWN_TIMEOUT\`              | \`down\` could not finish: process-compose was still running after devtrees force-killed the stuck services (\`details.stuck_services\`; empty when it is waiting on a \`shutdown.command\` that does not exit, or on an old process devtrees could not identify). Nothing was removed. **Retry** \`down\` once; if it fails again, **surface it to the human** with \`details.remedy\`, which names the process-compose pid to stop by hand. |
+| \`DOWN_TIMEOUT\`              | \`down\` could not finish: process-compose was still running after devtrees force-killed the stuck services (\`details.stuck_services\`; empty when it is waiting on a \`shutdown.command\` that does not exit), or a timed-out hot-reload was still being applied, so \`down\` did not start the stop (\`details.pending_reload\`; \`details.remedy\` names any old process devtrees could not verify, safe to kill by hand). Nothing was removed. **Retry** \`down\` once; if it fails again, **surface it to the human** with \`details.remedy\`, which names the process-compose pid to stop by hand. |
 | \`PROCESS_COMPOSE_NOT_FOUND\` | The \`process-compose\` binary is missing. **Surface this to the human** — it's an environment setup gap you can't fix.   |
 | \`PROCESS_COMPOSE_TOO_OLD\`   | The installed \`process-compose\` is below the minimum (v1.122.0). **Surface this to the human** — they need to upgrade it. |
 | \`CONFIG_INVALID\` / \`INVALID_ARGS\` | The config or your arguments are malformed. Fix the input; don't retry blindly.        |
