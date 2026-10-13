@@ -1655,6 +1655,68 @@ describe.skipIf(!ENABLED)("real-pc smoke — up --dry-run on a running instance 
     );
     expect(await waitForPid(api, 10_000), "api should be running again").toBe(true);
   }, 120_000);
+
+  it("scenario 72: a service added to a booted namespace — the dry run previews the reload's outcome, as the real up does (#210)", () => {
+    const repo = buildSmokeRepo("dt-rpc72-", ["login"]);
+    currentCtx = { pidNeedle: repo.root, root: repo.root };
+    const wt = repo.worktrees.login!;
+    const stack = (withCache: boolean) =>
+      writeFileSync(
+        join(wt, "devtrees.yaml"),
+        [
+          "services:",
+          ...["api", "db", ...(withCache ? ["cache"] : [])].flatMap((name, i) => [
+            `  ${name}:`,
+            "    tier: isolated",
+            "    namespace: local-backend",
+            `    command: "sleep 30${i}"`,
+          ]),
+          "  worker:",
+          "    tier: isolated",
+          "    namespace: jobs",
+          '    command: "sleep 309"',
+          "",
+        ].join("\n"),
+      );
+    stack(false);
+    cleanupStack.push(() => devtrees(wt, ["down"]));
+
+    const booted = devtrees(wt, ["up", "-n", "local-backend", "--json", "--wait-timeout", "30"]);
+    expect(booted.code, `up -n local-backend failed: ${booted.stderr}`).toBe(0);
+
+    stack(true);
+    const previewOf = (r: CliResult) => {
+      expect(r.code, `dry run failed: ${r.stderr} ${r.stdout}`).toBe(0);
+      return (r.doc as { up_dry_run: Record<string, unknown> }).up_dry_run;
+    };
+    const expected = {
+      instance: "running",
+      namespaces: ["local-backend"],
+      would_reload: true,
+      would_restart: [],
+    };
+    const dryBare = previewOf(devtrees(wt, ["up", "--dry-run", "--json"]));
+    const dryScoped = previewOf(devtrees(wt, ["up", "--dry-run", "--json", "-n", "local-backend"]));
+    expect(dryBare).toMatchObject(expected);
+    expect(dryScoped).toMatchObject(expected);
+    // `selected_services` is in devtrees.yaml order, `up.services` in
+    // process-compose's: compare them as sets.
+    const sorted = (names: unknown) => [...(names as string[])].sort();
+    expect(sorted(dryBare.selected_services)).toEqual(["api", "cache", "db"]);
+    expect(dryScoped.selected_services).toEqual(dryBare.selected_services);
+
+    // The real `up` reloads, then checks the same services.
+    const real = devtrees(wt, ["up", "-n", "local-backend", "--json", "--wait-timeout", "30"]);
+    expect(real.code, `real up failed: ${real.stderr} ${real.stdout}`).toBe(0);
+    expect(sorted((real.doc as UpDoc).up.services.map((s) => s.name))).toEqual(
+      sorted(dryScoped.selected_services),
+    );
+    const bare = up(wt);
+    expect(bare.code, `bare up failed: ${bare.stderr} ${bare.stdout}`).toBe(0);
+    expect(sorted((bare.doc as UpDoc).up.services.map((s) => s.name))).toEqual(
+      sorted(dryBare.selected_services),
+    );
+  }, 120_000);
 });
 
 /** Names of the marker's old runs that carry a recorded identity. */

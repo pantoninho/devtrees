@@ -109,6 +109,7 @@ import {
   clearPendingReload,
   identifyOldRuns,
   isProcessAlive,
+  namespaceOf,
   planPendingReload,
   readPendingReload,
   stuckFromMarker,
@@ -933,7 +934,9 @@ export interface DryRunResult {
   /**
    * The isolated services that selection covers, in declaration order — the
    * set the real `up` would spawn (fresh) or check (running) and health-wait
-   * on. `config` still carries every service: the selection is applied by
+   * on. Compare it with `up.services` as a set: that lists the project's rows
+   * in process-compose's order (by name), and on a running instance every
+   * service in the project, not only the selected ones. `config` still carries every service: the selection is applied by
    * process-compose's `-n` at launch, not by removing services from the
    * derived config.
    */
@@ -1721,9 +1724,9 @@ export async function runUpDryRun(deps: CommandDeps = {}): Promise<DryRunResult>
     { command: "up", instance: anchor.worktreeId },
     { readOnly: true },
   );
-  const plan = live
+  const preview: RunningPreview = live
     ? await previewRunning(stack, anchor, socketPath, deps)
-    : previewFresh(stack, anchor.worktreeId, deps.namespaces);
+    : { plan: previewFresh(stack, anchor.worktreeId, deps.namespaces) };
   const options = resolveAllocatorOptions(stack, deps.allocator ?? DEFAULT_ALLOCATOR);
   const sharedNeeded = hasTier(stack, "shared");
 
@@ -1743,6 +1746,9 @@ export async function runUpDryRun(deps: CommandDeps = {}): Promise<DryRunResult>
     portFor,
     sharedPortFor,
   });
+
+  // Only the reload filter needs the new derived config; every error is raised above.
+  const plan = withoutReloadRestarted(preview, derivedWt.config);
 
   const base: DryRunResult = {
     worktreeId: anchor.worktreeId,
@@ -1812,6 +1818,15 @@ function previewFresh(
  * restarted or written, no lock is taken, and a converged marker is left for
  * the real `up` to clear.
  *
+ * The real `up` hot-reloads a drifted stack *before* it reads the selection
+ * back, so on drift the preview decides against the project as the reload
+ * would leave it (`rowsAfterReload`), not as it is now.
+ *
+ * The read is capped at `--wait-timeout` when given, else at
+ * `READ_TIMEOUT_MS` (5s), not the real `up`'s 120s default: a process-compose
+ * too slow to answer (or frozen, e.g. SIGSTOPped) fails `HEALTH_TIMEOUT`
+ * sooner than the real `up` would.
+ *
  * What it cannot preview is the outcome of the side effects themselves: a
  * reload process-compose refuses (`CONFIG_DRIFT`), a restart it refuses
  * (`SERVICE_START_FAILED`), or a service that never becomes healthy
@@ -1822,37 +1837,104 @@ async function previewRunning(
   anchor: { readonly anchor: string; readonly worktreeId: string },
   socketPath: string,
   deps: CommandDeps,
-): Promise<DryRunPlan> {
+): Promise<RunningPreview> {
   const driver = createDriver(deps.driver);
   const rows = await readStatusesWithin(
     { getServiceStatuses: statusReader(deps, driver) },
     socketPath,
-    READ_TIMEOUT_MS,
+    deps.waitTimeoutMs ?? DRY_RUN_READ_TIMEOUT_MS,
     { probe: probeOf(deps) },
   );
   const readHash = deps.readStoredHash ?? defaultReadStoredHash;
   const wouldReload = readHash(anchor.anchor, anchor.worktreeId) !== stackHash(stack);
   const { configPath } = instancePaths(anchor.anchor, anchor.worktreeId);
+  const previous = derivedProcesses(
+    existsSync(configPath) ? readFileSync(configPath, "utf8") : undefined,
+  );
   assertNoPendingReload({
     anchor,
     marker: readPendingReload(anchor.anchor, anchor.worktreeId),
     rows,
-    previous: derivedProcesses(
-      existsSync(configPath) ? readFileSync(configPath, "utf8") : undefined,
-    ),
+    previous,
     isolated: stack.services.filter((s) => s.tier === "isolated"),
     requested: deps.namespaces ?? [],
     isAlive: deps.isProcessAlive ?? isProcessAlive,
   });
-  const plan = planRunningInstance(stack, anchor.worktreeId, rows, deps.namespaces);
+  const reload = wouldReload && previous !== undefined;
+  const projected = reload ? rowsAfterReload(stack, previous, rows) : rows;
+  const plan = planRunningInstance(stack, anchor.worktreeId, projected, deps.namespaces);
   return {
-    instance: "running",
-    namespaces: plan.namespaces,
-    selectedServices: plan.services.map((s) => s.name),
-    droppedNamespaceEdges: plan.droppedNamespaceEdges,
-    wouldReload,
-    wouldRestart: plan.dead,
+    plan: {
+      instance: "running",
+      namespaces: plan.namespaces,
+      selectedServices: plan.services.map((s) => s.name),
+      droppedNamespaceEdges: plan.droppedNamespaceEdges,
+      wouldReload,
+      wouldRestart: plan.dead,
+    },
+    ...(reload ? { previous } : {}),
   };
+}
+
+/** Budget for the dry run's one `process list` read when `--wait-timeout` is not given (#210). */
+const DRY_RUN_READ_TIMEOUT_MS = READ_TIMEOUT_MS;
+
+/**
+ * A preview's plan, plus — for a running instance the preview assumes is
+ * reloaded — the derived processes it runs now (`withoutReloadRestarted`
+ * needs them once the new config is derived).
+ */
+interface RunningPreview {
+  readonly plan: DryRunPlan;
+  readonly previous?: DerivedProcessMap;
+}
+
+/**
+ * The project as a hot-reload of `stack` would leave it (#210), for the
+ * preview to decide against. process-compose keeps the namespace selection it
+ * booted with across `project update` (ADR-0008): every service of `stack` in
+ * a booted namespace is in the project afterwards, new ones included, and a
+ * service moved to an unbooted namespace or removed from `devtrees.yaml` is
+ * gone (both verified on v1.122.0). The booted namespaces are read the way a
+ * bare `up` reads them, but against the config the instance runs now
+ * (`previous`), so a service that is absent only because it is new does not
+ * mark its namespace unbooted. A namespace booted with no services in it is
+ * not provable this way and is treated as unbooted.
+ *
+ * Rows of services already present are kept, so a dead one still reads dead;
+ * a new service reads `Pending`, not dead.
+ */
+function rowsAfterReload(
+  stack: ResolvedStack,
+  previous: DerivedProcessMap,
+  rows: ReadonlyArray<ServiceStatus>,
+): ServiceStatus[] {
+  const before = Object.keys(previous).map((name) => ({
+    name,
+    ...namespaceOf(previous[name]),
+  }));
+  const present = new Set(rows.map((r) => r.name));
+  const booted = resolveRunningSelection(before, present, undefined).namespaces;
+  const byName = new Map(rows.map((r) => [r.name, r]));
+  return stack.services
+    .filter((s) => s.tier === "isolated" && namespaceSelected(s, booted))
+    .map((s) => byName.get(s.name) ?? { name: s.name, status: "Pending", health: "unknown" });
+}
+
+/**
+ * Drop from `wouldRestart` the dead services the reload itself starts again
+ * (#210): process-compose restarts every service whose config changed, dead
+ * or not, so the real `up` finds those running and does not restart them
+ * (verified on v1.122.0). Compared like `planPendingReload` does, on the
+ * YAML round-trip of both configs.
+ */
+function withoutReloadRestarted(running: RunningPreview, next: DerivedConfig): DryRunPlan {
+  const { plan, previous } = running;
+  if (previous === undefined) return plan;
+  const after = derivedProcesses(stringifyYaml(next)) ?? {};
+  const unchanged = (name: string) =>
+    JSON.stringify(previous[name]) === JSON.stringify(after[name]);
+  return { ...plan, wouldRestart: plan.wouldRestart.filter(unchanged) };
 }
 
 /**

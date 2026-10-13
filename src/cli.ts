@@ -142,7 +142,11 @@ export interface ExecuteDeps {
    * carries the allocated worktree ports (and injected shared ports) a sibling
    * reads off the `--json` envelope (#125).
    */
-  upDryRun?: (options?: { readonly namespaces?: ReadonlyArray<string> }) => Promise<{
+  upDryRun?: (options?: {
+    readonly namespaces?: ReadonlyArray<string>;
+    /** Caps the running instance's status read (#210); default 5s. */
+    readonly waitTimeoutMs?: number;
+  }) => Promise<{
     worktreeId: string;
     env: Record<string, string>;
     config: DerivedConfig;
@@ -325,9 +329,12 @@ class UpCommand extends DevtreesCommand {
     // subset of the codes below (#124), plus NO_SERVICES_SELECTED (#176). On a
     // running instance it previews that path with read-only probes (#210), so
     // it also emits the decisions `up` makes before acting:
-    // NAMESPACE_NOT_RUNNING, CONFIG_DRIFT (`reload_pending`),
-    // INSTANCE_UNRESPONSIVE, and HEALTH_TIMEOUT / INSTANCE_NOT_FOUND when the
-    // project cannot be read.
+    // NAMESPACE_NOT_RUNNING and CONFIG_DRIFT (`reload_pending`); and
+    // HEALTH_TIMEOUT / INSTANCE_NOT_FOUND when the project cannot be read
+    // within its read cap (5s, or --wait-timeout). A frozen process-compose
+    // (e.g. SIGSTOPped) still accepts the socket connection, so it surfaces as
+    // HEALTH_TIMEOUT, as in the real `up`; INSTANCE_UNRESPONSIVE only when the
+    // liveness probe itself never gets a definitive answer.
     // NO_SERVICES_SELECTED: a bare fresh `up` whose `default` namespace has no
     // services, or an explicit `-n` naming only namespaces with none
     // (namespaces are opt-in, ADR-0008; #203).
@@ -375,7 +382,8 @@ class UpCommand extends DevtreesCommand {
   waitTimeout = Option.String("--wait-timeout", {
     description:
       "Health-wait timeout in seconds for the headless (`--no-attach` / `--json`) path. Default 120. " +
-      "Ignored when the TUI is attached — the live view, not a silent wait, signals readiness.",
+      "Ignored when the TUI is attached — the live view, not a silent wait, signals readiness. " +
+      "With `--dry-run` on a running instance, bounds its one read of the instance's state instead (default 5).",
   });
   // process-compose `-n/--namespace` (issue #128): a repeatable string-array
   // selecting which namespace subset to start. Repeat the flag to pass more
@@ -473,7 +481,12 @@ class UpCommand extends DevtreesCommand {
    */
   private async executeDryRun(): Promise<number> {
     if (!this.context.deps.upDryRun) return 0;
-    const result = await this.context.deps.upDryRun(this.namespaceOptions());
+    const result = await this.context.deps.upDryRun({
+      ...this.namespaceOptions(),
+      ...(this.waitTimeout !== undefined
+        ? { waitTimeoutMs: parseWaitTimeoutSecondsToMs(this.waitTimeout) }
+        : {}),
+    });
     const out = formatUpDryRun(dryRunPayload(result), this.mode);
     if (out.stdout) this.context.stdout.write(out.stdout);
     if (out.stderr) this.context.stderr.write(out.stderr);
@@ -1069,7 +1082,10 @@ if (isEntrypoint(import.meta.url, process.argv[1])) {
         ...(options?.namespaces !== undefined ? { namespaces: options.namespaces } : {}),
       }),
     upDryRun: (options) =>
-      runUpDryRun(options?.namespaces !== undefined ? { namespaces: options.namespaces } : {}),
+      runUpDryRun({
+        ...(options?.namespaces !== undefined ? { namespaces: options.namespaces } : {}),
+        ...(options?.waitTimeoutMs !== undefined ? { waitTimeoutMs: options.waitTimeoutMs } : {}),
+      }),
     down: ({ shared }) => runDown({ stop: stopSeamsFromEnv() }, { shared }),
     ls: () => runLs(),
     attach: ({ shared }) => runAttach({}, { shared }),

@@ -1334,6 +1334,16 @@ describe("devtrees CLI — up --dry-run (#124)", () => {
       expect(result.stdout).not.toContain("would");
     });
 
+    it("forwards --wait-timeout to upDryRun as its read cap (#210)", async () => {
+      const upDryRun = vi.fn().mockResolvedValue(withSelection);
+      await execute(["up", "--dry-run", "--wait-timeout", "2"], {
+        up: vi.fn(),
+        down: vi.fn(),
+        upDryRun,
+      });
+      expect(upDryRun).toHaveBeenCalledWith({ waitTimeoutMs: 2000 });
+    });
+
     it("`up --help` says --dry-run previews a running instance (#210)", async () => {
       const help = (await run(["up", "--help"])).stdout.replace(/\s+/g, " ");
       expect(help).toContain("If this worktree's instance is running, previews what `up` would do");
