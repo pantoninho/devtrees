@@ -1,15 +1,21 @@
 /**
  * The pure half of `devtrees stop <service...>` (ADR-0009, #223): which
  * named services are running, whether stopping them would end the
- * instance, and the errors it raises. The orchestration (`runStop`) and the
- * name resolution (`resolveNamedServices`) are in src/commands.ts; the
- * bounded stop is `boundedStopServices` in src/bounded-stop.ts.
+ * instance, its budget, and the errors it raises. The orchestration
+ * (`runStop`) and the name resolution (`resolveNamedServices`) are in
+ * src/commands.ts; the bounded stop is `boundedStopServices` in
+ * src/bounded-stop.ts.
  */
 
+import { existsSync, readFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import type { ForceKilled } from "./bounded-down.js";
+import type { DerivedConfig } from "./deriver.js";
 import { describeSurvivor, type DownSurvivor } from "./down-survivors.js";
-import type { ServiceStatus } from "./driver.js";
-import { isRunning } from "./service-state.js";
+import { downTimeoutMs, type ServiceStatus } from "./driver.js";
+import { stateDir } from "./paths.js";
+import { writeAtomic } from "./registry.js";
+import { isRunning, keepsInstanceAlive } from "./service-state.js";
 
 /** An error tagged with a stable `code` and `details` for the `--json` envelope. */
 export function codedError(code: string, message: string, details: Record<string, unknown>): Error {
@@ -30,9 +36,9 @@ export function instanceNotRunningError(command: string, worktreeId: string): Er
 }
 
 /**
- * Split the named services into those still running, which the stop acts
- * on, and the rest: already stopped, done, dead, or not booted at all (a
- * namespace the instance was not started with). Order of `names` is kept.
+ * Split the named services (each booted: the caller checked) into those
+ * still running or stopping, which the stop acts on, and the rest: already
+ * stopped, done or dead. Order of `names` is kept.
  */
 export function partitionRunning(
   rows: ReadonlyArray<ServiceStatus>,
@@ -50,7 +56,10 @@ export function partitionRunning(
  * Refuse a stop that would leave the instance with no running process
  * (ADR-0009): process-compose v1.122.0 then exits ("Project completed"),
  * silently tearing the instance down under a command that promised only a
- * service. Done one-shots and already-stopped services do not count.
+ * service. Conservative (`keepsInstanceAlive`): only a process running now
+ * counts. Done one-shots, stopped services, and a `Pending` dependent (it
+ * may wait on the very service being stopped, and then never starts) do
+ * not.
  */
 export function assertNotLastRunning(
   rows: ReadonlyArray<ServiceStatus>,
@@ -59,7 +68,7 @@ export function assertNotLastRunning(
 ): void {
   if (stopping.length === 0) return;
   const leaving = new Set(stopping);
-  if (rows.some((r) => !leaving.has(r.name) && isRunning(r))) return;
+  if (rows.some((r) => !leaving.has(r.name) && keepsInstanceAlive(r))) return;
   throw codedError(
     "LAST_SERVICES_RUNNING",
     `devtrees stop: ${stopping.join(", ")} ${stopping.length === 1 ? "is" : "are"} the last ` +
@@ -71,10 +80,28 @@ export function assertNotLastRunning(
 }
 
 /**
- * `SERVICE_STOP_INCOMPLETE` (ADR-0009): something a stopped service started
- * is still alive after the bounded stop and the force-kill. Mirrors
- * `DOWN_INCOMPLETE`: `details.survivors` lists each, `details.force_killed`
- * what devtrees signalled.
+ * The stop budget: `down`'s base (`baseMs`, default 30s) plus the
+ * `shutdown.timeout_seconds` of the services being stopped, and only those.
+ */
+export function stopTimeoutMs(
+  config: DerivedConfig | undefined,
+  names: ReadonlyArray<string>,
+  baseMs?: number,
+): number {
+  const picked = Object.entries(config?.processes ?? {}).filter(([name]) => names.includes(name));
+  return downTimeoutMs(
+    config === undefined ? undefined : { processes: Object.fromEntries(picked) },
+    baseMs,
+  );
+}
+
+/**
+ * `SERVICE_STOP_INCOMPLETE` (ADR-0009): after the bounded stop and the
+ * force-kill, something is still alive or still holds one of the checked
+ * services' ports. Mirrors `DOWN_INCOMPLETE`: `details.survivors` lists
+ * each, `details.force_killed` what devtrees signalled. A port holder is
+ * not necessarily something the service started, so the wording stays
+ * neutral.
  */
 export function serviceStopIncomplete(
   worktreeId: string,
@@ -92,8 +119,9 @@ export function serviceStopIncomplete(
       : "Never kill a container runtime's port forwarder: stop the container instead.");
   return codedError(
     "SERVICE_STOP_INCOMPLETE",
-    `devtrees stop: ${services.join(", ")} did not stop cleanly in '${worktreeId}'; some of ` +
-      `what ${services.length === 1 ? "it" : "they"} started is still alive:\n` +
+    `devtrees stop: ${services.join(", ")} ${services.length === 1 ? "is" : "are"} stopped in ` +
+      `'${worktreeId}', but these are still alive or still hold ` +
+      `${services.length === 1 ? "its" : "their"} ports:\n` +
       `${survivors.map(describeSurvivor).join("\n")}\n${remedy}`,
     {
       worktree_id: worktreeId,
@@ -103,4 +131,46 @@ export function serviceStopIncomplete(
       remedy,
     },
   );
+}
+
+// ---------------------------------------------------------------------------
+// The marker a `SERVICE_STOP_INCOMPLETE` leaves, so the retry its remedy
+// names checks the same ports again even though the service is now stopped.
+// ---------------------------------------------------------------------------
+
+function markerFile(anchor: string, worktreeId: string): string {
+  return join(stateDir(anchor), `${worktreeId}.stop-incomplete.json`);
+}
+
+/** The services an earlier `SERVICE_STOP_INCOMPLETE` left to re-check. */
+export function readStopIncomplete(anchor: string, worktreeId: string): string[] {
+  const file = markerFile(anchor, worktreeId);
+  if (!existsSync(file)) return [];
+  try {
+    const parsed = JSON.parse(readFileSync(file, "utf8")) as { services?: unknown } | null;
+    const services = parsed?.services;
+    return Array.isArray(services) ? services.filter((s) => typeof s === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Record the outcome of a stop's check: `failed` services are added to the
+ * marker, `passed` ones removed from it. The file goes when it is empty.
+ */
+export function updateStopIncomplete(
+  anchor: string,
+  worktreeId: string,
+  outcome: { readonly passed: ReadonlyArray<string>; readonly failed: ReadonlyArray<string> },
+): void {
+  const passed = new Set(outcome.passed);
+  const left = [...new Set([...readStopIncomplete(anchor, worktreeId), ...outcome.failed])].filter(
+    (s) => outcome.failed.includes(s) || !passed.has(s),
+  );
+  if (left.length === 0) {
+    rmSync(markerFile(anchor, worktreeId), { force: true });
+    return;
+  }
+  writeAtomic(markerFile(anchor, worktreeId), `${JSON.stringify({ services: left }, null, 2)}\n`);
 }

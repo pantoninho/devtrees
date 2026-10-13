@@ -158,7 +158,7 @@ function instanceStoppedError(
  * `stale`)? `unknown` (busy or frozen) and `running` (slow or unhealthy) keep
  * waiting. Called only after a failed read, so a healthy wait never probes.
  */
-async function isGone(
+export async function isGone(
   probe: (socketPath: string) => Promise<InstanceStatus>,
   socketPath: string,
 ): Promise<boolean> {

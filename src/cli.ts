@@ -627,8 +627,11 @@ class StopCommand extends DevtreesCommand {
         "INSTANCE_NOT_FOUND",
         "SERVICE_NOT_FOUND",
         "SHARED_SERVICE_REFUSED",
+        "NAMESPACE_NOT_RUNNING",
+        "CONFIG_DRIFT",
         "LAST_SERVICES_RUNNING",
         "SERVICE_STOP_INCOMPLETE",
+        "HEALTH_TIMEOUT",
         "LOCK_CONTENTION",
         "INSTANCE_UNRESPONSIVE",
         "PROCESS_COMPOSE_NOT_FOUND",
@@ -642,7 +645,7 @@ class StopCommand extends DevtreesCommand {
     ],
   });
 
-  services = Option.Rest();
+  services = Option.Rest({ name: "service" });
 
   override async execute(): Promise<number> {
     return this.dispatch(async () => {

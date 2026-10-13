@@ -1,17 +1,34 @@
 /**
- * The pure half of `devtrees stop` (ADR-0009, #223): name resolution, the
- * running/not-running split, the last-running refusal and the incomplete-stop
- * error.
+ * The pure half of `devtrees stop` (ADR-0009, #223): the running/not-running
+ * split, the last-running refusal, the budget, the incomplete-stop error and
+ * its re-check marker.
  */
 import { describe, expect, it } from "vite-plus/test";
-import { resolveNamedServices } from "./commands.js";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { DerivedConfig } from "./deriver.js";
 import type { ServiceStatus } from "./driver.js";
-import { assertNotLastRunning, partitionRunning, serviceStopIncomplete } from "./stop-services.js";
+import { stateDir } from "./paths.js";
+import {
+  assertNotLastRunning,
+  partitionRunning,
+  readStopIncomplete,
+  serviceStopIncomplete,
+  stopTimeoutMs,
+  updateStopIncomplete,
+} from "./stop-services.js";
 
 type Coded = Error & { code?: string; details?: Record<string, unknown> };
 
-function row(name: string, status: string, exitCode?: number): ServiceStatus {
-  return { name, status, health: "unknown", ...(exitCode !== undefined ? { exitCode } : {}) };
+function row(name: string, status: string, exitCode?: number, running?: boolean): ServiceStatus {
+  return {
+    name,
+    status,
+    health: "unknown",
+    ...(exitCode !== undefined ? { exitCode } : {}),
+    ...(running !== undefined ? { running } : {}),
+  };
 }
 
 function thrown(fn: () => unknown): Coded {
@@ -22,27 +39,6 @@ function thrown(fn: () => unknown): Coded {
   }
   throw new Error("expected a throw");
 }
-
-describe("resolveNamedServices", () => {
-  const services = { isolated: ["web", "api"], shared: ["db"] };
-
-  it("returns the isolated names once each, in the order given", () => {
-    expect(resolveNamedServices("stop", ["api", "web", "api"], services)).toEqual(["api", "web"]);
-  });
-
-  it("refuses a shared service with SHARED_SERVICE_REFUSED, before any unknown name", () => {
-    const err = thrown(() => resolveNamedServices("stop", ["nope", "db"], services));
-    expect(err.code).toBe("SHARED_SERVICE_REFUSED");
-    expect(err.details).toEqual({ services: ["db"] });
-    expect(err.message).toContain("devtrees down --shared");
-  });
-
-  it("fails SERVICE_NOT_FOUND with the logs details shape for an unknown name", () => {
-    const err = thrown(() => resolveNamedServices("stop", ["web", "nope"], services));
-    expect(err.code).toBe("SERVICE_NOT_FOUND");
-    expect(err.details).toEqual({ service: "nope", valid_services: ["web", "api"] });
-  });
-});
 
 describe("partitionRunning", () => {
   it("acts on running and stopping services; skips stopped, done, dead and unbooted ones", () => {
@@ -84,6 +80,29 @@ describe("assertNotLastRunning", () => {
     });
   });
 
+  it("does not count a Pending dependent: it may wait on the very service being stopped (B1)", () => {
+    // `app` depends on `api` being healthy; process-compose reports it
+    // `Pending`, `is_running: false`. Stopping `api` means `app` never starts.
+    const rows = [row("api", "Running", 0, true), row("app", "Pending", 0, false)];
+    const err = thrown(() => assertNotLastRunning(rows, ["api"], "login"));
+    expect(err.code).toBe("LAST_SERVICES_RUNNING");
+    // Without `is_running`, the status alone still excludes Pending and Terminating.
+    for (const other of [row("app", "Pending"), row("hook", "Terminating")]) {
+      expect(
+        thrown(() => assertNotLastRunning([row("api", "Running"), other], ["api"], "x")).code,
+      ).toBe("LAST_SERVICES_RUNNING");
+    }
+  });
+
+  it("trusts is_running over the status: a Running row that is not running does not count", () => {
+    const rows = [row("web", "Running", 0, true), row("api", "Restarting", 0, false)];
+    expect(thrown(() => assertNotLastRunning(rows, ["web"], "login")).code).toBe(
+      "LAST_SERVICES_RUNNING",
+    );
+    const alive = [row("web", "Running", 0, true), row("api", "Running", 0, true)];
+    expect(() => assertNotLastRunning(alive, ["web"], "login")).not.toThrow();
+  });
+
   it("never refuses when nothing is being stopped (a repeated stop)", () => {
     expect(() => assertNotLastRunning([row("web", "Completed", -1)], [], "login")).not.toThrow();
   });
@@ -115,5 +134,38 @@ describe("serviceStopIncomplete", () => {
       force_killed: [{ service: "web", pid: 7 }],
     });
     expect(String(err.details?.remedy)).toContain("devtrees stop web");
+  });
+});
+
+describe("stopTimeoutMs", () => {
+  it("adds only the named services' shutdown.timeout_seconds to the base", () => {
+    const config = {
+      version: "0.5",
+      processes: {
+        web: { command: "x", shutdown: { timeout_seconds: 2 } },
+        api: { command: "y", shutdown: { timeout_seconds: 100 } },
+      },
+    } as unknown as DerivedConfig;
+    expect(stopTimeoutMs(config, ["web"], 1_000)).toBe(3_000);
+    expect(stopTimeoutMs(config, ["web", "api"], 1_000)).toBe(103_000);
+    expect(stopTimeoutMs(undefined, ["web"], 1_000)).toBe(1_000);
+  });
+});
+
+describe("the stop-incomplete marker", () => {
+  it("records failed services, drops passed ones, and removes itself when empty", () => {
+    const anchor = mkdtempSync(join(tmpdir(), "pr223-marker-"));
+    try {
+      mkdirSync(stateDir(anchor), { recursive: true });
+      expect(readStopIncomplete(anchor, "login")).toEqual([]);
+      updateStopIncomplete(anchor, "login", { passed: [], failed: ["web", "api"] });
+      expect(readStopIncomplete(anchor, "login")).toEqual(["web", "api"]);
+      updateStopIncomplete(anchor, "login", { passed: ["web"], failed: [] });
+      expect(readStopIncomplete(anchor, "login")).toEqual(["api"]);
+      updateStopIncomplete(anchor, "login", { passed: ["api"], failed: [] });
+      expect(readStopIncomplete(anchor, "login")).toEqual([]);
+    } finally {
+      rmSync(anchor, { recursive: true, force: true });
+    }
   });
 });

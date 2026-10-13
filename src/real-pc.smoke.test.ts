@@ -2494,6 +2494,43 @@ describe.skipIf(!ENABLED)("real-pc smoke — stop <service...> (#223)", () => {
     expect(devtrees(wt, ["down", "--json"]).code).toBe(0);
   }, 120_000);
 
+  it("scenario 92b: a Pending dependent of the service being stopped does not count as running (B1)", async () => {
+    // `app` waits for `api` to be healthy, which it never is: process-compose
+    // shows `app` Pending (is_running false). Stopping `api` would leave
+    // nothing running, `app` would never start, and process-compose would
+    // exit, taking the instance with it.
+    const { wt, root, socketPath } = stopRepo("dt-rpc92b-", (r) => [
+      "  api:",
+      "    tier: isolated",
+      `    command: "python3 ${sleeper(r, "api")}"`,
+      "    readiness_probe:",
+      "      exec:",
+      '        command: "false"',
+      "      period_seconds: 1",
+      "      failure_threshold: 100000",
+      "  app:",
+      "    tier: isolated",
+      `    command: "python3 ${sleeper(r, "app")}"`,
+      "    depends_on:",
+      "      api:",
+      "        condition: process_healthy",
+    ]);
+    // api never becomes healthy, so up fails HEALTH_TIMEOUT; the instance stays up.
+    devtrees(wt, ["up", "--json", "--wait-timeout", "5"]);
+    expect(existsSync(socketPath), "the instance should be running").toBe(true);
+    const apiPids = pidsMatching(join(root, "api.py"));
+    expect(apiPids.length).toBeGreaterThan(0);
+    expect(pidsMatching(join(root, "app.py")), "app is still Pending").toEqual([]);
+
+    const refused = devtrees(wt, ["stop", "api", "--json"]);
+    expect(refused.code, refused.stdout).toBe(1);
+    expect((refused.doc as ErrorDoc).error.code).toBe("LAST_SERVICES_RUNNING");
+    // Nothing was stopped, and the instance is still there.
+    expect(pidsMatching(join(root, "api.py"))).toEqual(apiPids);
+    expect(existsSync(socketPath)).toBe(true);
+    expect(devtrees(wt, ["down", "--json"]).code).toBe(0);
+  }, 120_000);
+
   it("scenario 93: stopping twice is idempotent; bad names fail before anything is touched", async () => {
     const { wt, root } = stopRepo("dt-rpc93-", (r) => [
       "  db:",
@@ -2502,6 +2539,10 @@ describe.skipIf(!ENABLED)("real-pc smoke — stop <service...> (#223)", () => {
       "  web:",
       "    tier: isolated",
       `    command: "python3 ${sleeper(r, "web")}"`,
+      "  sim:",
+      "    tier: isolated",
+      "    namespace: mobile",
+      `    command: "python3 ${sleeper(r, "sim")}"`,
       ...apiLines(r),
     ]);
     cleanupStack.push(() => devtrees(wt, ["down", "--shared"]));
@@ -2514,12 +2555,22 @@ describe.skipIf(!ENABLED)("real-pc smoke — stop <service...> (#223)", () => {
     const unknown = devtrees(wt, ["stop", "web", "nope", "--json"]);
     expect((unknown.doc as ErrorDoc).error).toMatchObject({
       code: "SERVICE_NOT_FOUND",
-      details: { service: "nope", valid_services: expect.arrayContaining(["api", "web"]) },
+      details: { service: "nope", valid_services: expect.arrayContaining(["api", "web", "sim"]) },
     });
     const shared = devtrees(wt, ["stop", "db", "--json"]);
     expect((shared.doc as ErrorDoc).error).toMatchObject({
       code: "SHARED_SERVICE_REFUSED",
-      details: { services: ["db"] },
+      details: { services: ["db"], remedy: "devtrees down --shared && devtrees up" },
+    });
+    // sim's namespace was not booted: the same rule as `up -n` (ADR-0008).
+    const unbooted = devtrees(wt, ["stop", "web", "sim", "--json"]);
+    expect((unbooted.doc as ErrorDoc).error).toMatchObject({
+      code: "NAMESPACE_NOT_RUNNING",
+      details: {
+        namespaces: ["mobile"],
+        services: ["sim"],
+        remedy: "devtrees down && devtrees up -n default -n mobile",
+      },
     });
     // None of those touched web.
     expect(pidsMatching(join(root, "web.py")).length).toBeGreaterThan(0);

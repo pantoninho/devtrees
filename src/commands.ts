@@ -97,9 +97,19 @@ import {
   assertNotLastRunning,
   instanceNotRunningError,
   partitionRunning,
-  codedError,
+  readStopIncomplete,
   serviceStopIncomplete,
+  stopTimeoutMs,
+  updateStopIncomplete,
 } from "./stop-services.js";
+import {
+  declaredServices,
+  notBootedNamespaces,
+  orderedTargets,
+  sharedAmong,
+  unbootedServices,
+  unknownService,
+} from "./service-targets.js";
 import {
   readStoredHash as defaultReadStoredHash,
   writeStoredHash as defaultWriteStoredHash,
@@ -114,6 +124,7 @@ import {
 import {
   createWaitForHealth,
   createWaitForSharedHealth,
+  isGone,
   readStatusesWithin,
   sharedServiceDeadError,
   type RestartedService,
@@ -1296,7 +1307,7 @@ function resolveProbe(deps: CommandDeps): LivenessProbe {
 
 /** Which command is asking, and about which instance — for the #186 envelope. */
 interface LivenessContext {
-  readonly command: "up" | "down" | "stop";
+  readonly command: "up" | "down" | NamedServiceCommand;
   /** Worktree id, or `SHARED_INSTANCE_ID` for the shared instance. */
   readonly instance: string;
 }
@@ -1342,8 +1353,7 @@ async function socketIsLive(
 /** The `details.remedy` an `INSTANCE_UNRESPONSIVE` envelope carries (#186). */
 function unresponsiveRemedy(socketPath: string, context: LivenessContext): string {
   const down = context.instance === SHARED_INSTANCE_ID ? "devtrees down --shared" : "devtrees down";
-  const retry =
-    context.command === "up" ? "devtrees up" : context.command === "down" ? down : "devtrees stop";
+  const retry = context.command === "down" ? down : `devtrees ${context.command}`;
   return (
     `Retry \`${retry}\` in a moment. If it keeps failing, find the process-compose ` +
     `holding the socket with \`lsof -U -a ${socketPath}\`: resume it if it is stopped ` +
@@ -2741,12 +2751,11 @@ function downTimeoutRemedy(
 /** What `runStop` stopped (#223). */
 export interface StopServicesResult {
   readonly worktreeId: string;
-  /** The named services this call stopped, in the order given. */
+  /** The named services this call stopped, in `depends_on` order. */
   readonly stopped: ReadonlyArray<string>;
   /**
-   * The named services that were not running: already stopped, done, dead,
-   * or in a namespace the instance was not booted with. Not an error: a
-   * repeated `stop` succeeds (ADR-0009).
+   * The named services that were already not running: stopped, done or
+   * dead. Not an error: a repeated `stop` succeeds (ADR-0009).
    */
   readonly notRunning: ReadonlyArray<string>;
   /** Processes devtrees signalled to finish the stop (`down`'s `force_killed`). */
@@ -2757,15 +2766,20 @@ export interface StopServicesResult {
  * `devtrees stop <service...>` (ADR-0009, #223): stop named isolated
  * services of this worktree's instance and wait until they have exited.
  *
- * Under the worktree's lifecycle lock (as `up` and `down`): no running
- * instance fails `INSTANCE_NOT_FOUND`; every name is resolved before
- * anything is touched (`SHARED_SERVICE_REFUSED`, `SERVICE_NOT_FOUND`); a
- * stop that would leave no process running fails `LAST_SERVICES_RUNNING`,
- * because process-compose would exit and take the instance with it. Named
- * services that are not running are skipped, so a repeated stop succeeds.
- * The rest are stopped with `down`'s bounded escalation
- * (`boundedStopServices`), then their named ports are checked as `down`
- * checks them. Anything still alive fails `SERVICE_STOP_INCOMPLETE`.
+ * Under the worktree's lifecycle lock (as `up` and `down`), every check
+ * runs before anything is touched: the names (`resolveNamedServices`:
+ * `SERVICE_NOT_FOUND`, `SHARED_SERVICE_REFUSED`, `INSTANCE_NOT_FOUND`,
+ * `NAMESPACE_NOT_RUNNING`), a hot-reload still pending (#191, #206:
+ * `CONFIG_DRIFT` with `reload_pending`, as `up` refuses, since the pending
+ * update would bring a stopped service back), and a stop that would leave
+ * no process running (`LAST_SERVICES_RUNNING`: process-compose would exit
+ * and take the instance with it). Named services that are not running are
+ * skipped, so a repeated stop succeeds. The rest are stopped with `down`'s
+ * bounded escalation (`boundedStopServices`); process-compose exiting
+ * meanwhile fails `INSTANCE_NOT_FOUND`. Then the ports of the services this
+ * call stopped, and of those an earlier incomplete stop left to re-check,
+ * are checked as `down` checks them. Anything still alive or listening
+ * fails `SERVICE_STOP_INCOMPLETE`.
  *
  * The stop is transient: process-compose reports a stopped service like a
  * crashed one, so the next `up` covering it restarts it.
@@ -2775,91 +2789,67 @@ export async function runStop(
   options: { readonly services: ReadonlyArray<string> },
 ): Promise<StopServicesResult> {
   const { anchor } = resolve(deps);
-  const paths = instancePaths(anchor.anchor, anchor.worktreeId);
   const lifecycleLock = deps.withLifecycleLock ?? defaultWithLifecycleLock;
   return lifecycleLock(anchor.anchor, anchor.worktreeId, async () => {
-    const live = await socketIsLive(paths.socketPath, resolveProbe(deps), {
-      command: "stop",
-      instance: anchor.worktreeId,
-    });
-    if (!live) throw instanceNotRunningError("stop", anchor.worktreeId);
-    const config = readDerivedConfig(paths.configPath);
-    const names = resolveNamedServices("stop", options.services, {
-      isolated: Object.keys(config?.processes ?? {}),
-      shared: sharedServiceNames(deps, anchor),
-    });
-    const driver = createDriver(deps.driver);
-    const read = statusReader(deps, driver);
-    const rows = await read(paths.socketPath);
-    const { running, notRunning } = partitionRunning(rows, names);
-    assertNotLastRunning(rows, running, anchor.worktreeId);
+    const target = await resolveNamedServices(deps, options.services, "stop");
+    const id = anchor.worktreeId;
+    const names = target.services;
+    const { running, notRunning } = partitionRunning(target.rows, names);
+    assertNotLastRunning(target.rows, running, id);
+    const config = target.config;
     const stopped =
       running.length === 0
         ? { forceKilled: [], survivors: [], unsettled: [] }
-        : await boundedStopServices(
-            {
-              socketPath: paths.socketPath,
-              services: running,
-              statuses: rows,
-              timeoutMs: downTimeoutMs(onlyProcesses(config, running), deps.stop?.baseTimeoutMs),
-              unsignalled: unsignalledServices(config),
-            },
-            {
-              stopProcesses: (socket, services) => driver.stopProcesses(socket, services),
-              getServiceStatuses: (socket) => read(socket),
-            },
-            deps.stop,
-          );
-    const booted = names.filter((n) => rows.some((r) => r.name === n));
+        : await stopRunning(deps, target, running, config);
+    // Ports of what this call stopped, and of what an earlier incomplete stop
+    // left to re-check (its remedy is this same command): never those of a
+    // service merely found stopped, whose port may now be someone else's.
+    const recheck = readStopIncomplete(anchor.anchor, id).filter((n) => notRunning.includes(n));
+    const checked = [...running, ...recheck];
     const listeners =
-      config === undefined ? [] : await findPortSurvivors(config, booted, portSurvivorSeams(deps));
+      config === undefined ? [] : await findPortSurvivors(config, checked, portSurvivorSeams(deps));
     const survivors: DownSurvivor[] = [
       ...stopped.unsettled.map((u) => ({ service: u.service, pid: u.pid, command: null })),
       ...stopped.survivors.map(processSurvivor),
       ...listeners,
     ];
+    const failed = [...new Set(survivors.map((s) => s.service))];
+    updateStopIncomplete(anchor.anchor, id, {
+      passed: checked.filter((n) => !failed.includes(n)),
+      failed,
+    });
     if (survivors.length > 0) {
-      throw serviceStopIncomplete(anchor.worktreeId, names, survivors, stopped.forceKilled);
+      throw serviceStopIncomplete(id, checked, survivors, stopped.forceKilled);
     }
-    return {
-      worktreeId: anchor.worktreeId,
-      stopped: running,
-      notRunning,
-      forceKilled: stopped.forceKilled,
-    };
+    return { worktreeId: id, stopped: running, notRunning, forceKilled: stopped.forceKilled };
   });
 }
 
-/**
- * The repo's shared service names, so a per-service command can refuse
- * them by name: from `devtrees.yaml`, and from the running shared
- * instance's derived config. Best-effort: an unreadable source adds none.
- */
-function sharedServiceNames(
+/** `boundedStopServices` for `runStop`, wired to the driver, the deps and the budget. */
+function stopRunning(
   deps: CommandDeps,
-  anchor: { readonly anchor: string; readonly worktreeRoot: string },
-): string[] {
-  const fromConfig = Object.keys(
-    readDerivedConfig(sharedInstancePaths(anchor.anchor).configPath)?.processes ?? {},
-  );
-  let fromStack: string[] = [];
-  try {
-    const stack = (deps.readStack ?? loadStack)(anchor.worktreeRoot);
-    fromStack = stack.services.filter((s) => s.tier === "shared").map((s) => s.name);
-  } catch {
-    // A broken devtrees.yaml must not block a stop; the shared config still names them.
-  }
-  return [...new Set([...fromStack, ...fromConfig])];
-}
-
-/** `config` narrowed to `names`, so a stop's budget counts only their shutdown timeouts. */
-function onlyProcesses(
+  target: NamedServices,
+  running: ReadonlyArray<string>,
   config: DerivedConfig | undefined,
-  names: ReadonlyArray<string>,
-): DerivedConfig | undefined {
-  if (config === undefined) return undefined;
-  const picked = Object.entries(config.processes).filter(([name]) => names.includes(name));
-  return { ...config, processes: Object.fromEntries(picked) };
+) {
+  const driver = createDriver(deps.driver);
+  const read = statusReader(deps, driver);
+  return boundedStopServices(
+    {
+      socketPath: target.socketPath,
+      services: running,
+      statuses: target.rows,
+      timeoutMs: stopTimeoutMs(config, running, deps.stop?.baseTimeoutMs),
+      unsignalled: unsignalledServices(config),
+      instance: target.anchor.worktreeId,
+      instanceGone: () => isGone(probeOf(deps), target.socketPath),
+    },
+    {
+      stopProcesses: (socket, services) => driver.stopProcesses(socket, services),
+      getServiceStatuses: (socket) => read(socket),
+    },
+    deps.stop,
+  );
 }
 
 /** Inputs unique to `runLs` — same anchor resolution as the other commands. */
@@ -3638,34 +3628,173 @@ function serviceNotFoundError(
   return err;
 }
 
+/** The verbs that act on named services of this worktree's instance (ADR-0009). */
+export type NamedServiceCommand = "restart" | "stop";
+
+/** What `resolveNamedServices` hands a per-service verb. */
+export interface NamedServices {
+  readonly anchor: { readonly anchor: string; readonly worktreeId: string };
+  readonly socketPath: string;
+  readonly configPath: string;
+  /** The running instance's derived config, the source of the declared services. */
+  readonly config: DerivedConfig | undefined;
+  /** The named isolated services, in `depends_on` order, each in the running project. */
+  readonly services: ReadonlyArray<string>;
+  /** The `process list` read the checks were made against. */
+  readonly rows: ServiceStatus[];
+}
+
 /**
- * Resolve the services a per-service command names against this worktree's
- * instance (ADR-0009). Every name is checked before anything is touched:
- * a shared service fails `SHARED_SERVICE_REFUSED` (a worktree command must
- * not bounce a repo-wide process, ADR-0008), and a name that is in neither
- * tier fails `SERVICE_NOT_FOUND`. Returns the names once each, in the order
- * given.
+ * Resolve the services a per-service verb names (ADR-0009). Every check runs
+ * before anything is touched, in this order:
+ *
+ *  1. no running worktree instance fails `INSTANCE_NOT_FOUND` (liveness is
+ *     probed, as on every write path, #80; unknown liveness fails
+ *     `INSTANCE_UNRESPONSIVE`, #186);
+ *  2. the declared services are the running instance's derived config, not
+ *     `devtrees.yaml`, which may have changed since;
+ *  3. a shared service (from `devtrees.yaml`, tolerated when broken, and the
+ *     shared derived config) fails `SHARED_SERVICE_REFUSED`
+ *     (`details: {services, remedy}`);
+ *  4. an unknown name fails `SERVICE_NOT_FOUND` (`details: {service,
+ *     valid_services[]}`, as for `logs`, listing the derived config's
+ *     services);
+ *  5. a hot-reload still pending (#191, #206) fails `CONFIG_DRIFT` with
+ *     `reason: reload_pending`, exactly as `up` refuses: the pending update
+ *     would start the new copy and undo the verb;
+ *  6. a declared service the instance did not boot (its namespace was not
+ *     selected) fails `NAMESPACE_NOT_RUNNING`, as `up -n` does (ADR-0008),
+ *     `details: {worktree_id, namespaces, services, remedy}`.
+ *
+ * Returns the named services in `depends_on` order, with the rows. Takes no
+ * lock: the caller holds this worktree's lifecycle lock around it and the
+ * action, so a concurrent `down` cannot stop the instance in between.
  */
-export function resolveNamedServices(
-  command: string,
+export async function resolveNamedServices(
+  deps: CommandDeps,
   names: ReadonlyArray<string>,
-  services: { readonly isolated: ReadonlyArray<string>; readonly shared: ReadonlyArray<string> },
-): string[] {
-  const isolated = new Set(services.isolated);
-  const shared = new Set(services.shared);
-  const refused = names.filter((n) => shared.has(n) && !isolated.has(n));
-  if (refused.length > 0) {
-    throw codedError(
-      "SHARED_SERVICE_REFUSED",
-      `devtrees ${command}: ${refused.join(", ")} ${refused.length === 1 ? "is a shared service" : "are shared services"}. ` +
-        "A worktree command never stops or restarts the shared instance, which serves every " +
-        "worktree. Nothing was touched. Run `devtrees down --shared` to stop the shared instance.",
-      { services: refused },
+  command: NamedServiceCommand,
+): Promise<NamedServices> {
+  const { anchor } = resolve(deps);
+  const paths = instancePaths(anchor.anchor, anchor.worktreeId);
+  const live = await socketIsLive(paths.socketPath, resolveProbe(deps), {
+    command,
+    instance: anchor.worktreeId,
+  });
+  if (!live) throw instanceNotRunningError(command, anchor.worktreeId);
+  const configText = existsSync(paths.configPath)
+    ? readFileSync(paths.configPath, "utf8")
+    : undefined;
+  const processes = derivedProcesses(configText);
+  const declared = declaredServices(processes);
+  const shared = sharedAmong(sharedServiceNames(deps, anchor), declared, names);
+  if (shared.length > 0) throw sharedServiceRefusedError(shared, command);
+  const unknown = unknownService(declared, names);
+  if (unknown !== undefined) {
+    throw serviceNotFoundError(
+      unknown,
+      declared.map((s) => s.name),
+      false,
     );
   }
-  const unknown = names.find((n) => !isolated.has(n));
-  if (unknown !== undefined) throw serviceNotFoundError(unknown, services.isolated, false);
-  return [...new Set(names)];
+  const rows = await readStatusesWithin(
+    { getServiceStatuses: statusReader(deps, createDriver(deps.driver)) },
+    paths.socketPath,
+    Math.min(deps.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS, READ_TIMEOUT_MS),
+    { notify: deps.warn ?? defaultWarn, probe: probeOf(deps) },
+  );
+  assertNoPendingReload({
+    anchor,
+    marker: readPendingReload(anchor.anchor, anchor.worktreeId),
+    rows,
+    previous: processes,
+    isolated: declared,
+    requested: [],
+    isAlive: deps.isProcessAlive ?? isProcessAlive,
+    command,
+  });
+  const targets = orderedTargets(declared, names);
+  const present = new Set(rows.map((r) => r.name));
+  const missing = unbootedServices(targets, present);
+  if (missing.length > 0) {
+    const booted = resolveRunningSelection(declared, present, undefined).namespaces;
+    const notRunning = notBootedNamespaces(missing);
+    throw namespaceNotRunningError(
+      anchor.worktreeId,
+      notRunning,
+      [...booted, ...notRunning.map((n) => n.namespace)],
+      command,
+      declared,
+    );
+  }
+  return {
+    anchor: { anchor: anchor.anchor, worktreeId: anchor.worktreeId },
+    socketPath: paths.socketPath,
+    configPath: paths.configPath,
+    config: readDerivedConfig(paths.configPath),
+    services: targets.map((s) => s.name),
+    rows,
+  };
+}
+
+/**
+ * The repo's shared service names, so a per-service verb can refuse them by
+ * name: from `devtrees.yaml`, and from the shared instance's derived config.
+ * Best-effort: a broken `devtrees.yaml` adds none, and must not block a
+ * command on a running instance.
+ */
+function sharedServiceNames(
+  deps: CommandDeps,
+  anchor: { readonly anchor: string; readonly worktreeRoot: string },
+): string[] {
+  const fromConfig = Object.keys(
+    readDerivedConfig(sharedInstancePaths(anchor.anchor).configPath)?.processes ?? {},
+  );
+  let fromStack: string[] = [];
+  try {
+    const stack = (deps.readStack ?? loadStack)(anchor.worktreeRoot);
+    fromStack = stack.services.filter((s) => s.tier === "shared").map((s) => s.name);
+  } catch {
+    // The shared derived config still names them.
+  }
+  return [...new Set([...fromStack, ...fromConfig])];
+}
+
+/**
+ * Thrown when a per-service verb names a shared service (ADR-0009). The
+ * shared instance serves every worktree, so a worktree's command never stops
+ * or restarts one of its processes (ADR-0001, ADR-0008). Nothing is touched;
+ * `details.remedy` is the repo-wide way to bounce it, which affects every
+ * worktree.
+ */
+class SharedServiceRefusedError extends Error {
+  readonly code = "SHARED_SERVICE_REFUSED" as const;
+  constructor(
+    message: string,
+    readonly details: {
+      readonly services: ReadonlyArray<string>;
+      readonly remedy: string;
+    },
+  ) {
+    super(message);
+    this.name = "SharedServiceRefusedError";
+  }
+}
+
+function sharedServiceRefusedError(
+  services: ReadonlyArray<string>,
+  command: NamedServiceCommand,
+): SharedServiceRefusedError {
+  const remedy = "devtrees down --shared && devtrees up";
+  const quoted = services.map((s) => `'${s}'`).join(", ");
+  const one = services.length === 1;
+  return new SharedServiceRefusedError(
+    `devtrees ${command}: ${quoted} ${one ? "is a shared service" : "are shared services"}. ` +
+      `The shared instance serves every worktree, so devtrees does not ${command} its ` +
+      `services from a worktree. Nothing was touched. \`${remedy}\` restarts the shared ` +
+      `instance, for every worktree.`,
+    { services, remedy },
+  );
 }
 
 /**
@@ -3899,15 +4028,22 @@ function assertNoPendingReload(args: {
   readonly marker: PendingReload | undefined;
   readonly rows: ServiceStatus[] | undefined;
   readonly previous: DerivedProcessMap | undefined;
-  readonly isolated: ReadonlyArray<ResolvedService>;
+  readonly isolated: ReadonlyArray<Pick<ResolvedService, "name" | "namespace">>;
   readonly requested: ReadonlyArray<string>;
   readonly isAlive: (pid: number) => boolean;
+  /** Who is refusing (#223): a per-service verb refuses too, as the update would undo it. */
+  readonly command?: "up" | NamedServiceCommand;
 }): boolean {
   const { anchor, marker, rows } = args;
   if (marker === undefined) return false;
   const stuck = stuckFromMarker(marker, rows, args.isAlive);
   if (stuck !== undefined) {
-    throw reloadPendingError(anchor.worktreeId, stuck, pendingRemedyUp({ ...args, stuck }));
+    throw reloadPendingError(
+      anchor.worktreeId,
+      stuck,
+      pendingRemedyUp({ ...args, stuck }),
+      args.command,
+    );
   }
   return rows !== undefined;
 }
@@ -3921,7 +4057,7 @@ function assertNoPendingReload(args: {
 function pendingRemedyUp(args: {
   readonly rows: ServiceStatus[] | undefined;
   readonly previous: DerivedProcessMap | undefined;
-  readonly isolated: ReadonlyArray<ResolvedService>;
+  readonly isolated: ReadonlyArray<Pick<ResolvedService, "name" | "namespace">>;
   readonly requested: ReadonlyArray<string>;
   readonly stuck: StuckReload;
 }): string {
@@ -3941,6 +4077,7 @@ function reloadPendingError(
   worktreeId: string,
   stuck: StuckReload,
   rebootCommand: string,
+  command: "up" | NamedServiceCommand = "up",
 ): ConfigDriftError {
   const names = stuck.services.map((s) => `'${s}'`).join(", ");
   const pids = stuck.pids.join(" ");
@@ -3955,10 +4092,17 @@ function reloadPendingError(
           `Wait a moment for process-compose to start the new one, then run ` +
             `\`devtrees up\` again. If this persists, run \`${rebootCommand}\`.`,
         ];
+  // A stop is refused too (#223): when the pending update finishes it starts
+  // the new copy, which would bring a stopped service back without any `up`.
+  const consequence =
+    command !== "up"
+      ? "When that update finishes, process-compose starts the new copy, which would undo " +
+        "this command, so nothing was touched and the instance is unchanged."
+      : "Reloading again now would make process-compose start a second, untracked copy, " +
+        "so nothing was reloaded and the instance is unchanged.";
   return new ConfigDriftError(
-    `devtrees up: a previous hot-reload of '${worktreeId}' is still pending for ${names}: ` +
-      `${waitingOn}. Reloading again now would make process-compose start a second, ` +
-      `untracked copy, so nothing was reloaded and the instance is unchanged. ${remedy}`,
+    `devtrees ${command}: a previous hot-reload of '${worktreeId}' is still pending for ` +
+      `${names}: ${waitingOn}. ${consequence} ${remedy}`,
     { reason: "reload_pending", services: stuck.services, pids: stuck.pids },
   );
 }
@@ -4228,15 +4372,22 @@ function namespaceNotRunningError(
   worktreeId: string,
   notRunning: ReadonlyArray<NamespaceNotRunning>,
   requested: ReadonlyArray<string>,
+  command: "up" | NamedServiceCommand = "up",
+  declared?: ReadonlyArray<Pick<ResolvedService, "namespace">>,
 ): NamespaceNotRunningError {
   const namespaces = notRunning.map((n) => n.namespace);
-  const services = notRunning.flatMap((n) => n.missingServices);
+  const services = [...new Set(notRunning.flatMap((n) => n.missingServices))];
   const flags = [...new Set(requested)].map((ns) => `-n ${ns}`).join(" ");
-  const remedy = `devtrees down && devtrees up ${flags}`;
+  // A per-service verb (#223) spells the boot with `formatUpCommand`, as the
+  // other remedies do; `up` keeps its own `-n` list.
+  const remedy =
+    declared === undefined
+      ? `devtrees down && devtrees up ${flags}`
+      : `devtrees down && ${formatUpCommand(declared, requested)}`;
   const quoted = namespaces.map((ns) => `'${ns}'`).join(", ");
   const one = namespaces.length === 1;
   return new NamespaceNotRunningError(
-    `devtrees up: namespace${one ? "" : "s"} ${quoted} ${one ? "is" : "are"} not running in ` +
+    `devtrees ${command}: namespace${one ? "" : "s"} ${quoted} ${one ? "is" : "are"} not running in ` +
       `'${worktreeId}' (not started: ${services.join(", ")}). A running instance keeps the ` +
       `namespaces it was booted with and cannot add more. Run \`${remedy}\` to boot with ` +
       `them. Nothing was started or stopped.`,

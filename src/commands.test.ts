@@ -7619,19 +7619,22 @@ describe("runStop — stop named services (#223, ADR-0009)", () => {
   const stack: ResolvedStack = {
     services: [
       isolated("web", "node web.js", ["WEB_PORT"]),
-      isolated("api", "node api.js"),
+      isolated("api", "node api.js", ["API_PORT"]),
       isolated("seed", "true"),
+      { ...isolated("sim", "simctl boot"), namespace: "mobile" },
       shared("db", "postgres", ["DB_PORT"]),
     ],
   };
+
+  type Row = { status: string; exit_code?: number; pid?: number; running?: boolean };
 
   /**
    * A live instance whose `process list` reads `rows`. `process stop` is
    * recorded and marks each named service stopped (`Completed`, exit -1),
    * as process-compose v1.122.0 does; anything else goes to the stub.
    */
-  async function liveInstance(rows: Record<string, { status: string; exit_code?: number }>) {
-    const deps = stubDeps({ stack, track: { invocations: [], touchSocket: true } });
+  async function liveInstance(rows: Record<string, Row>, declared: ResolvedStack = stack) {
+    const deps = stubDeps({ stack: declared, track: { invocations: [], touchSocket: true } });
     const up = await runUp(deps);
     const state = new Map(Object.entries(rows));
     const stops: string[][] = [];
@@ -7640,7 +7643,8 @@ describe("runStop — stop named services (#223, ADR-0009)", () => {
       if (args[0] === "process" && args[1] === "stop") {
         const names = args.slice(2, args.indexOf("-U"));
         stops.push(names);
-        for (const n of names) state.set(n, { status: "Completed", exit_code: -1 });
+        for (const n of names)
+          state.set(n, { ...state.get(n), status: "Completed", exit_code: -1 });
         return spawnedOk();
       }
       return base?.spawner?.(binary, args, options) ?? spawnedOk();
@@ -7651,6 +7655,8 @@ describe("runStop — stop named services (#223, ADR-0009)", () => {
         status: r.status,
         health: "unknown" as const,
         ...(r.exit_code !== undefined ? { exitCode: r.exit_code } : {}),
+        ...(r.pid !== undefined ? { pid: r.pid } : {}),
+        ...(r.running !== undefined ? { running: r.running } : {}),
       }));
     const stopDeps: CommandDeps = {
       ...deps,
@@ -7658,15 +7664,29 @@ describe("runStop — stop named services (#223, ADR-0009)", () => {
       getServiceStatuses,
       stop: { readProcessTable: async () => [], pollMs: 1, baseTimeoutMs: 50, graceMs: 10 },
     };
+    const anchor = (deps.git!(["rev-parse", "--git-common-dir"]) as string).trim();
     return {
       deps: stopDeps,
       stops,
+      state,
+      anchor,
       port: (n: string) => Number(up.env[n]),
       id: deps.expectedWorktreeId,
     };
   }
 
-  const running = { web: { status: "Running" }, api: { status: "Running" } };
+  const running = {
+    web: { status: "Running" },
+    api: { status: "Running" },
+    seed: { status: "Completed", exit_code: 0 },
+  };
+
+  async function failure(p: Promise<unknown>) {
+    return (await p.then(
+      () => undefined,
+      (e: unknown) => e,
+    )) as (Error & { code?: string; details?: Record<string, unknown> }) | undefined;
+  }
 
   it("stops only the named running service and reports it", async () => {
     const { deps, stops, id } = await liveInstance(running);
@@ -7691,51 +7711,196 @@ describe("runStop — stop named services (#223, ADR-0009)", () => {
       api: { status: "Completed", exit_code: -1 },
       seed: { status: "Completed", exit_code: 0 },
     });
-    const err = (await runStop(deps, { services: ["web"] }).catch((e: unknown) => e)) as Error & {
-      code?: string;
-    };
-    expect(err.code).toBe("LAST_SERVICES_RUNNING");
+    expect((await failure(runStop(deps, { services: ["web"] })))?.code).toBe(
+      "LAST_SERVICES_RUNNING",
+    );
     expect(stops).toEqual([]);
   });
 
-  it("refuses a shared service and an unknown one before touching anything", async () => {
+  it("fails LAST_SERVICES_RUNNING when the only other process is a Pending dependent (B1)", async () => {
+    const { deps, stops } = await liveInstance({
+      api: { status: "Running", running: true },
+      web: { status: "Pending", running: false },
+    });
+    expect((await failure(runStop(deps, { services: ["api"] })))?.code).toBe(
+      "LAST_SERVICES_RUNNING",
+    );
+    expect(stops).toEqual([]);
+  });
+
+  it("fails INSTANCE_NOT_FOUND, not success, when process-compose exits during the stop (B1)", async () => {
+    const { deps, state } = await liveInstance({
+      web: { status: "Running" },
+      api: { status: "Running" },
+    });
+    let gone = false;
+    const err = await failure(
+      runStop(
+        {
+          ...deps,
+          // `process stop` leaves web stopping; then process-compose exits.
+          getServiceStatuses: async () => {
+            if (gone) throw new Error("connect ENOENT");
+            gone = true;
+            state.set("web", { status: "Terminating" });
+            return [...state].map(([name, r]) => ({ name, status: r.status, health: "unknown" }));
+          },
+          probeSocket: async () => (gone ? "stale" : "running"),
+          stop: { ...deps.stop, baseTimeoutMs: 10_000 },
+        },
+        { services: ["web"] },
+      ),
+    );
+    expect(err?.code).toBe("INSTANCE_NOT_FOUND");
+    expect(err?.message).toContain("process-compose exited");
+  });
+
+  it("refuses a shared service with {services, remedy}, before an unknown name, touching nothing", async () => {
     const { deps, stops } = await liveInstance(running);
-    const shared = (await runStop(deps, { services: ["web", "db"] }).catch((e: unknown) => e)) as {
-      code?: string;
-    };
-    expect(shared.code).toBe("SHARED_SERVICE_REFUSED");
-    const unknown = (await runStop(deps, { services: ["nope"] }).catch((e: unknown) => e)) as {
-      code?: string;
-      details?: unknown;
-    };
-    expect(unknown.code).toBe("SERVICE_NOT_FOUND");
-    expect(unknown.details).toMatchObject({ service: "nope" });
+    const shared = await failure(runStop(deps, { services: ["nope", "db"] }));
+    expect(shared?.code).toBe("SHARED_SERVICE_REFUSED");
+    expect(shared?.details).toEqual({
+      services: ["db"],
+      remedy: "devtrees down --shared && devtrees up",
+    });
+    const unknown = await failure(runStop(deps, { services: ["nope"] }));
+    expect(unknown?.code).toBe("SERVICE_NOT_FOUND");
+    expect(unknown?.details).toEqual({
+      service: "nope",
+      valid_services: ["web", "api", "seed", "sim"],
+    });
     expect(stops).toEqual([]);
   });
 
-  it("fails INSTANCE_NOT_FOUND when no instance is running", async () => {
-    const deps = stubDeps({ stack });
-    const err = (await runStop(deps, { services: ["web"] }).catch((e: unknown) => e)) as {
-      code?: string;
-    };
-    expect(err.code).toBe("INSTANCE_NOT_FOUND");
+  it("still refuses a shared service when devtrees.yaml is broken (the shared config names it)", async () => {
+    const { deps, anchor } = await liveInstance(running);
+    const sharedConfig = sharedInstancePaths(anchor).configPath;
+    expect(existsSync(sharedConfig)).toBe(true);
+    const err = await failure(
+      runStop(
+        {
+          ...deps,
+          readStack: () => {
+            throw new Error("devtrees.yaml: bad");
+          },
+        },
+        { services: ["db"] },
+      ),
+    );
+    expect(err?.code).toBe("SHARED_SERVICE_REFUSED");
+  });
+
+  it("fails NAMESPACE_NOT_RUNNING for a service whose namespace the instance did not boot", async () => {
+    const { deps, stops, id } = await liveInstance(running);
+    const err = await failure(runStop(deps, { services: ["web", "sim"] }));
+    expect(err?.code).toBe("NAMESPACE_NOT_RUNNING");
+    expect(err?.details).toEqual({
+      worktree_id: id,
+      namespaces: ["mobile"],
+      services: ["sim"],
+      remedy: "devtrees down && devtrees up -n default -n mobile",
+    });
+    expect(stops).toEqual([]);
+  });
+
+  it("refuses with CONFIG_DRIFT reload_pending while a hot-reload is pending, as up does (B2)", async () => {
+    const { deps, stops, anchor, id } = await liveInstance(running);
+    writePendingReload(anchor, id, { services: ["web"], oldRuns: [{ name: "web", pid: 100 }] });
+    const err = await failure(
+      runStop({ ...deps, isProcessAlive: (pid) => pid === 100 }, { services: ["web"] }),
+    );
+    expect(err?.code).toBe("CONFIG_DRIFT");
+    expect(err?.details).toEqual({ reason: "reload_pending", services: ["web"], pids: [100] });
+    expect(err?.message).toContain("devtrees stop");
+    expect(stops).toEqual([]);
   });
 
   it("fails SERVICE_STOP_INCOMPLETE naming a listener still on a stopped service's port", async () => {
     const { deps, port } = await liveInstance(running);
     const webPort = port("WEB_PORT");
-    const err = (await runStop(
-      {
-        ...deps,
-        portAccepts: async (p) => p === webPort,
-        identifyPortHolder: () => ({ pid: 4242, command: "python3 escapee.py" }),
-      },
-      { services: ["web"] },
-    ).catch((e: unknown) => e)) as { code?: string; details?: { survivors?: unknown } };
-    expect(err.code).toBe("SERVICE_STOP_INCOMPLETE");
-    expect(err.details?.survivors).toMatchObject([
+    const err = await failure(
+      runStop(
+        {
+          ...deps,
+          portAccepts: async (p) => p === webPort,
+          identifyPortHolder: () => ({ pid: 4242, command: "python3 escapee.py" }),
+        },
+        { services: ["web"] },
+      ),
+    );
+    expect(err?.code).toBe("SERVICE_STOP_INCOMPLETE");
+    expect(err?.details?.survivors).toMatchObject([
       { service: "web", pid: 4242, port_name: "WEB_PORT", port: webPort },
     ]);
+  });
+
+  it("checks only the ports of services it stopped: a foreign holder of a stopped service's port is not its survivor", async () => {
+    const { deps, port } = await liveInstance({
+      web: { status: "Completed", exit_code: -1 },
+      api: { status: "Running" },
+      seed: { status: "Running" },
+    });
+    const ports = [port("WEB_PORT"), port("API_PORT")];
+    const checked: number[] = [];
+    const result = await runStop(
+      {
+        ...deps,
+        portAccepts: async (p) => {
+          checked.push(p);
+          return p === ports[0];
+        },
+      },
+      { services: ["web", "api"] },
+    );
+    expect(result).toMatchObject({ stopped: ["api"], notRunning: ["web"] });
+    expect(checked).toContain(ports[1]);
+    expect(checked).not.toContain(ports[0]);
+  });
+
+  it("re-checks, on the retry its remedy names, the ports an incomplete stop left held", async () => {
+    const { deps, port } = await liveInstance(running);
+    const webPort = port("WEB_PORT");
+    let held = true;
+    const probing = { ...deps, portAccepts: async (p: number) => held && p === webPort };
+    expect((await failure(runStop(probing, { services: ["web"] })))?.code).toBe(
+      "SERVICE_STOP_INCOMPLETE",
+    );
+    // web is stopped now, but its port is still held: the retry fails the same way.
+    expect((await failure(runStop(probing, { services: ["web"] })))?.code).toBe(
+      "SERVICE_STOP_INCOMPLETE",
+    );
+    held = false;
+    expect(await runStop(probing, { services: ["web"] })).toMatchObject({ notRunning: ["web"] });
+    // Converged: a later foreign holder is no longer this stop's business.
+    held = true;
+    expect(await runStop(probing, { services: ["web"] })).toMatchObject({ notRunning: ["web"] });
+  });
+
+  it("reports what the group sweep killed and what survived it, with an unsettled service", async () => {
+    const { deps, id } = await liveInstance(running);
+    const err = await failure(
+      runStop(
+        {
+          ...deps,
+          // process-compose keeps showing web stopping, and ps cannot verify it.
+          getServiceStatuses: async () => [
+            { name: "web", status: "Terminating", health: "unknown", pid: 201 },
+            { name: "api", status: "Running", health: "unknown" },
+          ],
+        },
+        { services: ["web"] },
+      ),
+    );
+    expect(err?.code).toBe("SERVICE_STOP_INCOMPLETE");
+    expect(err?.details).toMatchObject({
+      worktree_id: id,
+      survivors: [{ service: "web", pid: 201, command: null }],
+    });
+  });
+
+  it("fails INSTANCE_NOT_FOUND when no instance is running", async () => {
+    const deps = stubDeps({ stack });
+    expect((await failure(runStop(deps, { services: ["web"] })))?.code).toBe("INSTANCE_NOT_FOUND");
   });
 
   it("runs under the worktree's lifecycle lock", async () => {

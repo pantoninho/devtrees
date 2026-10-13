@@ -88,17 +88,17 @@ export const ERROR_CODE_DESCRIPTIONS: Readonly<Record<ErrorCode, string>> = {
   HEALTH_TIMEOUT:
     "Stack started but services did not report healthy before the wait window expired, or a selected service is dead, including one `up` restarted (`details.dead_services`).",
   NAMESPACE_NOT_RUNNING:
-    "`up -n` named a namespace the running instance was not booted with; `details.remedy` is the `down` + `up` that boots it.",
+    "`up -n` named a namespace the running instance was not booted with, or `stop` named a service in one; `details` has `{worktree_id, namespaces, services, remedy}`, the remedy being the `down` + `up` that boots it.",
   SHARED_SERVICE_DEAD:
     "A shared service in the running shared instance is dead; it is not restarted from a worktree, run `details.remedy` (`devtrees down --shared && devtrees up`).",
   SERVICE_START_FAILED:
     "`up` tried to restart a dead service on the running instance and process-compose refused; `details.services` names each one, `details.remedy` is the `down` + `up` that restarts the stack.",
   SHARED_SERVICE_REFUSED:
-    "A per-service command named a shared service; a worktree never stops the shared instance's services (`devtrees down --shared` stops the whole shared instance). `details.services` names them; nothing was touched.",
+    "A per-service command named a shared service; a worktree never stops the shared instance's services. Nothing was touched; `details` has `{services, remedy}`, the remedy being `devtrees down --shared && devtrees up` (for every worktree).",
   LAST_SERVICES_RUNNING:
-    "`stop` would leave the instance with no running process, and process-compose would then exit and take the instance down; nothing was stopped. `details.services` names them, `details.remedy` is `devtrees down`.",
+    "`stop` would leave the instance with no running process (a `Pending` service does not count), and process-compose would then exit and take the instance down; nothing was stopped. `details.services` names them, `details.remedy` is `devtrees down`.",
   SERVICE_STOP_INCOMPLETE:
-    "`stop` stopped the services, but something they started is still alive after the bounded stop and the force-kill: a listener on one of their ports, a process that survived SIGKILL, or a service process-compose still reports running; `details.survivors` lists each `{service, pid, command, port_name?, port?, port_forwarder?}`, `details.force_killed` what devtrees signalled, `details.remedy` what to do.",
+    "`stop` stopped the services, but after the bounded stop and the force-kill something is still alive or still holds one of their ports: a listener on a port (not necessarily one they started), a process that survived SIGKILL, or a service process-compose still reports running; `details.survivors` lists each `{service, pid, command, port_name?, port?, port_forwarder?}`, `details.force_killed` what devtrees signalled, `details.remedy` what to do. Rerunning the same `stop` checks the same ports again.",
   CONFIG_DRIFT:
     "Running config differs from devtrees.yaml and hot-reload failed, or an earlier reload is still pending; `details.reason` is `timeout`, `not_supported`, `error`, or `reload_pending` (nothing was reloaded: kill `details.pids`, then retry; empty `pids` means the old process is gone and process-compose is still starting the new one, so retry shortly).",
   SHARED_DRIFT:

@@ -64,6 +64,23 @@ export function isRunning(row: Pick<ServiceStatus, "status" | "exitCode">): bool
 }
 
 /**
+ * Will this service keep process-compose from exiting once others stop
+ * (#223)? Conservative: only a process that is running now counts. Whenever
+ * process-compose reports `is_running` it decides, so a `Pending` service
+ * (its dependency may be the one being stopped, and then it never starts), a
+ * `Restarting` one in its backoff and a `Terminating` one do not count.
+ * Without `is_running`, the status decides, with `Pending` and
+ * `Terminating` excluded for the same reasons.
+ */
+export function keepsInstanceAlive(
+  row: Pick<ServiceStatus, "status" | "exitCode" | "running">,
+): boolean {
+  if (row.running !== undefined) return row.running;
+  const status = row.status.toLowerCase();
+  return isRunning(row) && status !== "pending" && status !== "terminating";
+}
+
+/**
  * The rows among `names` that are dead, in `names` order. A name with no row
  * is not dead — absence is a selection question (`NAMESPACE_NOT_RUNNING`) or
  * a still-starting instance, never a crash.
