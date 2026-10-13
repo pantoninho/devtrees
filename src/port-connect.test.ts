@@ -4,7 +4,12 @@
  */
 import { describe, expect, it } from "vite-plus/test";
 import { createServer, type Server } from "node:net";
-import { acceptsConnections, isPortForwarder } from "./port-connect.js";
+import {
+  acceptsConnections,
+  isPortForwarder,
+  type ConnectAttempt,
+  type ConnectOutcome,
+} from "./port-connect.js";
 
 function listen(host: string, opts: { ipv6Only?: boolean } = {}): Promise<Server> {
   return new Promise((resolve, reject) => {
@@ -47,6 +52,23 @@ describe("acceptsConnections", () => {
     const port = portOf(server);
     await close(server);
     expect(await acceptsConnections(port)).toBe(false);
+  });
+});
+
+describe("acceptsConnections — how each connect outcome counts", () => {
+  const stub =
+    (outcomes: Record<string, ConnectOutcome>): ConnectAttempt =>
+    async (host) =>
+      outcomes[host] ?? "refused";
+
+  it("fails closed: a connect that is never answered counts as accepting", async () => {
+    expect(await acceptsConnections(1, 10, stub({ "127.0.0.1": "timeout" }))).toBe(true);
+    expect(await acceptsConnections(1, 10, stub({ "::1": "timeout" }))).toBe(true);
+  });
+
+  it("is false only when both loopbacks refuse", async () => {
+    expect(await acceptsConnections(1, 10, stub({}))).toBe(false);
+    expect(await acceptsConnections(1, 10, stub({ "::1": "connected" }))).toBe(true);
   });
 });
 

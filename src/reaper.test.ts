@@ -13,8 +13,10 @@
  */
 
 import { describe, expect, it } from "vite-plus/test";
+import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
 import type { DerivedConfig } from "./deriver.js";
-import { reapShutdownHooks, type HookRun } from "./reaper.js";
+import { DEFAULT_HOOK_TIMEOUT_MS, reapShutdownHooks, type HookRun } from "./reaper.js";
 
 /** Minimal derived config with the given processes. */
 function config(processes: DerivedConfig["processes"]): DerivedConfig {
@@ -133,3 +135,52 @@ describe("reapShutdownHooks — runs each process's shutdown.command from a vali
     expect(result.failures).toEqual([]);
   });
 });
+
+// Issue #155: a hook with no `shutdown.timeout_seconds` used to run unbounded,
+// holding `down`'s lifecycle lock forever.
+describe("reapShutdownHooks — every hook is bounded (#155)", () => {
+  it("gives a hook with no timeout_seconds process-compose's own default", async () => {
+    const runs: HookRun[] = [];
+    await reapShutdownHooks(config({ db: proc("x", { command: "reap.sh" }) }), {
+      cwd: "/anchor",
+      run: async (run) => (runs.push(run), { ok: true }),
+    });
+    expect(runs[0]?.timeoutMs).toBe(DEFAULT_HOOK_TIMEOUT_MS);
+    expect(DEFAULT_HOOK_TIMEOUT_MS).toBe(10_000);
+  });
+
+  it("kills an overrunning hook's whole process group and reports the timeout", async () => {
+    const marker = `pr155-hook-${process.pid}-${Date.now()}`;
+    const started = Date.now();
+    const result = await reapShutdownHooks(
+      config({
+        db: proc("x", {
+          // The hook backgrounds a child, as `supabase stop` might spawn docker.
+          // `$0` puts the marker in each shell's argv for `livePids`.
+          command: `sh -c 'sleep 600; :' ${marker}-bg & sh -c 'sleep 600; :' ${marker}-fg; true`,
+          timeout_seconds: 0.3,
+        }),
+      }),
+      { cwd: tmpdir() },
+    );
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(result.failures).toMatchObject([{ process: "db", reason: "timeout" }]);
+    // Neither the hook's shell nor anything it started outlives the budget.
+    const deadline = Date.now() + 3_000;
+    let left = livePids(marker);
+    while (left.length > 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50));
+      left = livePids(marker);
+    }
+    expect(left).toEqual([]);
+  });
+});
+
+/** Pids whose command line contains `needle`. */
+function livePids(needle: string): number[] {
+  const out = spawnSync("ps", ["-A", "-o", "pid=,args="], { encoding: "utf8" });
+  return out.stdout
+    .split("\n")
+    .filter((line) => line.includes(needle) && !line.includes("ps -A"))
+    .map((line) => Number(line.trim().split(/\s+/)[0]));
+}

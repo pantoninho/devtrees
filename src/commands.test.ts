@@ -5876,6 +5876,7 @@ describe("runUp — stale port block detection (#58)", () => {
       pid: 12345,
       command: "node stale.mjs",
       accepts_connections: true,
+      port_forwarder: false,
     });
     // The human message lists the collision too (#155), not just `details`.
     expect(err.message).toContain(`WEB_PORT ${blockBase}: pid 12345 (node stale.mjs)`);
@@ -7324,9 +7325,19 @@ describe("runDown after process-compose stops (#155)", () => {
     ],
   };
 
+  /** `stack`, with a hook on `web` too (a service that is not a daemon). */
+  const hooked: ResolvedStack = {
+    services: stack.services.map((svc) =>
+      svc.name === "web" ? { ...svc, shutdown: { command: "stop-web.sh" } } : svc,
+    ),
+  };
+
   /** A live instance whose `process list` reads `rows`. */
-  async function liveInstance(rows: ReadonlyArray<{ name: string; status: string }>) {
-    const deps = stubDeps({ stack, track: { invocations: [], touchSocket: true } });
+  async function liveInstance(
+    rows: ReadonlyArray<{ name: string; status: string; exit_code?: number }>,
+    declared: ResolvedStack = stack,
+  ) {
+    const deps = stubDeps({ stack: declared, track: { invocations: [], touchSocket: true } });
     const up = await runUp(deps);
     const base = deps.driver;
     const spawner: NonNullable<CommandDeps["driver"]>["spawner"] = (binary, args, options) => {
@@ -7348,9 +7359,9 @@ describe("runDown after process-compose stops (#155)", () => {
     return { deps: { ...deps, driver: { ...base, spawner }, reap }, reaped, port };
   }
 
-  it("runs the shutdown hook of a daemon whose launch had already exited, and only that one", async () => {
+  it("runs the shutdown hook of a daemon whose launch had failed, and only that one", async () => {
     const { deps, reaped } = await liveInstance([
-      { name: "db", status: "Completed" },
+      { name: "db", status: "Completed", exit_code: 1 },
       { name: "cache", status: "Launched" },
       { name: "web", status: "Running" },
     ]);
@@ -7358,6 +7369,35 @@ describe("runDown after process-compose stops (#155)", () => {
     expect(result).toMatchObject({ shared: false, stopped: true });
     // process-compose ran cache's hook itself; db's it skipped.
     expect(reaped).toEqual([["db"]]);
+  });
+
+  it("runs the hook of a daemon in Error (it could not start)", async () => {
+    const { deps, reaped } = await liveInstance([
+      { name: "db", status: "Error" },
+      { name: "web", status: "Running" },
+    ]);
+    await runDown(deps);
+    expect(reaped).toEqual([["db"]]);
+  });
+
+  it("never re-runs the hook of a daemon stopped earlier (Completed, exit 0: its hook already ran)", async () => {
+    const { deps, reaped } = await liveInstance([
+      { name: "db", status: "Completed", exit_code: 0 },
+      { name: "cache", status: "Completed" },
+      { name: "web", status: "Running" },
+    ]);
+    await runDown(deps);
+    expect(reaped).toEqual([]);
+  });
+
+  it("never runs a hook for a failed service that is not a daemon", async () => {
+    // `web` has a hook and failed: only the is_daemon filter keeps it out.
+    const { deps, reaped } = await liveInstance(
+      [{ name: "web", status: "Completed", exit_code: 1 }],
+      hooked,
+    );
+    await runDown(deps);
+    expect(reaped).toEqual([]);
   });
 
   it("runs no hook when every daemon was still launched", async () => {
@@ -7382,13 +7422,62 @@ describe("runDown after process-compose stops (#155)", () => {
     }).catch((e: unknown) => e)) as Error & { code?: string; details?: Record<string, unknown> };
     expect(err.code).toBe("DOWN_INCOMPLETE");
     expect(err.details?.survivors).toEqual([
-      { service: "db", pid: 4242, command: "OrbStack Helper", port_name: "DB_PORT", port: dbPort },
+      {
+        service: "db",
+        pid: 4242,
+        command: "OrbStack Helper",
+        port_name: "DB_PORT",
+        port: dbPort,
+        port_forwarder: true,
+      },
     ]);
     expect(err.message).toContain(`db DB_PORT ${dbPort}: pid 4242 (OrbStack Helper)`);
     // A shared port forwarder is never offered up for killing.
     expect(err.message).toContain(`docker ps --filter publish=${dbPort}`);
     expect(err.message).toContain("never this process");
     expect(err.message).not.toMatch(/kill 4242/);
+  });
+
+  it("a second down re-checks the ports and fails again while the listener survives, then converges", async () => {
+    const { deps, port } = await liveInstance([
+      { name: "db", status: "Completed", exit_code: 1 },
+      { name: "web", status: "Running" },
+    ]);
+    const dbPort = port("DB_PORT");
+    let listening = true;
+    const seams = {
+      ...deps,
+      portAccepts: async (p: number) => listening && p === dbPort,
+      identifyPortHolder: () => ({ pid: 4242, command: "python3" }),
+    };
+    const first = (await runDown(seams).catch((e: unknown) => e)) as { code?: string };
+    expect(first.code).toBe("DOWN_INCOMPLETE");
+    // process-compose is gone now: the next `down` takes the dead-supervisor path.
+    const dead = { ...seams, probeSocket: async () => "stale" as const };
+    const second = (await runDown(dead).catch((e: unknown) => e)) as {
+      code?: string;
+      details?: { survivors?: unknown[] };
+    };
+    expect(second.code).toBe("DOWN_INCOMPLETE");
+    expect(second.details?.survivors).toMatchObject([{ service: "db", port: dbPort }]);
+    // Once the listener is gone, the same `down` succeeds, and stays succeeded.
+    listening = false;
+    await expect(runDown(dead)).resolves.toMatchObject({ stopped: false });
+    listening = true;
+    await expect(runDown(dead)).resolves.toMatchObject({ stopped: false });
+  });
+
+  it("waits for a port that closes shortly after the stop instead of reporting it", async () => {
+    const { deps, port } = await liveInstance([{ name: "web", status: "Running" }]);
+    let checks = 0;
+    const result = await runDown({
+      ...deps,
+      portSettleMs: 2_000,
+      // Still open on the first check, closed on the next.
+      portAccepts: async (p) => p === port("WEB_PORT") && checks++ === 0,
+    });
+    expect(result).toMatchObject({ stopped: true });
+    expect(checks).toBe(2);
   });
 
   it("never checks the ports of a service the instance did not boot", async () => {

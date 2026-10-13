@@ -80,8 +80,12 @@ import {
 } from "./port-probe.js";
 import { acceptsConnections, forwarderLabel, isPortForwarder } from "./port-connect.js";
 import {
+  clearDownIncomplete,
   daemonHooksSkipped,
+  unsignalledServices,
   downIncomplete,
+  readDownIncomplete,
+  writeDownIncomplete,
   findPortSurvivors,
   processSurvivor,
   type DownSurvivor,
@@ -557,6 +561,12 @@ interface PortCollision {
    * may be one process serving every instance, so it is not to be killed.
    */
   readonly accepts_connections: boolean;
+  /**
+   * The holder is a container runtime's port forwarder (OrbStack Helper,
+   * `com.docker.backend`, ...), which serves every instance's containers:
+   * never kill it, stop the container that publishes the port (#155).
+   */
+  readonly port_forwarder: boolean;
 }
 
 /**
@@ -657,7 +667,7 @@ function describeCollision(c: PortCollision): string {
 /** Why a holder is not one to kill, if it is not (#155). */
 function collisionLabel(c: PortCollision): string {
   if (!c.accepts_connections) return ` — ${REFUSING_LABEL}`;
-  if (isPortForwarder(c.command)) return ` — ${forwarderLabel(c.port)}`;
+  if (c.port_forwarder) return ` — ${forwarderLabel(c.port)}`;
   return "";
 }
 
@@ -701,6 +711,7 @@ async function collectPortCollisions(
         pid: report.pid,
         command: report.command,
         accepts_connections: await portAccepts(port),
+        port_forwarder: isPortForwarder(report.command),
       });
     }
   }
@@ -1591,8 +1602,10 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     // isolated services land in this instance, so scope dir creation to them.
     ensureLogsDir(stack, logsDir(anchor.anchor, anchor.worktreeId), "isolated");
     writeFileSync(paths.configPath, stringifyYaml(derived.config), "utf8");
-    // A pending-reload marker (#191) describes an instance that is gone now.
+    // A pending-reload marker (#191) describes an instance that is gone now,
+    // and so does a DOWN_INCOMPLETE marker (#155).
     clearPendingReload(anchor.anchor, anchor.worktreeId);
+    clearDownIncomplete(anchor.anchor, anchor.worktreeId);
 
     // Shared-health wait: gate the worktree start on the shared services'
     // readiness probes whenever this worktree drops a cross-tier `depends_on`
@@ -2505,13 +2518,18 @@ export async function runDown(
       // Still under the lock, so a concurrent `up` cannot start listeners that
       // would pass for survivors (#155).
       if (stopped === undefined || stopped.supervisorExited) return { stopped };
-      return { stopped, ...(await checkAfterStop(stopped, paths.configPath, anchor, deps)) };
+      const after = await checkAfterStop(stopped, paths.configPath, anchor, deps);
+      // Record what to re-check, so the `down` the remedy names converges (#155).
+      if ((after.survivors ?? []).length === 0)
+        clearDownIncomplete(anchor.anchor, anchor.worktreeId);
+      else writeDownIncomplete(anchor.anchor, anchor.worktreeId, bootedServices(stopped));
+      return { stopped, ...after };
     },
   );
   if (stop.stopped !== undefined && !stop.stopped.supervisorExited) {
     const forceKilled = stop.stopped.forceKilled;
     if (stop.survivors !== undefined && stop.survivors.length > 0) {
-      throw downIncomplete(anchor.worktreeId, stop.survivors, forceKilled);
+      throw downIncomplete(anchor.worktreeId, stop.survivors, forceKilled, stop.warning?.failures);
     }
     return {
       shared: false,
@@ -2531,6 +2549,9 @@ export async function runDown(
   // the stop (#206) is reaped the same way, and the instance was stopped.
   const reap = deps.reap ?? reapShutdownHooks;
   const warning = await reapDerivedConfig(paths.configPath, anchor.worktreeId, anchor.anchor, reap);
+  // An earlier `down` failed DOWN_INCOMPLETE (#155): with the hooks re-run,
+  // check the same ports again, and succeed only once they are free.
+  await recheckDownIncomplete(paths.configPath, anchor, deps, warning);
 
   return {
     shared: false,
@@ -2566,11 +2587,44 @@ async function checkAfterStop(
     skipped === undefined
       ? undefined
       : await reapDerivedHooks(skipped, configPath, anchor, deps.reap ?? reapShutdownHooks);
-  const listeners = await findPortSurvivors(config, stopped.statuses, portSurvivorSeams(deps));
+  const listeners = await findPortSurvivors(
+    config,
+    bootedServices(stopped),
+    portSurvivorSeams(deps),
+  );
   return {
     survivors: [...processes, ...listeners],
     ...(warning !== undefined ? { warning } : {}),
   };
+}
+
+/** The services the pre-stop `process list` showed: the ones the instance had booted. */
+function bootedServices(stopped: StopResult): string[] {
+  return (stopped.statuses ?? []).map((s) => s.name);
+}
+
+/**
+ * The dead-supervisor half of #155's convergence: when an earlier `down`
+ * failed `DOWN_INCOMPLETE`, check the services it recorded again. Still
+ * held: fail `DOWN_INCOMPLETE` again (with any hook that failed this time),
+ * keeping the marker. Free: clear it.
+ */
+async function recheckDownIncomplete(
+  configPath: string,
+  anchor: { readonly anchor: string; readonly worktreeId: string },
+  deps: CommandDeps,
+  warning: ReapWarning | undefined,
+): Promise<void> {
+  const services = readDownIncomplete(anchor.anchor, anchor.worktreeId);
+  if (services === undefined) return;
+  const config = readDerivedConfig(configPath);
+  const survivors =
+    config === undefined ? [] : await findPortSurvivors(config, services, portSurvivorSeams(deps));
+  if (survivors.length === 0) {
+    clearDownIncomplete(anchor.anchor, anchor.worktreeId);
+    return;
+  }
+  throw downIncomplete(anchor.worktreeId, survivors, [], warning?.failures);
 }
 
 /** Run `config`'s shutdown hooks from the anchor; a `ReapWarning` when any failed. */
@@ -2616,15 +2670,17 @@ function stopInstance(
   seams: StopSeams | undefined,
   pendingReload?: PendingReload,
 ): Promise<StopResult> {
+  const config = readDerivedConfig(paths.configPath);
   return boundedDown(
     {
       inst: { configPath: paths.configPath, socketPath: paths.socketPath },
       instance,
       command,
-      timeoutMs: downTimeoutMs(readDerivedConfig(paths.configPath), seams?.baseTimeoutMs),
+      timeoutMs: downTimeoutMs(config, seams?.baseTimeoutMs),
       remedy: (pid, pending) =>
         downTimeoutRemedy(instance, command, paths.socketPath, pid, pending),
       pendingReload,
+      unsignalled: unsignalledServices(config),
     },
     driver,
     seams,

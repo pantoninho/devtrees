@@ -1928,13 +1928,16 @@ describe.skipIf(!ENABLED)("real-pc smoke — down leaves nothing behind (#155)",
     expect(devtrees(wt, ["down", "--json"]).code).toBe(0);
   }, 120_000);
 
-  it("scenario 81: down runs the shutdown hook process-compose skips for a daemon whose launch failed (#155)", async () => {
+  it("scenario 81: down runs each skipped daemon hook once, bounded, and never re-runs one that already ran (#155)", async () => {
     const { wt, root } = scenarioRepo("dt-rpc81-");
     // Each daemon "starts a container" (a resource file), and its hook
     // removes it and logs that it ran. `app`'s launch then fails, as a
-    // `supabase start` that times out on a health check does.
+    // `supabase start` that times out on a health check does. `slow`'s
+    // launch fails too, and its hook never finishes and declares no
+    // timeout. `data` launches fine and is stopped by hand before `down`
+    // (its hook runs then, and it shows Completed, exit 0).
     const hookLog = join(root, "hooks.log");
-    const daemon = (name: string, ns: string, exit: number) => [
+    const daemon = (name: string, ns: string, exit: number, hookTail = "") => [
       `  ${name}:`,
       "    tier: isolated",
       `    namespace: ${ns}`,
@@ -1943,22 +1946,51 @@ describe.skipIf(!ENABLED)("real-pc smoke — down leaves nothing behind (#155)",
       "    availability:",
       '      restart: "no"',
       "    shutdown:",
-      `      command: "sh -c 'rm -f ${join(root, `res-${name}`)}; echo ${name} >> ${hookLog}'"`,
+      `      command: "sh -c 'rm -f ${join(root, `res-${name}`)}; echo ${name} >> ${hookLog}${hookTail}'"`,
     ];
     writeFileSync(
       join(wt, "devtrees.yaml"),
-      ["services:", ...daemon("data", "backoffice", 0), ...daemon("app", "app", 1), ""].join("\n"),
+      [
+        "services:",
+        ...daemon("data", "backoffice", 0),
+        ...daemon("app", "app", 1),
+        ...daemon("slow", "app", 1, "; sleep 600"),
+        // Keeps process-compose running once `data` is stopped: it exits when
+        // nothing runs, and then `down` takes the dead-supervisor path.
+        "  web:",
+        "    tier: isolated",
+        "    namespace: app",
+        '    command: "sleep 300"',
+        "",
+      ].join("\n"),
     );
-    // `app`'s failed launch makes this up fail HEALTH_TIMEOUT; the instance stays up.
+    // The failed launches make this up fail HEALTH_TIMEOUT; the instance stays up.
     devtrees(wt, ["up", "--json", "--wait-timeout", "5", "-n", "backoffice", "-n", "app"]);
     expect(existsSync(join(root, "res-app")), "app's launch should have run").toBe(true);
+    const commonDir = execGit(wt, ["rev-parse", "--git-common-dir"]);
+    const absCommon = commonDir.startsWith("/") ? commonDir : join(wt, commonDir);
+    const socketPath = instancePaths(absCommon, wtId(wt)).socketPath;
+    const stop = spawnSync("process-compose", ["process", "stop", "data", "-u", socketPath], {
+      encoding: "utf8",
+    });
+    expect(stop.status, stop.stderr).toBe(0);
+    expect(readFileSync(hookLog, "utf8")).toBe("data\n");
 
+    const started = Date.now();
     const down = devtrees(wt, ["down", "--json"]);
     expect(down.code, `down should succeed: ${down.stdout}`).toBe(0);
-    expect(existsSync(join(root, "res-data")), "process-compose runs data's hook").toBe(false);
+    // `slow`'s hook is cut off at process-compose's default 10s, not left to
+    // hold the lifecycle lock forever.
+    expect(Date.now() - started).toBeLessThan(45_000);
+    const doc = down.doc as { down: { warning?: { failures: Array<{ process: string }> } } };
+    expect(doc.down.warning?.failures).toMatchObject([{ process: "slow", reason: "timeout" }]);
     expect(existsSync(join(root, "res-app")), "devtrees runs app's skipped hook").toBe(false);
-    // Each hook ran exactly once.
-    expect(readFileSync(hookLog, "utf8").trim().split("\n").sort()).toEqual(["app", "data"]);
+    // Each hook ran exactly once: data's by the stop, the two failed ones by devtrees.
+    expect(readFileSync(hookLog, "utf8").trim().split("\n").sort()).toEqual([
+      "app",
+      "data",
+      "slow",
+    ]);
   }, 120_000);
 
   it("scenario 82: down fails DOWN_INCOMPLETE naming a listener that outlived the stop (#155)", async () => {
@@ -1998,6 +2030,51 @@ describe.skipIf(!ENABLED)("real-pc smoke — down leaves nothing behind (#155)",
     ]);
     // The human message names it too.
     expect(down.stderr).toContain(`db DB_PORT ${port}: pid ${pid}`);
+
+    // The remedy converges: a second `down` re-checks the port and fails
+    // the same way while the listener lives, then succeeds once it is gone.
+    const again = devtrees(wt, ["down", "--json"]);
+    expect(again.code).toBe(1);
+    expect((again.doc as { error: { code: string } }).error.code).toBe("DOWN_INCOMPLETE");
+    process.kill(pid!, "SIGKILL");
+    expect(await waitForNoPids(listener, 5_000)).toEqual([]);
+    const last = devtrees(wt, ["down", "--json"]);
+    expect(last.code, last.stdout).toBe(0);
+  }, 120_000);
+
+  it("scenario 84: down never signals a daemon a service detached from its process group (#155)", async () => {
+    const { wt, root } = scenarioRepo("dt-rpc84-");
+    const listener = listenerScript(root);
+    // A launcher that starts (or would reuse) a per-user daemon in a session
+    // of its own, on a fixed port outside the block, then keeps running:
+    // the Gradle-daemon / Node `detached: true` + `unref()` shape.
+    const shared = await new Promise<number>((resolve) => {
+      const srv = createServer();
+      srv.listen(0, "127.0.0.1", () => {
+        const address = srv.address();
+        srv.close(() => resolve(typeof address === "object" && address ? address.port : 0));
+      });
+    });
+    writeFileSync(
+      join(wt, "devtrees.yaml"),
+      [
+        "services:",
+        "  web:",
+        "    tier: isolated",
+        `    command: "sh -c 'python3 ${listener} ${shared} detach; exec sleep 300'"`,
+        "",
+      ].join("\n"),
+    );
+    expect(up(wt).code).toBe(0);
+    expect(await waitForListener(shared, 10_000), "the shared daemon should serve").toBe(true);
+    const [daemonPid] = pidsMatching(listener);
+
+    const down = devtrees(wt, ["down", "--json"]);
+    expect(down.code, down.stdout).toBe(0);
+    expect((down.doc as { down: { force_killed: unknown[] } }).down.force_killed).toEqual([]);
+    // Still alive and serving: other instances may be using it.
+    expect(pidsMatching(listener)).toEqual([daemonPid]);
+    expect(await waitForListener(shared, 2_000)).toBe(true);
   }, 120_000);
 
   it("scenario 83: STALE_PORT_BLOCK lists each held port with its pid and command in human output (#155)", async () => {
@@ -2028,7 +2105,13 @@ describe.skipIf(!ENABLED)("real-pc smoke — down leaves nothing behind (#155)",
     expect(human.stderr).toContain(`WEB_PORT ${port}: pid ${squatter.pid}`);
     const json = staleCollisions(devtrees(wt, ["up", "--json", "--wait-timeout", "10"]));
     expect(json).toMatchObject([
-      { port_name: "WEB_PORT", port, pid: squatter.pid, accepts_connections: true },
+      {
+        port_name: "WEB_PORT",
+        port,
+        pid: squatter.pid,
+        accepts_connections: true,
+        port_forwarder: false,
+      },
     ]);
   }, 120_000);
 });

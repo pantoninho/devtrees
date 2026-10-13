@@ -79,7 +79,7 @@ export const ERROR_CODE_DESCRIPTIONS: Readonly<Record<ErrorCode, string>> = {
   DOWN_TIMEOUT:
     "The stop did not finish within its budget and process-compose was still running after devtrees force-killed the stuck services, or a timed-out hot-reload never finished so the stop was not started (`details.pending_reload`); the socket and config were kept, `details` names the stuck services, their pids and the process-compose pid, `details.remedy` says what to do.",
   DOWN_INCOMPLETE:
-    "process-compose stopped, but something the instance started is still alive: a listener on a booted service's port, or a service descendant that survived SIGKILL; `details.survivors` lists each `{service, pid, command, port_name?, port?}`, `details.remedy` says what to do.",
+    "process-compose stopped, but something the instance started is still alive: a listener on a booted service's port, or a member of a service's process group that survived SIGKILL; `details.survivors` lists each `{service, pid, command, port_name?, port?, port_forwarder?}`, `details.remedy` says what to do. A retried `down` checks the same ports again.",
   SERVICE_NOT_FOUND:
     "The named service does not exist in the target instance; `details.valid_services` lists the known ones.",
   HEALTH_TIMEOUT:
@@ -103,7 +103,7 @@ export const ERROR_CODE_DESCRIPTIONS: Readonly<Record<ErrorCode, string>> = {
   SOCKET_PATH_TOO_LONG:
     "The control socket path exceeds the platform's unix-socket limit; set DEVTREES_RUNTIME_DIR to a shorter directory.",
   STALE_PORT_BLOCK:
-    "Foreign listeners hold ports in this worktree's allocated block (likely orphans); `details.collisions[]` lists each `{port_name, port, pid, command, accepts_connections}`, and a holder that refuses connections (`accepts_connections: false`) is not one to kill.",
+    "Foreign listeners hold ports in this worktree's allocated block (likely orphans); `details.collisions[]` lists each `{port_name, port, pid, command, accepts_connections, port_forwarder}`. Never kill a holder with `accepts_connections: false` or `port_forwarder: true`.",
   LOCK_CONTENTION:
     "Another devtrees process holds a devtrees lock (allocation registry or an instance's lifecycle lock).",
   CONFIG_INVALID: "devtrees.yaml is malformed or rejected by the deriver.",

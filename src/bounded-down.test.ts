@@ -854,21 +854,53 @@ describe("readSupervisedTable", () => {
 // Issue #155: process-compose calls a service stopped once its direct child
 // exits, so a grandchild that ignores SIGTERM (`exec pnpm exec keyshelf run
 // ... -- uv run ... uvicorn --reload`) outlived `down`, holding its port.
-describe("service process trees (#155)", () => {
+describe("service process groups (#155)", () => {
+  const T0 = "Tue Oct 13 14:06:00 2026";
   /** `web`'s wrapper chain: WEB (sh) -> UV -> UVICORN, all in WEB's group. */
-  const UV: ProcessRow = { pid: 501, ppid: 201, pgid: 201, command: "uv run uvicorn" };
-  const UVICORN: ProcessRow = { pid: 502, ppid: 501, pgid: 201, command: "python uvicorn" };
-  /** A descendant that moved to a process group of its own. */
-  const DETACHED: ProcessRow = { pid: 503, ppid: 502, pgid: 503, command: "python worker" };
+  const UV: ProcessRow = { pid: 501, ppid: 201, pgid: 201, command: "uv run uvicorn", started: T0 };
+  const UVICORN: ProcessRow = {
+    pid: 502,
+    ppid: 501,
+    pgid: 201,
+    command: "python uvicorn",
+    started: T0,
+  };
+  /** A descendant that left the group on purpose (setsid): maybe shared by other instances. */
+  const DETACHED: ProcessRow = {
+    pid: 503,
+    ppid: 502,
+    pgid: 503,
+    command: "python shared-daemon",
+    started: T0,
+  };
   /** UVICORN after its parents died: reparented to PID 1, still in WEB's group. */
   const ORPHAN: ProcessRow = { ...UVICORN, ppid: 1 };
   const svc = (row: ProcessRow) => ({ service: "web", ...row });
 
-  it("serviceTrees: each service with its descendants and group members", () => {
+  it("parseProcessTable reads the start time when ps prints lstart", () => {
+    const rows = parseProcessTable(
+      [
+        "  502   501   201 Tue Oct 13 14:06:00 2026 python uvicorn",
+        "  503     1   503 Sat Oct  3 09:01:02 2026 python worker --x",
+      ].join("\n"),
+    );
+    expect(rows).toEqual([
+      { pid: 502, ppid: 501, pgid: 201, command: "python uvicorn", started: T0 },
+      {
+        pid: 503,
+        ppid: 1,
+        pgid: 503,
+        command: "python worker --x",
+        started: "Sat Oct 3 09:01:02 2026",
+      },
+    ]);
+  });
+
+  it("serviceTrees: each service with its process-group members, never a process that left the group", () => {
     const stray: ProcessRow = { pid: 600, ppid: 1, pgid: 201, command: "python reloader" };
     const other: ProcessRow = { pid: 700, ppid: 1, pgid: 700, command: "vim" };
     const tree = serviceTrees([svc(WEB)], [PC, WEB, UV, UVICORN, DETACHED, stray, other, OLD]);
-    expect(tree.map((p) => p.pid)).toEqual([201, 501, 502, 503, 600]);
+    expect(tree.map((p) => p.pid)).toEqual([201, 501, 502, 600]);
     expect(tree.every((p) => p.service === "web")).toBe(true);
   });
 
@@ -877,9 +909,15 @@ describe("service process trees (#155)", () => {
     expect(tree.map((p) => p.pid)).toEqual([201, 501]);
   });
 
-  it("treeSurvivors accepts a reparented process but not a reused pid", () => {
-    const tree = [svc(UVICORN), svc(UV)];
-    expect(treeSurvivors(tree, [ORPHAN, { ...UV, command: "vim" }])).toEqual([svc(UVICORN)]);
+  it("treeSurvivors accepts a reparented process", () => {
+    expect(treeSurvivors([svc(UVICORN)], [ORPHAN])).toEqual([svc(UVICORN)]);
+  });
+
+  it("treeSurvivors rejects a reused pid: another command, process group or start time", () => {
+    const tree = [svc(UVICORN)];
+    expect(treeSurvivors(tree, [{ ...ORPHAN, command: "vim" }])).toEqual([]);
+    expect(treeSurvivors(tree, [{ ...ORPHAN, pgid: 900 }])).toEqual([]);
+    expect(treeSurvivors(tree, [{ ...ORPHAN, started: "Wed Oct 14 08:00:00 2026" }])).toEqual([]);
   });
 
   /** A clean stop of `web`, after which `left` is what the process table still shows. */
@@ -914,21 +952,36 @@ describe("service process trees (#155)", () => {
     expect(result.survivors).toBeUndefined();
   });
 
-  it("sends SIGTERM first to a leftover outside the service's group, then SIGKILL by pid", async () => {
+  it("never signals a descendant that left the service's group (a detached, maybe shared daemon)", async () => {
     const w = sweepWorld([{ ...DETACHED, ppid: 1 }]);
     const result = await boundedDown(target, w.driver, w.seams);
-    expect(w.signals).toEqual([
-      [503, "SIGTERM"],
-      [503, "SIGKILL"],
-    ]);
-    expect(result.forceKilled).toEqual([{ service: "web", pid: 503 }]);
+    expect(w.signals).toEqual([]);
+    expect(result.forceKilled).toEqual([]);
   });
 
-  it("kills nothing when the leftover exits within the grace", async () => {
-    const w = sweepWorld([{ ...DETACHED, ppid: 1 }], { exitsOnTerm: true });
-    const result = await boundedDown(target, w.driver, w.seams);
-    expect(w.signals).toEqual([[503, "SIGTERM"]]);
-    expect(result.forceKilled).toEqual([]);
+  it("sends SIGTERM first when process-compose did not signal the group, and reports it", async () => {
+    const w = sweepWorld([ORPHAN], { exitsOnTerm: true });
+    const result = await boundedDown(
+      { ...target, unsignalled: new Set(["web"]) },
+      w.driver,
+      w.seams,
+    );
+    expect(w.signals).toEqual([[502, "SIGTERM"]]);
+    expect(result.forceKilled).toEqual([{ service: "web", pid: 502 }]);
+  });
+
+  it("then SIGKILLs the group when SIGTERM did not take, reporting the process once", async () => {
+    const w = sweepWorld([ORPHAN]);
+    const result = await boundedDown(
+      { ...target, unsignalled: new Set(["web"]) },
+      w.driver,
+      w.seams,
+    );
+    expect(w.signals).toEqual([
+      [502, "SIGTERM"],
+      [-201, "SIGKILL"],
+    ]);
+    expect(result.forceKilled).toEqual([{ service: "web", pid: 502 }]);
   });
 
   it("returns what SIGKILL could not stop as survivors", async () => {
@@ -937,8 +990,8 @@ describe("service process trees (#155)", () => {
     expect(result.survivors).toEqual([svc(UVICORN)]);
   });
 
-  it("never kills a pid reused during the grace", async () => {
-    const reused = { ...ORPHAN, command: "vim notes" };
+  it("never kills a pid reused during the grace, even with the same command line", async () => {
+    const reused = { ...ORPHAN, started: "Wed Oct 14 08:00:00 2026" };
     const w = sweepWorld([ORPHAN]);
     let n = 0;
     const tables = [[PC, WEB, UV, UVICORN], [ORPHAN], [reused]];

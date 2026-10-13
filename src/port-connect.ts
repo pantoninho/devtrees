@@ -27,33 +27,44 @@ const CONNECT_TIMEOUT_MS = 500;
  */
 const LOOPBACKS = ["127.0.0.1", "::1"] as const;
 
-/** Resolve whether a TCP connect to `host:port` is accepted. */
-function connects(host: string, port: number, timeoutMs: number): Promise<boolean> {
+/** How one TCP connect attempt ended. */
+export type ConnectOutcome = "connected" | "timeout" | "refused";
+
+/** One TCP connect to `host:port`, capped at `timeoutMs`. */
+export type ConnectAttempt = (
+  host: string,
+  port: number,
+  timeoutMs: number,
+) => Promise<ConnectOutcome>;
+
+function connectOnce(host: string, port: number, timeoutMs: number): Promise<ConnectOutcome> {
   return new Promise((resolve) => {
     const socket = connect({ host, port });
-    const done = (accepted: boolean): void => {
+    const done = (outcome: ConnectOutcome): void => {
       socket.destroy();
-      resolve(accepted);
+      resolve(outcome);
     };
     socket.setTimeout(timeoutMs);
-    socket.once("connect", () => done(true));
-    // No answer at all: fail closed, as a holder that may well be serving.
-    socket.once("timeout", () => done(true));
-    socket.once("error", () => done(false));
+    socket.once("connect", () => done("connected"));
+    socket.once("timeout", () => done("timeout"));
+    socket.once("error", () => done("refused"));
   });
 }
 
 /**
- * True when a TCP connect to `port` on either loopback address is accepted
- * (or never answered, which is treated as accepted so a wedged listener is
- * never waved through). False only when every address refuses.
+ * True when a TCP connect to `port` on either loopback address is accepted,
+ * or never answered: no answer fails closed, so a wedged listener (or, on
+ * macOS, a socket bound without listening, which drops the SYN and does
+ * block a bind) is never waved through as refusing. False only when every
+ * address refuses. `attempt` is a test seam.
  */
 export async function acceptsConnections(
   port: number,
   timeoutMs: number = CONNECT_TIMEOUT_MS,
+  attempt: ConnectAttempt = connectOnce,
 ): Promise<boolean> {
   for (const host of LOOPBACKS) {
-    if (await connects(host, port, timeoutMs)) return true;
+    if ((await attempt(host, port, timeoutMs)) !== "refused") return true;
   }
   return false;
 }
