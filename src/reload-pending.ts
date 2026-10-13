@@ -105,7 +105,7 @@ export interface StuckReload {
 type DerivedProcesses = Readonly<Record<string, Readonly<Record<string, unknown>>>>;
 
 /** A derived process entry's `namespace`, when it is a well-formed one. */
-function namespaceOf(entry: Readonly<Record<string, unknown>> | undefined): {
+export function namespaceOf(entry: Readonly<Record<string, unknown>> | undefined): {
   readonly namespace?: Namespace;
 } {
   const ns = entry?.namespace;

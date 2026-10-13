@@ -109,6 +109,7 @@ import {
   clearPendingReload,
   identifyOldRuns,
   isProcessAlive,
+  namespaceOf,
   planPendingReload,
   readPendingReload,
   stuckFromMarker,
@@ -916,24 +917,47 @@ export interface DryRunResult {
    */
   readonly droppedEdges: ReadonlyArray<DroppedEdge>;
   /**
-   * The namespace selection a fresh `up` with the same flags would pass to
-   * process-compose (issue #176): the `-n` values verbatim, or `["default"]`
-   * for a bare `up` (namespaces are opt-in, ADR-0008).
+   * Which path the previewed `up` takes (#210): `"fresh"` when this
+   * worktree's instance is not running (a new process-compose would be
+   * spawned), `"running"` when it is (the instance would be verified,
+   * reloaded on drift and repaired, ADR-0008). Decided by a read-only
+   * liveness probe of the control socket.
+   */
+  readonly instance: "fresh" | "running";
+  /**
+   * The effective namespace selection. Fresh (#176): the `-n` values
+   * verbatim, or `["default"]` for a bare `up` (namespaces are opt-in,
+   * ADR-0008). Running (#210): the `-n` values, or for a bare `up` the
+   * namespaces the instance was booted with, read back from process-compose.
    */
   readonly namespaces: ReadonlyArray<string>;
   /**
-   * The isolated services that selection starts, in declaration order — the
-   * set a real fresh `up` would spawn and health-wait on. `config` still
-   * carries every service: the selection is applied by process-compose's
-   * `-n` at launch, not by removing services from the derived config.
+   * The isolated services that selection covers, in declaration order — the
+   * set the real `up` would spawn (fresh) or check (running) and health-wait
+   * on. Compare it with `up.services` as a set: that lists the project's rows
+   * in process-compose's order (by name), and on a running instance every
+   * service in the project, not only the selected ones. `config` still carries every service: the selection is applied by
+   * process-compose's `-n` at launch, not by removing services from the
+   * derived config.
    */
   readonly selectedServices: ReadonlyArray<string>;
   /**
-   * `depends_on` edges a fresh `up` with the same flags would lose because
-   * their target is in no selected namespace (ADR-0008, #179): process-compose
-   * drops them and starts the dependent ungated. Empty when none would be.
+   * `depends_on` edges the selection loses because their target is in no
+   * selected namespace (ADR-0008, #179): process-compose drops them and
+   * starts the dependent ungated. Empty when none would be.
    */
   readonly droppedNamespaceEdges: ReadonlyArray<DroppedNamespaceEdge>;
+  /**
+   * Running only (#210): the stack changed since the instance was last
+   * synced, so the real `up` would hot-reload it. Always `false` on a fresh
+   * preview.
+   */
+  readonly wouldReload: boolean;
+  /**
+   * Running only (#210): dead selected isolated services the real `up` would
+   * restart, in `depends_on` order. Always empty on a fresh preview.
+   */
+  readonly wouldRestart: ReadonlyArray<string>;
   /** `${NAME}` references to injected variables in service commands (#200). */
   readonly bracedEnvVars: ReadonlyArray<BracedEnvVar>;
 }
@@ -1029,6 +1053,32 @@ interface AllocatedPortMaps {
 }
 
 /**
+ * The named-port → number resolvers for a worktree block at `blockBase` and,
+ * when the stack has shared services, a shared block at `sharedBase`: each
+ * name resolves to its block's base plus its positional offset. Shared by
+ * `allocateAndBuildPortMaps` (under the registry lock) and `runEnv` (a
+ * lock-free read).
+ */
+function namedPortResolvers(
+  stack: ResolvedStack,
+  options: AllocatorOptions,
+  blockBase: number,
+  sharedBase: number | undefined,
+): Pick<AllocatedPortMaps, "portFor" | "sharedPortFor"> {
+  const isolatedOffsets = buildOffsetMap(stack.services, "isolated", options.blockSize);
+  const sharedOffsets =
+    sharedBase === undefined
+      ? new Map<string, number>()
+      : buildOffsetMap(stack.services, "shared", options.blockSize);
+  const at = (base: number | undefined, offset: number | undefined) =>
+    base === undefined || offset === undefined ? undefined : base + offset;
+  return {
+    portFor: (name) => at(blockBase, isolatedOffsets.get(name)),
+    sharedPortFor: (name) => at(sharedBase, sharedOffsets.get(name)),
+  };
+}
+
+/**
  * Allocate this worktree's port block — and, if the stack declares shared
  * services, the shared block — under one read-modify-write of the registry
  * lock, then build the named-port → number resolvers from the resulting
@@ -1066,20 +1116,7 @@ async function allocateAndBuildPortMaps(args: {
     return next === snapshot ? snapshot : next;
   });
 
-  const isolatedOffsets = buildOffsetMap(stack.services, "isolated", options.blockSize);
-  const sharedOffsets = sharedNeeded
-    ? buildOffsetMap(stack.services, "shared", options.blockSize)
-    : new Map<string, number>();
-
-  const portFor = (name: string): number | undefined => {
-    const offset = isolatedOffsets.get(name);
-    return offset === undefined ? undefined : blockBase + offset;
-  };
-  const sharedPortFor = (name: string): number | undefined => {
-    if (sharedBase === undefined) return undefined;
-    const offset = sharedOffsets.get(name);
-    return offset === undefined ? undefined : sharedBase + offset;
-  };
+  const { portFor, sharedPortFor } = namedPortResolvers(stack, options, blockBase, sharedBase);
 
   return sharedBase === undefined
     ? { blockBase, portFor, sharedPortFor }
@@ -1168,12 +1205,14 @@ async function socketIsLive(
   socketPath: string,
   liveness: LivenessProbe,
   context: LivenessContext,
+  /** `up --dry-run` (#210): answer the same question, but leave a stale file. */
+  opts: { readonly readOnly?: boolean } = {},
 ): Promise<boolean> {
   if (!existsSync(socketPath)) return false;
   const status = await probeUntilDefinitive(socketPath, liveness.probe, liveness.retryDelaysMs);
   if (status === "running") return true;
   if (status === "stale") {
-    rmSync(socketPath, { force: true });
+    if (opts.readOnly !== true) rmSync(socketPath, { force: true });
     return false;
   }
   throw new InstanceUnresponsiveError(context.command, {
@@ -1645,16 +1684,26 @@ async function collectIsolatedServices(
  * effect (#124). The result is the agent-readable preview of what `devtrees
  * up` would run.
  *
+ * Instance-aware (#210): when this worktree's instance is running, the
+ * preview is of the running-instance path — the namespaces it was booted
+ * with (for a bare `up`), whether the config would be hot-reloaded, which
+ * dead services would be restarted, and the errors that path raises
+ * (`NAMESPACE_NOT_RUNNING`, `CONFIG_DRIFT` with `reload_pending`). That needs
+ * read-only probes of the instance: a liveness probe of its control socket
+ * and one `process list` read (`previewRunning`).
+ *
  * No side effects, by design (the dry-run invariant, ADR-0005):
  *
- *  - No `process-compose` spawn, no control socket, no health/readiness wait.
+ *  - No `process-compose` spawn, no reload, no restart, no health/readiness
+ *    wait; a stale control-socket file is left in place (the real `up`
+ *    unlinks it).
  *  - No config files written under `<anchor>/devtrees/` — neither the
  *    worktree config nor the shared config touch disk.
  *  - No instance registered: the registry's allocation entry IS read-modify-
  *    written (allocation needs a non-colliding block), but no *instance* is
- *    recorded. The stored-stack hash is not written, the per-worktree
- *    lifecycle lock is never taken, and the shared instance is never
- *    lazy-started.
+ *    recorded. The stored-stack hash and the pending-reload marker are read
+ *    but never written, the per-worktree lifecycle lock is never taken, and
+ *    the shared instance is never lazy-started.
  *
  * The one registry touch — `allocateAndBuildPortMaps`'s lock-guarded
  * read-modify-write — is acceptable for a dry run because it neither starts
@@ -1675,10 +1724,22 @@ export async function runUpDryRun(deps: CommandDeps = {}): Promise<DryRunResult>
   const isPortFree = deps.isPortFree ?? defaultIsPortFree;
 
   const stack = readStack(anchor.worktreeRoot);
-  // Preview the fresh-start selection (issues #176, #203): same namespaces, same
-  // NO_SERVICES_SELECTED failure a real fresh `up` would hit — checked before
-  // the registry is touched, so a failing preview has no side effect at all.
-  const selection = resolveFreshSelection(stack, anchor.worktreeId, deps.namespaces);
+  // The same explicit-`-n` check the real `up` makes first (#203).
+  assertExplicitSelectionNotEmpty(stack, anchor.worktreeId, deps.namespaces);
+  // Preview the path the real `up` would take (#210): the running-instance
+  // one when this worktree's instance is live, else a fresh start (#176). Both
+  // raise the errors the real `up` would, and both run before the registry is
+  // touched, so a failing preview has no side effect at all.
+  const socketPath = instancePaths(anchor.anchor, anchor.worktreeId).socketPath;
+  const live = await socketIsLive(
+    socketPath,
+    resolveProbe(deps),
+    { command: "up", instance: anchor.worktreeId },
+    { readOnly: true },
+  );
+  const preview: RunningPreview = live
+    ? await previewRunning(stack, anchor, socketPath, deps)
+    : { plan: previewFresh(stack, anchor.worktreeId, deps.namespaces) };
   const options = resolveAllocatorOptions(stack, deps.allocator ?? DEFAULT_ALLOCATOR);
   const sharedNeeded = hasTier(stack, "shared");
 
@@ -1699,6 +1760,9 @@ export async function runUpDryRun(deps: CommandDeps = {}): Promise<DryRunResult>
     sharedPortFor,
   });
 
+  // Only the reload filter needs the new derived config; every error is raised above.
+  const plan = withoutReloadRestarted(preview, derivedWt.config);
+
   const base: DryRunResult = {
     worktreeId: anchor.worktreeId,
     worktreeRoot: anchor.worktreeRoot,
@@ -1706,9 +1770,7 @@ export async function runUpDryRun(deps: CommandDeps = {}): Promise<DryRunResult>
     env: derivedWt.env,
     config: derivedWt.config,
     droppedEdges: derivedWt.droppedEdges,
-    namespaces: selection.namespaces,
-    selectedServices: selection.services.map((s) => s.name),
-    droppedNamespaceEdges: droppedNamespaceEdges(stack.services, selection.services),
+    ...plan,
     bracedEnvVars: bracedEnvVars(stack),
   };
 
@@ -1729,6 +1791,163 @@ export async function runUpDryRun(deps: CommandDeps = {}): Promise<DryRunResult>
     // exhaustive if that validation ever loosens.
     droppedEdges: [...derivedWt.droppedEdges, ...derivedShared.droppedEdges],
   };
+}
+
+/** The part of a `DryRunResult` that depends on which path `up` would take (#210). */
+type DryRunPlan = Pick<
+  DryRunResult,
+  | "instance"
+  | "namespaces"
+  | "selectedServices"
+  | "droppedNamespaceEdges"
+  | "wouldReload"
+  | "wouldRestart"
+>;
+
+/** A fresh start's preview (#176): `-n` verbatim, or `default` for a bare `up`. */
+function previewFresh(
+  stack: ResolvedStack,
+  worktreeId: string,
+  requested: ReadonlyArray<string> | undefined,
+): DryRunPlan {
+  const selection = resolveFreshSelection(stack, worktreeId, requested);
+  return {
+    instance: "fresh",
+    namespaces: selection.namespaces,
+    selectedServices: selection.services.map((s) => s.name),
+    droppedNamespaceEdges: droppedNamespaceEdges(stack.services, selection.services),
+    wouldReload: false,
+    wouldRestart: [],
+  };
+}
+
+/**
+ * A running instance's preview (#210), decided by the same checks the real
+ * `up` makes, in the same order, from read-only inputs: one bounded `process
+ * list` read, the stored stack hash, the pending-reload marker and the
+ * on-disk derived config. It raises `reload_pending` (`assertNoPendingReload`,
+ * which `reconcileRunning` uses) and `NAMESPACE_NOT_RUNNING`
+ * (`planRunningInstance`, which `verifyRunning` uses). Nothing is reloaded,
+ * restarted or written, no lock is taken, and a converged marker is left for
+ * the real `up` to clear.
+ *
+ * The real `up` hot-reloads a drifted stack *before* it reads the selection
+ * back, so on drift the preview decides against the project as the reload
+ * would leave it (`rowsAfterReload`), not as it is now.
+ *
+ * The read is capped at `--wait-timeout` when given, else at
+ * `READ_TIMEOUT_MS` (5s), not the real `up`'s 120s default: a process-compose
+ * too slow to answer (or frozen, e.g. SIGSTOPped) fails `HEALTH_TIMEOUT`
+ * sooner than the real `up` would.
+ *
+ * What it cannot preview is the outcome of the side effects themselves: a
+ * reload process-compose refuses (`CONFIG_DRIFT`), a restart it refuses
+ * (`SERVICE_START_FAILED`), or a service that never becomes healthy
+ * (`HEALTH_TIMEOUT`).
+ */
+async function previewRunning(
+  stack: ResolvedStack,
+  anchor: { readonly anchor: string; readonly worktreeId: string },
+  socketPath: string,
+  deps: CommandDeps,
+): Promise<RunningPreview> {
+  const driver = createDriver(deps.driver);
+  const rows = await readStatusesWithin(
+    { getServiceStatuses: statusReader(deps, driver) },
+    socketPath,
+    deps.waitTimeoutMs ?? DRY_RUN_READ_TIMEOUT_MS,
+    { probe: probeOf(deps) },
+  );
+  const readHash = deps.readStoredHash ?? defaultReadStoredHash;
+  const wouldReload = readHash(anchor.anchor, anchor.worktreeId) !== stackHash(stack);
+  const { configPath } = instancePaths(anchor.anchor, anchor.worktreeId);
+  const previous = derivedProcesses(
+    existsSync(configPath) ? readFileSync(configPath, "utf8") : undefined,
+  );
+  assertNoPendingReload({
+    anchor,
+    marker: readPendingReload(anchor.anchor, anchor.worktreeId),
+    rows,
+    previous,
+    isolated: stack.services.filter((s) => s.tier === "isolated"),
+    requested: deps.namespaces ?? [],
+    isAlive: deps.isProcessAlive ?? isProcessAlive,
+  });
+  const reload = wouldReload && previous !== undefined;
+  const projected = reload ? rowsAfterReload(stack, previous, rows) : rows;
+  const plan = planRunningInstance(stack, anchor.worktreeId, projected, deps.namespaces);
+  return {
+    plan: {
+      instance: "running",
+      namespaces: plan.namespaces,
+      selectedServices: plan.services.map((s) => s.name),
+      droppedNamespaceEdges: plan.droppedNamespaceEdges,
+      wouldReload,
+      wouldRestart: plan.dead,
+    },
+    ...(reload ? { previous } : {}),
+  };
+}
+
+/** Budget for the dry run's one `process list` read when `--wait-timeout` is not given (#210). */
+const DRY_RUN_READ_TIMEOUT_MS = READ_TIMEOUT_MS;
+
+/**
+ * A preview's plan, plus — for a running instance the preview assumes is
+ * reloaded — the derived processes it runs now (`withoutReloadRestarted`
+ * needs them once the new config is derived).
+ */
+interface RunningPreview {
+  readonly plan: DryRunPlan;
+  readonly previous?: DerivedProcessMap;
+}
+
+/**
+ * The project as a hot-reload of `stack` would leave it (#210), for the
+ * preview to decide against. process-compose keeps the namespace selection it
+ * booted with across `project update` (ADR-0008): every service of `stack` in
+ * a booted namespace is in the project afterwards, new ones included, and a
+ * service moved to an unbooted namespace or removed from `devtrees.yaml` is
+ * gone (both verified on v1.122.0). The booted namespaces are read the way a
+ * bare `up` reads them, but against the config the instance runs now
+ * (`previous`), so a service that is absent only because it is new does not
+ * mark its namespace unbooted. A namespace booted with no services in it is
+ * not provable this way and is treated as unbooted.
+ *
+ * Rows of services already present are kept, so a dead one still reads dead;
+ * a new service reads `Pending`, not dead.
+ */
+function rowsAfterReload(
+  stack: ResolvedStack,
+  previous: DerivedProcessMap,
+  rows: ReadonlyArray<ServiceStatus>,
+): ServiceStatus[] {
+  const before = Object.keys(previous).map((name) => ({
+    name,
+    ...namespaceOf(previous[name]),
+  }));
+  const present = new Set(rows.map((r) => r.name));
+  const booted = resolveRunningSelection(before, present, undefined).namespaces;
+  const byName = new Map(rows.map((r) => [r.name, r]));
+  return stack.services
+    .filter((s) => s.tier === "isolated" && namespaceSelected(s, booted))
+    .map((s) => byName.get(s.name) ?? { name: s.name, status: "Pending", health: "unknown" });
+}
+
+/**
+ * Drop from `wouldRestart` the dead services the reload itself starts again
+ * (#210): process-compose restarts every service whose config changed, dead
+ * or not, so the real `up` finds those running and does not restart them
+ * (verified on v1.122.0). Compared like `planPendingReload` does, on the
+ * YAML round-trip of both configs.
+ */
+function withoutReloadRestarted(running: RunningPreview, next: DerivedConfig): DryRunPlan {
+  const { plan, previous } = running;
+  if (previous === undefined) return plan;
+  const after = derivedProcesses(stringifyYaml(next)) ?? {};
+  const unchanged = (name: string) =>
+    JSON.stringify(previous[name]) === JSON.stringify(after[name]);
+  return { ...plan, wouldRestart: plan.wouldRestart.filter(unchanged) };
 }
 
 /**
@@ -2792,20 +3011,12 @@ export async function runEnv(deps: CommandDeps = {}): Promise<EnvResult> {
     ? await allocateBlock(SHARED_REGISTRY_KEY, snapshot, options, isPortFree)
     : undefined;
 
-  const isolatedOffsets = buildOffsetMap(stack.services, "isolated", options.blockSize);
-  const sharedOffsets = sharedNeeded
-    ? buildOffsetMap(stack.services, "shared", options.blockSize)
-    : new Map<string, number>();
-
-  const portFor = (name: string): number | undefined => {
-    const offset = isolatedOffsets.get(name);
-    return offset === undefined ? undefined : block.base + offset;
-  };
-  const sharedPortFor = (name: string): number | undefined => {
-    if (sharedBlock === undefined) return undefined;
-    const offset = sharedOffsets.get(name);
-    return offset === undefined ? undefined : sharedBlock.base + offset;
-  };
+  const { portFor, sharedPortFor } = namedPortResolvers(
+    stack,
+    options,
+    block.base,
+    sharedBlock?.base,
+  );
 
   // Shared ports come from the running instance, not positional offsets
   // (issue #83): when the shared socket is live and a persisted map exists,
@@ -3145,7 +3356,7 @@ async function reconcileRunning(args: {
   const rows = await statusReader(args.deps, args.driver)(paths.socketPath, {
     timeoutMs: READ_TIMEOUT_MS,
   }).catch(() => undefined);
-  assertNoPendingReload({
+  const converged = assertNoPendingReload({
     anchor,
     marker,
     rows,
@@ -3154,6 +3365,7 @@ async function reconcileRunning(args: {
     requested: args.deps.namespaces ?? [],
     isAlive: args.deps.isProcessAlive ?? isProcessAlive,
   });
+  if (converged) clearPendingReload(anchor.anchor, anchor.worktreeId);
   if (!drift) return;
   await applyReload({ ...args, previousConfig, rows });
   args.writeHash(anchor.anchor, anchor.worktreeId, currentHash);
@@ -3266,9 +3478,11 @@ const RELOAD_TIMED_OUT_HASH = "reload-timed-out";
 
 /**
  * Refuse to reload while a previous reload is still pending (#191; see
- * src/reload-pending.ts). The marker is checked whenever there is one, and
- * cleared once a successful read shows it converged; a failed read leaves it
- * in place, with only the old PIDs as evidence.
+ * src/reload-pending.ts). The marker is checked whenever there is one.
+ * Pure, so `up --dry-run` can raise the same refusal (#210): returns `true`
+ * when a successful read shows the reload converged, and the caller (the
+ * real `up` only) then clears the marker; a failed read leaves it in place,
+ * with only the old PIDs as evidence.
  */
 function assertNoPendingReload(args: {
   readonly anchor: { readonly anchor: string; readonly worktreeId: string };
@@ -3278,14 +3492,14 @@ function assertNoPendingReload(args: {
   readonly isolated: ReadonlyArray<ResolvedService>;
   readonly requested: ReadonlyArray<string>;
   readonly isAlive: (pid: number) => boolean;
-}): void {
+}): boolean {
   const { anchor, marker, rows } = args;
-  if (marker === undefined) return;
+  if (marker === undefined) return false;
   const stuck = stuckFromMarker(marker, rows, args.isAlive);
   if (stuck !== undefined) {
     throw reloadPendingError(anchor.worktreeId, stuck, pendingRemedyUp({ ...args, stuck }));
   }
-  if (rows !== undefined) clearPendingReload(anchor.anchor, anchor.worktreeId);
+  return rows !== undefined;
 }
 
 /**
@@ -3385,7 +3599,6 @@ async function verifyRunning(args: {
   readonly restarted: string[];
 }> {
   const { stack, anchor, socketPath, deps, driver } = args;
-  const isolated = stack.services.filter((s) => s.tier === "isolated");
   const timeoutMs = deps.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS;
 
   // The boot-time selection only exists in the live project, so `up` needs
@@ -3397,18 +3610,9 @@ async function verifyRunning(args: {
     timeoutMs,
     { notify: args.warn, probe: probeOf(deps) },
   );
-  const present = new Set(rows.map((r) => r.name));
-  const selection = resolveRunningSelection(isolated, present, deps.namespaces);
-
-  if (selection.notRunning.length > 0) {
-    throw namespaceNotRunningError(anchor.worktreeId, selection.notRunning, deps.namespaces ?? []);
-  }
-
-  // Dropped cross-namespace edges against the effective selection (#179):
-  // on a bare `up` that is the booted one read back above, not `default`.
-  // A target counts as kept when it is in the project, so a narrower `-n`
-  // than the boot selection does not report edges to services still running.
-  const nsEdges = warnDroppedNamespaceEdges(stack, selection.services, args.warn, present);
+  const selection = planRunningInstance(stack, anchor.worktreeId, rows, deps.namespaces);
+  const nsEdges = selection.droppedNamespaceEdges;
+  for (const edge of nsEdges) args.warn(formatDroppedNamespaceEdgeWarning(edge));
 
   const remedy = `devtrees down && ${formatUpCommand(stack.services, selection.namespaces)}`;
   const { restarted, firstRead } = await restartDeadServices({
@@ -3427,6 +3631,49 @@ async function verifyRunning(args: {
     rows: lastRows,
     droppedNamespaceEdges: nsEdges,
     restarted: restarted.map((r) => r.name),
+  };
+}
+
+/**
+ * What `up` does to a running instance, decided from one `process list` read
+ * (ADR-0008). Pure: the real `up` (`verifyRunning`) and `up --dry-run`
+ * (`previewRunning`, #210) both decide through it, so the preview cannot
+ * drift from the command it previews.
+ *
+ *  - **Selection.** A bare `up` targets the namespaces whose declared
+ *    services are all present (the boot-time selection); `-n` is exact, and a
+ *    requested namespace whose services are absent throws
+ *    `NAMESPACE_NOT_RUNNING` (#170).
+ *  - **Dropped edges** (#179) against that effective selection. A target
+ *    counts as kept when it is in the project, so a narrower `-n` than the
+ *    boot selection does not report edges to services still running.
+ *  - **Dead** selected isolated services, in `depends_on` order: the ones
+ *    `up` would restart (#178), given the same read.
+ */
+function planRunningInstance(
+  stack: ResolvedStack,
+  worktreeId: string,
+  rows: ReadonlyArray<ServiceStatus>,
+  requested: ReadonlyArray<string> | undefined,
+): {
+  readonly namespaces: ReadonlyArray<string>;
+  readonly services: ReadonlyArray<ResolvedService>;
+  readonly droppedNamespaceEdges: DroppedNamespaceEdge[];
+  readonly dead: string[];
+} {
+  const isolated = stack.services.filter((s) => s.tier === "isolated");
+  const present = new Set(rows.map((r) => r.name));
+  const selection = resolveRunningSelection(isolated, present, requested);
+  if (selection.notRunning.length > 0) {
+    throw namespaceNotRunningError(worktreeId, selection.notRunning, requested ?? []);
+  }
+  const names = selection.services.map((s) => s.name);
+  const dead = findDeadServices(rows, names).map((d) => d.name);
+  return {
+    namespaces: selection.namespaces,
+    services: selection.services,
+    droppedNamespaceEdges: droppedNamespaceEdges(stack.services, selection.services, present),
+    dead: dependencyOrder(stack.services, dead),
   };
 }
 

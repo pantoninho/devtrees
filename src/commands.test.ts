@@ -9,7 +9,7 @@
  * state and no real `process-compose` are involved.
  */
 
-import { afterEach, describe, expect, it } from "vite-plus/test";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { EventEmitter } from "node:events";
 import {
   existsSync,
@@ -2346,6 +2346,379 @@ describe("runUpDryRun — namespace selection preview (#176)", () => {
       details: { selected_namespaces: ["nope"], namespaces: ["app"] },
     });
     expect(registryRef.snapshot).toEqual({});
+  });
+});
+
+/**
+ * `up --dry-run` on a running instance previews the running-instance path
+ * (#210): the selection read back from process-compose, the reload and the
+ * restarts the real `up` would make, and the errors it would raise — with
+ * read-only probes only. Before #210 it always previewed a fresh start, so a
+ * bare dry run of a stack with no `default` services failed
+ * NO_SERVICES_SELECTED where the real bare `up` succeeded.
+ */
+describe("runUpDryRun — a running instance (#210)", () => {
+  const running = (name: string, pid?: number): ServiceStatus => ({
+    name,
+    status: "Running",
+    health: "unknown",
+    ...(pid !== undefined ? { pid } : {}),
+  });
+  const killed = (name: string): ServiceStatus => ({
+    name,
+    status: "Completed",
+    health: "unknown",
+    exitCode: -1,
+  });
+  const noDefault: ResolvedStack = {
+    services: [
+      { ...isolated("api", "sleep 300", ["API_PORT"]), namespace: "local-backend" },
+      { ...isolated("worker", "sleep 300"), namespace: "jobs" },
+    ],
+  };
+
+  /**
+   * A live worktree instance (socket file present, probe `running`) whose
+   * project is `rows`, with every side-effecting seam recording its use.
+   */
+  function live(stack: ResolvedStack, rows: ServiceStatus[], extra: Partial<CommandDeps> = {}) {
+    const tmp = tmpAnchor();
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const registryRef = { snapshot: {} as RegistrySnapshot };
+    const base = stubDeps({
+      stack,
+      track,
+      registryRef,
+      anchorOverride: tmp.anchor,
+      worktreeRootOverride: tmp.worktreeRoot,
+    });
+    const id = base.expectedWorktreeId;
+    const paths = instancePaths(tmp.anchor, id);
+    mkdirSync(runDir(tmp.anchor), { recursive: true });
+    writeFileSync(paths.socketPath, "");
+    const effects = {
+      spawned: [] as string[][],
+      controlRequests: 0,
+      lifecycleLock: 0,
+      hashWrites: 0,
+      reads: 0,
+    };
+    const inner = base.driver?.spawner;
+    if (inner === undefined) throw new Error("expected stub spawner");
+    const deps: StubbedDeps = {
+      ...base,
+      readStoredHash: () => stackHash(stack),
+      writeStoredHash: () => {
+        effects.hashWrites++;
+      },
+      withLifecycleLock: async (_a, _i, fn) => {
+        effects.lifecycleLock++;
+        return fn();
+      },
+      getServiceStatuses: async () => {
+        effects.reads++;
+        return rows;
+      },
+      driver: {
+        ...base.driver,
+        spawner: (binary, args, options) => {
+          effects.spawned.push([...args]);
+          return inner(binary, args, options);
+        },
+        controlRequest: () => {
+          effects.controlRequests++;
+          return Promise.resolve({ status: 200, body: "{}" });
+        },
+      },
+      ...extra,
+    };
+    return { deps, effects, paths, id, anchor: tmp.anchor, registryRef };
+  }
+
+  async function dryFailure(deps: CommandDeps) {
+    return runUpDryRun(deps).then(
+      () => undefined,
+      (e: unknown) => e as Error & { code?: string; details?: Record<string, unknown> },
+    );
+  }
+
+  it("a bare dry run targets the booted namespaces, as the real bare up does (no default services)", async () => {
+    const { deps, effects } = live(noDefault, [running("api")]);
+    const dry = await runUpDryRun(deps);
+    expect(dry.instance).toBe("running");
+    expect(dry.namespaces).toEqual(["local-backend"]);
+    expect(dry.selectedServices).toEqual(["api"]);
+    expect(dry.wouldReload).toBe(false);
+    expect(dry.wouldRestart).toEqual([]);
+
+    // The real bare `up` on the same instance checks exactly those services.
+    const waited: string[][] = [];
+    await runUp({
+      ...deps,
+      waitForHealth: async ({ serviceNames }) => {
+        waited.push([...serviceNames]);
+      },
+    });
+    expect(waited).toEqual([dry.selectedServices]);
+    expect(effects.spawned.filter((a) => a[0] !== "process")).toEqual([]);
+  });
+
+  it("-n naming a namespace the instance was not booted with fails NAMESPACE_NOT_RUNNING, registry untouched", async () => {
+    const { deps, id, registryRef } = live(noDefault, [running("api")]);
+    const err = await dryFailure({ ...deps, namespaces: ["local-backend", "jobs"] });
+    expect(err?.code).toBe("NAMESPACE_NOT_RUNNING");
+    expect(err?.details).toEqual({
+      worktree_id: id,
+      namespaces: ["jobs"],
+      services: ["worker"],
+      remedy: "devtrees down && devtrees up -n local-backend -n jobs",
+    });
+    expect(registryRef.snapshot).toEqual({});
+  });
+
+  it("-n naming only a namespace with no services still fails NO_SERVICES_SELECTED (#203)", async () => {
+    const { deps } = live(noDefault, [running("api")]);
+    const err = await dryFailure({ ...deps, namespaces: ["nope"] });
+    expect(err?.code).toBe("NO_SERVICES_SELECTED");
+  });
+
+  it("names the dead selected services the real up would restart, and starts none", async () => {
+    const stack: ResolvedStack = {
+      services: [
+        { ...isolated("web", "sleep 300"), dependsOn: [{ name: "db" }] },
+        isolated("db", "sleep 300"),
+        isolated("ok", "sleep 300"),
+      ],
+    };
+    const { deps, effects } = live(stack, [killed("web"), killed("db"), running("ok")]);
+    const dry = await runUpDryRun(deps);
+    // `depends_on` order, as the real restart uses.
+    expect(dry.wouldRestart).toEqual(["db", "web"]);
+    expect(effects.spawned).toEqual([]);
+    expect(effects.lifecycleLock).toBe(0);
+  });
+
+  it("reports a drifted stack as a reload without reloading, writing the config or the hash", async () => {
+    const stack: ResolvedStack = { services: [isolated("web", "node b.js", ["WEB_PORT"])] };
+    const { deps, effects, paths } = live(stack, [running("web")], {
+      readStoredHash: () => "older-hash",
+    });
+    writeFileSync(paths.configPath, "processes: {}\n");
+    const dry = await runUpDryRun(deps);
+    expect(dry.instance).toBe("running");
+    expect(dry.wouldReload).toBe(true);
+    expect(effects.controlRequests).toBe(0);
+    expect(effects.hashWrites).toBe(0);
+    expect(readFileSync(paths.configPath, "utf8")).toBe("processes: {}\n");
+  });
+
+  it("a pending reload fails CONFIG_DRIFT reload_pending like the real up; the marker is kept", async () => {
+    const stack: ResolvedStack = {
+      services: [isolated("web", "node b.js"), isolated("api", "node api.js")],
+    };
+    const { deps, anchor, id } = live(stack, [running("api", 200)], {
+      isProcessAlive: (pid) => pid === 100,
+    });
+    const marker: PendingReload = { services: ["web"], oldRuns: [{ name: "web", pid: 100 }] };
+    writePendingReload(anchor, id, marker);
+    const err = await dryFailure(deps);
+    expect(err?.code).toBe("CONFIG_DRIFT");
+    expect(err?.details).toEqual({ reason: "reload_pending", services: ["web"], pids: [100] });
+    expect(readPendingReload(anchor, id)).toEqual(marker);
+  });
+
+  it("a converged pending reload passes, but only the real up clears its marker", async () => {
+    const stack: ResolvedStack = { services: [isolated("web", "node b.js")] };
+    const { deps, anchor, id } = live(stack, [running("web", 101)], {
+      isProcessAlive: () => false,
+    });
+    const marker: PendingReload = { services: ["web"], oldRuns: [{ name: "web", pid: 100 }] };
+    writePendingReload(anchor, id, marker);
+    const dry = await runUpDryRun(deps);
+    expect(dry.instance).toBe("running");
+    expect(readPendingReload(anchor, id)).toEqual(marker);
+  });
+
+  it("a stale socket file previews a fresh start and is left in place", async () => {
+    const { deps, paths, effects } = live(noDefault, [], {
+      probeSocket: async () => "stale" as const,
+    });
+    const dry = await runUpDryRun({ ...deps, namespaces: ["jobs"] });
+    expect(dry.instance).toBe("fresh");
+    expect(dry.selectedServices).toEqual(["worker"]);
+    expect(existsSync(paths.socketPath)).toBe(true);
+    expect(effects.reads).toBe(0);
+  });
+
+  it("a socket whose liveness stays unknown fails INSTANCE_UNRESPONSIVE and is kept", async () => {
+    const { deps, paths } = live(noDefault, [], {
+      probeSocket: async () => "unknown" as const,
+      probeRetryDelaysMs: [],
+    });
+    const err = await dryFailure(deps);
+    expect(err?.code).toBe("INSTANCE_UNRESPONSIVE");
+    expect(existsSync(paths.socketPath)).toBe(true);
+  });
+
+  it("with no instance running, a bare dry run of a stack with no default services still fails NO_SERVICES_SELECTED", async () => {
+    const { deps, paths } = live(noDefault, []);
+    rmSync(paths.socketPath);
+    const err = await dryFailure(deps);
+    expect(err?.code).toBe("NO_SERVICES_SELECTED");
+  });
+
+  /**
+   * The real `up` hot-reloads a drifted stack before it reads the selection
+   * back, so the preview must decide against the project the reload leaves.
+   * `before` is the config the instance runs (on disk); `rows` the project.
+   */
+  describe("a drifted stack is previewed after its reload", () => {
+    const lb = (name: string) => ({ ...isolated(name, `run ${name}`), namespace: "local-backend" });
+    const jobs = (name: string) => ({ ...isolated(name, `run ${name}`), namespace: "jobs" });
+    const before: ResolvedStack = { services: [lb("api"), lb("db"), jobs("worker")] };
+
+    /** A live instance booted with `-n local-backend` from `before`, now drifted to `after`. */
+    function drifted(after: ResolvedStack, projectAfterReload: string[]) {
+      let rows = [running("api"), running("db")];
+      const fixture = live(after, rows, {
+        readStoredHash: () => stackHash(before),
+        getServiceStatuses: async () => rows,
+      });
+      const processes = Object.fromEntries(
+        before.services.map((s) => [s.name, { command: s.command, namespace: s.namespace }]),
+      );
+      writeFileSync(fixture.paths.configPath, stringifyYaml({ processes }));
+      // What process-compose does on `project update` (verified on v1.122.0).
+      const reloaded: CommandDeps = {
+        ...fixture.deps,
+        driver: {
+          ...fixture.deps.driver,
+          controlRequest: () => {
+            rows = projectAfterReload.map((n) => running(n));
+            return Promise.resolve({ status: 200, body: "{}" });
+          },
+        },
+      };
+      return { dry: fixture.deps, real: reloaded };
+    }
+
+    async function realChecks(deps: CommandDeps): Promise<string[] | string> {
+      const waited: string[][] = [];
+      return runUp({
+        ...deps,
+        waitForHealth: async ({ serviceNames }) => {
+          waited.push([...serviceNames]);
+        },
+      }).then(
+        () => waited.flat(),
+        (e: { code?: string }) => e.code ?? "error",
+      );
+    }
+
+    it("a new service in a booted namespace: neither NAMESPACE_NOT_RUNNING nor an empty bare selection", async () => {
+      const after: ResolvedStack = {
+        services: [lb("api"), lb("db"), lb("cache"), jobs("worker")],
+      };
+      const scoped = drifted(after, ["api", "cache", "db"]);
+      const dryScoped = await runUpDryRun({ ...scoped.dry, namespaces: ["local-backend"] });
+      expect(dryScoped.wouldReload).toBe(true);
+      expect(dryScoped.selectedServices).toEqual(["api", "db", "cache"]);
+      expect(await realChecks({ ...scoped.real, namespaces: ["local-backend"] })).toEqual(
+        dryScoped.selectedServices,
+      );
+
+      const bare = drifted(after, ["api", "cache", "db"]);
+      const dryBare = await runUpDryRun(bare.dry);
+      expect(dryBare.namespaces).toEqual(["local-backend"]);
+      expect(dryBare.selectedServices).toEqual(["api", "db", "cache"]);
+      expect(await realChecks(bare.real)).toEqual(dryBare.selectedServices);
+    });
+
+    it("a service removed from a booted namespace", async () => {
+      const after: ResolvedStack = { services: [lb("api"), jobs("worker")] };
+      const { dry, real } = drifted(after, ["api"]);
+      const preview = await runUpDryRun(dry);
+      expect(preview.namespaces).toEqual(["local-backend"]);
+      expect(preview.selectedServices).toEqual(["api"]);
+      expect(await realChecks(real)).toEqual(preview.selectedServices);
+    });
+
+    it("a service moved to an unbooted namespace leaves the project", async () => {
+      const after: ResolvedStack = { services: [jobs("api"), lb("db"), jobs("worker")] };
+      const bare = drifted(after, ["db"]);
+      const preview = await runUpDryRun(bare.dry);
+      expect(preview.namespaces).toEqual(["local-backend"]);
+      expect(preview.selectedServices).toEqual(["db"]);
+      expect(await realChecks(bare.real)).toEqual(preview.selectedServices);
+
+      const scoped = drifted(after, ["db"]);
+      const err = await dryFailure({ ...scoped.dry, namespaces: ["jobs"] });
+      expect(err?.code).toBe("NAMESPACE_NOT_RUNNING");
+      expect(err?.details?.["services"]).toEqual(["api", "worker"]);
+      expect(await realChecks({ ...scoped.real, namespaces: ["jobs"] })).toBe(
+        "NAMESPACE_NOT_RUNNING",
+      );
+    });
+
+    it("a dead service the reload edits is started by the reload, so it is not in would_restart", async () => {
+      const stack: ResolvedStack = {
+        services: [isolated("edited", "run a"), isolated("kept", "run k"), isolated("ok", "run o")],
+      };
+      const { deps, paths } = live(stack, [killed("edited"), killed("kept"), running("ok")]);
+      // The config the instance runs: exactly what `stack` derives to.
+      const current = await runUpDryRun(deps);
+      writeFileSync(paths.configPath, stringifyYaml(current.config));
+      const edited: ResolvedStack = {
+        services: [isolated("edited", "run b"), isolated("kept", "run k"), isolated("ok", "run o")],
+      };
+      const preview = await runUpDryRun({
+        ...deps,
+        readStack: () => edited,
+        readStoredHash: () => stackHash(stack),
+      });
+      expect(preview.wouldReload).toBe(true);
+      expect(preview.wouldRestart).toEqual(["kept"]);
+    });
+  });
+
+  it("the real up keeps the pending-reload marker when its read fails (#191)", async () => {
+    // A failed read is no evidence the reload converged.
+    const stack: ResolvedStack = { services: [isolated("web", "node b.js")] };
+    let reads = 0;
+    const { deps, anchor, id } = live(stack, [], {
+      isProcessAlive: () => false,
+      waitForHealth: async () => {},
+      getServiceStatuses: async () => {
+        reads++;
+        if (reads === 1) throw new Error("process list failed");
+        return [running("web", 101)];
+      },
+    });
+    const marker: PendingReload = { services: ["web"], oldRuns: [{ name: "web", pid: 100 }] };
+    writePendingReload(anchor, id, marker);
+    await runUp(deps);
+    expect(reads).toBeGreaterThanOrEqual(2);
+    expect(readPendingReload(anchor, id)).toEqual(marker);
+  });
+
+  it("caps its process list read at 5s by default, and at --wait-timeout when given", async () => {
+    const failing = () => Promise.reject(new Error("process list hung"));
+    const { deps } = live(noDefault, [], { getServiceStatuses: failing });
+    vi.useFakeTimers();
+    try {
+      const outcome = runUpDryRun(deps).then(
+        () => "ok",
+        (e: { code?: string; message?: string }) => `${e.code}: ${e.message}`,
+      );
+      await vi.advanceTimersByTimeAsync(5_500);
+      const settled = await Promise.race([outcome, Promise.resolve("still pending")]);
+      expect(settled).toMatch(/^HEALTH_TIMEOUT: .*within 5000ms/);
+    } finally {
+      vi.useRealTimers();
+    }
+    const err = await dryFailure({ ...deps, waitTimeoutMs: 50 });
+    expect(err?.code).toBe("HEALTH_TIMEOUT");
+    expect(err?.message).toContain("within 50ms");
   });
 });
 

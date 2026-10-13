@@ -40,6 +40,7 @@ import {
   type FormatMode,
   type LsInstanceRow,
   type LsServiceRow,
+  type OutputResult,
   type PrunedRow,
   type ReapWarningRow,
   type ForceKilledRow,
@@ -142,7 +143,11 @@ export interface ExecuteDeps {
    * carries the allocated worktree ports (and injected shared ports) a sibling
    * reads off the `--json` envelope (#125).
    */
-  upDryRun?: (options?: { readonly namespaces?: ReadonlyArray<string> }) => Promise<{
+  upDryRun?: (options?: {
+    readonly namespaces?: ReadonlyArray<string>;
+    /** Caps the running instance's status read (#210); default 5s. */
+    readonly waitTimeoutMs?: number;
+  }) => Promise<{
     worktreeId: string;
     env: Record<string, string>;
     config: DerivedConfig;
@@ -163,6 +168,14 @@ export interface ExecuteDeps {
      */
     namespaces?: ReadonlyArray<string>;
     selectedServices?: ReadonlyArray<string>;
+    /**
+     * Which path the previewed `up` takes, and on a running instance whether
+     * it would hot-reload and which dead services it would restart (#210).
+     * Optional so a test stub can omit them; absent reads as a fresh start.
+     */
+    instance?: "fresh" | "running";
+    wouldReload?: boolean;
+    wouldRestart?: ReadonlyArray<string>;
   }>;
   down: (options: { shared: boolean }) => Promise<{
     worktreeId?: string;
@@ -273,6 +286,12 @@ abstract class DevtreesCommand extends Command<DevtreesContext> {
     return this.json ? "json" : "human";
   }
 
+  /** Write a formatter's output: its stdout part to stdout, its stderr part to stderr. */
+  protected emit(out: OutputResult): void {
+    if (out.stdout) this.context.stdout.write(out.stdout);
+    if (out.stderr) this.context.stderr.write(out.stderr);
+  }
+
   /**
    * Run a command body with the documented error envelope. The body returns
    * an exit code (0 for success, non-zero for in-band failure modes such as
@@ -285,8 +304,7 @@ abstract class DevtreesCommand extends Command<DevtreesContext> {
     } catch (err) {
       const payload = classifyError(err as Error);
       const out = formatError(payload, this.mode);
-      if (out.stdout) this.context.stdout.write(out.stdout);
-      if (out.stderr) this.context.stderr.write(out.stderr);
+      this.emit(out);
       return 1;
     }
   }
@@ -300,8 +318,7 @@ abstract class DevtreesCommand extends Command<DevtreesContext> {
   override async catch(error: unknown): Promise<void> {
     const payload = classifyError(error as Error);
     const out = formatError(payload, this.mode);
-    if (out.stdout) this.context.stdout.write(out.stdout);
-    if (out.stderr) this.context.stderr.write(out.stderr);
+    this.emit(out);
   }
 }
 
@@ -314,7 +331,15 @@ class UpCommand extends DevtreesCommand {
     // `--dry-run` runs only the derivation pipeline (load devtrees.yaml →
     // CONFIG_INVALID; allocate ports under the registry lock → LOCK_CONTENTION)
     // and stops before any side effect, so it can only emit the allocation
-    // subset of the codes below (#124), plus NO_SERVICES_SELECTED (#176).
+    // subset of the codes below (#124), plus NO_SERVICES_SELECTED (#176). On a
+    // running instance it previews that path with read-only probes (#210), so
+    // it also emits the decisions `up` makes before acting:
+    // NAMESPACE_NOT_RUNNING and CONFIG_DRIFT (`reload_pending`); and
+    // HEALTH_TIMEOUT / INSTANCE_NOT_FOUND when the project cannot be read
+    // within its read cap (5s, or --wait-timeout). A frozen process-compose
+    // (e.g. SIGSTOPped) still accepts the socket connection, so it surfaces as
+    // HEALTH_TIMEOUT, as in the real `up`; INSTANCE_UNRESPONSIVE only when the
+    // liveness probe itself never gets a definitive answer.
     // NO_SERVICES_SELECTED: a bare fresh `up` whose `default` namespace has no
     // services, or an explicit `-n` naming only namespaces with none
     // (namespaces are opt-in, ADR-0008; #203).
@@ -362,7 +387,8 @@ class UpCommand extends DevtreesCommand {
   waitTimeout = Option.String("--wait-timeout", {
     description:
       "Health-wait timeout in seconds for the headless (`--no-attach` / `--json`) path. Default 120. " +
-      "Ignored when the TUI is attached — the live view, not a silent wait, signals readiness.",
+      "Ignored when the TUI is attached — the live view, not a silent wait, signals readiness. " +
+      "With `--dry-run` on a running instance, bounds its one read of the instance's state instead (default 5).",
   });
   // process-compose `-n/--namespace` (issue #128): a repeatable string-array
   // selecting which namespace subset to start. Repeat the flag to pass more
@@ -382,10 +408,12 @@ class UpCommand extends DevtreesCommand {
   dryRun = Option.Boolean("--dry-run", false, {
     description:
       "Derive and print the config(s) + allocated env to stdout WITHOUT side effects: " +
-      "no process-compose spawn, no config file written, no socket, no instance registered, " +
+      "no process-compose spawn, reload or restart, no config file written, no socket, no instance registered, " +
       "no health wait. With `--json`, emits the `up_dry_run` envelope so an agent reads the " +
-      "allocated ports and the full process-compose document off stdout. (Port allocation may " +
-      "briefly take the registry lock to pick a non-colliding block.)",
+      "allocated ports and the full process-compose document off stdout. If this worktree's instance " +
+      "is running, previews what `up` would do to it (read-only): the namespaces it targets, whether it " +
+      "would hot-reload, which dead services it would restart, and the same errors (e.g. NAMESPACE_NOT_RUNNING). " +
+      "(Port allocation may briefly take the registry lock to pick a non-colliding block.)",
   });
 
   override async execute(): Promise<number> {
@@ -396,8 +424,7 @@ class UpCommand extends DevtreesCommand {
       // `restarted`) pass through
       // as-is; `formatUp` defaults whichever a caller left out.
       const out = formatUp({ ...result, sharedStarted: result.sharedStarted ?? false }, this.mode);
-      if (out.stdout) this.context.stdout.write(out.stdout);
-      if (out.stderr) this.context.stderr.write(out.stderr);
+      this.emit(out);
       this.emitInitHint();
       return 0;
     });
@@ -458,18 +485,22 @@ class UpCommand extends DevtreesCommand {
    */
   private async executeDryRun(): Promise<number> {
     if (!this.context.deps.upDryRun) return 0;
-    const result = await this.context.deps.upDryRun(this.namespaceOptions());
+    const result = await this.context.deps.upDryRun({
+      ...this.namespaceOptions(),
+      ...(this.waitTimeout !== undefined
+        ? { waitTimeoutMs: parseWaitTimeoutSecondsToMs(this.waitTimeout) }
+        : {}),
+    });
     const out = formatUpDryRun(dryRunPayload(result), this.mode);
-    if (out.stdout) this.context.stdout.write(out.stdout);
-    if (out.stderr) this.context.stderr.write(out.stderr);
+    this.emit(out);
     return 0;
   }
 }
 
+type DryRunResultView = Awaited<ReturnType<NonNullable<ExecuteDeps["upDryRun"]>>>;
+
 /** Map the injected `upDryRun` result onto the formatter's payload. */
-function dryRunPayload(
-  result: Awaited<ReturnType<NonNullable<ExecuteDeps["upDryRun"]>>>,
-): UpDryRunPayload {
+function dryRunPayload(result: DryRunResultView): UpDryRunPayload {
   return {
     worktreeId: result.worktreeId,
     env: result.env,
@@ -479,6 +510,19 @@ function dryRunPayload(
     droppedEdges: result.droppedEdges ?? [],
     droppedNamespaceEdges: result.droppedNamespaceEdges ?? [],
     bracedEnvVars: result.bracedEnvVars ?? [],
+    ...dryRunPlanPayload(result),
+  };
+}
+
+/**
+ * The plan part of the dry-run payload: the selection (#176) and which path
+ * `up` would take, with its reload and restarts (#210). Absent fields default
+ * to a fresh preview.
+ */
+function dryRunPlanPayload(
+  result: DryRunResultView,
+): Pick<UpDryRunPayload, "selection" | "instance" | "wouldReload" | "wouldRestart"> {
+  return {
     ...(result.namespaces !== undefined
       ? {
           selection: {
@@ -487,6 +531,9 @@ function dryRunPayload(
           },
         }
       : {}),
+    instance: result.instance ?? "fresh",
+    wouldReload: result.wouldReload ?? false,
+    wouldRestart: result.wouldRestart ?? [],
   };
 }
 
@@ -540,8 +587,7 @@ class DownCommand extends DevtreesCommand {
             },
         this.mode,
       );
-      if (out.stdout) this.context.stdout.write(out.stdout);
-      if (out.stderr) this.context.stderr.write(out.stderr);
+      this.emit(out);
       return 0;
     });
   }
@@ -559,8 +605,7 @@ class LsCommand extends DevtreesCommand {
       if (!this.context.deps.ls) return 0;
       const result = await this.context.deps.ls();
       const out = formatLs(result.instances, this.mode);
-      if (out.stdout) this.context.stdout.write(out.stdout);
-      if (out.stderr) this.context.stderr.write(out.stderr);
+      this.emit(out);
       return 0;
     });
   }
@@ -611,8 +656,7 @@ class PruneCommand extends DevtreesCommand {
         result.warnings ?? [],
         result.unreclaimed ?? [],
       );
-      if (out.stdout) this.context.stdout.write(out.stdout);
-      if (out.stderr) this.context.stderr.write(out.stderr);
+      this.emit(out);
       return 0;
     });
   }
@@ -633,8 +677,7 @@ class EnvCommand extends DevtreesCommand {
       if (!this.context.deps.env) return 0;
       const result = await this.context.deps.env();
       const out = formatEnv(result.env, this.mode);
-      if (out.stdout) this.context.stdout.write(out.stdout);
-      if (out.stderr) this.context.stderr.write(out.stderr);
+      this.emit(out);
       return 0;
     });
   }
@@ -738,8 +781,7 @@ class InitCommand extends DevtreesCommand {
         { target: result.target, path: result.path, action: result.action },
         this.mode,
       );
-      if (out.stdout) this.context.stdout.write(out.stdout);
-      if (out.stderr) this.context.stderr.write(out.stderr);
+      this.emit(out);
       return 0;
     });
   }
@@ -1051,7 +1093,10 @@ if (isEntrypoint(import.meta.url, process.argv[1])) {
         ...(options?.namespaces !== undefined ? { namespaces: options.namespaces } : {}),
       }),
     upDryRun: (options) =>
-      runUpDryRun(options?.namespaces !== undefined ? { namespaces: options.namespaces } : {}),
+      runUpDryRun({
+        ...(options?.namespaces !== undefined ? { namespaces: options.namespaces } : {}),
+        ...(options?.waitTimeoutMs !== undefined ? { waitTimeoutMs: options.waitTimeoutMs } : {}),
+      }),
     down: ({ shared }) => runDown({ stop: stopSeamsFromEnv() }, { shared }),
     ls: () => runLs(),
     attach: ({ shared }) => runAttach({}, { shared }),

@@ -80,7 +80,18 @@ Namespaces are **opt-in** and selection is **exact**
   `NAMESPACE_NOT_RUNNING` (`devtrees down && devtrees up -n …` boots it).
 - `devtrees up --dry-run` (with the same `-n` flags) shows the selection — the
   `namespaces` and `selected_services` fields under `--json` — and fails the
-  same way.
+  same way. It previews the path the real `up` would take: on a running stack
+  (`"instance": "running"`) that is the namespaces it was booted with for a bare
+  `up`, whether the changed config would be hot-reloaded (`would_reload`), which
+  dead services would be restarted (`would_restart`), and the same errors
+  (`NAMESPACE_NOT_RUNNING`, `CONFIG_DRIFT` with `reload_pending`). It only reads
+  the running instance: nothing is reloaded, restarted or written. A drifted
+  stack is previewed as the hot-reload would leave it, since the real `up`
+  reloads before it checks. The read of the instance is capped at 5s (or
+  `--wait-timeout`), so a process-compose too slow to answer fails
+  `HEALTH_TIMEOUT` sooner than the real `up`. With nothing running it previews
+  a fresh start (`"instance": "fresh"`). `selected_services` is in
+  `devtrees.yaml` order; `up.services` is in process-compose's order.
 
 ```yaml
 services:
