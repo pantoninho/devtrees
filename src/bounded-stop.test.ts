@@ -6,12 +6,7 @@
  */
 import { describe, expect, it } from "vite-plus/test";
 import type { ProcessRow, StopSeams } from "./bounded-down.js";
-import {
-  boundedStopServices,
-  InstanceExitedError,
-  StopRefusedError,
-  type ServiceStopDriver,
-} from "./bounded-stop.js";
+import { boundedStopServices, StopRefusedError, type ServiceStopDriver } from "./bounded-stop.js";
 import type { ServiceStatus } from "./driver.js";
 
 const SOCK = "/tmp/devtrees-501/abc/login-1234.sock";
@@ -155,9 +150,9 @@ describe("boundedStopServices (#223)", () => {
         driver,
         w.seams,
       ).catch((e: unknown) => e);
-      expect(err).toBeInstanceOf(InstanceExitedError);
-      expect((err as InstanceExitedError).code).toBe("INSTANCE_NOT_FOUND");
-      expect((err as InstanceExitedError).details).toEqual({
+      const coded = err as Error & { code?: string; details?: unknown };
+      expect(coded.code).toBe("INSTANCE_NOT_FOUND");
+      expect(coded.details).toEqual({
         worktree_id: "login",
         services: ["web"],
       });

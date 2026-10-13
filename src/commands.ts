@@ -3629,10 +3629,10 @@ function serviceNotFoundError(
 }
 
 /** The verbs that act on named services of this worktree's instance (ADR-0009). */
-export type NamedServiceCommand = "restart" | "stop";
+type NamedServiceCommand = "restart" | "stop";
 
 /** What `resolveNamedServices` hands a per-service verb. */
-export interface NamedServices {
+interface NamedServices {
   readonly anchor: { readonly anchor: string; readonly worktreeId: string };
   readonly socketPath: string;
   readonly configPath: string;
@@ -3670,7 +3670,7 @@ export interface NamedServices {
  * lock: the caller holds this worktree's lifecycle lock around it and the
  * action, so a concurrent `down` cannot stop the instance in between.
  */
-export async function resolveNamedServices(
+async function resolveNamedServices(
   deps: CommandDeps,
   names: ReadonlyArray<string>,
   command: NamedServiceCommand,

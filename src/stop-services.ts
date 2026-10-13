@@ -7,22 +7,44 @@
  * src/bounded-stop.ts.
  */
 
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { join } from "node:path";
 import type { ForceKilled } from "./bounded-down.js";
 import type { DerivedConfig } from "./deriver.js";
-import { describeSurvivor, type DownSurvivor } from "./down-survivors.js";
+import {
+  describeSurvivor,
+  readServicesMarker,
+  writeServicesMarker,
+  type DownSurvivor,
+} from "./down-survivors.js";
 import { downTimeoutMs, type ServiceStatus } from "./driver.js";
 import { stateDir } from "./paths.js";
-import { writeAtomic } from "./registry.js";
 import { isRunning, keepsInstanceAlive } from "./service-state.js";
 
 /** An error tagged with a stable `code` and `details` for the `--json` envelope. */
-export function codedError(code: string, message: string, details: Record<string, unknown>): Error {
+function codedError(code: string, message: string, details: Record<string, unknown>): Error {
   const err = new Error(message) as Error & { code?: string; details?: Record<string, unknown> };
   err.code = code;
   err.details = details;
   return err;
+}
+
+/**
+ * `INSTANCE_NOT_FOUND` when process-compose exited while devtrees was
+ * stopping services (#223): it exits once nothing runs, so something else
+ * stopped meanwhile (a dependent that never started, a crash). The whole
+ * instance is gone, so the stop must not report success; the next `up`
+ * starts it again.
+ */
+export function instanceExitedError(worktreeId: string, services: ReadonlyArray<string>): Error {
+  return codedError(
+    "INSTANCE_NOT_FOUND",
+    `devtrees stop: process-compose exited while ${services.join(", ")} ` +
+      `${services.length === 1 ? "was" : "were"} stopping, so '${worktreeId}' is no longer ` +
+      "running: no other process was left running (process-compose exits once nothing " +
+      "runs). Run `devtrees up` to start the instance again.",
+    { worktree_id: worktreeId, services: [...services] },
+  );
 }
 
 /** `INSTANCE_NOT_FOUND` for a per-service command with no instance running. */
@@ -144,15 +166,7 @@ function markerFile(anchor: string, worktreeId: string): string {
 
 /** The services an earlier `SERVICE_STOP_INCOMPLETE` left to re-check. */
 export function readStopIncomplete(anchor: string, worktreeId: string): string[] {
-  const file = markerFile(anchor, worktreeId);
-  if (!existsSync(file)) return [];
-  try {
-    const parsed = JSON.parse(readFileSync(file, "utf8")) as { services?: unknown } | null;
-    const services = parsed?.services;
-    return Array.isArray(services) ? services.filter((s) => typeof s === "string") : [];
-  } catch {
-    return [];
-  }
+  return readServicesMarker(markerFile(anchor, worktreeId)) ?? [];
 }
 
 /**
@@ -172,5 +186,5 @@ export function updateStopIncomplete(
     rmSync(markerFile(anchor, worktreeId), { force: true });
     return;
   }
-  writeAtomic(markerFile(anchor, worktreeId), `${JSON.stringify({ services: left }, null, 2)}\n`);
+  writeServicesMarker(markerFile(anchor, worktreeId), left);
 }

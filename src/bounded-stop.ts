@@ -23,6 +23,7 @@ import {
 } from "./bounded-down.js";
 import type { ServiceStatus } from "./driver.js";
 import { isRunning } from "./service-state.js";
+import { instanceExitedError } from "./stop-services.js";
 
 /** The slice of the driver `boundedStopServices` uses. */
 export interface ServiceStopDriver {
@@ -77,28 +78,6 @@ export class StopRefusedError extends Error {
 }
 
 /**
- * Raised when process-compose exited while devtrees was stopping services
- * (#223): it exits once nothing runs, so something else stopped meanwhile
- * (a dependent that never started, a crash). The whole instance is gone, so
- * the stop must not report success. `INSTANCE_NOT_FOUND`, the state the
- * worktree is now in; the next `up` starts it again.
- */
-export class InstanceExitedError extends Error {
-  readonly code = "INSTANCE_NOT_FOUND" as const;
-  constructor(
-    readonly details: { readonly worktree_id: string; readonly services: ReadonlyArray<string> },
-  ) {
-    super(
-      `devtrees stop: process-compose exited while ${details.services.join(", ")} ` +
-        `${details.services.length === 1 ? "was" : "were"} stopping, so '${details.worktree_id}' ` +
-        "is no longer running: no other process was left running (process-compose exits once " +
-        "nothing runs). Run `devtrees up` to start the instance again.",
-    );
-    this.name = "InstanceExitedError";
-  }
-}
-
-/**
  * Stop some services of a running instance and wait until they have exited,
  * bounded, with `down`'s escalation (ADR-0009, #223):
  *
@@ -116,7 +95,7 @@ export class InstanceExitedError extends Error {
  * Only these services' processes are ever signalled. A process that left
  * its group (`setsid`) is never signalled: the caller's port check reports
  * it. Throws `StopRefusedError` when process-compose refused the request
- * for a service it still runs, and `InstanceExitedError` as soon as a failed
+ * for a service it still runs, and `INSTANCE_NOT_FOUND` (`instanceExitedError`) as soon as a failed
  * `process list` read turns out to be process-compose gone. A service whose
  * state could not be read at the end is reported `unsettled`, never as
  * stopped.
@@ -138,10 +117,7 @@ export async function boundedStopServices(
   const settled = async (): Promise<boolean> => {
     rows = await driver.getServiceStatuses(target.socketPath).catch(() => undefined);
     if (rows === undefined && (await target.instanceGone?.())) {
-      throw new InstanceExitedError({
-        worktree_id: target.instance,
-        services: [...target.services],
-      });
+      throw instanceExitedError(target.instance, target.services);
     }
     return rows !== undefined && activeAmong(rows, target.services).length === 0;
   };
