@@ -59,3 +59,9 @@ As built (#226): `services[]` already existed on `ls --json` (and on `up --json`
 - **The README and `--help` need the new verbs**, the transient-stop caveat, and the error codes table.
 - **The implementation reuses `down`'s bounded stop and `up`'s reconcile and health wait**; neither is a new mechanism, which keeps one definition of "stopped" and of "healthy".
 - **`stop` can never end an instance**; `down` remains the only verb that does, apart from `prune`.
+
+## Amendment (#222)
+
+A named service that the running instance did not boot (its namespace was not selected) fails `NAMESPACE_NOT_RUNNING` for `stop` and `restart` alike, with ADR-0008's details `{worktree_id, namespaces, services, remedy}`, the remedy booting the running namespaces plus the needed ones; names are checked against the running instance's derived config, and a pending hot-reload refuses with `CONFIG_DRIFT` (`reload_pending`) as `up` does.
+
+Restarting the instance's last running process(es) is refused with `LAST_SERVICES_RUNNING` (`details: {worktree_id, services, remedy}`, the remedy a `down` + `up` with the booted namespaces), before anything is touched. `restart` stops a service with `stop`'s bounded stop before starting it, and process-compose v1.122.0 exits once nothing runs. Its own `process restart`, which keeps the project alive, starts the new run after about 1s whether or not the old run has exited, so a server still draining loses its port: the new run dies (and the instance with it) or comes up on another port. Booting with `--keep-project` is the deferred alternative, as for `stop`.

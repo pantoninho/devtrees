@@ -34,27 +34,48 @@ function codedError(code: string, message: string, details: Record<string, unkno
  * stopping services (#223): it exits once nothing runs, so something else
  * stopped meanwhile (a dependent that never started, a crash). The whole
  * instance is gone, so the stop must not report success; the next `up`
- * starts it again.
+ * starts it again. `restart` (#222) raises it too, naming what it had
+ * already restarted (`done`).
  */
-export function instanceExitedError(worktreeId: string, services: ReadonlyArray<string>): Error {
+export function instanceExitedError(
+  worktreeId: string,
+  services: ReadonlyArray<string>,
+  command: "stop" | "restart" = "stop",
+  done: ReadonlyArray<string> = [],
+): Error {
   return codedError(
     "INSTANCE_NOT_FOUND",
-    `devtrees stop: process-compose exited while ${services.join(", ")} ` +
+    `devtrees ${command}: process-compose exited while ${services.join(", ")} ` +
       `${services.length === 1 ? "was" : "were"} stopping, so '${worktreeId}' is no longer ` +
       "running: no other process was left running (process-compose exits once nothing " +
-      "runs). Run `devtrees up` to start the instance again.",
+      `runs).${alreadyRestarted(done)} Run \`devtrees up\` to start the instance again.`,
     { worktree_id: worktreeId, services: [...services] },
   );
 }
 
-/** `INSTANCE_NOT_FOUND` for a per-service command with no instance running. */
-export function instanceNotRunningError(command: string, worktreeId: string): Error {
-  return codedError(
-    "INSTANCE_NOT_FOUND",
-    `devtrees ${command}: no worktree instance is running for '${worktreeId}'. ` +
-      "Nothing was touched. Run `devtrees up` to bring it up first.",
-    { worktree_id: worktreeId },
-  );
+/** " devtrees had already restarted api, mobile." when `done` is not empty. */
+function alreadyRestarted(done: ReadonlyArray<string>): string {
+  return done.length === 0 ? "" : ` devtrees had already restarted ${done.join(", ")}.`;
+}
+
+/**
+ * `INSTANCE_NOT_FOUND` for a per-service command with no instance running.
+ * A `restart` that had already restarted some services (`done`) found it
+ * gone between two of its steps, most likely to a concurrent `down`.
+ */
+export function instanceNotRunningError(
+  command: string,
+  worktreeId: string,
+  done: ReadonlyArray<string> = [],
+): Error {
+  const message =
+    done.length === 0
+      ? `devtrees ${command}: no worktree instance is running for '${worktreeId}'. ` +
+        "Nothing was touched. Run `devtrees up` to bring it up first."
+      : `devtrees ${command}: '${worktreeId}' stopped between two of this \`${command}\`'s ` +
+        `steps (most likely a concurrent \`devtrees down\`).${alreadyRestarted(done)} ` +
+        "Run `devtrees up` to start it again.";
+  return codedError("INSTANCE_NOT_FOUND", message, { worktree_id: worktreeId });
 }
 
 /** Is the row a service still waiting on its dependencies, never started? */
@@ -137,17 +158,31 @@ export function assertNotLastRunning(
   rows: ReadonlyArray<ServiceStatus>,
   stopping: ReadonlyArray<string>,
   worktreeId: string,
+  /**
+   * `restart` (#222) refuses the same way, since it stops a service before
+   * starting it again; its remedy restarts the whole instance.
+   */
+  restart?: { readonly remedy: string; readonly done: ReadonlyArray<string> },
 ): void {
   if (stopping.length === 0) return;
   const leaving = new Set(stopping);
   if (rows.some((r) => !leaving.has(r.name) && keepsInstanceAlive(r))) return;
+  const [command, outcome, remedy, what] =
+    restart === undefined
+      ? ["stop", "nothing was stopped.", "devtrees down", "stop"]
+      : [
+          "restart",
+          `nothing was restarted.${alreadyRestarted(restart.done)}`,
+          restart.remedy,
+          "restart",
+        ];
   throw codedError(
     "LAST_SERVICES_RUNNING",
-    `devtrees stop: ${stopping.join(", ")} ${stopping.length === 1 ? "is" : "are"} the last ` +
+    `devtrees ${command}: ${stopping.join(", ")} ${stopping.length === 1 ? "is" : "are"} the last ` +
       `running process(es) of '${worktreeId}'. process-compose exits once nothing runs, which ` +
-      "would take the whole instance down, so nothing was stopped. Run `devtrees down` to " +
-      "stop the instance.",
-    { worktree_id: worktreeId, services: [...stopping], remedy: "devtrees down" },
+      `would take the whole instance down, so ${outcome} Run \`${remedy}\` to ` +
+      `${what} the instance.`,
+    { worktree_id: worktreeId, services: [...stopping], remedy },
   );
 }
 

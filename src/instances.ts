@@ -439,6 +439,19 @@ function readPortsByService(
   return byService;
 }
 
+/**
+ * Each service's declared named ports, read from the derived config at
+ * `configPath` (issue #110): the same `ports` an `ls --json` row carries.
+ * `{}` when the config or its metadata is missing.
+ */
+export function readDeclaredPorts(configPath: string): Record<string, Record<string, number>> {
+  try {
+    return readPortsByService(readDerivedConfig(configPath)) ?? {};
+  } catch {
+    return {};
+  }
+}
+
 /** True for a plain mapping (non-null, non-array object) — the YAML dict shape. */
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);

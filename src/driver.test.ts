@@ -536,6 +536,7 @@ describe("process-compose driver — startProcess (#178)", () => {
     expect(await driver.startProcess(socket, "toy")).toEqual({
       ok: false,
       message: "process-compose process start did not finish within 0s",
+      timedOut: true,
     });
     expect(killed).toEqual(["SIGTERM"]);
   });

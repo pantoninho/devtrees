@@ -47,6 +47,8 @@ export interface ServiceStopTarget {
   readonly unsignalled?: ReadonlySet<string>;
   /** The worktree id, for the error raised when process-compose exits. */
   readonly instance: string;
+  /** The command stopping them, for its errors. Default `stop`; `restart` (#222). */
+  readonly command?: "stop" | "restart";
   /**
    * Has process-compose exited (its control socket no longer answers)? Asked
    * whenever a `process list` read fails. Default: never.
@@ -71,8 +73,13 @@ export interface ServiceStopResult {
  * still reports running. Nothing was escalated.
  */
 export class StopRefusedError extends Error {
-  constructor(services: ReadonlyArray<string>, message: string) {
-    super(`devtrees stop: process-compose refused to stop ${services.join(", ")}: ${message}`);
+  constructor(
+    services: ReadonlyArray<string>,
+    /** process-compose's own complaint. */
+    readonly reason: string,
+    command = "stop",
+  ) {
+    super(`devtrees ${command}: process-compose refused to stop ${services.join(", ")}: ${reason}`);
     this.name = "StopRefusedError";
   }
 }
@@ -117,14 +124,16 @@ export async function boundedStopServices(
   const settled = async (): Promise<boolean> => {
     rows = await driver.getServiceStatuses(target.socketPath).catch(() => undefined);
     if (rows === undefined && (await target.instanceGone?.())) {
-      throw instanceExitedError(target.instance, target.services);
+      throw instanceExitedError(target.instance, target.services, target.command);
     }
     return rows !== undefined && activeAmong(rows, target.services).length === 0;
   };
   const request = await driver.stopProcesses(target.socketPath, target.services);
   if (!request.ok && !(await settled())) {
     const running = (rows ?? []).filter((r) => names.has(r.name) && r.status === "Running");
-    if (running.length > 0) throw new StopRefusedError(target.services, request.message);
+    if (running.length > 0) {
+      throw new StopRefusedError(target.services, request.message, target.command);
+    }
   }
 
   let killed: ForceKilled[] = [];

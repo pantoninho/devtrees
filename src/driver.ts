@@ -267,9 +267,18 @@ const STOP_REQUEST_TIMEOUT_MS = 10_000;
  * complaint (its stderr, the exit code, or the timeout) for the
  * `SERVICE_START_FAILED` envelope.
  */
-type StartResult =
+export type StartResult =
   | { readonly ok: true; readonly alreadyRunning: boolean }
-  | { readonly ok: false; readonly message: string };
+  | {
+      readonly ok: false;
+      readonly message: string;
+      /**
+       * The client did not answer within its budget and was killed. Not a
+       * refusal: process-compose may still be carrying the start out, so
+       * `restart` re-reads the state before deciding (#222).
+       */
+      readonly timedOut?: true;
+    };
 
 /**
  * Budget for one `process start` call. On v1.122.0 it returns as soon as the
@@ -834,6 +843,7 @@ async function startProcessImpl(
     return {
       ok: false,
       message: `${deps.binary} process start did not finish within ${Math.round(deps.timeoutMs / 1000)}s`,
+      timedOut: true,
     };
   }
   return startOutcome(exit.code, stderr(), deps.binary);

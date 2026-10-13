@@ -2687,6 +2687,343 @@ describe.skipIf(!ENABLED)("real-pc smoke — stop <service...> (#223)", () => {
   }, 120_000);
 });
 
+describe.skipIf(!ENABLED)("real-pc smoke — restart <service...> (#222)", () => {
+  /** The `restart --json` success envelope. */
+  interface RestartDoc {
+    readonly restart: {
+      readonly worktree_id: string;
+      readonly restarted: ReadonlyArray<string>;
+      readonly services: ReadonlyArray<LsServiceRow>;
+      readonly force_killed: ReadonlyArray<{ service: string; pid: number }>;
+    };
+  }
+
+  /** The `--json` error envelope's `error`, or `undefined`. */
+  function errorOf(
+    result: CliResult,
+  ): { code?: string; message?: string; details?: unknown } | undefined {
+    return (result.doc as { error?: { code?: string; message?: string; details?: unknown } })
+      ?.error;
+  }
+
+  /**
+   * #160's shape. `api` is the backend `mobile` (Metro) depends on, `worker`
+   * an unrelated service; `db` is shared, to be refused. Each server's argv
+   * carries `--directory <root>/<name>`, so its pids are found exactly.
+   * `mobileShutdown` / `apiShutdown`, when set, are `shutdown.command`s. `mobile`
+   * exits 4 at start whenever `<root>/mobile-armed` exists.
+   */
+  function metroRepo(
+    prefix: string,
+    opts: { readonly mobileShutdown?: string; readonly apiShutdown?: string } = {},
+  ): { wt: string; root: string; needle: (name: string) => string } {
+    const repo = buildSmokeRepo(prefix, ["login"]);
+    currentCtx = { pidNeedle: repo.root, root: repo.root };
+    cleanupStack.push(() => reapPids(pidsMatching(repo.root)));
+    const wt = repo.worktrees.login!;
+    const needle = (name: string): string => `--directory ${join(repo.root, name)}`;
+    const server = (name: string, port: string, guard = ""): string[] => {
+      mkdirSync(join(repo.root, name));
+      return [
+        `  ${name}:`,
+        "    tier: isolated",
+        `    command: "${guard}exec python3 -m http.server $${port} --bind 127.0.0.1 ${needle(name)}"`,
+        `    ports: [${port}]`,
+        "    readiness_probe:",
+        "      exec:",
+        `        command: "curl -fsS --max-time 2 -o /dev/null http://127.0.0.1:$${port}/"`,
+        "      initial_delay_seconds: 0",
+        "      period_seconds: 1",
+        "      timeout_seconds: 3",
+        "      failure_threshold: 30",
+      ];
+    };
+    const armed = join(repo.root, "mobile-armed");
+    writeFileSync(
+      join(wt, "devtrees.yaml"),
+      [
+        "services:",
+        "  db:",
+        "    tier: shared",
+        `    command: "python3 ${sleeper(repo.root, "db")}"`,
+        ...server("api", "API_PORT"),
+        ...(opts.apiShutdown === undefined
+          ? []
+          : ["    shutdown:", `      command: "${opts.apiShutdown}"`]),
+        ...server("mobile", "MOBILE_PORT", `test -e ${armed} && exit 4; `),
+        "    depends_on:",
+        "      api:",
+        "        condition: process_healthy",
+        ...(opts.mobileShutdown === undefined
+          ? []
+          : ["    shutdown:", `      command: "${opts.mobileShutdown}"`]),
+        "  worker:",
+        "    tier: isolated",
+        `    command: "python3 ${sleeper(repo.root, "worker")}"`,
+        "",
+      ].join("\n"),
+    );
+    cleanupStack.push(() => devtrees(wt, ["down", "--shared"]));
+    cleanupStack.push(() => devtrees(wt, ["down"], { DEVTREES_DOWN_BASE_TIMEOUT_MS: "3000" }));
+    return { wt, root: repo.root, needle };
+  }
+
+  /** `up --json` the Metro stack; returns its env. */
+  async function bootMetro(wt: string): Promise<Record<string, string>> {
+    const first = up(wt);
+    expect(first.code, `up failed: ${first.stderr} ${first.stdout}`).toBe(0);
+    const env = (first.doc as UpDoc).up.env;
+    expect(await httpStatus(Number(env.MOBILE_PORT))).toBe(200);
+    return env;
+  }
+
+  it("scenario 85: restart mobile keeps its port, the instance and the other services' pids; refusals touch nothing (#160, #222)", async () => {
+    const { wt, root, needle } = metroRepo("dt-rpc85-");
+    const none = devtrees(wt, ["restart", "mobile", "--json"]);
+    expect(none.code).toBe(1);
+    expect(errorOf(none)?.code).toBe("INSTANCE_NOT_FOUND");
+
+    const env = await bootMetro(wt);
+    const workerNeedle = join(root, "worker.py");
+    const before = {
+      api: pidsMatching(needle("api")),
+      worker: pidsMatching(workerNeedle),
+      db: pidsMatching(join(root, "db.py")),
+      mobile: pidsMatching(needle("mobile")),
+    };
+    expect(before.mobile.length, "mobile should be running").toBeGreaterThan(0);
+
+    // Refusals first: each one leaves every process as it was.
+    const pids = pidsMatching(root).sort((a, b) => a - b);
+    expect(errorOf(devtrees(wt, ["restart", "mobile", "nope", "--json"]))).toMatchObject({
+      code: "SERVICE_NOT_FOUND",
+      details: { service: "nope", valid_services: ["api", "mobile", "worker"] },
+    });
+    expect(errorOf(devtrees(wt, ["restart", "mobile", "db", "--json"]))).toMatchObject({
+      code: "SHARED_SERVICE_REFUSED",
+      details: { services: ["db"] },
+    });
+    expect(errorOf(devtrees(wt, ["restart", "--json"]))?.code).toBe("INVALID_ARGS");
+    expect(pidsMatching(root).sort((a, b) => a - b)).toEqual(pids);
+
+    const result = devtrees(wt, ["restart", "mobile", "--json", "--wait-timeout", "30"]);
+    expect(result.code, `restart failed: ${result.stderr} ${result.stdout}`).toBe(0);
+    const doc = (result.doc as RestartDoc).restart;
+    expect(doc.worktree_id).toBe(wtId(wt));
+    expect(doc.restarted).toEqual(["mobile"]);
+    expect(doc.force_killed).toEqual([]);
+    expect(doc.services).toMatchObject([
+      { name: "mobile", health: "ready", ports: { MOBILE_PORT: Number(env.MOBILE_PORT) } },
+    ]);
+
+    // mobile is a new process on the same port; nothing else was touched.
+    const mobileAfter = pidsMatching(needle("mobile"));
+    expect(mobileAfter.length).toBeGreaterThan(0);
+    expect(mobileAfter.some((pid) => before.mobile.includes(pid))).toBe(false);
+    expect(await httpStatus(Number(env.MOBILE_PORT))).toBe(200);
+    expect(pidsMatching(needle("api"))).toEqual(before.api);
+    expect(pidsMatching(workerNeedle)).toEqual(before.worker);
+    expect(pidsMatching(join(root, "db.py"))).toEqual(before.db);
+    expect(await httpStatus(Number(env.API_PORT))).toBe(200);
+
+    // Same instance: ls reports every service running under the same id.
+    const ls = devtrees(wt, ["ls", "--json"]);
+    const inst = (ls.doc as LsDoc).ls.instances.find((i) => i.id === wtId(wt));
+    expect(inst?.services.map((s) => s.name).sort()).toEqual(["api", "mobile", "worker"]);
+    expect(orphanedServices(root)).toEqual([]);
+
+    // Human output, in `up`'s shape.
+    const human = devtrees(wt, ["restart", "mobile", "--wait-timeout", "30"]);
+    expect(human.code, human.stderr).toBe(0);
+    expect(human.stdout).toBe(`devtrees restart: restarted mobile in '${wtId(wt)}'.\n`);
+  }, 180_000);
+
+  it("scenario 86: shutdown.commands: one that leaves api running is bounded by a force-kill; a slow one with no timeout is no false SERVICE_START_FAILED (#222)", async () => {
+    // `api`'s hook exits at once and leaves the server running; `mobile`'s
+    // outlasts process-compose's own 10s hook limit.
+    const { wt, root, needle } = metroRepo("dt-rpc86-", {
+      apiShutdown: "true",
+      mobileShutdown: "sleep 11",
+    });
+    const env = await bootMetro(wt);
+    const oldApi = pidsMatching(needle("api"));
+
+    const api = devtrees(wt, ["restart", "api", "--json", "--wait-timeout", "30"]);
+    expect(api.code, `restart api failed: ${api.stderr} ${api.stdout}`).toBe(0);
+    const apiDoc = (api.doc as RestartDoc).restart;
+    expect(apiDoc.force_killed.map((k) => k.service)).toContain("api");
+    expect(apiDoc.force_killed.map((k) => k.pid)).toEqual(expect.arrayContaining(oldApi));
+    const nowApi = pidsMatching(needle("api"));
+    expect(nowApi.some((pid) => oldApi.includes(pid))).toBe(false);
+    expect(nowApi.length).toBeGreaterThan(0);
+    expect(await httpStatus(Number(env.API_PORT))).toBe(200);
+
+    const oldMobile = pidsMatching(needle("mobile"));
+    const started = Date.now();
+    const mobile = devtrees(wt, ["restart", "mobile", "--json", "--wait-timeout", "30"]);
+    expect(mobile.code, `restart mobile failed: ${mobile.stderr} ${mobile.stdout}`).toBe(0);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(10_000);
+    expect((mobile.doc as RestartDoc).restart.restarted).toEqual(["mobile"]);
+    const nowMobile = pidsMatching(needle("mobile"));
+    expect(nowMobile.some((pid) => oldMobile.includes(pid))).toBe(false);
+    expect(await httpStatus(Number(env.MOBILE_PORT))).toBe(200);
+    expect(orphanedServices(root)).toEqual([]);
+  }, 180_000);
+
+  it("scenario 87: two names restart in depends_on order, a stopped one is simply started; one that dies fails HEALTH_TIMEOUT and is left running (#222)", async () => {
+    const { wt, root, needle } = metroRepo("dt-rpc87-");
+    const env = await bootMetro(wt);
+    const worker = pidsMatching(join(root, "worker.py"));
+    // Stop mobile behind devtrees' back: process-compose reports Completed/-1.
+    reapPids(pidsMatching(needle("mobile")));
+    expect(await waitForNoPids(needle("mobile"), 5000)).toEqual([]);
+
+    const result = devtrees(wt, ["restart", "mobile", "api", "--json", "--wait-timeout", "30"]);
+    expect(result.code, `restart failed: ${result.stderr} ${result.stdout}`).toBe(0);
+    const doc = (result.doc as RestartDoc).restart;
+    expect(doc.restarted).toEqual(["api", "mobile"]);
+    expect(doc.services.map((s) => s.name)).toEqual(["api", "mobile"]);
+    expect(await httpStatus(Number(env.MOBILE_PORT))).toBe(200);
+    expect(await httpStatus(Number(env.API_PORT))).toBe(200);
+    expect(pidsMatching(join(root, "worker.py"))).toEqual(worker);
+
+    // A restart that dies straight away fails fast, naming the retry.
+    const api = pidsMatching(needle("api"));
+    writeFileSync(join(root, "mobile-armed"), "");
+    const started = Date.now();
+    const dies = devtrees(wt, ["restart", "mobile", "--json", "--wait-timeout", "60"]);
+    expect(dies.code, dies.stdout).toBe(1);
+    const err = errorOf(dies);
+    expect(err?.code).toBe("HEALTH_TIMEOUT");
+    expect(err?.message).toContain("mobile (Completed, exit 4)");
+    expect(err?.message).toContain("restarted mobile, and it died again");
+    expect(err?.message).toContain("`devtrees restart mobile` restarts it again");
+    expect(Date.now() - started).toBeLessThan(30_000);
+    expect(pidsMatching(needle("api"))).toEqual(api);
+    expect(await httpStatus(Number(env.API_PORT))).toBe(200);
+    const ls = devtrees(wt, ["ls", "--json"]);
+    expect((ls.doc as LsDoc).ls.instances.some((i) => i.id === wtId(wt))).toBe(true);
+  }, 180_000);
+
+  it("scenario 88: a one-service instance refuses LAST_SERVICES_RUNNING; restart during a pending hot-reload refuses with CONFIG_DRIFT reload_pending, and down still recovers (#191, #206, #222)", async () => {
+    // Scenario 60's setup: the edited service's old process never stops.
+    const repo = buildSmokeRepo("dt-rpc88-", ["login"]);
+    currentCtx = { pidNeedle: repo.root, root: repo.root };
+    const wt = repo.worktrees.login!;
+    cleanupStack.push(() => reapPids(pidsMatching(repo.root)));
+    const [holdA, holdB] = [join(repo.root, "hold-a"), join(repo.root, "hold-b")];
+    writeReloadStack(wt, { hold: holdA, shutdownCommand: "echo bye" });
+    expect(up(wt).code).toBe(0);
+    expect(await waitForPid(holdA, 10_000)).toBe(true);
+    const oldPids = pidsMatching(holdA);
+
+    // A one-service instance: its only process cannot be restarted in place,
+    // as its stop would make process-compose exit. Refused, nothing touched.
+    const last = devtrees(wt, ["restart", "web", "--json"]);
+    expect(last.code).toBe(1);
+    expect(errorOf(last)).toMatchObject({
+      code: "LAST_SERVICES_RUNNING",
+      details: { services: ["web"], remedy: "devtrees down && devtrees up" },
+    });
+    expect(pidsMatching(holdA)).toEqual(oldPids);
+    expect(errorOf(devtrees(wt, ["ls", "--json"]))).toBeUndefined();
+
+    writeReloadStack(wt, { hold: holdB, shutdownCommand: "echo bye" });
+    expect(errorOf(up(wt))?.code).toBe("CONFIG_DRIFT");
+
+    const restart = devtrees(wt, ["restart", "web", "--json"]);
+    expect(restart.code).toBe(1);
+    const err = errorOf(restart);
+    expect(err?.code).toBe("CONFIG_DRIFT");
+    expect(err?.message).toMatch(/^devtrees restart: a previous hot-reload/);
+    expect(err?.details).toMatchObject({ reason: "reload_pending", services: ["web"] });
+    const pids = (err?.details as { pids?: number[] } | undefined)?.pids ?? [];
+    expect(pids.some((p) => oldPids.includes(p))).toBe(true);
+    // Nothing was started: the old run is the only one, as before.
+    expect(pidsMatching(holdA)).toEqual(oldPids);
+    expect(pidsMatching(holdB)).toEqual([]);
+
+    // The instance is still recoverable.
+    const down = devtrees(wt, ["down", "--json"], { DEVTREES_DOWN_BASE_TIMEOUT_MS: "3000" });
+    expect(down.code, `down should recover it: ${down.stdout}${down.stderr}`).toBe(0);
+    expect(await waitForNoPids(repo.root, 10_000)).toEqual([]);
+  }, 120_000);
+
+  it("scenario 89: a server that drains for 3s on SIGTERM, still holding its port, restarts cleanly on the same port (#222)", async () => {
+    const repo = buildSmokeRepo("dt-rpc89-", ["login"]);
+    currentCtx = { pidNeedle: repo.root, root: repo.root };
+    const wt = repo.worktrees.login!;
+    cleanupStack.push(() => reapPids(pidsMatching(repo.root)));
+    const server = join(repo.root, "draining.py");
+    writeFileSync(
+      server,
+      [
+        "import signal, sys, time",
+        "from http.server import HTTPServer, BaseHTTPRequestHandler",
+        "class H(BaseHTTPRequestHandler):",
+        "    def do_GET(self):",
+        "        self.send_response(200); self.end_headers()",
+        "    def log_message(self, *a): pass",
+        "srv = HTTPServer(('127.0.0.1', int(sys.argv[1])), H)  # SO_REUSEADDR",
+        "def drain(*_):",
+        "    srv.timeout = 0.2",
+        "    end = time.time() + 3",
+        "    while time.time() < end: srv.handle_request()",
+        "    sys.exit(0)",
+        "signal.signal(signal.SIGTERM, drain)",
+        "srv.serve_forever()",
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(
+      join(wt, "devtrees.yaml"),
+      [
+        "services:",
+        "  web:",
+        "    tier: isolated",
+        "    ports: [WEB_PORT]",
+        `    command: "exec python3 ${server} $WEB_PORT"`,
+        "    readiness_probe:",
+        "      exec:",
+        `        command: "curl -fsS --max-time 2 -o /dev/null http://127.0.0.1:$WEB_PORT/"`,
+        "      initial_delay_seconds: 0",
+        "      period_seconds: 1",
+        "      timeout_seconds: 3",
+        "      failure_threshold: 30",
+        "  keeper:",
+        "    tier: isolated",
+        `    command: "python3 ${sleeper(repo.root, "keeper")}"`,
+        "",
+      ].join("\n"),
+    );
+    cleanupStack.push(() => devtrees(wt, ["down"], { DEVTREES_DOWN_BASE_TIMEOUT_MS: "3000" }));
+    const first = up(wt);
+    expect(first.code, first.stdout).toBe(0);
+    const port = Number((first.doc as UpDoc).up.env.WEB_PORT);
+    expect(await httpStatus(port)).toBe(200);
+    const old = pidsMatching(server);
+    const keeper = pidsMatching(join(repo.root, "keeper.py"));
+
+    const started = Date.now();
+    const result = devtrees(wt, ["restart", "web", "--json", "--wait-timeout", "60"]);
+    expect(result.code, `restart failed: ${result.stderr} ${result.stdout}`).toBe(0);
+    // The drain ran its course: nothing had to be killed, and the new run
+    // was started only after it, on the same port.
+    expect(Date.now() - started).toBeGreaterThanOrEqual(3_000);
+    const doc = (result.doc as RestartDoc).restart;
+    expect(doc.force_killed).toEqual([]);
+    expect(doc.services).toMatchObject([
+      { name: "web", health: "ready", ports: { WEB_PORT: port } },
+    ]);
+    const now = pidsMatching(server);
+    expect(now.length).toBe(1);
+    expect(old).not.toContain(now[0]);
+    expect(await httpStatus(port)).toBe(200);
+    expect(pidsMatching(join(repo.root, "keeper.py"))).toEqual(keeper);
+    expect(orphanedServices(repo.root)).toEqual([]);
+  }, 120_000);
+});
+
 if (!ENABLED) {
   describe("real-pc smoke — gated", () => {
     it.skip(SKIP_REASON, () => {});

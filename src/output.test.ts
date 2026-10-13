@@ -19,6 +19,7 @@ import {
   formatLogLine,
   formatLs,
   formatPrune,
+  formatRestart,
   formatStop,
   formatUp,
   formatDroppedEdgeWarning,
@@ -1169,6 +1170,35 @@ describe("output formatter — formatPrune", () => {
  * call `ls --json` before/after `down`; the action envelope no longer
  * pre-bakes either snapshot. Human output is unchanged.
  */
+describe("output formatter — formatRestart (#222)", () => {
+  it("human mode names what was restarted, in `up`'s shape, with nothing on stderr", () => {
+    const result = formatRestart({ worktreeId: "login", restarted: ["api", "mobile"] }, "human");
+    expect(result).toEqual({
+      stdout: "devtrees restart: restarted api, mobile in 'login'.\n",
+      stderr: "",
+    });
+  });
+
+  it("human mode warns on stderr about an old run devtrees had to force-kill", () => {
+    const result = formatRestart(
+      { worktreeId: "login", restarted: ["mobile"], forceKilled: [{ service: "mobile", pid: 7 }] },
+      "human",
+    );
+    expect(result.stderr).toBe(
+      "devtrees restart: WARNING — the old run outlived the restart; devtrees force-killed mobile (pid 7).\n",
+    );
+  });
+
+  it("json mode always carries restarted, services and force_killed", () => {
+    const result = formatRestart({ worktreeId: "login", restarted: ["mobile"] }, "json");
+    expect(result.stderr).toBe("");
+    expect(JSON.parse(result.stdout)).toEqual({
+      schema_version: SCHEMA_VERSION,
+      restart: { worktree_id: "login", restarted: ["mobile"], services: [], force_killed: [] },
+    });
+  });
+});
+
 describe("output formatter — formatDown", () => {
   it("in human mode for a worktree down, emits today's 'worktree instance stopped' line", () => {
     const result = formatDown({ worktreeId: "login" }, "human");

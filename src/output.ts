@@ -87,17 +87,17 @@ export const ERROR_CODE_DESCRIPTIONS: Readonly<Record<ErrorCode, string>> = {
   SERVICE_NOT_FOUND:
     "The named service does not exist in the target instance; `details.valid_services` lists the known ones.",
   HEALTH_TIMEOUT:
-    "Stack started but services did not report healthy before the wait window expired, or a selected service is dead, including one `up` restarted (`details.dead_services`).",
+    "Stack started but services did not report healthy before the wait window expired, or a selected service is dead, including one `up` or `restart` restarted (`details.dead_services`); after `restart`, `devtrees restart <service>` retries it.",
   NAMESPACE_NOT_RUNNING:
-    "`up -n` named a namespace the running instance was not booted with, or `stop` named a service in one; `details` has `{worktree_id, namespaces, services, remedy}`, the remedy being the `down` + `up` that boots it.",
+    "`up -n` named a namespace the running instance was not booted with, or `stop` or `restart` named a service in one; `details` has `{worktree_id, namespaces, services, remedy}`, the remedy being the `down` + `up` that boots it.",
   SHARED_SERVICE_DEAD:
     "A shared service in the running shared instance is dead; it is not restarted from a worktree, run `details.remedy` (`devtrees down --shared && devtrees up`).",
   SERVICE_START_FAILED:
-    "`up` tried to restart a dead service on the running instance and process-compose refused; `details.services` names each one, `details.remedy` is the `down` + `up` that restarts the stack.",
+    "`up` tried to restart a dead service on the running instance, or `restart` a named one, and process-compose refused; `details.services` names each one, `details.remedy` says what to run next. The instance is still running.",
   SHARED_SERVICE_REFUSED:
     "A per-service command named a shared service; a worktree never stops the shared instance's services. Nothing was touched; `details` has `{services, remedy}`, the remedy being `devtrees down --shared && devtrees up` (for every worktree).",
   LAST_SERVICES_RUNNING:
-    "`stop` would leave the instance with no running process (a `Pending` service does not count), and process-compose would then exit and take the instance down; nothing was stopped. `details.services` names them, `details.remedy` is `devtrees down`.",
+    "`stop` or `restart` would leave the instance with no running process (a `Pending` service does not count), and process-compose would then exit and take the instance down; nothing was touched. `details.services` names them, `details.remedy` is `devtrees down` for `stop`, and for `restart` the `down` + `up` that restarts the instance.",
   SERVICE_PENDING:
     "`stop` named a service still waiting on its dependencies (`Pending`): it has not started, so there is nothing to stop, and nothing was touched. `details` has `{services, waiting_on, remedy}`: wait until it starts, or stop what it waits on.",
   SERVICE_STOP_INCOMPLETE:
@@ -806,6 +806,52 @@ export function formatStop(payload: StopPayload, mode: FormatMode): OutputResult
   return {
     stdout: `${lines.join("\n")}\n`,
     stderr: formatForceKilledStderr("stop", what, payload.forceKilled ?? []),
+  };
+}
+
+// --- restart ----------------------------------------------------------------
+
+/** `devtrees restart <service...>` payload (ADR-0009, #222). */
+export interface RestartPayload {
+  readonly worktreeId: string;
+  /** The services restarted, in the order they were restarted (`depends_on`). */
+  readonly restarted: ReadonlyArray<string>;
+  /** Their rows once healthy, in the `ls --json` shape. Defaults to `[]`. */
+  readonly services?: ReadonlyArray<LsServiceRow>;
+  /** Old-run processes devtrees signalled because they outlived the restart. */
+  readonly forceKilled?: ReadonlyArray<ForceKilledRow>;
+}
+
+/**
+ * Render `devtrees restart`.
+ *
+ *   - `human`: one line naming what was restarted, in the shape of `up`'s;
+ *     a restart that had to force-kill an old run adds a stderr warning.
+ *   - `json`: `{schema_version, restart: {worktree_id, restarted[],
+ *     services[], force_killed[]}}`; every list is always present.
+ */
+export function formatRestart(payload: RestartPayload, mode: FormatMode): OutputResult {
+  const forceKilled = payload.forceKilled ?? [];
+  if (mode === "json") {
+    const restart = {
+      worktree_id: payload.worktreeId,
+      restarted: payload.restarted,
+      services: (payload.services ?? []).map(lsServiceJson),
+      force_killed: forceKilledJson(forceKilled),
+    };
+    return {
+      stdout: `${JSON.stringify({ schema_version: SCHEMA_VERSION, restart })}\n`,
+      stderr: "",
+    };
+  }
+  const stderr =
+    forceKilled.length === 0
+      ? ""
+      : `devtrees restart: WARNING — the old run outlived the restart; devtrees ` +
+        `force-killed ${forceKilled.map((k) => `${k.service} (pid ${k.pid})`).join(", ")}.\n`;
+  return {
+    stdout: `devtrees restart: restarted ${payload.restarted.join(", ")} in '${payload.worktreeId}'.\n`,
+    stderr,
   };
 }
 

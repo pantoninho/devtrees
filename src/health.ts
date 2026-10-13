@@ -88,7 +88,15 @@ export type WaitForHealth = (args: {
    * fail-fast — see `createRestartTracker`.
    */
   readonly restarted?: ReadonlyArray<RestartedService>;
+  /**
+   * The command waiting (ADR-0009): `up` (default), or `restart`, whose
+   * messages name `devtrees restart <service>` as the retry.
+   */
+  readonly command?: WaitingCommand;
 }) => Promise<void>;
+
+/** The commands that wait on a worktree instance's health. */
+export type WaitingCommand = "up" | "restart";
 
 /** A service `up` restarted, and the pid of the run that died (when known). */
 export interface RestartedService {
@@ -142,13 +150,22 @@ class InstanceStoppedError extends Error {
 function instanceStoppedError(
   instance: "worktree" | "shared",
   socketPath: string,
+  /** The command that was waiting (`up`, or `restart`, ADR-0009). */
+  command: WaitingCommand = "up",
 ): InstanceStoppedError {
   const remedy = "devtrees up";
   const which = instance === "shared" ? "the shared instance" : "the worktree instance";
+  // `up` never stops anything, so only a `down` can have ended the instance
+  // under it. A per-service verb stops services itself: process-compose also
+  // exits once nothing is left running.
+  const why =
+    command === "up"
+      ? "most likely a concurrent `devtrees down`"
+      : "a concurrent `devtrees down`, or process-compose exiting once nothing else was running";
   return new InstanceStoppedError(
-    `devtrees up: ${which} was stopped while \`up\` was waiting for it (most likely a ` +
-      `concurrent \`devtrees down\`). Its control socket is gone, so there is nothing to ` +
-      `wait for. Run \`${remedy}\` to start it again.`,
+    `devtrees ${command}: ${which} was stopped while \`${command}\` was waiting for it (${why}). ` +
+      "Its control socket is gone, so there is nothing to wait for. " +
+      `Run \`${remedy}\` to start it again.`,
     { instance, socket_path: socketPath, remedy },
   );
 }
@@ -454,7 +471,9 @@ export function createWaitForHealth(
       if (last.healthy) return;
       if (last.readError !== undefined) {
         notifyFailure(last.readError);
-        if (await isGone(probe, socketPath)) throw instanceStoppedError("worktree", socketPath);
+        if (await isGone(probe, socketPath)) {
+          throw instanceStoppedError("worktree", socketPath, args.command);
+        }
       }
       const dead = countable(last);
       if (dead.length > 0 && sameDead(dead, lastDead)) throw dying(dead);
@@ -469,10 +488,11 @@ export function createWaitForHealth(
 function deadServicesErrorFor(args: {
   readonly remedy?: string;
   readonly restarted?: ReadonlyArray<RestartedService>;
+  readonly command?: WaitingCommand;
 }): (dead: ReadonlyArray<DeadService>) => HealthTimeoutError {
   const fix = args.remedy ?? "devtrees down && devtrees up";
   const restartedNames = new Set((args.restarted ?? []).map((r) => r.name));
-  return (dead) => deadServicesError(dead, fix, restartedNames);
+  return (dead) => deadServicesError(dead, fix, restartedNames, args.command ?? "up");
 }
 
 /**
@@ -542,13 +562,18 @@ function deadServicesError(
   dead: ReadonlyArray<DeadService>,
   remedy: string,
   restarted: ReadonlySet<string>,
+  command: WaitingCommand,
 ): HealthTimeoutError {
   const again = dead.filter((d) => restarted.has(d.name)).map((d) => d.name);
   const againNote =
-    again.length > 0 ? ` This \`up\` restarted ${again.join(", ")}, and it died again.` : "";
+    again.length > 0 ? ` devtrees restarted ${again.join(", ")}, and it died again.` : "";
+  const retry =
+    command === "restart"
+      ? `\`devtrees restart ${dead.map((d) => d.name).join(" ")}\` restarts ${dead.length === 1 ? "it" : "them"} again`
+      : "Re-running `devtrees up` restarts dead services";
   return new HealthTimeoutError(
     `service(s) not running: ${describeDeadServices(dead)}.${againNote} Read why with ` +
-      `\`devtrees logs <service>\`. Re-running \`devtrees up\` restarts dead services; ` +
+      `\`devtrees logs <service>\`. ${retry}; ` +
       `\`${remedy}\` restarts the whole stack. The worktree instance is still running.`,
     { dead_services: deadServicesDetails(dead), remedy },
   );

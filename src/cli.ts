@@ -34,6 +34,7 @@ import {
   formatLogLine,
   formatLs,
   formatPrune,
+  formatRestart,
   formatStop,
   formatUp,
   formatUpDryRun,
@@ -44,6 +45,7 @@ import {
   type OutputResult,
   type PrunedRow,
   type ReapWarningRow,
+  type RestartPayload,
   type ForceKilledRow,
   type UnreclaimedRow,
   type UpDryRunPayload,
@@ -75,6 +77,10 @@ export const COMMANDS: ReadonlyArray<{ name: string; summary: string }> = [
   {
     name: "stop",
     summary: "Stop named services of this worktree's instance until the next `up`",
+  },
+  {
+    name: "restart",
+    summary: "Restart named isolated services in place; the rest of the stack keeps running",
   },
   { name: "ls", summary: "List every instance with status, namespaces and ports (--services)" },
   {
@@ -195,6 +201,12 @@ export interface ExecuteDeps {
     notRunning: ReadonlyArray<string>;
     forceKilled?: ReadonlyArray<ForceKilledRow>;
   }>;
+  /** `restart <service...>` (ADR-0009, #222). Optional, like the other non-core commands. */
+  restart?: (options: {
+    readonly services: ReadonlyArray<string>;
+    /** Health-wait window in ms (`--wait-timeout=<seconds>`). */
+    readonly waitTimeoutMs?: number;
+  }) => Promise<RestartPayload>;
   ls?: () => Promise<{ anchor: string; instances: ReadonlyArray<LsInstanceRow> }>;
   attach?: (options: { shared: boolean }) => Promise<void>;
   prune?: () => Promise<{
@@ -665,6 +677,79 @@ class StopCommand extends DevtreesCommand {
   }
 }
 
+class RestartCommand extends DevtreesCommand {
+  static override paths = [["restart"]];
+  static override usage = Command.Usage({
+    description: "Restart named isolated services of this worktree's instance in place (ADR-0009).",
+    // Every check runs before anything is touched, under the lifecycle lock
+    // (LOCK_CONTENTION): no running instance → INSTANCE_NOT_FOUND (a socket or
+    // process-compose that does not answer → INSTANCE_UNRESPONSIVE); a shared
+    // service → SHARED_SERVICE_REFUSED; an unknown name → SERVICE_NOT_FOUND; a
+    // pending hot-reload → CONFIG_DRIFT (reload_pending); a service whose
+    // namespace was not booted → NAMESPACE_NOT_RUNNING; the instance's last running
+    // process → LAST_SERVICES_RUNNING. process-compose refusing
+    // the stop or start → SERVICE_START_FAILED; a restarted service that never
+    // becomes healthy, or dies → HEALTH_TIMEOUT. No names → INVALID_ARGS (bare
+    // `restart` is #225).
+    details:
+      "Usage: `devtrees restart <service>... [--wait-timeout <seconds>] [--json]`.\n\n" +
+      "Restarts each named service in `depends_on` order: stops it, waits for the old " +
+      "process to exit, starts it, and waits for it to be healthy before restarting the " +
+      "services that depend on it. The instance, its ports and every other service keep " +
+      "running, and services that depend on a named one are not restarted (name them too). " +
+      "A stopped service is simply started. The instance's last running process is refused " +
+      "(`LAST_SERVICES_RUNNING`): stopping it would make process-compose exit. Each service's " +
+      "`shutdown.command` is honoured; " +
+      "an old process that does not exit within its grace is force-killed, as `down` does, " +
+      "and reported. Succeeds once the named services are healthy, as `up` does.\n\n" +
+      errorCodeFooter([
+        "SERVICE_NOT_FOUND",
+        "SHARED_SERVICE_REFUSED",
+        "NAMESPACE_NOT_RUNNING",
+        "LAST_SERVICES_RUNNING",
+        "CONFIG_DRIFT",
+        "INSTANCE_NOT_FOUND",
+        "INSTANCE_UNRESPONSIVE",
+        "LOCK_CONTENTION",
+        "SERVICE_START_FAILED",
+        "HEALTH_TIMEOUT",
+        "PROCESS_COMPOSE_NOT_FOUND",
+        "INVALID_ARGS",
+        "UNKNOWN",
+      ]),
+    examples: [
+      ["Restart one service", "devtrees restart mobile"],
+      ["Restart two, dependencies first", "devtrees restart api mobile"],
+      ["Restart and emit the JSON envelope", "devtrees restart mobile --json"],
+    ],
+  });
+
+  services = Option.Rest({ name: "service" });
+  waitTimeout = Option.String("--wait-timeout", {
+    description: "Health-wait timeout in seconds for the restarted services. Default 120.",
+  });
+
+  override async execute(): Promise<number> {
+    return this.dispatch(async () => {
+      if (this.services.length === 0) {
+        throw invalidArgsError(
+          "name the service(s) to restart, e.g. `devtrees restart web`. " +
+            "To restart the whole stack, run `devtrees down && devtrees up`.",
+        );
+      }
+      if (!this.context.deps.restart) return 0;
+      const result = await this.context.deps.restart({
+        services: this.services,
+        ...(this.waitTimeout !== undefined
+          ? { waitTimeoutMs: parseWaitTimeoutSecondsToMs(this.waitTimeout) }
+          : {}),
+      });
+      this.emit(formatRestart(result, this.mode));
+      return 0;
+    });
+  }
+}
+
 class LsCommand extends DevtreesCommand {
   static override paths = [["ls"]];
   static override usage = Command.Usage({
@@ -969,6 +1054,7 @@ function buildCli(): Cli<DevtreesContext> {
   cli.register(UpCommand);
   cli.register(DownCommand);
   cli.register(StopCommand);
+  cli.register(RestartCommand);
   cli.register(LsCommand);
   cli.register(AttachCommand);
   cli.register(PruneCommand);
@@ -1176,6 +1262,7 @@ if (isEntrypoint(import.meta.url, process.argv[1])) {
     runUpDryRun,
     runDown,
     runStop,
+    runRestart,
     runEnv,
     runLs,
     runAttach,
@@ -1197,6 +1284,11 @@ if (isEntrypoint(import.meta.url, process.argv[1])) {
       }),
     down: ({ shared }) => runDown({ stop: stopSeamsFromEnv() }, { shared }),
     stop: ({ services }) => runStop({ stop: stopSeamsFromEnv() }, { services }),
+    restart: ({ services, waitTimeoutMs }) =>
+      runRestart(
+        { stop: stopSeamsFromEnv(), ...(waitTimeoutMs !== undefined ? { waitTimeoutMs } : {}) },
+        services,
+      ),
     ls: () => runLs(),
     attach: ({ shared }) => runAttach({}, { shared }),
     prune: () => runPrune({ stop: stopSeamsFromEnv() }),

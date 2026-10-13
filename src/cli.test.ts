@@ -27,7 +27,18 @@ describe("devtrees CLI", () => {
     expect(result.code).toBe(0);
     expect(result.stdout).toContain("devtrees");
     // clipanion lists every registered command in `$ devtrees <cmd>` form.
-    for (const cmd of ["up", "down", "stop", "ls", "attach", "prune", "env", "logs", "init"]) {
+    for (const cmd of [
+      "up",
+      "down",
+      "stop",
+      "restart",
+      "ls",
+      "attach",
+      "prune",
+      "env",
+      "logs",
+      "init",
+    ]) {
       expect(result.stdout).toContain(`devtrees ${cmd}`);
     }
   });
@@ -76,7 +87,18 @@ describe("devtrees CLI", () => {
    * body — verified by passing `--help` with no deps wired: a help path
    * that fell through to the command body would throw.
    */
-  for (const cmd of ["up", "down", "stop", "ls", "attach", "prune", "env", "logs", "init"]) {
+  for (const cmd of [
+    "up",
+    "down",
+    "stop",
+    "restart",
+    "ls",
+    "attach",
+    "prune",
+    "env",
+    "logs",
+    "init",
+  ]) {
     it(`\`devtrees ${cmd} --help\` exits 0, prints non-empty help, skips the body`, async () => {
       // No deps wired — the command body would throw "up: no deps provided"
       // if it were invoked. The fact this test passes proves help is a
@@ -162,6 +184,26 @@ describe("devtrees CLI", () => {
         "LOCK_CONTENTION",
         "INSTANCE_UNRESPONSIVE",
         "PROCESS_COMPOSE_NOT_FOUND",
+        "UNKNOWN",
+      ],
+    ],
+    // `restart` (#222): every check before anything is touched, the restarts
+    // under the lifecycle lock, and an `up`-style health wait.
+    [
+      "restart",
+      [
+        "SERVICE_NOT_FOUND",
+        "SHARED_SERVICE_REFUSED",
+        "NAMESPACE_NOT_RUNNING",
+        "LAST_SERVICES_RUNNING",
+        "CONFIG_DRIFT",
+        "INSTANCE_NOT_FOUND",
+        "INSTANCE_UNRESPONSIVE",
+        "LOCK_CONTENTION",
+        "SERVICE_START_FAILED",
+        "HEALTH_TIMEOUT",
+        "PROCESS_COMPOSE_NOT_FOUND",
+        "INVALID_ARGS",
         "UNKNOWN",
       ],
     ],
@@ -265,6 +307,75 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
     expect(down).toHaveBeenCalledWith({ shared: false });
     expect(result.code).toBe(0);
     expect(result.stdout).toContain("worktree instance stopped");
+  });
+
+  describe("restart (#222)", () => {
+    const restarted = {
+      worktreeId: "login",
+      restarted: ["api", "mobile"],
+      services: [{ name: "mobile", status: "Running", health: "ready" as const, ports: {} }],
+      forceKilled: [{ service: "mobile", pid: 42 }],
+    };
+
+    it("routes the names and --wait-timeout to restart, and prints `up`-style output", async () => {
+      const restart = vi.fn().mockResolvedValue(restarted);
+      const result = await execute(["restart", "mobile", "api", "--wait-timeout", "30"], {
+        up: vi.fn(),
+        down: vi.fn(),
+        restart,
+      });
+      expect(restart).toHaveBeenCalledWith({ services: ["mobile", "api"], waitTimeoutMs: 30_000 });
+      expect(result.code).toBe(0);
+      expect(result.stdout).toBe("devtrees restart: restarted api, mobile in 'login'.\n");
+      expect(result.stderr).toContain("force-killed mobile (pid 42)");
+    });
+
+    it("--json emits the restart envelope on stdout only", async () => {
+      const restart = vi.fn().mockResolvedValue(restarted);
+      const result = await execute(["restart", "mobile", "--json"], {
+        up: vi.fn(),
+        down: vi.fn(),
+        restart,
+      });
+      expect(restart).toHaveBeenCalledWith({ services: ["mobile"] });
+      expect(result.stderr).toBe("");
+      expect(JSON.parse(result.stdout)).toEqual({
+        schema_version: "1",
+        restart: {
+          worktree_id: "login",
+          restarted: ["api", "mobile"],
+          services: [{ name: "mobile", status: "Running", health: "ready", ports: {} }],
+          force_killed: [{ service: "mobile", pid: 42 }],
+        },
+      });
+    });
+
+    it("no names fails INVALID_ARGS without calling restart", async () => {
+      const restart = vi.fn();
+      const result = await execute(["restart", "--json"], { up: vi.fn(), down: vi.fn(), restart });
+      expect(restart).not.toHaveBeenCalled();
+      expect(result.code).toBe(1);
+      expect(JSON.parse(result.stdout).error.code).toBe("INVALID_ARGS");
+    });
+
+    it("a typed failure keeps its code in the envelope", async () => {
+      const restart = vi.fn().mockRejectedValue(
+        Object.assign(new Error("'db' is a shared service"), {
+          code: "SHARED_SERVICE_REFUSED",
+          details: { services: ["db"], remedy: "devtrees down --shared && devtrees up" },
+        }),
+      );
+      const result = await execute(["restart", "db", "--json"], {
+        up: vi.fn(),
+        down: vi.fn(),
+        restart,
+      });
+      expect(result.code).toBe(1);
+      expect(JSON.parse(result.stdout).error).toMatchObject({
+        code: "SHARED_SERVICE_REFUSED",
+        details: { services: ["db"] },
+      });
+    });
   });
 
   it("passes shared=true through when --shared is given", async () => {
