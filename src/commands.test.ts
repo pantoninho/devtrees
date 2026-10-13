@@ -7696,7 +7696,13 @@ describe("runStop — stop named services (#223, ADR-0009)", () => {
     const { deps, stops, id } = await liveInstance(running);
     const result = await runStop(deps, { services: ["web"] });
     expect(stops).toEqual([["web"]]);
-    expect(result).toEqual({ worktreeId: id, stopped: ["web"], notRunning: [], forceKilled: [] });
+    expect(result).toEqual({
+      worktreeId: id,
+      stopped: ["web"],
+      notRunning: [],
+      forceKilled: [],
+      skippedShared: [],
+    });
   });
 
   it("is idempotent: a service already stopped is skipped, and nothing is asked of process-compose", async () => {
@@ -8018,5 +8024,135 @@ describe("runStop — stop named services (#223, ADR-0009)", () => {
       { services: ["web"] },
     );
     expect(locked).toEqual([id]);
+  });
+
+  describe("-n <namespace> (#224)", () => {
+    /**
+     * `jobs` holds two isolated services, one also in `ops`. The shared `db`
+     * and `cache` declare no namespace (they cannot), so they are in `default`.
+     */
+    const nsStack: ResolvedStack = {
+      services: [
+        isolated("web", "node web.js", ["WEB_PORT"]),
+        { ...isolated("worker", "node worker.js"), namespace: "jobs" },
+        {
+          ...isolated("cron", "node cron.js"),
+          namespace: ["jobs", "ops"],
+          dependsOn: [{ name: "worker", condition: "process_started" }],
+        },
+        { ...isolated("sim", "simctl boot"), namespace: "mobile" },
+        shared("db", "postgres", ["DB_PORT"]),
+        shared("cache", "redis"),
+      ],
+    };
+    const booted = {
+      web: { status: "Running" },
+      worker: { status: "Running" },
+      cron: { status: "Running" },
+    };
+
+    it("stops every isolated service of the namespace, in depends_on order, and nothing else", async () => {
+      const { deps, stops, id, state } = await liveInstance(booted, nsStack);
+      const result = await runStop(deps, { services: [], namespaces: ["jobs"] });
+      expect(stops).toEqual([["worker", "cron"]]);
+      expect(result).toEqual({
+        worktreeId: id,
+        stopped: ["worker", "cron"],
+        notRunning: [],
+        forceKilled: [],
+        skippedShared: [],
+      });
+      expect(state.get("web")?.status).toBe("Running");
+    });
+
+    it("skips and reports the shared services in `default`, stopping its isolated ones", async () => {
+      const { deps, stops } = await liveInstance(booted, nsStack);
+      const result = await runStop(deps, { services: [], namespaces: ["default"] });
+      expect(stops).toEqual([["web"]]);
+      expect(result).toMatchObject({ stopped: ["web"], skippedShared: ["db", "cache"] });
+    });
+
+    it("unions -n with named services, without duplicates", async () => {
+      const { deps, stops } = await liveInstance(
+        { ...booted, api: { status: "Running" } },
+        { services: [...nsStack.services, isolated("api", "node api.js")] },
+      );
+      const result = await runStop(deps, {
+        services: ["cron", "web"],
+        namespaces: ["ops", "ops"],
+      });
+      expect(stops).toEqual([["cron", "web"]]);
+      expect(result.stopped).toEqual(["cron", "web"]);
+      expect(result.skippedShared).toEqual([]);
+    });
+
+    it("still refuses the last running processes (LAST_SERVICES_RUNNING)", async () => {
+      const { deps, stops } = await liveInstance(
+        { worker: { status: "Running" }, cron: { status: "Running" } },
+        nsStack,
+      );
+      const err = await failure(runStop(deps, { services: [], namespaces: ["jobs"] }));
+      expect(err?.code).toBe("LAST_SERVICES_RUNNING");
+      expect(stops).toEqual([]);
+    });
+
+    it("fails NAMESPACE_NOT_RUNNING for a namespace the instance did not boot", async () => {
+      const { deps, stops, id } = await liveInstance(booted, nsStack);
+      const err = await failure(runStop(deps, { services: ["web"], namespaces: ["mobile"] }));
+      expect(err?.code).toBe("NAMESPACE_NOT_RUNNING");
+      expect(err?.details).toEqual({
+        worktree_id: id,
+        namespaces: ["mobile"],
+        services: ["sim"],
+        remedy: "devtrees down && devtrees up -n default -n jobs -n ops -n mobile",
+      });
+      expect(stops).toEqual([]);
+    });
+
+    it("fails NO_SERVICES_SELECTED for a namespace with no isolated service", async () => {
+      const { deps, stops, id } = await liveInstance(booted, nsStack);
+      const err = await failure(runStop(deps, { services: ["web"], namespaces: ["jobs", "nope"] }));
+      expect(err?.code).toBe("NO_SERVICES_SELECTED");
+      expect(err?.details).toEqual({
+        worktree_id: id,
+        selected_namespaces: ["nope"],
+        namespaces: ["default", "jobs", "mobile", "ops"],
+      });
+      expect(err?.message).toContain("devtrees stop: no services selected");
+      expect(stops).toEqual([]);
+    });
+
+    it("refuses a Pending service in the expansion with SERVICE_PENDING, touching nothing", async () => {
+      const { deps, stops } = await liveInstance(
+        { web: { status: "Running" }, worker: { status: "Running" }, cron: { status: "Pending" } },
+        nsStack,
+      );
+      const err = await failure(runStop(deps, { services: [], namespaces: ["jobs"] }));
+      expect(err?.code).toBe("SERVICE_PENDING");
+      expect(err?.details).toMatchObject({ services: ["cron"], waiting_on: ["worker"] });
+      expect(stops).toEqual([]);
+    });
+
+    it("refuses with CONFIG_DRIFT reload_pending, its retry spelling the names and -n flags", async () => {
+      const { deps, stops, anchor, id } = await liveInstance(booted, nsStack);
+      writePendingReload(anchor, id, { services: ["web"], oldRuns: [{ name: "web", pid: 100 }] });
+      const err = await failure(
+        runStop(
+          { ...deps, isProcessAlive: (pid) => pid === 100 },
+          { services: ["web", "web"], namespaces: ["jobs", "ops", "jobs"] },
+        ),
+      );
+      expect(err?.code).toBe("CONFIG_DRIFT");
+      expect(err?.details).toEqual({ reason: "reload_pending", services: ["web"], pids: [100] });
+      expect(err?.message).toContain("`devtrees stop web -n jobs -n ops`");
+      expect(stops).toEqual([]);
+    });
+
+    it("still refuses a shared service named explicitly next to -n", async () => {
+      const { deps, stops } = await liveInstance(booted, nsStack);
+      const err = await failure(runStop(deps, { services: ["db"], namespaces: ["default"] }));
+      expect(err?.code).toBe("SHARED_SERVICE_REFUSED");
+      expect(stops).toEqual([]);
+    });
   });
 });

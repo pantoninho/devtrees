@@ -110,11 +110,13 @@ import {
 } from "./stop-services.js";
 import {
   declaredServices,
+  expandNamespaces,
   notBootedNamespaces,
   orderedTargets,
   sharedAmong,
   unbootedServices,
   unknownService,
+  type DeclaredService,
 } from "./service-targets.js";
 import {
   readStoredHash as defaultReadStoredHash,
@@ -334,17 +336,22 @@ class NoServicesSelectedError extends Error {
     available: ReadonlyArray<string>,
     selected: ReadonlyArray<string> = [DEFAULT_NAMESPACE],
     explicit = false,
+    command: "up" | NamedServiceCommand = "up",
   ) {
     const example = available[0] ?? "<ns>";
     const why = explicit
-      ? `\`-n ${selected.join(", ")}\` names no namespace with services in this stack.`
+      ? `\`-n ${selected.join(", ")}\` names no namespace with ${command === "up" ? "services in this stack" : "isolated services in this instance"}.`
       : `A bare \`devtrees up\` starts only the \`${DEFAULT_NAMESPACE}\` namespace ` +
         `(services with no \`namespace:\`), and this stack has none.`;
+    // A per-service verb (#224) touched nothing; `up` says how to select.
+    const next =
+      command === "up"
+        ? `Name the ones to start with -n, e.g. \`devtrees up -n ${example}\` ` +
+          `(repeat -n for several).`
+        : `Nothing was touched.`;
     super(
-      `devtrees up: no services selected (NO_SERVICES_SELECTED) for '${worktreeId}'. ${why} ` +
-        `Available namespaces: ${available.join(", ")}. ` +
-        `Name the ones to start with -n, e.g. \`devtrees up -n ${example}\` ` +
-        `(repeat -n for several).`,
+      `devtrees ${command}: no services selected (NO_SERVICES_SELECTED) for '${worktreeId}'. ${why} ` +
+        `Available namespaces: ${available.join(", ")}. ${next}`,
     );
     this.name = "NoServicesSelectedError";
     this.details = {
@@ -2776,6 +2783,8 @@ export interface StopServicesResult {
   readonly notRunning: ReadonlyArray<string>;
   /** Processes devtrees signalled to finish the stop (`down`'s `force_killed`). */
   readonly forceKilled: ReadonlyArray<ForceKilled>;
+  /** Shared services in a `-n` namespace, not stopped (#224). */
+  readonly skippedShared: ReadonlyArray<string>;
 }
 
 /**
@@ -2797,17 +2806,24 @@ export interface StopServicesResult {
  * are checked as `down` checks them. Anything still alive or listening
  * fails `SERVICE_STOP_INCOMPLETE`.
  *
+ * `options.namespaces` (`-n`, #224) adds every isolated service of each
+ * namespace to the names (`resolveNamedServices`); shared services in them
+ * are skipped and reported in `skippedShared`.
+ *
  * The stop is transient: process-compose reports a stopped service like a
  * crashed one, so the next `up` covering it restarts it.
  */
 export async function runStop(
   deps: CommandDeps,
-  options: { readonly services: ReadonlyArray<string> },
+  options: {
+    readonly services: ReadonlyArray<string>;
+    readonly namespaces?: ReadonlyArray<string>;
+  },
 ): Promise<StopServicesResult> {
   const { anchor } = resolve(deps);
   const lifecycleLock = deps.withLifecycleLock ?? defaultWithLifecycleLock;
   return lifecycleLock(anchor.anchor, anchor.worktreeId, async () => {
-    const target = await resolveNamedServices(deps, options.services, "stop");
+    const target = await resolveNamedServices(deps, options.services, "stop", options.namespaces);
     const id = anchor.worktreeId;
     const names = target.services;
     const { running, pending, notRunning } = partitionRunning(target.rows, names);
@@ -2843,7 +2859,13 @@ export async function runStop(
     if (survivors.length > 0) {
       throw serviceStopIncomplete(id, checked, survivors, stopped.forceKilled);
     }
-    return { worktreeId: id, stopped: running, notRunning, forceKilled: stopped.forceKilled };
+    return {
+      worktreeId: id,
+      stopped: running,
+      notRunning,
+      forceKilled: stopped.forceKilled,
+      skippedShared: target.skippedShared,
+    };
   });
 }
 
@@ -2884,6 +2906,8 @@ export interface RestartResult {
   readonly services: ReadonlyArray<Service>;
   /** Old-run processes devtrees signalled because they did not exit on their own. */
   readonly forceKilled: ReadonlyArray<ForceKilled>;
+  /** Shared services in a `-n` namespace, not restarted (#224). */
+  readonly skippedShared: ReadonlyArray<string>;
 }
 
 /**
@@ -2917,10 +2941,15 @@ export interface RestartResult {
  * `INSTANCE_NOT_FOUND` saying so. A service that does not become healthy, or
  * dies, fails `HEALTH_TIMEOUT` and is left running so `logs` and
  * `ls --json` still work.
+ *
+ * `namespaces` (`-n`, #224) adds every isolated service of each namespace to
+ * `names` (`resolveNamedServices`); shared services in them are skipped and
+ * reported in `skippedShared`.
  */
 export async function runRestart(
   deps: CommandDeps,
   names: ReadonlyArray<string>,
+  namespaces: ReadonlyArray<string> = [],
 ): Promise<RestartResult> {
   const { anchor } = resolve(deps);
   const lifecycleLock = deps.withLifecycleLock ?? defaultWithLifecycleLock;
@@ -2931,11 +2960,15 @@ export async function runRestart(
   const done: Array<{ name: string; row: Service | undefined }> = [];
   const forceKilled: ForceKilled[] = [];
   let order: string[] | undefined;
+  let skippedShared: ReadonlyArray<string> = [];
   for (let i = 0; order === undefined || i < order.length; i++) {
     const step = await lifecycleLock(anchor.anchor, anchor.worktreeId, async () => {
       const restarted = done.map((d) => d.name);
-      const target = await resolveRestartStep(deps, names, restarted);
-      order ??= [...target.services];
+      const target = await resolveRestartStep(deps, names, restarted, namespaces);
+      if (order === undefined) {
+        order = [...target.services];
+        skippedShared = target.skippedShared;
+      }
       // Before anything is touched, and again before each later service: a
       // one-shot that finished meanwhile may have left it the last one.
       const ahead = order.slice(i);
@@ -2971,6 +3004,7 @@ export async function runRestart(
     restarted: done.map((d) => d.name),
     services: done.flatMap((d) => (d.row === undefined ? [] : [d.row])),
     forceKilled,
+    skippedShared,
   };
 }
 
@@ -2985,15 +3019,16 @@ async function resolveRestartStep(
   deps: CommandDeps,
   names: ReadonlyArray<string>,
   done: ReadonlyArray<string>,
+  namespaces: ReadonlyArray<string>,
 ): Promise<NamedServices> {
   const { anchor } = resolve(deps);
   try {
-    return await resolveNamedServices(deps, names, "restart");
+    return await resolveNamedServices(deps, names, "restart", namespaces);
   } catch (err) {
     const code = (err as { code?: unknown }).code;
     if (code === "HEALTH_TIMEOUT") {
       const socketPath = instancePaths(anchor.anchor, anchor.worktreeId).socketPath;
-      const retry = `devtrees restart ${[...new Set(names)].join(" ")}`;
+      const retry = namedServicesInvocation("restart", names, namespaces);
       throw new InstanceUnresponsiveError("restart", {
         instance: anchor.worktreeId,
         socket_path: socketPath,
@@ -3959,6 +3994,8 @@ interface NamedServices {
   readonly services: ReadonlyArray<string>;
   /** The `process list` read the checks were made against. */
   readonly rows: ServiceStatus[];
+  /** Shared services in a `-n` namespace (#224): skipped, for the verb to report. */
+  readonly skippedShared: ReadonlyArray<string>;
 }
 
 /**
@@ -3983,18 +4020,25 @@ interface NamedServices {
  *     selected) fails `NAMESPACE_NOT_RUNNING`, as `up -n` does (ADR-0008),
  *     `details: {worktree_id, namespaces, services, remedy}`.
  *
+ * `namespaces` (`-n`, #224) adds every isolated service of each namespace to
+ * `names` (`expandNamespaces`, against the derived config); every check above
+ * then applies to the union. Between checks 4 and 5, a namespace with no
+ * isolated service fails `NO_SERVICES_SELECTED`. Shared services in the
+ * namespaces are not added: they are returned in `skippedShared`.
+ *
  * Returns the named services in `depends_on` order, with the rows. Takes no
  * lock: the caller holds this worktree's lifecycle lock around it and the
  * action, so a concurrent `down` cannot stop the instance in between.
  */
 async function resolveNamedServices(
   deps: CommandDeps,
-  names: ReadonlyArray<string>,
+  named: ReadonlyArray<string>,
   command: NamedServiceCommand,
+  namespaces: ReadonlyArray<string> = [],
 ): Promise<NamedServices> {
   const { anchor } = resolve(deps);
   const paths = instancePaths(anchor.anchor, anchor.worktreeId);
-  const retry = `devtrees ${command} ${[...new Set(names)].join(" ")}`;
+  const retry = namedServicesInvocation(command, named, namespaces);
   const live = await socketIsLive(paths.socketPath, resolveProbe(deps), {
     command,
     instance: anchor.worktreeId,
@@ -4006,17 +4050,13 @@ async function resolveNamedServices(
     : undefined;
   const processes = derivedProcesses(configText);
   const declared = declaredServices(processes);
-  const shared = sharedAmong(sharedServiceNames(deps, anchor), declared, names);
-  if (shared.length > 0) throw sharedServiceRefusedError(shared, command);
-  const unknown = unknownService(declared, names);
-  if (unknown !== undefined) {
-    throw serviceNotFoundError(
-      unknown,
-      declared.map((s) => s.name),
-      false,
-      command,
-    );
-  }
+  const { names, skippedShared } = checkedSelection(
+    deps,
+    anchor,
+    declared,
+    { named, namespaces },
+    command,
+  );
   const rows = await readStatusesWithin(
     { getServiceStatuses: statusReader(deps, createDriver(deps.driver)) },
     paths.socketPath,
@@ -4055,30 +4095,90 @@ async function resolveNamedServices(
     config: readDerivedConfig(paths.configPath),
     services: targets.map((s) => s.name),
     rows,
+    skippedShared,
   };
 }
 
 /**
- * The repo's shared service names, so a per-service verb can refuse them by
- * name: from `devtrees.yaml`, and from the shared instance's derived config.
+ * Checks 3 and 4 of `resolveNamedServices` on the named services, then the
+ * `-n` expansion (#224): a namespace with no isolated service fails
+ * `NO_SERVICES_SELECTED`. Returns the union of the names and the expansion,
+ * each once, and the shared services the expansion skipped.
+ */
+function checkedSelection(
+  deps: CommandDeps,
+  anchor: { readonly anchor: string; readonly worktreeId: string; readonly worktreeRoot: string },
+  declared: ReadonlyArray<DeclaredService>,
+  selection: { readonly named: ReadonlyArray<string>; readonly namespaces: ReadonlyArray<string> },
+  command: NamedServiceCommand,
+): { names: string[]; skippedShared: ReadonlyArray<string> } {
+  const { named, namespaces } = selection;
+  const repoShared = sharedServices(deps, anchor);
+  const shared = sharedAmong(
+    repoShared.map((s) => s.name),
+    declared,
+    named,
+  );
+  if (shared.length > 0) throw sharedServiceRefusedError(shared, command);
+  const unknown = unknownService(declared, named);
+  if (unknown !== undefined) {
+    throw serviceNotFoundError(
+      unknown,
+      declared.map((s) => s.name),
+      false,
+      command,
+    );
+  }
+  const expansion = expandNamespaces(declared, repoShared, namespaces);
+  if (expansion.empty.length > 0) {
+    throw new NoServicesSelectedError(
+      anchor.worktreeId,
+      declaredNamespaces(declared),
+      expansion.empty,
+      true,
+      command,
+    );
+  }
+  return {
+    names: [...new Set([...named, ...expansion.services])],
+    skippedShared: expansion.skippedShared,
+  };
+}
+
+/** The command line a per-service verb was run as, for retry and remedy text. */
+function namedServicesInvocation(
+  command: NamedServiceCommand,
+  names: ReadonlyArray<string>,
+  namespaces: ReadonlyArray<string> = [],
+): string {
+  const flags = [...new Set(namespaces)].map((ns) => `-n ${ns}`);
+  return [`devtrees ${command}`, ...new Set(names), ...flags].join(" ");
+}
+
+/**
+ * The repo's shared services, with their namespaces, so a per-service verb
+ * can refuse them by name and skip them in a `-n` expansion (#224): from
+ * `devtrees.yaml`, and from the shared instance's derived config.
  * Best-effort: a broken `devtrees.yaml` adds none, and must not block a
  * command on a running instance.
  */
-function sharedServiceNames(
+function sharedServices(
   deps: CommandDeps,
   anchor: { readonly anchor: string; readonly worktreeRoot: string },
-): string[] {
-  const fromConfig = Object.keys(
-    readDerivedConfig(sharedInstancePaths(anchor.anchor).configPath)?.processes ?? {},
+): Array<Pick<ResolvedService, "name" | "namespace">> {
+  const fromConfig = declaredServices(
+    readDerivedConfig(sharedInstancePaths(anchor.anchor).configPath)?.processes as
+      | DerivedProcessMap
+      | undefined,
   );
-  let fromStack: string[] = [];
+  let fromStack: Array<Pick<ResolvedService, "name" | "namespace">> = [];
   try {
     const stack = (deps.readStack ?? loadStack)(anchor.worktreeRoot);
-    fromStack = stack.services.filter((s) => s.tier === "shared").map((s) => s.name);
+    fromStack = stack.services.filter((s) => s.tier === "shared");
   } catch {
     // The shared derived config still names them.
   }
-  return [...new Set([...fromStack, ...fromConfig])];
+  return [...fromStack, ...fromConfig];
 }
 
 /**

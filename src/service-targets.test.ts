@@ -6,6 +6,7 @@
 import { describe, expect, it } from "vite-plus/test";
 import {
   declaredServices,
+  expandNamespaces,
   notBootedNamespaces,
   orderedTargets,
   sharedAmong,
@@ -67,5 +68,44 @@ describe("unbootedServices / notBootedNamespaces", () => {
       { namespace: "mobile", missingServices: ["app", "api"] },
       { namespace: "backend", missingServices: ["api"] },
     ]);
+  });
+});
+
+describe("expandNamespaces (#224)", () => {
+  // Shared services cannot declare a namespace, so they are in `default`.
+  const sharedServices = [
+    { name: "db" },
+    { name: "cache" },
+    // A name this instance declares is its own service, never a skipped shared one.
+    { name: "web" },
+  ];
+
+  it("expands to every isolated service in any namespace (list-valued included), in declared order", () => {
+    expect(expandNamespaces(declared, sharedServices, ["backend"])).toEqual({
+      services: ["api"],
+      empty: [],
+      skippedShared: [],
+    });
+    expect(expandNamespaces(declared, sharedServices, ["mobile", "default", "mobile"])).toEqual({
+      services: ["app", "api", "web"],
+      empty: [],
+      skippedShared: ["db", "cache"],
+    });
+  });
+
+  it("reports each namespace with no isolated service as empty", () => {
+    expect(expandNamespaces(declared, sharedServices, ["nope", "mobile"])).toEqual({
+      services: ["app", "api"],
+      empty: ["nope"],
+      skippedShared: [],
+    });
+  });
+
+  it("expands nothing for no namespaces", () => {
+    expect(expandNamespaces(declared, sharedServices, [])).toEqual({
+      services: [],
+      empty: [],
+      skippedShared: [],
+    });
   });
 });

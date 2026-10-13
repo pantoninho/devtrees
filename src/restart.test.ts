@@ -627,3 +627,110 @@ describe("runRestart (#222)", () => {
     expect(err.message).toContain("while `restart` was waiting");
   });
 });
+
+describe("runRestart -n <namespace> (#224)", () => {
+  it("expands to the namespace's isolated services, unions with names, and skips and reports shared ones", async () => {
+    // The shared `db` declares no namespace, so it is in `default`.
+    const { deps, log, id } = instance();
+    const result = await runRestart(deps, ["mobile", "api"], ["default"]);
+    expect(touched(log)).toEqual([
+      "process stop api",
+      "process start api",
+      "process stop mobile",
+      "process start mobile",
+      "process stop worker",
+      "process start worker",
+    ]);
+    expect(result).toMatchObject({
+      worktreeId: id,
+      restarted: ["api", "mobile", "worker"],
+      skippedShared: ["db"],
+    });
+  });
+
+  it("a namespace alone restarts only its services; shared skipped is empty when there are none", async () => {
+    const { deps, log } = instance();
+    const result = await runRestart(deps, [], ["ios"]);
+    expect(touched(log)).toEqual(["process stop mobile", "process start mobile"]);
+    expect(result).toMatchObject({ restarted: ["mobile"], skippedShared: [] });
+  });
+
+  it("a namespace the instance did not boot fails NAMESPACE_NOT_RUNNING, touching nothing", async () => {
+    const { deps, log, id } = instance({ rows: [running("api", 11), running("worker", 13)] });
+    const err = await failure(runRestart(deps, ["worker"], ["ios"]));
+    expect(err).toMatchObject({
+      code: "NAMESPACE_NOT_RUNNING",
+      details: {
+        worktree_id: id,
+        namespaces: ["ios"],
+        services: ["mobile"],
+        remedy: "devtrees down && devtrees up -n default -n ios",
+      },
+    });
+    expect(touched(log)).toEqual([]);
+  });
+
+  it("a namespace with no isolated service fails NO_SERVICES_SELECTED, touching nothing", async () => {
+    const { deps, log, id } = instance();
+    const err = await failure(runRestart(deps, ["worker"], ["ios", "nope"]));
+    expect(err).toMatchObject({
+      code: "NO_SERVICES_SELECTED",
+      details: { worktree_id: id, selected_namespaces: ["nope"], namespaces: ["default", "ios"] },
+    });
+    expect(err.message).toContain("devtrees restart: no services selected");
+    expect(touched(log)).toEqual([]);
+  });
+
+  it("a pending hot-reload refuses with CONFIG_DRIFT reload_pending, its retry spelling the -n flags", async () => {
+    // worker's new copy is not in the project yet: the reload is still pending.
+    const { deps, log, anchor, id } = instance({
+      rows: [running("api", 11), running("mobile", 12)],
+    });
+    writePendingReload(anchor, id, { services: ["worker"], oldRuns: [{ name: "worker", pid: 9 }] });
+    const err = await failure(
+      runRestart({ ...deps, isProcessAlive: () => true }, ["api"], ["ios", "ios"]),
+    );
+    expect(err.code).toBe("CONFIG_DRIFT");
+    expect(err.message).toContain("then run `devtrees restart api -n ios` again");
+    expect(err.details).toEqual({ reason: "reload_pending", services: ["worker"], pids: [9] });
+    expect(touched(log)).toEqual([]);
+  });
+
+  it("an unresponsive instance's retry spells the -n flags", async () => {
+    const { deps, log } = instance();
+    const err = await failure(
+      runRestart(
+        {
+          ...deps,
+          waitTimeoutMs: 30,
+          getServiceStatuses: () => Promise.reject(new Error("process list hung")),
+        },
+        [],
+        ["ios", "default"],
+      ),
+    );
+    expect(err.code).toBe("INSTANCE_UNRESPONSIVE");
+    expect(err.message).toContain("devtrees restart -n ios -n default");
+    expect(touched(log)).toEqual([]);
+  });
+
+  it("a Pending service in the expansion is refused with SERVICE_PENDING, touching nothing", async () => {
+    const pendingMobile: ServiceStatus = { name: "mobile", status: "Pending", health: "unknown" };
+    const { deps, log } = instance({
+      rows: [running("api", 11), pendingMobile, running("worker", 13)],
+    });
+    const err = await failure(runRestart(deps, ["worker"], ["ios"]));
+    expect(err).toMatchObject({
+      code: "SERVICE_PENDING",
+      details: { services: ["mobile"], waiting_on: ["api"] },
+    });
+    expect(touched(log)).toEqual([]);
+  });
+
+  it("naming a shared service explicitly is still refused alongside -n", async () => {
+    const { deps, log } = instance();
+    const err = await failure(runRestart(deps, ["db"], ["default"]));
+    expect(err.code).toBe("SHARED_SERVICE_REFUSED");
+    expect(touched(log)).toEqual([]);
+  });
+});

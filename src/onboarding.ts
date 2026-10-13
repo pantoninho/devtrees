@@ -129,6 +129,12 @@ are. It never stops anything, and never attaches the TUI.
   is no \`start\`). Stopping a service that is not running succeeds. It refuses
   a shared service (\`SHARED_SERVICE_REFUSED\`) and a stop that would leave
   nothing running (\`LAST_SERVICES_RUNNING\`; use \`devtrees down\`).
+- \`-n <namespace>\` on \`stop\` or \`restart\` acts on every isolated service of
+  that namespace (\`devtrees stop -n ios\`, \`devtrees restart -n app\`), and can
+  be mixed with names. \`devtrees up -n <namespace>\` brings a stopped one
+  back. Shared services are skipped and listed in \`skipped_shared\`. A
+  namespace the stack was not booted with fails \`NAMESPACE_NOT_RUNNING\`, and
+  one with no isolated service \`NO_SERVICES_SELECTED\`.
 - To cycle one service without touching the rest (a wedged dev server, say),
   run \`devtrees restart <service>...\`. It restarts only the services it
   names, in \`depends_on\` order, keeps their ports and the instance, and
@@ -157,7 +163,7 @@ Branch on \`error.code\`:
 | \`SHARED_DRIFT\`              | This worktree's shared services diverge from the running shared instance. Follow the message: \`devtrees down --shared && devtrees up\`. |
 | \`CONFIG_DRIFT\`              | The running config differs from \`devtrees.yaml\` and hot-reload failed, or an earlier reload is still pending. Branch on \`details.reason\`: \`not_supported\`/\`error\` → \`devtrees down && devtrees up\`. \`timeout\` → a changed service's old process won't stop: kill that process, then run \`devtrees up\` again to resync. Or run \`devtrees down && devtrees up\`: \`down\` force-kills that old process first and lists it in \`force_killed\`. \`reload_pending\` → that earlier reload is still waiting, so \`up\` reloaded nothing (another reload would start an untracked second copy): kill the old process (\`details.pids\`, for \`details.services\`), then run \`devtrees up\` again. Empty \`details.pids\` → the old process is gone and process-compose is still starting the new one: retry shortly; if it persists, follow the message's \`devtrees down && devtrees up …\`. |
 | \`SERVICE_NOT_FOUND\`         | You named a service that isn't in the instance. \`details.valid_services\` lists the real names; pick one. |
-| \`NO_SERVICES_SELECTED\`      | The selection has no services: a bare \`up\` starts only services with no \`namespace:\` and there are none, or \`-n\` names only namespaces with none. \`details.namespaces\` lists the namespaces; retry with \`devtrees up -n <ns>\`. |
+| \`NO_SERVICES_SELECTED\`      | The selection has no services: a bare \`up\` starts only services with no \`namespace:\` and there are none, or \`-n\` names only namespaces with none (on \`stop\` or \`restart\`, any \`-n\` namespace with no isolated service, in \`details.selected_namespaces\`). \`details.namespaces\` lists the namespaces; retry with one of them. |
 | \`INSTANCE_NOT_FOUND\`        | No instance is running for this worktree. Run \`devtrees up\` first.                            |
 | \`INSTANCE_UNRESPONSIVE\`     | The instance may be running but its process-compose did not answer (busy or frozen). Nothing changed. **Retry** in a moment; if it persists, follow \`details.remedy\`. Do not delete the socket by hand. |
 | \`DOWN_TIMEOUT\`              | \`down\` could not finish: process-compose was still running after devtrees force-killed the stuck services (\`details.stuck_services\`; empty when it is waiting on a \`shutdown.command\` that does not exit), or a timed-out hot-reload was still being applied, so \`down\` did not start the stop (\`details.pending_reload\`; \`details.remedy\` names the old process to kill by hand first, which is safe because no stop is running). Nothing was removed. **Retry** \`down\` once; if it fails again, **surface it to the human** with \`details.remedy\`, which names the process-compose pid to stop by hand, or for a pending reload the old process to kill. |

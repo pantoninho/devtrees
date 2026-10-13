@@ -23,7 +23,7 @@
  */
 
 import { namespaceOf } from "./reload-pending.js";
-import { serviceNamespaces, type NamespaceNotRunning } from "./selection.js";
+import { namespaceSelected, serviceNamespaces, type NamespaceNotRunning } from "./selection.js";
 import { dependencyOrder } from "./service-state.js";
 import type { ResolvedService } from "./stack.js";
 
@@ -101,4 +101,38 @@ export function notBootedNamespaces(
       .filter((s) => serviceNamespaces(s).includes(namespace))
       .map((s) => s.name),
   }));
+}
+
+/** What a per-service verb's `-n` flags expand to (#224). */
+export interface NamespaceExpansion {
+  /** The isolated services in any of the namespaces, in declared order. */
+  readonly services: ReadonlyArray<string>;
+  /** Requested namespaces with no isolated service: `NO_SERVICES_SELECTED`. */
+  readonly empty: ReadonlyArray<string>;
+  /** Shared services in any of the namespaces, skipped and reported. */
+  readonly skippedShared: ReadonlyArray<string>;
+}
+
+/**
+ * Expand `-n` namespaces (#224) to every isolated service of the running
+ * instance's derived config in any of them (a list-valued `namespace:` puts a
+ * service in each, as for `up`). Shared services in them are not expanded:
+ * they are returned in `skippedShared` for the verb to report. A namespace
+ * that selects no isolated service is returned in `empty`.
+ */
+export function expandNamespaces(
+  declared: ReadonlyArray<DeclaredService>,
+  shared: ReadonlyArray<Pick<ResolvedService, "name" | "namespace">>,
+  namespaces: ReadonlyArray<string>,
+): NamespaceExpansion {
+  const requested = [...new Set(namespaces)];
+  const own = new Set(declared.map((s) => s.name));
+  const services = declared.filter((s) => namespaceSelected(s, requested)).map((s) => s.name);
+  const empty = requested.filter((ns) => !declared.some((s) => namespaceSelected(s, [ns])));
+  const skippedShared = [
+    ...new Set(
+      shared.filter((s) => !own.has(s.name) && namespaceSelected(s, requested)).map((s) => s.name),
+    ),
+  ];
+  return { services, empty, skippedShared };
 }

@@ -595,6 +595,22 @@ async function httpStatus(port: number): Promise<number> {
 }
 
 /**
+ * `httpStatus`, retried until it is 200 or `timeoutMs` passes; returns the
+ * last status. For a check right after a readiness wait, where one GET on a
+ * loaded runner can miss (a 3s timeout, a refused connect) though the server
+ * is serving.
+ */
+async function httpStatusWithin(port: number, timeoutMs: number): Promise<number> {
+  const deadline = Date.now() + timeoutMs;
+  let status = await httpStatus(port);
+  while (status !== 200 && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 250));
+    status = await httpStatus(port);
+  }
+  return status;
+}
+
+/**
  * Poll `ls --json` until a given service row reports `health: "ready"`, or
  * until `timeoutMs` elapses. Returns the last-observed row (possibly
  * `undefined` if the instance never appeared) so the caller can assert.
@@ -2871,7 +2887,7 @@ describe.skipIf(!ENABLED)("real-pc smoke — restart <service...> (#222)", () =>
     const nowApi = pidsMatching(needle("api"));
     expect(nowApi.some((pid) => oldApi.includes(pid))).toBe(false);
     expect(nowApi.length).toBeGreaterThan(0);
-    expect(await httpStatus(Number(env.API_PORT))).toBe(200);
+    expect(await httpStatusWithin(Number(env.API_PORT), 10_000)).toBe(200);
 
     const oldMobile = pidsMatching(needle("mobile"));
     const started = Date.now();
@@ -2881,7 +2897,9 @@ describe.skipIf(!ENABLED)("real-pc smoke — restart <service...> (#222)", () =>
     expect((mobile.doc as RestartDoc).restart.restarted).toEqual(["mobile"]);
     const nowMobile = pidsMatching(needle("mobile"));
     expect(nowMobile.some((pid) => oldMobile.includes(pid))).toBe(false);
-    expect(await httpStatus(Number(env.MOBILE_PORT))).toBe(200);
+    // Ready was the new run's own probe (process-compose clears readiness on
+    // stop), but one GET on a loaded runner can still miss (#231 CI): poll.
+    expect(await httpStatusWithin(Number(env.MOBILE_PORT), 10_000)).toBe(200);
     expect(orphanedServices(root)).toEqual([]);
   }, 180_000);
 
@@ -3037,6 +3055,218 @@ describe.skipIf(!ENABLED)("real-pc smoke — restart <service...> (#222)", () =>
     expect(pidsMatching(join(repo.root, "keeper.py"))).toEqual(keeper);
     expect(orphanedServices(repo.root)).toEqual([]);
   }, 120_000);
+});
+
+// Issue #224 (ADR-0009): `stop -n` and `restart -n` expand a namespace to its
+// isolated services and go through the per-service paths; shared services in
+// the namespace are skipped and reported.
+describe.skipIf(!ENABLED)("real-pc smoke — stop -n / restart -n (#224)", () => {
+  interface VerbDoc {
+    readonly stop?: {
+      readonly stopped: string[];
+      readonly not_running: string[];
+      readonly skipped_shared: string[];
+      readonly transient: boolean;
+    };
+    readonly restart?: {
+      readonly restarted: string[];
+      readonly skipped_shared: string[];
+      readonly services: ReadonlyArray<LsServiceRow>;
+    };
+    readonly up?: { readonly restarted: string[] };
+    readonly error?: { readonly code: string; readonly details?: Record<string, unknown> };
+  }
+  const docOf = (r: CliResult): VerbDoc => r.doc as VerbDoc;
+
+  /**
+   * `app` holds `api` and `web` (web waits on api being healthy); `ios`
+   * holds `sim`; `default` holds `worker` and, as a shared service cannot
+   * declare a namespace, the shared `db`. Each http server's argv carries
+   * `--directory <root>/<name>`, so its pids are found exactly.
+   */
+  function nsRepo(prefix: string): {
+    wt: string;
+    root: string;
+    pids: (name: string) => number[];
+  } {
+    const repo = buildSmokeRepo(prefix, ["login"]);
+    currentCtx = { pidNeedle: repo.root, root: repo.root };
+    cleanupStack.push(() => reapPids(pidsMatching(repo.root)));
+    const wt = repo.worktrees.login!;
+    const needles: Record<string, string> = {
+      db: join(repo.root, "db.py"),
+      sim: join(repo.root, "sim.py"),
+      worker: join(repo.root, "worker.py"),
+    };
+    const server = (name: string, port: string): string[] => {
+      mkdirSync(join(repo.root, name));
+      needles[name] = `--directory ${join(repo.root, name)}`;
+      return [
+        `  ${name}:`,
+        "    tier: isolated",
+        "    namespace: app",
+        `    command: "exec python3 -m http.server $${port} --bind 127.0.0.1 ${needles[name]}"`,
+        `    ports: [${port}]`,
+        "    readiness_probe:",
+        "      exec:",
+        `        command: "curl -fsS --max-time 2 -o /dev/null http://127.0.0.1:$${port}/"`,
+        "      initial_delay_seconds: 0",
+        "      period_seconds: 1",
+        "      timeout_seconds: 3",
+        "      failure_threshold: 30",
+      ];
+    };
+    writeFileSync(
+      join(wt, "devtrees.yaml"),
+      [
+        "services:",
+        "  db:",
+        "    tier: shared",
+        `    command: "python3 ${sleeper(repo.root, "db")}"`,
+        ...server("api", "API_PORT"),
+        ...server("web", "WEB_PORT"),
+        "    depends_on:",
+        "      api:",
+        "        condition: process_healthy",
+        "  sim:",
+        "    tier: isolated",
+        "    namespace: ios",
+        `    command: "python3 ${sleeper(repo.root, "sim")}"`,
+        "  worker:",
+        "    tier: isolated",
+        `    command: "python3 ${sleeper(repo.root, "worker")}"`,
+        "",
+      ].join("\n"),
+    );
+    cleanupStack.push(() => devtrees(wt, ["down", "--shared"]));
+    cleanupStack.push(() => devtrees(wt, ["down"], { DEVTREES_DOWN_BASE_TIMEOUT_MS: "3000" }));
+    return { wt, root: repo.root, pids: (name) => pidsMatching(needles[name]!) };
+  }
+
+  /** `up --json -n <ns>...`; returns its env. */
+  function upNs(wt: string, namespaces: ReadonlyArray<string>): Record<string, string> {
+    const flags = namespaces.flatMap((ns) => ["-n", ns]);
+    const result = devtrees(wt, ["up", "--json", "--wait-timeout", "30", ...flags]);
+    expect(result.code, `up failed: ${result.stderr} ${result.stdout}`).toBe(0);
+    return (result.doc as UpDoc).up.env;
+  }
+
+  const snapshot = (pids: (name: string) => number[], names: ReadonlyArray<string>) =>
+    Object.fromEntries(names.map((n) => [n, pids(n)]));
+
+  it("scenario 100: stop -n ios stops only sim, transiently; up -n ios brings it back", async () => {
+    const { wt, pids } = nsRepo("dt-rpc100-");
+    const env = upNs(wt, ["default", "app", "ios"]);
+    expect(pids("sim").length, "sim should run").toBeGreaterThan(0);
+    const others = snapshot(pids, ["api", "web", "worker", "db"]);
+
+    // A name and the namespace naming it again: the union, once.
+    const stop = devtrees(wt, ["stop", "sim", "-n", "ios", "--json"]);
+    expect(stop.code, `stop failed: ${stop.stderr} ${stop.stdout}`).toBe(0);
+    expect(docOf(stop).stop).toMatchObject({
+      stopped: ["sim"],
+      not_running: [],
+      skipped_shared: [],
+      transient: true,
+    });
+    expect(pids("sim")).toEqual([]);
+    expect(snapshot(pids, ["api", "web", "worker", "db"])).toEqual(others);
+    expect(await httpStatus(Number(env.WEB_PORT))).toBe(200);
+
+    const again = devtrees(wt, ["up", "--json", "--wait-timeout", "30", "-n", "ios"]);
+    expect(again.code, `up -n ios failed: ${again.stderr} ${again.stdout}`).toBe(0);
+    expect(docOf(again).up?.restarted).toEqual(["sim"]);
+    expect(pids("sim").length, "sim should run again").toBeGreaterThan(0);
+    expect(snapshot(pids, ["api", "web", "worker", "db"])).toEqual(others);
+  }, 180_000);
+
+  it("scenario 101: restart -n app restarts api then web in depends_on order, on the same ports, touching nothing else", async () => {
+    const { wt, root, pids } = nsRepo("dt-rpc101-");
+    const env = upNs(wt, ["default", "app", "ios"]);
+    const before = snapshot(pids, ["api", "web", "sim", "worker", "db"]);
+
+    const result = devtrees(wt, ["restart", "-n", "app", "--json", "--wait-timeout", "30"]);
+    expect(result.code, `restart failed: ${result.stderr} ${result.stdout}`).toBe(0);
+    const doc = docOf(result).restart;
+    expect(doc?.restarted).toEqual(["api", "web"]);
+    expect(doc?.skipped_shared).toEqual([]);
+    expect(doc?.services).toMatchObject([
+      { name: "api", health: "ready", ports: { API_PORT: Number(env.API_PORT) } },
+      { name: "web", health: "ready", ports: { WEB_PORT: Number(env.WEB_PORT) } },
+    ]);
+    for (const name of ["api", "web"]) {
+      const now = pids(name);
+      expect(now.length, `${name} should run`).toBeGreaterThan(0);
+      expect(
+        now.some((pid) => before[name]!.includes(pid)),
+        `${name} is a new run`,
+      ).toBe(false);
+    }
+    expect(await httpStatus(Number(env.API_PORT))).toBe(200);
+    expect(await httpStatus(Number(env.WEB_PORT))).toBe(200);
+    expect(snapshot(pids, ["sim", "worker", "db"])).toEqual({
+      sim: before.sim,
+      worker: before.worker,
+      db: before.db,
+    });
+    expect(orphanedServices(root)).toEqual([]);
+  }, 180_000);
+
+  it("scenario 102: a namespace the instance did not boot fails NAMESPACE_NOT_RUNNING; one with no isolated service NO_SERVICES_SELECTED; nothing touched", async () => {
+    const { wt, root } = nsRepo("dt-rpc102-");
+    upNs(wt, ["default", "app"]);
+    const pidsBefore = pidsMatching(root).sort((a, b) => a - b);
+
+    for (const verb of ["stop", "restart"]) {
+      const err = docOf(devtrees(wt, [verb, "worker", "-n", "ios", "--json"])).error;
+      expect(err, verb).toMatchObject({
+        code: "NAMESPACE_NOT_RUNNING",
+        details: {
+          worktree_id: wtId(wt),
+          namespaces: ["ios"],
+          services: ["sim"],
+          remedy: "devtrees down && devtrees up -n app -n default -n ios",
+        },
+      });
+      const none = docOf(devtrees(wt, [verb, "-n", "nope", "--json"])).error;
+      expect(none, verb).toMatchObject({
+        code: "NO_SERVICES_SELECTED",
+        details: { selected_namespaces: ["nope"], namespaces: ["app", "default", "ios"] },
+      });
+    }
+    expect(pidsMatching(root).sort((a, b) => a - b)).toEqual(pidsBefore);
+  }, 180_000);
+
+  it("scenario 103: stop -n default skips and reports the shared db, leaving it running; naming db is still refused", async () => {
+    const { wt, pids } = nsRepo("dt-rpc103-");
+    upNs(wt, ["default", "app"]);
+    const db = pids("db");
+    expect(db.length, "db should run").toBeGreaterThan(0);
+    const app = snapshot(pids, ["api", "web"]);
+
+    const stop = devtrees(wt, ["stop", "-n", "default", "--json"]);
+    expect(stop.code, `stop failed: ${stop.stderr} ${stop.stdout}`).toBe(0);
+    expect(docOf(stop).stop).toMatchObject({ stopped: ["worker"], skipped_shared: ["db"] });
+    expect(pids("worker")).toEqual([]);
+    expect(pids("db")).toEqual(db);
+    expect(snapshot(pids, ["api", "web"])).toEqual(app);
+
+    // Human output reports the skip too; a repeated stop is idempotent.
+    const human = devtrees(wt, ["stop", "-n", "default"]);
+    expect(human.code, human.stderr).toBe(0);
+    expect(human.stdout).toContain("not running, nothing to stop: worker.");
+    expect(human.stdout).toContain("skipped shared service db");
+
+    const refused = docOf(devtrees(wt, ["stop", "db", "-n", "default", "--json"])).error;
+    expect(refused).toMatchObject({
+      code: "SHARED_SERVICE_REFUSED",
+      details: { services: ["db"] },
+    });
+    expect(pids("db")).toEqual(db);
+
+    upNs(wt, ["default"]);
+    expect(pids("worker").length, "up -n default brings worker back").toBeGreaterThan(0);
+  }, 180_000);
 });
 
 if (!ENABLED) {
