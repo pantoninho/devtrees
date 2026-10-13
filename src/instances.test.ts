@@ -70,27 +70,36 @@ function writeRegistry(anchor: string, snapshot: Record<string, number>): void {
  * `{ metadata: false }` to model a legacy config written before the metadata
  * existed.
  */
+interface DerivedProcessFixture {
+  readonly ports: ReadonlyArray<[string, number]>;
+  /** process-compose `namespace:` (#226); omitted means `default`. */
+  readonly namespace?: string | ReadonlyArray<string>;
+}
+
+/** One process's lines in a derived config, environment carrying `allPorts`. */
+function derivedProcessLines(
+  name: string,
+  proc: DerivedProcessFixture,
+  allPorts: ReadonlyArray<[string, number]>,
+): string[] {
+  const lines = [`  ${name}:`, "    command: noop", `    working_dir: /tmp`];
+  if (proc.namespace !== undefined) lines.push(`    namespace: ${JSON.stringify(proc.namespace)}`);
+  if (allPorts.length > 0) {
+    lines.push("    environment:", ...allPorts.map(([k, v]) => `      - ${k}=${v}`));
+  }
+  return lines;
+}
+
 function writeDerivedConfig(
   anchor: string,
   id: string,
-  processes: Record<
-    string,
-    { ports: ReadonlyArray<[string, number]>; namespace?: string | ReadonlyArray<string> }
-  >,
+  processes: Record<string, DerivedProcessFixture>,
   opts: { metadata?: boolean } = {},
 ): void {
   const allPorts = Object.values(processes).flatMap((p) => p.ports);
   const lines = ["processes:"];
   for (const [name, proc] of Object.entries(processes)) {
-    lines.push(`  ${name}:`);
-    lines.push("    command: noop");
-    lines.push(`    working_dir: /tmp`);
-    if (proc.namespace !== undefined)
-      lines.push(`    namespace: ${JSON.stringify(proc.namespace)}`);
-    if (allPorts.length > 0) {
-      lines.push("    environment:");
-      for (const [k, v] of allPorts) lines.push(`      - ${k}=${v}`);
-    }
+    lines.push(...derivedProcessLines(name, proc, allPorts));
   }
   if (opts.metadata !== false) {
     lines.push("x-devtrees:");
