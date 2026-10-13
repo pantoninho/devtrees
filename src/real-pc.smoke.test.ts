@@ -595,6 +595,22 @@ async function httpStatus(port: number): Promise<number> {
 }
 
 /**
+ * `httpStatus`, retried until it is 200 or `timeoutMs` passes; returns the
+ * last status. For a check right after a readiness wait, where one GET on a
+ * loaded runner can miss (a 3s timeout, a refused connect) though the server
+ * is serving.
+ */
+async function httpStatusWithin(port: number, timeoutMs: number): Promise<number> {
+  const deadline = Date.now() + timeoutMs;
+  let status = await httpStatus(port);
+  while (status !== 200 && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 250));
+    status = await httpStatus(port);
+  }
+  return status;
+}
+
+/**
  * Poll `ls --json` until a given service row reports `health: "ready"`, or
  * until `timeoutMs` elapses. Returns the last-observed row (possibly
  * `undefined` if the instance never appeared) so the caller can assert.
@@ -2871,7 +2887,7 @@ describe.skipIf(!ENABLED)("real-pc smoke — restart <service...> (#222)", () =>
     const nowApi = pidsMatching(needle("api"));
     expect(nowApi.some((pid) => oldApi.includes(pid))).toBe(false);
     expect(nowApi.length).toBeGreaterThan(0);
-    expect(await httpStatus(Number(env.API_PORT))).toBe(200);
+    expect(await httpStatusWithin(Number(env.API_PORT), 10_000)).toBe(200);
 
     const oldMobile = pidsMatching(needle("mobile"));
     const started = Date.now();
@@ -2881,7 +2897,9 @@ describe.skipIf(!ENABLED)("real-pc smoke — restart <service...> (#222)", () =>
     expect((mobile.doc as RestartDoc).restart.restarted).toEqual(["mobile"]);
     const nowMobile = pidsMatching(needle("mobile"));
     expect(nowMobile.some((pid) => oldMobile.includes(pid))).toBe(false);
-    expect(await httpStatus(Number(env.MOBILE_PORT))).toBe(200);
+    // Ready was the new run's own probe (process-compose clears readiness on
+    // stop), but one GET on a loaded runner can still miss (#231 CI): poll.
+    expect(await httpStatusWithin(Number(env.MOBILE_PORT), 10_000)).toBe(200);
     expect(orphanedServices(root)).toEqual([]);
   }, 180_000);
 

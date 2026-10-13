@@ -8122,6 +8122,32 @@ describe("runStop — stop named services (#223, ADR-0009)", () => {
       expect(stops).toEqual([]);
     });
 
+    it("refuses a Pending service in the expansion with SERVICE_PENDING, touching nothing", async () => {
+      const { deps, stops } = await liveInstance(
+        { web: { status: "Running" }, worker: { status: "Running" }, cron: { status: "Pending" } },
+        nsStack,
+      );
+      const err = await failure(runStop(deps, { services: [], namespaces: ["jobs"] }));
+      expect(err?.code).toBe("SERVICE_PENDING");
+      expect(err?.details).toMatchObject({ services: ["cron"], waiting_on: ["worker"] });
+      expect(stops).toEqual([]);
+    });
+
+    it("refuses with CONFIG_DRIFT reload_pending, its retry spelling the names and -n flags", async () => {
+      const { deps, stops, anchor, id } = await liveInstance(booted, nsStack);
+      writePendingReload(anchor, id, { services: ["web"], oldRuns: [{ name: "web", pid: 100 }] });
+      const err = await failure(
+        runStop(
+          { ...deps, isProcessAlive: (pid) => pid === 100 },
+          { services: ["web", "web"], namespaces: ["jobs", "ops", "jobs"] },
+        ),
+      );
+      expect(err?.code).toBe("CONFIG_DRIFT");
+      expect(err?.details).toEqual({ reason: "reload_pending", services: ["web"], pids: [100] });
+      expect(err?.message).toContain("`devtrees stop web -n jobs -n ops`");
+      expect(stops).toEqual([]);
+    });
+
     it("still refuses a shared service named explicitly next to -n", async () => {
       const { deps, stops } = await liveInstance(booted, nsStack);
       const err = await failure(runStop(deps, { services: ["db"], namespaces: ["default"] }));

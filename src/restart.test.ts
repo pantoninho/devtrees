@@ -681,6 +681,52 @@ describe("runRestart -n <namespace> (#224)", () => {
     expect(touched(log)).toEqual([]);
   });
 
+  it("a pending hot-reload refuses with CONFIG_DRIFT reload_pending, its retry spelling the -n flags", async () => {
+    // worker's new copy is not in the project yet: the reload is still pending.
+    const { deps, log, anchor, id } = instance({
+      rows: [running("api", 11), running("mobile", 12)],
+    });
+    writePendingReload(anchor, id, { services: ["worker"], oldRuns: [{ name: "worker", pid: 9 }] });
+    const err = await failure(
+      runRestart({ ...deps, isProcessAlive: () => true }, ["api"], ["ios", "ios"]),
+    );
+    expect(err.code).toBe("CONFIG_DRIFT");
+    expect(err.message).toContain("then run `devtrees restart api -n ios` again");
+    expect(err.details).toEqual({ reason: "reload_pending", services: ["worker"], pids: [9] });
+    expect(touched(log)).toEqual([]);
+  });
+
+  it("an unresponsive instance's retry spells the -n flags", async () => {
+    const { deps, log } = instance();
+    const err = await failure(
+      runRestart(
+        {
+          ...deps,
+          waitTimeoutMs: 30,
+          getServiceStatuses: () => Promise.reject(new Error("process list hung")),
+        },
+        [],
+        ["ios", "default"],
+      ),
+    );
+    expect(err.code).toBe("INSTANCE_UNRESPONSIVE");
+    expect(err.message).toContain("devtrees restart -n ios -n default");
+    expect(touched(log)).toEqual([]);
+  });
+
+  it("a Pending service in the expansion is refused with SERVICE_PENDING, touching nothing", async () => {
+    const pendingMobile: ServiceStatus = { name: "mobile", status: "Pending", health: "unknown" };
+    const { deps, log } = instance({
+      rows: [running("api", 11), pendingMobile, running("worker", 13)],
+    });
+    const err = await failure(runRestart(deps, ["worker"], ["ios"]));
+    expect(err).toMatchObject({
+      code: "SERVICE_PENDING",
+      details: { services: ["mobile"], waiting_on: ["api"] },
+    });
+    expect(touched(log)).toEqual([]);
+  });
+
   it("naming a shared service explicitly is still refused alongside -n", async () => {
     const { deps, log } = instance();
     const err = await failure(runRestart(deps, ["db"], ["default"]));
