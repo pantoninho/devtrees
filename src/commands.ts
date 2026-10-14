@@ -98,6 +98,7 @@ import { boundedRestart } from "./bounded-restart.js";
 import {
   assertNotLastRunning,
   assertNotPending,
+  clearLegacyStopMarker,
   instanceExitedError,
   instanceNotRunningError,
   partitionRunning,
@@ -1638,6 +1639,8 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     // and so does a DOWN_INCOMPLETE (#155) marker.
     clearPendingReload(anchor.anchor, anchor.worktreeId);
     clearDownIncomplete(anchor.anchor, anchor.worktreeId);
+    // A 0.2.0 `stop` marker (removed in 0.3.0); drop after 0.3.x.
+    clearLegacyStopMarker(anchor.anchor, anchor.worktreeId);
 
     // Shared-health wait: gate the worktree start on the shared services'
     // readiness probes whenever this worktree drops a cross-tier `depends_on`
@@ -2547,6 +2550,8 @@ export async function runDown(
       // The instance is gone either way, and with it any reload still pending
       // in it (#191). Not reached when the stop throws (DOWN_TIMEOUT keeps it).
       clearPendingReload(anchor.anchor, anchor.worktreeId);
+      // A 0.2.0 `stop` marker (removed in 0.3.0); drop after 0.3.x.
+      clearLegacyStopMarker(anchor.anchor, anchor.worktreeId);
       // Still under the lock, so a concurrent `up` cannot start listeners that
       // would pass for survivors (#155).
       if (stopped === undefined || stopped.supervisorExited) return { stopped };
@@ -3534,6 +3539,8 @@ async function reapAndCleanupOrphan(
   rmSync(socketPath, { force: true });
   rmSync(paths.configPath, { force: true });
   clearPendingReload(anchor, orphan.id);
+  // A 0.2.0 `stop` marker (removed in 0.3.0); drop after 0.3.x.
+  clearLegacyStopMarker(anchor, orphan.id);
   return { ...reapPart, forceKilled: stop.forceKilled };
 }
 

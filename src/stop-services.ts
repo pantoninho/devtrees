@@ -7,8 +7,11 @@
  * bounded stop is `boundedStopServices` in src/bounded-stop.ts.
  */
 
+import { rmSync } from "node:fs";
+import { join } from "node:path";
 import type { DerivedConfig } from "./deriver.js";
 import { downTimeoutMs, type ServiceStatus } from "./driver.js";
+import { stateDir } from "./paths.js";
 import { isRunning, keepsInstanceAlive } from "./service-state.js";
 
 /** An error tagged with a stable `code` and `details` for the `--json` envelope. */
@@ -183,4 +186,13 @@ export function stopTimeoutMs(
     config === undefined ? undefined : { processes: Object.fromEntries(picked) },
     baseMs,
   );
+}
+
+/**
+ * Best-effort removal of the re-check marker a 0.2.0 `devtrees stop` left
+ * on `SERVICE_STOP_INCOMPLETE` (both removed in 0.3.0), so its state does
+ * not linger. No-op when absent. Can be removed after 0.3.x.
+ */
+export function clearLegacyStopMarker(anchor: string, worktreeId: string): void {
+  rmSync(join(stateDir(anchor), `${worktreeId}.stop-incomplete.json`), { force: true });
 }

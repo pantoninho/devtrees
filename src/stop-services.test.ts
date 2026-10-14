@@ -4,14 +4,35 @@
  * budget.
  */
 import { describe, expect, it } from "vite-plus/test";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { DerivedConfig } from "./deriver.js";
 import type { ServiceStatus } from "./driver.js";
+import { stateDir } from "./paths.js";
 import {
   assertNotLastRunning,
   assertNotPending,
+  clearLegacyStopMarker,
   partitionRunning,
   stopTimeoutMs,
 } from "./stop-services.js";
+
+describe("clearLegacyStopMarker", () => {
+  it("removes a 0.2.0 stop-incomplete marker, and is a no-op when absent", () => {
+    const anchor = mkdtempSync(join(tmpdir(), "rmstop-legacy-"));
+    try {
+      mkdirSync(stateDir(anchor), { recursive: true });
+      const marker = join(stateDir(anchor), "login.stop-incomplete.json");
+      writeFileSync(marker, '{"services":["web"]}\n');
+      clearLegacyStopMarker(anchor, "login");
+      expect(existsSync(marker)).toBe(false);
+      expect(() => clearLegacyStopMarker(anchor, "login")).not.toThrow();
+    } finally {
+      rmSync(anchor, { recursive: true, force: true });
+    }
+  });
+});
 
 /** `assertNotLastRunning`'s restart context: the remedy and what was already restarted. */
 const R = { remedy: "devtrees down && devtrees up -n app", done: [] };

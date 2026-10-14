@@ -2435,6 +2435,47 @@ describe.skipIf(!ENABLED)("real-pc smoke — stop removed, restart's stop refusa
     expect(devtrees(wt, ["down", "--json"]).code).toBe(0);
   }, 120_000);
 
+  it("scenario 112: restarting the only running service is refused LAST_SERVICES_RUNNING when its dependent is Pending (B1)", async () => {
+    // `app` waits for `api` to be healthy, which it never is: process-compose
+    // shows `app` Pending (is_running false). Restarting `api` stops it first,
+    // which would leave nothing running; `app` would never start, and
+    // process-compose would exit, taking the instance with it.
+    const { wt, root, socketPath } = stopRepo("dt-rpc112-", (r) => [
+      "  api:",
+      "    tier: isolated",
+      `    command: "python3 ${sleeper(r, "api")}"`,
+      "    readiness_probe:",
+      "      exec:",
+      '        command: "false"',
+      "      period_seconds: 1",
+      "      failure_threshold: 100000",
+      "  app:",
+      "    tier: isolated",
+      `    command: "python3 ${sleeper(r, "app")}"`,
+      "    depends_on:",
+      "      api:",
+      "        condition: process_healthy",
+    ]);
+    // api never becomes healthy, so up fails HEALTH_TIMEOUT; the instance stays up.
+    devtrees(wt, ["up", "--json", "--wait-timeout", "5"]);
+    expect(existsSync(socketPath), "the instance should be running").toBe(true);
+    const apiPids = pidsMatching(join(root, "api.py"));
+    expect(apiPids.length).toBeGreaterThan(0);
+    expect(pidsMatching(join(root, "app.py")), "app is still Pending").toEqual([]);
+
+    const started = Date.now();
+    const refused = devtrees(wt, ["restart", "api", "--json"]);
+    expect(Date.now() - started, "refused up front").toBeLessThan(15_000);
+    expect(refused.code, refused.stdout).toBe(1);
+    const error = (refused.doc as ErrorDoc).error;
+    expect(error.code).toBe("LAST_SERVICES_RUNNING");
+    expect(error.details).toMatchObject({ worktree_id: wtId(wt), services: ["api"] });
+    // Nothing was restarted, and the instance is still there.
+    expect(pidsMatching(join(root, "api.py"))).toEqual(apiPids);
+    expect(existsSync(socketPath)).toBe(true);
+    expect(devtrees(wt, ["down", "--json"]).code).toBe(0);
+  }, 120_000);
+
   it("scenario 110: `devtrees stop` is an unknown command and touches nothing", async () => {
     const { wt, root, socketPath } = stopRepo("dt-rpc110-", (r) => [
       "  web:",
