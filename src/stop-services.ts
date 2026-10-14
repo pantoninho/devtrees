@@ -1,24 +1,14 @@
 /**
- * The pure half of `devtrees stop <service...>` (ADR-0009, #223): which
- * named services are running, whether stopping them would end the
- * instance, its budget, and the errors it raises. The orchestration
- * (`runStop`) and the name resolution (`resolveNamedServices`) are in
- * src/commands.ts; the bounded stop is `boundedStopServices` in
- * src/bounded-stop.ts.
+ * The pure half of stopping named services, the first half of
+ * `devtrees restart <service...>` (ADR-0009, #222, #223): which named
+ * services are running, whether stopping them would end the instance, its
+ * budget, and the errors it raises. The orchestration (`runRestart`) and the
+ * name resolution (`resolveNamedServices`) are in src/commands.ts; the
+ * bounded stop is `boundedStopServices` in src/bounded-stop.ts.
  */
 
-import { rmSync } from "node:fs";
-import { join } from "node:path";
-import type { ForceKilled } from "./bounded-down.js";
 import type { DerivedConfig } from "./deriver.js";
-import {
-  describeSurvivor,
-  readServicesMarker,
-  writeServicesMarker,
-  type DownSurvivor,
-} from "./down-survivors.js";
 import { downTimeoutMs, type ServiceStatus } from "./driver.js";
-import { stateDir } from "./paths.js";
 import { isRunning, keepsInstanceAlive } from "./service-state.js";
 
 /** An error tagged with a stable `code` and `details` for the `--json` envelope. */
@@ -30,22 +20,20 @@ function codedError(code: string, message: string, details: Record<string, unkno
 }
 
 /**
- * `INSTANCE_NOT_FOUND` when process-compose exited while devtrees was
- * stopping services (#223): it exits once nothing runs, so something else
+ * `INSTANCE_NOT_FOUND` when process-compose exited while `restart` (#222)
+ * was stopping services: it exits once nothing runs, so something else
  * stopped meanwhile (a dependent that never started, a crash). The whole
- * instance is gone, so the stop must not report success; the next `up`
- * starts it again. `restart` (#222) raises it too, naming what it had
- * already restarted (`done`).
+ * instance is gone, so the restart must not report success; the next `up`
+ * starts it again. Names what it had already restarted (`done`).
  */
 export function instanceExitedError(
   worktreeId: string,
   services: ReadonlyArray<string>,
-  command: "stop" | "restart" = "stop",
   done: ReadonlyArray<string> = [],
 ): Error {
   return codedError(
     "INSTANCE_NOT_FOUND",
-    `devtrees ${command}: process-compose exited while ${services.join(", ")} ` +
+    `devtrees restart: process-compose exited while ${services.join(", ")} ` +
       `${services.length === 1 ? "was" : "were"} stopping, so '${worktreeId}' is no longer ` +
       "running: no other process was left running (process-compose exits once nothing " +
       `runs).${alreadyRestarted(done)} Run \`devtrees up\` to start the instance again.`,
@@ -114,9 +102,9 @@ export function partitionRunning(
 }
 
 /**
- * Refuse to stop a service still `Pending` (#223, B3): it is waiting on its
- * dependencies and has not started, so there is nothing to stop.
- * process-compose v1.122.0 would accept the request and leave it
+ * Refuse to restart a service still `Pending` (#223, B3): it is waiting on
+ * its dependencies and has not started, so there is nothing to restart.
+ * process-compose v1.122.0 would accept the stop request and leave it
  * `Terminating` with no process for good: it never starts, not even once its
  * dependency is healthy, and `up` cannot bring it back. Nothing is touched.
  * `waitingOn` maps each pending service to what it `depends_on`.
@@ -125,11 +113,6 @@ export function assertNotPending(
   pending: ReadonlyArray<string>,
   waitingOn: (service: string) => ReadonlyArray<string>,
   worktreeId: string,
-  /**
-   * `restart` (#222) refuses the same way: its stop would leave the service
-   * `Terminating` with no process for good, just as `stop`'s would.
-   */
-  command: "stop" | "restart" = "stop",
 ): void {
   if (pending.length === 0) return;
   const deps = [...new Set(pending.flatMap(waitingOn))];
@@ -138,58 +121,50 @@ export function assertNotPending(
     deps.length === 0
       ? `Wait until ${one ? "it starts" : "they start"}.`
       : `Wait until ${one ? "it starts" : "they start"} (once ${deps.join(", ")} ` +
-        `${deps.length === 1 ? "is" : "are"} ready), or ${command} what ${one ? "it waits" : "they wait"} ` +
-        `on: \`devtrees ${command} ${deps.join(" ")}\`.`;
+        `${deps.length === 1 ? "is" : "are"} ready), or restart what ${one ? "it waits" : "they wait"} ` +
+        `on: \`devtrees restart ${deps.join(" ")}\`.`;
   throw codedError(
     "SERVICE_PENDING",
-    `devtrees ${command}: ${pending.join(", ")} ${one ? "is" : "are"} still waiting on ` +
+    `devtrees restart: ${pending.join(", ")} ${one ? "is" : "are"} still waiting on ` +
       `${one ? "its" : "their"} dependencies in '${worktreeId}' and ` +
-      `${one ? "has" : "have"} not started, so there is nothing to ${command}. Nothing was ` +
+      `${one ? "has" : "have"} not started, so there is nothing to restart. Nothing was ` +
       `touched. ${remedy}`,
     { services: [...pending], waiting_on: deps, remedy },
   );
 }
 
 /**
- * Refuse a stop that would leave the instance with no running process
- * (ADR-0009): process-compose v1.122.0 then exits ("Project completed"),
+ * Refuse a restart that would stop the instance's last running process
+ * (ADR-0009): `restart` stops a service before starting it again, and
+ * process-compose v1.122.0 exits once nothing runs ("Project completed"),
  * silently tearing the instance down under a command that promised only a
  * service. Conservative (`keepsInstanceAlive`): only a process running now
  * counts. Done one-shots, stopped services, and a `Pending` dependent (it
  * may wait on the very service being stopped, and then never starts) do
- * not.
+ * not. `remedy` restarts the whole instance; `done` names the services
+ * already restarted.
  */
 export function assertNotLastRunning(
   rows: ReadonlyArray<ServiceStatus>,
   stopping: ReadonlyArray<string>,
   worktreeId: string,
-  /**
-   * `restart` (#222) refuses the same way, since it stops a service before
-   * starting it again; its remedy restarts the whole instance.
-   */
-  restart?: { readonly remedy: string; readonly done: ReadonlyArray<string> },
+  restart: { readonly remedy: string; readonly done: ReadonlyArray<string> },
 ): void {
   if (stopping.length === 0) return;
   const leaving = new Set(stopping);
   if (rows.some((r) => !leaving.has(r.name) && keepsInstanceAlive(r))) return;
-  const [command, outcome, remedy, what] =
-    restart === undefined
-      ? ["stop", "nothing was stopped.", "devtrees down", "stop"]
-      : [
-          "restart",
-          restart.done.length === 0
-            ? "nothing was restarted."
-            : `devtrees did not restart ${stopping.join(", ")} (it had restarted ` +
-              `${restart.done.join(", ")} before).`,
-          restart.remedy,
-          "restart",
-        ];
+  const outcome =
+    restart.done.length === 0
+      ? "nothing was restarted."
+      : `devtrees did not restart ${stopping.join(", ")} (it had restarted ` +
+        `${restart.done.join(", ")} before).`;
+  const remedy = restart.remedy;
   throw codedError(
     "LAST_SERVICES_RUNNING",
-    `devtrees ${command}: ${stopping.join(", ")} ${stopping.length === 1 ? "is" : "are"} the last ` +
+    `devtrees restart: ${stopping.join(", ")} ${stopping.length === 1 ? "is" : "are"} the last ` +
       `running process(es) of '${worktreeId}'. process-compose exits once nothing runs, which ` +
       `would take the whole instance down, so ${outcome} Run \`${remedy}\` to ` +
-      `${what} the instance.`,
+      "restart the instance.",
     { worktree_id: worktreeId, services: [...stopping], remedy },
   );
 }
@@ -208,84 +183,4 @@ export function stopTimeoutMs(
     config === undefined ? undefined : { processes: Object.fromEntries(picked) },
     baseMs,
   );
-}
-
-/**
- * `SERVICE_STOP_INCOMPLETE` (ADR-0009): after the bounded stop and the
- * force-kill, something is still alive or still holds one of the checked
- * services' ports. Mirrors `DOWN_INCOMPLETE`: `details.survivors` lists
- * each, `details.force_killed` what devtrees signalled. A port holder is
- * not necessarily something the service started, so the wording stays
- * neutral.
- */
-export function serviceStopIncomplete(
-  worktreeId: string,
-  services: ReadonlyArray<string>,
-  survivors: ReadonlyArray<DownSurvivor>,
-  forceKilled: ReadonlyArray<ForceKilled>,
-): Error {
-  const forwarded = survivors.some((s) => s.port_forwarder === true);
-  const remedy =
-    `Stop what is listed by hand, then run \`devtrees stop ${services.join(" ")}\` again: ` +
-    "it checks the same ports and succeeds once they are free. " +
-    (forwarded
-      ? "A port held by a container runtime's port forwarder means a container still " +
-        "publishes it: stop that container, never the forwarder."
-      : "Never kill a container runtime's port forwarder: stop the container instead.");
-  return codedError(
-    "SERVICE_STOP_INCOMPLETE",
-    `devtrees stop: ${services.join(", ")} ${services.length === 1 ? "is" : "are"} stopped in ` +
-      `'${worktreeId}', but these are still alive or still hold ` +
-      `${services.length === 1 ? "its" : "their"} ports:\n` +
-      `${survivors.map(describeSurvivor).join("\n")}\n${remedy}`,
-    {
-      worktree_id: worktreeId,
-      services: [...services],
-      survivors: [...survivors],
-      force_killed: [...forceKilled],
-      remedy,
-    },
-  );
-}
-
-// ---------------------------------------------------------------------------
-// The marker a `SERVICE_STOP_INCOMPLETE` leaves, so the retry its remedy
-// names checks the same ports again even though the service is now stopped.
-// ---------------------------------------------------------------------------
-
-function markerFile(anchor: string, worktreeId: string): string {
-  return join(stateDir(anchor), `${worktreeId}.stop-incomplete.json`);
-}
-
-/** The services an earlier `SERVICE_STOP_INCOMPLETE` left to re-check. */
-export function readStopIncomplete(anchor: string, worktreeId: string): string[] {
-  return readServicesMarker(markerFile(anchor, worktreeId)) ?? [];
-}
-
-/**
- * Remove the marker: the instance it describes is gone (a `down`, a fresh
- * boot, a `prune` of the orphan). No-op when absent.
- */
-export function clearStopIncomplete(anchor: string, worktreeId: string): void {
-  rmSync(markerFile(anchor, worktreeId), { force: true });
-}
-
-/**
- * Record the outcome of a stop's check: `failed` services are added to the
- * marker, `passed` ones removed from it. The file goes when it is empty.
- */
-export function updateStopIncomplete(
-  anchor: string,
-  worktreeId: string,
-  outcome: { readonly passed: ReadonlyArray<string>; readonly failed: ReadonlyArray<string> },
-): void {
-  const passed = new Set(outcome.passed);
-  const left = [...new Set([...readStopIncomplete(anchor, worktreeId), ...outcome.failed])].filter(
-    (s) => outcome.failed.includes(s) || !passed.has(s),
-  );
-  if (left.length === 0) {
-    clearStopIncomplete(anchor, worktreeId);
-    return;
-  }
-  writeServicesMarker(markerFile(anchor, worktreeId), left);
 }

@@ -202,7 +202,7 @@ describe("runRestart (#222)", () => {
     });
   });
 
-  it("a Pending service is refused with SERVICE_PENDING, as stop refuses it: nothing touched", async () => {
+  it("a Pending service is refused with SERVICE_PENDING: nothing touched", async () => {
     // mobile waits on api (process_healthy): it has not started, so its stop
     // would leave it Terminating with no process for good.
     const pendingMobile: ServiceStatus = { name: "mobile", status: "Pending", health: "unknown" };

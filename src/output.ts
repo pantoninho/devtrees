@@ -46,7 +46,6 @@ export const ERROR_CODES = [
   "SHARED_SERVICE_REFUSED",
   "LAST_SERVICES_RUNNING",
   "SERVICE_PENDING",
-  "SERVICE_STOP_INCOMPLETE",
   "CONFIG_DRIFT",
   "SHARED_DRIFT",
   "SHARED_START_FAILED",
@@ -89,19 +88,17 @@ export const ERROR_CODE_DESCRIPTIONS: Readonly<Record<ErrorCode, string>> = {
   HEALTH_TIMEOUT:
     "Stack started but services did not report healthy before the wait window expired, or a selected service is dead, including one `up` or `restart` restarted (`details.dead_services`); after `restart`, `devtrees restart <service>` retries it.",
   NAMESPACE_NOT_RUNNING:
-    "`up -n` named a namespace the running instance was not booted with, or `stop` or `restart` named a service in one, or such a namespace with `-n`; `details` has `{worktree_id, namespaces, services, remedy}`, the remedy being the `down` + `up` that boots it.",
+    "`up -n` named a namespace the running instance was not booted with, or `restart` named a service in one, or such a namespace with `-n`; `details` has `{worktree_id, namespaces, services, remedy}`, the remedy being the `down` + `up` that boots it.",
   SHARED_SERVICE_DEAD:
     "A shared service in the running shared instance is dead; it is not restarted from a worktree, run `details.remedy` (`devtrees down --shared && devtrees up`).",
   SERVICE_START_FAILED:
     "`up` tried to restart a dead service on the running instance, or `restart` a named one, and process-compose refused; `details.services` names each one, `details.remedy` says what to run next. The instance is still running.",
   SHARED_SERVICE_REFUSED:
-    "A per-service command named a shared service; a worktree never stops the shared instance's services. Nothing was touched; `details` has `{services, remedy}`, the remedy being `devtrees down --shared && devtrees up` (for every worktree).",
+    "`restart` named a shared service; a worktree never restarts the shared instance's services. Nothing was touched; `details` has `{services, remedy}`, the remedy being `devtrees down --shared && devtrees up` (for every worktree).",
   LAST_SERVICES_RUNNING:
-    "`stop` or `restart` would leave the instance with no running process (a `Pending` service does not count), and process-compose would then exit and take the instance down; nothing was touched. `details.services` names them, `details.remedy` is `devtrees down` for `stop`, and for `restart` the `down` + `up` that restarts the instance.",
+    "`restart` would have to stop the instance's last running process (a `Pending` service does not count), and process-compose would then exit and take the instance down; nothing was touched. `details.services` names them, `details.remedy` is the `down` + `up` that restarts the instance.",
   SERVICE_PENDING:
-    "`stop` or `restart` named a service still waiting on its dependencies (`Pending`): it has not started, so there is nothing to stop or restart, and nothing was touched. `details` has `{services, waiting_on, remedy}`: wait until it starts, or stop (restart) what it waits on.",
-  SERVICE_STOP_INCOMPLETE:
-    "`stop` stopped the services, but after the bounded stop and the force-kill something is still alive or still holds one of their ports: a listener on a port (not necessarily one they started), a process that survived SIGKILL, or a service process-compose still reports running; `details.survivors` lists each `{service, pid, command, port_name?, port?, port_forwarder?}`, `details.force_killed` what devtrees signalled, `details.remedy` what to do. Rerunning the same `stop` checks the same ports again.",
+    "`restart` named a service still waiting on its dependencies (`Pending`): it has not started, so there is nothing to restart, and nothing was touched. `details` has `{services, waiting_on, remedy}`: wait until it starts, or restart what it waits on.",
   CONFIG_DRIFT:
     "Running config differs from devtrees.yaml and hot-reload failed, or an earlier reload is still pending; `details.reason` is `timeout`, `not_supported`, `error`, or `reload_pending` (nothing was reloaded: kill `details.pids`, then retry; empty `pids` means the old process is gone and process-compose is still starting the new one, so retry shortly).",
   SHARED_DRIFT:
@@ -111,7 +108,7 @@ export const ERROR_CODE_DESCRIPTIONS: Readonly<Record<ErrorCode, string>> = {
   WORKTREE_START_FAILED:
     "This worktree's instance died before binding its control socket; `details.config_path` is the config to run by hand.",
   NO_SERVICES_SELECTED:
-    "The selection has no services: a bare `up` starts only the `default` namespace and it has none, or `-n` names only namespaces with none, or a `stop -n` / `restart -n` namespace has no isolated service (`details.selected_namespaces` names it; nothing was touched). `details.namespaces` lists the namespaces to pass with `-n`.",
+    "The selection has no services: a bare `up` starts only the `default` namespace and it has none, or `-n` names only namespaces with none, or a `restart -n` namespace has no isolated service (`details.selected_namespaces` names it; nothing was touched). `details.namespaces` lists the namespaces to pass with `-n`.",
   SOCKET_PATH_TOO_LONG:
     "The control socket path exceeds the platform's unix-socket limit; set DEVTREES_RUNTIME_DIR to a shorter directory.",
   STALE_PORT_BLOCK:
@@ -757,77 +754,17 @@ export function formatDown(payload: DownPayload, mode: FormatMode): OutputResult
   return { stdout: text, stderr };
 }
 
-// --- stop -------------------------------------------------------------------
-
-/** `devtrees stop <service...>` result (ADR-0009, #223). */
-export interface StopPayload {
-  readonly worktreeId: string;
-  readonly stopped: ReadonlyArray<string>;
-  /** Named services that were not running (already stopped, done or not booted). */
-  readonly notRunning: ReadonlyArray<string>;
-  readonly forceKilled?: ReadonlyArray<ForceKilledRow>;
-  /** Shared services in a `-n` namespace, not stopped (#224). Defaults to `[]`. */
-  readonly skippedShared?: ReadonlyArray<string>;
-}
-
 /**
  * The line reporting shared services a `-n` expansion skipped (#224): a
  * worktree's verb never acts on the shared instance (ADR-0008, ADR-0009).
  */
-function skippedSharedLines(
-  command: "restart" | "stop",
-  skipped: ReadonlyArray<string> | undefined,
-): string[] {
+function skippedSharedLines(skipped: ReadonlyArray<string> | undefined): string[] {
   if (skipped === undefined || skipped.length === 0) return [];
   return [
-    `devtrees ${command}: skipped shared ${skipped.length === 1 ? "service" : "services"} ` +
+    `devtrees restart: skipped shared ${skipped.length === 1 ? "service" : "services"} ` +
       `${skipped.join(", ")}: the shared instance serves every worktree, so devtrees does ` +
-      `not ${command} its services from a worktree.`,
+      "not restart its services from a worktree.",
   ];
-}
-
-/** The transient-stop caveat both output modes carry (ADR-0009). */
-const STOP_NOTE =
-  "A stop lasts only until the next `devtrees up`, which starts stopped services again.";
-
-/**
- * Render `devtrees stop` output. Both modes say the stop is transient: the
- * next `up` brings the services back (ADR-0009).
- *
- *   - `json`: `{schema_version, stop: {worktreeId, stopped[], not_running[],
- *     force_killed[], skipped_shared[], transient: true, note}}`.
- *   - `human`: what was stopped, what was not running, the shared services a
- *     `-n` skipped, and the caveat on
- *     stdout; a force-kill warning on stderr, as on `down`.
- */
-export function formatStop(payload: StopPayload, mode: FormatMode): OutputResult {
-  if (mode === "json") {
-    const stop = {
-      worktreeId: payload.worktreeId,
-      stopped: [...payload.stopped],
-      not_running: [...payload.notRunning],
-      force_killed: forceKilledJson(payload.forceKilled),
-      skipped_shared: [...(payload.skippedShared ?? [])],
-      transient: true,
-      note: STOP_NOTE,
-    };
-    return { stdout: `${JSON.stringify({ schema_version: SCHEMA_VERSION, stop })}\n`, stderr: "" };
-  }
-  const lines = [
-    ...(payload.stopped.length > 0
-      ? [`devtrees stop: stopped ${payload.stopped.join(", ")}.`]
-      : []),
-    ...(payload.notRunning.length > 0
-      ? [`devtrees stop: not running, nothing to stop: ${payload.notRunning.join(", ")}.`]
-      : []),
-    ...skippedSharedLines("stop", payload.skippedShared),
-    STOP_NOTE,
-  ];
-  const what = payload.stopped.join(", ");
-  return {
-    stdout: `${lines.join("\n")}\n`,
-    stderr: formatForceKilledStderr("stop", what, payload.forceKilled ?? []),
-  };
 }
 
 // --- restart ----------------------------------------------------------------
@@ -877,7 +814,7 @@ export function formatRestart(payload: RestartPayload, mode: FormatMode): Output
         `force-killed ${forceKilled.map((k) => `${k.service} (pid ${k.pid})`).join(", ")}.\n`;
   const lines = [
     `devtrees restart: restarted ${payload.restarted.join(", ")} in '${payload.worktreeId}'.`,
-    ...skippedSharedLines("restart", payload.skippedShared),
+    ...skippedSharedLines(payload.skippedShared),
   ];
   return { stdout: `${lines.join("\n")}\n`, stderr };
 }

@@ -35,7 +35,6 @@ import {
   formatLs,
   formatPrune,
   formatRestart,
-  formatStop,
   formatUp,
   formatUpDryRun,
   type ErrorCode,
@@ -74,10 +73,6 @@ export const VERSION = readVersion();
 export const COMMANDS: ReadonlyArray<{ name: string; summary: string }> = [
   { name: "up", summary: "Bring up this worktree's stack" },
   { name: "down", summary: "Stop this worktree's stack (--shared tears down the shared instance)" },
-  {
-    name: "stop",
-    summary: "Stop named services of this worktree's instance until the next `up`",
-  },
   {
     name: "restart",
     summary: "Restart named isolated services in place; the rest of the stack keeps running",
@@ -194,18 +189,6 @@ export interface ExecuteDeps {
     warning?: ReapWarningRow;
     forceKilled?: ReadonlyArray<ForceKilledRow>;
   } | void>;
-  /** `devtrees stop <service...>` (#223). Optional like the other non-core commands. */
-  stop?: (options: {
-    readonly services: ReadonlyArray<string>;
-    /** `-n` namespaces, expanded to their isolated services (#224). */
-    readonly namespaces?: ReadonlyArray<string>;
-  }) => Promise<{
-    worktreeId: string;
-    stopped: ReadonlyArray<string>;
-    notRunning: ReadonlyArray<string>;
-    forceKilled?: ReadonlyArray<ForceKilledRow>;
-    skippedShared?: ReadonlyArray<string>;
-  }>;
   /** `restart <service...>` (ADR-0009, #222). Optional, like the other non-core commands. */
   restart?: (options: {
     readonly services: ReadonlyArray<string>;
@@ -638,10 +621,11 @@ class DownCommand extends DevtreesCommand {
   }
 }
 
-/** `stop` and `restart`'s repeatable `-n` (#224, ADR-0009). */
-function namespaceOption(verb: "restart" | "stop") {
+/** `restart`'s repeatable `-n` (#224, ADR-0009). */
+function namespaceOption() {
   return Option.Array("--namespace,-n", {
-    description: `Also ${verb} every isolated service of this namespace. Repeatable; shared services are skipped.`,
+    description:
+      "Also restart every isolated service of this namespace. Repeatable; shared services are skipped.",
   });
 }
 
@@ -656,71 +640,6 @@ function serviceSelection(
   const ns = namespaces ?? [];
   if (services.length === 0 && ns.length === 0) return undefined;
   return { services, ...(ns.length > 0 ? { namespaces: ns } : {}) };
-}
-
-class StopCommand extends DevtreesCommand {
-  static override paths = [["stop"]];
-  static override usage = Command.Usage({
-    description: "Stop named isolated services of this worktree's instance (ADR-0009).",
-    // Under the worktree's lifecycle lock (LOCK_CONTENTION; INSTANCE_UNRESPONSIVE
-    // for a socket that never answers, #186). Names are resolved before
-    // anything is touched; the stop reuses `down`'s bounded escalation.
-    details: [
-      "Waits until each service has exited, force-killing (SIGKILL) what is still running " +
-        "after the grace period, as `down` does. Stopping a service that is not running " +
-        "succeeds. Shared services are refused, and so is a service still waiting on its " +
-        "dependencies (it has not started), and a stop that would leave the instance with no " +
-        "running process (use `devtrees down`).",
-      "`-n <namespace>` (repeatable, mixable with names) adds every isolated service of the " +
-        "namespace; shared services in it are skipped and reported. A namespace the instance " +
-        "did not boot fails NAMESPACE_NOT_RUNNING, and one with no isolated service " +
-        "NO_SERVICES_SELECTED.",
-      "The stop is transient: process-compose reports a stopped service like a crashed one, " +
-        "so the next `devtrees up` starts it again. There is no `start`; `up` is the way back.",
-      errorCodeFooter([
-        "INVALID_ARGS",
-        "INSTANCE_NOT_FOUND",
-        "SERVICE_NOT_FOUND",
-        "SHARED_SERVICE_REFUSED",
-        "NO_SERVICES_SELECTED",
-        "NAMESPACE_NOT_RUNNING",
-        "CONFIG_DRIFT",
-        "LAST_SERVICES_RUNNING",
-        "SERVICE_PENDING",
-        "SERVICE_STOP_INCOMPLETE",
-        "HEALTH_TIMEOUT",
-        "LOCK_CONTENTION",
-        "INSTANCE_UNRESPONSIVE",
-        "PROCESS_COMPOSE_NOT_FOUND",
-        "UNKNOWN",
-      ]),
-    ].join("\n\n"),
-    examples: [
-      ["Stop one service", "devtrees stop web"],
-      ["Stop two, with the JSON envelope", "devtrees stop web worker --json"],
-      ["Stop every isolated service of a namespace", "devtrees stop -n ios"],
-      ["Bring them back", "devtrees up -n ios"],
-    ],
-  });
-
-  services = Option.Rest({ name: "service" });
-  namespaces = namespaceOption("stop");
-
-  override async execute(): Promise<number> {
-    return this.dispatch(async () => {
-      const selection = serviceSelection(this.services, this.namespaces);
-      if (selection === undefined) {
-        throw invalidArgsError(
-          "`devtrees stop` needs at least one service name or `-n <namespace>` " +
-            "(e.g. `devtrees stop web`). To stop the whole instance, run `devtrees down`.",
-        );
-      }
-      if (!this.context.deps.stop) return 0;
-      const result = await this.context.deps.stop(selection);
-      this.emit(formatStop(result, this.mode));
-      return 0;
-    });
-  }
 }
 
 class RestartCommand extends DevtreesCommand {
@@ -793,7 +712,7 @@ class RestartCommand extends DevtreesCommand {
   });
 
   services = Option.Rest({ name: "service" });
-  namespaces = namespaceOption("restart");
+  namespaces = namespaceOption();
   waitTimeout = Option.String("--wait-timeout", {
     description: "Health-wait timeout in seconds for the restarted services. Default 120.",
   });
@@ -1153,7 +1072,6 @@ function buildCli(): Cli<DevtreesContext> {
   cli.register(Builtins.VersionCommand);
   cli.register(UpCommand);
   cli.register(DownCommand);
-  cli.register(StopCommand);
   cli.register(RestartCommand);
   cli.register(LsCommand);
   cli.register(AttachCommand);
@@ -1361,7 +1279,6 @@ if (isEntrypoint(import.meta.url, process.argv[1])) {
     runUp,
     runUpDryRun,
     runDown,
-    runStop,
     runRestart,
     bareRestartRemedy,
     runEnv,
@@ -1384,11 +1301,6 @@ if (isEntrypoint(import.meta.url, process.argv[1])) {
         ...(options?.waitTimeoutMs !== undefined ? { waitTimeoutMs: options.waitTimeoutMs } : {}),
       }),
     down: ({ shared }) => runDown({ stop: stopSeamsFromEnv() }, { shared }),
-    stop: ({ services, namespaces }) =>
-      runStop(
-        { stop: stopSeamsFromEnv() },
-        { services, ...(namespaces !== undefined ? { namespaces } : {}) },
-      ),
     restart: ({ services, namespaces, waitTimeoutMs }) =>
       runRestart(
         { stop: stopSeamsFromEnv(), ...(waitTimeoutMs !== undefined ? { waitTimeoutMs } : {}) },

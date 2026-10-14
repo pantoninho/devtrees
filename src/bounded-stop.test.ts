@@ -1,5 +1,5 @@
 /**
- * Bounded per-service stop (`devtrees stop`, #223): one `process stop`
+ * Bounded per-service stop (`restart`'s first half, #223): one `process stop`
  * request, the wait for the exit, the SIGKILL of what is still the same
  * process after the budget, and the refusal handling. Every effect is a
  * seam, so no real process is touched.

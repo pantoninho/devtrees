@@ -1,6 +1,6 @@
 /**
  * Restart one service in place (`devtrees restart`, ADR-0009, #222):
- * `stop`'s bounded stop, then a start.
+ * a bounded stop, then a start.
  *
  * process-compose v1.122.0's `process restart` cannot be trusted with a
  * running service: it starts the new run after at most
@@ -12,7 +12,7 @@
  *
  * So a running service is restarted as **stop, wait for exit, start**:
  *
- *  1. `boundedStopServices` (src/bounded-stop.ts, `devtrees stop`'s): the
+ *  1. `boundedStopServices` (src/bounded-stop.ts): the
  *     snapshot, `process stop`, the wait until process-compose no longer
  *     reads it active, `down`'s escalation and process-group sweep. What it
  *     had to signal is reported as `forceKilled`. A service still read
@@ -83,11 +83,7 @@ export async function boundedRestart(
   }
   let stopped: Awaited<ReturnType<typeof boundedStopServices>>;
   try {
-    stopped = await boundedStopServices(
-      { ...target, services: [target.service], command: "restart" },
-      driver,
-      seams,
-    );
+    stopped = await boundedStopServices({ ...target, services: [target.service] }, driver, seams);
   } catch (err) {
     if (err instanceof StopRefusedError) return { ok: false, message: err.reason };
     throw err;

@@ -238,7 +238,7 @@ export function buildProcessStartArgs(socketPath: string, service: string): stri
 }
 
 /**
- * Stop processes of a running instance over its UDS (`devtrees stop`, #223).
+ * Stop processes of a running instance over its UDS (`restart`'s stop, #223).
  * On v1.122.0 `process stop` takes several names, returns as soon as the
  * stop is requested (it does not wait for the exit), signals each process's
  * whole group, and fails ("Failed to stop") for a process that is not

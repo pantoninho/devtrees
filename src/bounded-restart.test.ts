@@ -1,6 +1,6 @@
 /**
  * `boundedRestart` (#222): one running service restarted in place as
- * `stop`'s bounded stop, then a start. Every effect (process-compose calls,
+ * a bounded stop, then a start. Every effect (process-compose calls,
  * `ps`, kill, liveness) is a seam, so no real process is touched.
  */
 import { describe, expect, it } from "vite-plus/test";

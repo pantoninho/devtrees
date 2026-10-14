@@ -1,24 +1,20 @@
 /**
- * The pure half of `devtrees stop` (ADR-0009, #223): the running/not-running
- * split, the last-running refusal, the budget, the incomplete-stop error and
- * its re-check marker.
+ * The pure half of `restart`'s stop (ADR-0009, #222, #223): the
+ * running/not-running split, the pending and last-running refusals, and the
+ * budget.
  */
 import { describe, expect, it } from "vite-plus/test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import type { DerivedConfig } from "./deriver.js";
 import type { ServiceStatus } from "./driver.js";
-import { stateDir } from "./paths.js";
 import {
   assertNotLastRunning,
   assertNotPending,
   partitionRunning,
-  readStopIncomplete,
-  serviceStopIncomplete,
   stopTimeoutMs,
-  updateStopIncomplete,
 } from "./stop-services.js";
+
+/** `assertNotLastRunning`'s restart context: the remedy and what was already restarted. */
+const R = { remedy: "devtrees down && devtrees up -n app", done: [] };
 
 type Coded = Error & { code?: string; details?: Record<string, unknown> };
 
@@ -60,8 +56,8 @@ describe("partitionRunning / assertNotPending (B3)", () => {
       services: ["app", "ios"],
       waiting_on: ["api", "db"],
       remedy:
-        "Wait until they start (once api, db are ready), or stop what they wait on: " +
-        "`devtrees stop api db`.",
+        "Wait until they start (once api, db are ready), or restart what they wait on: " +
+        "`devtrees restart api db`.",
     });
     expect(() => assertNotPending([], () => [], "login")).not.toThrow();
   });
@@ -87,7 +83,7 @@ describe("partitionRunning", () => {
 describe("assertNotLastRunning", () => {
   it("allows a stop that leaves another process running", () => {
     expect(() =>
-      assertNotLastRunning([row("web", "Running"), row("api", "Running")], ["web"], "login"),
+      assertNotLastRunning([row("web", "Running"), row("api", "Running")], ["web"], "login", R),
     ).not.toThrow();
   });
 
@@ -99,12 +95,12 @@ describe("assertNotLastRunning", () => {
       row("off", "Disabled"),
       row("skip", "Skipped"),
     ];
-    const err = thrown(() => assertNotLastRunning(rows, ["web"], "login"));
+    const err = thrown(() => assertNotLastRunning(rows, ["web"], "login", R));
     expect(err.code).toBe("LAST_SERVICES_RUNNING");
     expect(err.details).toEqual({
       worktree_id: "login",
       services: ["web"],
-      remedy: "devtrees down",
+      remedy: "devtrees down && devtrees up -n app",
     });
   });
 
@@ -112,56 +108,27 @@ describe("assertNotLastRunning", () => {
     // `app` depends on `api` being healthy; process-compose reports it
     // `Pending`, `is_running: false`. Stopping `api` means `app` never starts.
     const rows = [row("api", "Running", 0, true), row("app", "Pending", 0, false)];
-    const err = thrown(() => assertNotLastRunning(rows, ["api"], "login"));
+    const err = thrown(() => assertNotLastRunning(rows, ["api"], "login", R));
     expect(err.code).toBe("LAST_SERVICES_RUNNING");
     // Without `is_running`, the status alone still excludes Pending and Terminating.
     for (const other of [row("app", "Pending"), row("hook", "Terminating")]) {
       expect(
-        thrown(() => assertNotLastRunning([row("api", "Running"), other], ["api"], "x")).code,
+        thrown(() => assertNotLastRunning([row("api", "Running"), other], ["api"], "x", R)).code,
       ).toBe("LAST_SERVICES_RUNNING");
     }
   });
 
   it("trusts is_running over the status: a Running row that is not running does not count", () => {
     const rows = [row("web", "Running", 0, true), row("api", "Restarting", 0, false)];
-    expect(thrown(() => assertNotLastRunning(rows, ["web"], "login")).code).toBe(
+    expect(thrown(() => assertNotLastRunning(rows, ["web"], "login", R)).code).toBe(
       "LAST_SERVICES_RUNNING",
     );
     const alive = [row("web", "Running", 0, true), row("api", "Running", 0, true)];
-    expect(() => assertNotLastRunning(alive, ["web"], "login")).not.toThrow();
+    expect(() => assertNotLastRunning(alive, ["web"], "login", R)).not.toThrow();
   });
 
-  it("never refuses when nothing is being stopped (a repeated stop)", () => {
-    expect(() => assertNotLastRunning([row("web", "Completed", -1)], [], "login")).not.toThrow();
-  });
-});
-
-describe("serviceStopIncomplete", () => {
-  it("names each survivor and carries force_killed and the remedy, like DOWN_INCOMPLETE", () => {
-    const err = serviceStopIncomplete(
-      "login",
-      ["web"],
-      [
-        {
-          service: "web",
-          pid: 42,
-          command: "python3 listener.py",
-          port_name: "WEB_PORT",
-          port: 4000,
-        },
-        { service: "web", pid: null, command: null },
-      ],
-      [{ service: "web", pid: 7 }],
-    ) as Coded;
-    expect(err.code).toBe("SERVICE_STOP_INCOMPLETE");
-    expect(err.message).toContain("web WEB_PORT 4000: pid 42 (python3 listener.py)");
-    expect(err.message).toContain("web: process-compose still reports it running");
-    expect(err.details).toMatchObject({
-      worktree_id: "login",
-      services: ["web"],
-      force_killed: [{ service: "web", pid: 7 }],
-    });
-    expect(String(err.details?.remedy)).toContain("devtrees stop web");
+  it("never refuses when nothing is being stopped", () => {
+    expect(() => assertNotLastRunning([row("web", "Completed", -1)], [], "login", R)).not.toThrow();
   });
 });
 
@@ -177,23 +144,5 @@ describe("stopTimeoutMs", () => {
     expect(stopTimeoutMs(config, ["web"], 1_000)).toBe(3_000);
     expect(stopTimeoutMs(config, ["web", "api"], 1_000)).toBe(103_000);
     expect(stopTimeoutMs(undefined, ["web"], 1_000)).toBe(1_000);
-  });
-});
-
-describe("the stop-incomplete marker", () => {
-  it("records failed services, drops passed ones, and removes itself when empty", () => {
-    const anchor = mkdtempSync(join(tmpdir(), "pr223-marker-"));
-    try {
-      mkdirSync(stateDir(anchor), { recursive: true });
-      expect(readStopIncomplete(anchor, "login")).toEqual([]);
-      updateStopIncomplete(anchor, "login", { passed: [], failed: ["web", "api"] });
-      expect(readStopIncomplete(anchor, "login")).toEqual(["web", "api"]);
-      updateStopIncomplete(anchor, "login", { passed: ["web"], failed: [] });
-      expect(readStopIncomplete(anchor, "login")).toEqual(["api"]);
-      updateStopIncomplete(anchor, "login", { passed: ["api"], failed: [] });
-      expect(readStopIncomplete(anchor, "login")).toEqual([]);
-    } finally {
-      rmSync(anchor, { recursive: true, force: true });
-    }
   });
 });
