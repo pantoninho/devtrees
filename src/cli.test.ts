@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
-import { execute, isEntrypoint, run } from "./cli.js";
+import { COMMANDS, execute, isEntrypoint, run } from "./cli.js";
 import { withRegistryLock } from "./registry.js";
 import { parseStack } from "./stack.js";
 
@@ -27,18 +27,7 @@ describe("devtrees CLI", () => {
     expect(result.code).toBe(0);
     expect(result.stdout).toContain("devtrees");
     // clipanion lists every registered command in `$ devtrees <cmd>` form.
-    for (const cmd of [
-      "up",
-      "down",
-      "stop",
-      "restart",
-      "ls",
-      "attach",
-      "prune",
-      "env",
-      "logs",
-      "init",
-    ]) {
+    for (const cmd of ["up", "down", "restart", "ls", "attach", "prune", "env", "logs", "init"]) {
       expect(result.stdout).toContain(`devtrees ${cmd}`);
     }
   });
@@ -87,18 +76,7 @@ describe("devtrees CLI", () => {
    * body — verified by passing `--help` with no deps wired: a help path
    * that fell through to the command body would throw.
    */
-  for (const cmd of [
-    "up",
-    "down",
-    "stop",
-    "restart",
-    "ls",
-    "attach",
-    "prune",
-    "env",
-    "logs",
-    "init",
-  ]) {
+  for (const cmd of ["up", "down", "restart", "ls", "attach", "prune", "env", "logs", "init"]) {
     it(`\`devtrees ${cmd} --help\` exits 0, prints non-empty help, skips the body`, async () => {
       // No deps wired — the command body would throw "up: no deps provided"
       // if it were invoked. The fact this test passes proves help is a
@@ -166,28 +144,6 @@ describe("devtrees CLI", () => {
     // `down` serializes on a lifecycle lock (worktree or shared) → LOCK_CONTENTION;
     // a socket that never answers the probes → INSTANCE_UNRESPONSIVE (#186).
     ["down", ["PROCESS_COMPOSE_NOT_FOUND", "LOCK_CONTENTION", "INSTANCE_UNRESPONSIVE", "UNKNOWN"]],
-    // `stop` (#223): resolves names before acting, refuses shared services and
-    // the last running processes, and reuses `down`'s bounded stop.
-    [
-      "stop",
-      [
-        "INVALID_ARGS",
-        "INSTANCE_NOT_FOUND",
-        "SERVICE_NOT_FOUND",
-        "SHARED_SERVICE_REFUSED",
-        "NO_SERVICES_SELECTED",
-        "NAMESPACE_NOT_RUNNING",
-        "CONFIG_DRIFT",
-        "LAST_SERVICES_RUNNING",
-        "SERVICE_PENDING",
-        "SERVICE_STOP_INCOMPLETE",
-        "HEALTH_TIMEOUT",
-        "LOCK_CONTENTION",
-        "INSTANCE_UNRESPONSIVE",
-        "PROCESS_COMPOSE_NOT_FOUND",
-        "UNKNOWN",
-      ],
-    ],
     // `restart` (#222): every check before anything is touched, the restarts
     // under the lifecycle lock, and an `up`-style health wait.
     [
@@ -236,7 +192,6 @@ describe("devtrees CLI", () => {
     "SHARED_SERVICE_REFUSED",
     "LAST_SERVICES_RUNNING",
     "SERVICE_PENDING",
-    "SERVICE_STOP_INCOMPLETE",
     "CONFIG_DRIFT",
     "SHARED_DRIFT",
     "SHARED_START_FAILED",
@@ -449,9 +404,6 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
       });
       expect(JSON.parse(badTimeout.stdout).error.code).toBe("INVALID_ARGS");
       expect(JSON.parse(badTimeout.stdout).error).not.toHaveProperty("details");
-      const bareStop = await execute(["stop", "--json"], { up: vi.fn(), down: vi.fn() });
-      expect(JSON.parse(bareStop.stdout).error.code).toBe("INVALID_ARGS");
-      expect(JSON.parse(bareStop.stdout).error).not.toHaveProperty("details");
       expect(restart).not.toHaveBeenCalled();
     });
 
@@ -2036,74 +1988,17 @@ describe("devtrees CLI — isEntrypoint", () => {
   });
 });
 
-describe("devtrees CLI — stop <service...> (#223)", () => {
-  const result = {
-    worktreeId: "login-1234",
-    stopped: ["web"],
-    notRunning: ["api"],
-    forceKilled: [{ service: "web", pid: 42 }],
-  };
-
-  it("a bare `stop` fails INVALID_ARGS, points to `down`, and runs nothing", async () => {
-    const stop = vi.fn();
-    const out = await execute(["stop", "--json"], { up: vi.fn(), down: vi.fn(), stop });
+describe("devtrees CLI — stop removed (ADR-0009 amendment)", () => {
+  it("`stop` is an unknown command: it runs nothing and lists no `stop` in COMMANDS", async () => {
+    const up = vi.fn();
+    const down = vi.fn();
+    const restart = vi.fn();
+    const out = await execute(["stop", "web"], { up, down, restart });
     expect(out.code).toBe(1);
-    const doc = JSON.parse(out.stdout) as { error: { code: string; message: string } };
-    expect(doc.error.code).toBe("INVALID_ARGS");
-    expect(doc.error.message).toContain("devtrees down");
-    expect(stop).not.toHaveBeenCalled();
-  });
-
-  it("passes every name through and emits the stop envelope, transient and with force_killed", async () => {
-    const stop = vi.fn().mockResolvedValue(result);
-    const out = await execute(["stop", "web", "api", "--json"], {
-      up: vi.fn(),
-      down: vi.fn(),
-      stop,
-    });
-    expect(out.code).toBe(0);
-    expect(stop).toHaveBeenCalledWith({ services: ["web", "api"] });
-    const doc = JSON.parse(out.stdout) as { stop: Record<string, unknown> };
-    expect(doc.stop).toMatchObject({
-      worktreeId: "login-1234",
-      stopped: ["web"],
-      not_running: ["api"],
-      force_killed: [{ service: "web", pid: 42 }],
-      transient: true,
-    });
-    expect(String(doc.stop.note)).toContain("devtrees up");
-    expect(out.stderr).toBe("");
-  });
-
-  it("passes repeatable -n through, alone or mixed with names, and reports skipped shared (#224)", async () => {
-    const stop = vi.fn().mockResolvedValue({ ...result, skippedShared: ["db"] });
-    const out = await execute(["stop", "-n", "ios", "--json"], {
-      up: vi.fn(),
-      down: vi.fn(),
-      stop,
-    });
-    expect(out.code).toBe(0);
-    expect(stop).toHaveBeenCalledWith({ services: [], namespaces: ["ios"] });
-    expect(JSON.parse(out.stdout).stop.skipped_shared).toEqual(["db"]);
-    await execute(["stop", "web", "-n", "ios", "-n", "app"], { up: vi.fn(), down: vi.fn(), stop });
-    expect(stop).toHaveBeenLastCalledWith({ services: ["web"], namespaces: ["ios", "app"] });
-  });
-
-  it("in human mode says `up` brings the service back, and warns about force-kills on stderr", async () => {
-    const stop = vi.fn().mockResolvedValue(result);
-    const out = await execute(["stop", "web"], { up: vi.fn(), down: vi.fn(), stop });
-    expect(out.stdout).toContain("stopped web");
-    expect(out.stdout).toContain("next `devtrees up`");
-    expect(out.stderr).toContain("web (pid 42)");
-  });
-
-  it("routes a coded error to its envelope", async () => {
-    const err = Object.assign(new Error("last"), { code: "LAST_SERVICES_RUNNING" });
-    const stop = vi.fn().mockRejectedValue(err);
-    const out = await execute(["stop", "web", "--json"], { up: vi.fn(), down: vi.fn(), stop });
-    expect(out.code).toBe(1);
-    expect((JSON.parse(out.stdout) as { error: { code: string } }).error.code).toBe(
-      "LAST_SERVICES_RUNNING",
-    );
+    expect(out.stderr).toContain("stop");
+    expect(up).not.toHaveBeenCalled();
+    expect(down).not.toHaveBeenCalled();
+    expect(restart).not.toHaveBeenCalled();
+    expect(COMMANDS.map((c) => c.name)).not.toContain("stop");
   });
 });

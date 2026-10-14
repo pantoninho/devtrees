@@ -55,7 +55,7 @@ const IDLE_STATES = new Set(["disabled", "skipped"]);
 /**
  * Is the service running, or on its way up or down (`Running`, `Pending`,
  * `Restarting`, `Terminating`, …)? This is what keeps process-compose from
- * exiting ("Project completed"), and what `devtrees stop` waits out (#223).
+ * exiting ("Project completed"), and what `restart`'s stop waits out (#223).
  * A stopped service (`Completed`, exit -1), a done one-shot, a dead service
  * and an idle one (`Disabled`, `Skipped`) are not running.
  */

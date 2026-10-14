@@ -2366,21 +2366,9 @@ describe.skipIf(!ENABLED)("real-pc smoke — down leaves nothing behind (#155)",
   }, 120_000);
 });
 
-// Issue #223 (ADR-0009): `devtrees stop <service...>` stops named isolated
-// services, waits for them to exit with `down`'s bounded escalation, and is
-// transient: the next `up` brings them back.
-describe.skipIf(!ENABLED)("real-pc smoke — stop <service...> (#223)", () => {
-  // The base budget, shrunk as for scenarios 50-51 so the escalation stays fast.
-  const STOP_BUDGET = { DEVTREES_DOWN_BASE_TIMEOUT_MS: "3000" };
-
-  interface StopDoc {
-    readonly stop: {
-      readonly stopped: string[];
-      readonly not_running: string[];
-      readonly force_killed: Array<{ service: string; pid: number }>;
-      readonly transient: boolean;
-    };
-  }
+// ADR-0009: `devtrees stop` is removed (see the amendment "`stop` removed");
+// `restart` keeps its bounded stop and its refusals.
+describe.skipIf(!ENABLED)("real-pc smoke — stop removed, restart's stop refusals (#223)", () => {
   interface ErrorDoc {
     readonly error: { readonly code: string; readonly details?: Record<string, unknown> };
   }
@@ -2400,123 +2388,59 @@ describe.skipIf(!ENABLED)("real-pc smoke — stop <service...> (#223)", () => {
     return { wt, root: repo.root, socketPath: instancePaths(absCommon, wtId(wt)).socketPath };
   }
 
-  /** `api`: a plain sleeper that keeps the instance alive while `web` is stopped. */
-  function apiLines(root: string): string[] {
-    return ["  api:", "    tier: isolated", `    command: "python3 ${sleeper(root, "api")}"`];
-  }
-
-  it("scenario 90: stop web stops only web, says up brings it back, and up does", async () => {
-    const { wt, root } = stopRepo("dt-rpc90-", (r) => [
-      "  web:",
+  it("scenario 92c: restarting a Pending service fails SERVICE_PENDING, touches nothing, and it still starts later (B3, #222)", async () => {
+    // `app` waits for `api` to be healthy; api becomes healthy only once
+    // `ready` exists. process-compose would accept `process stop app` (the
+    // first half of a restart) and leave it Terminating with no process for
+    // good; devtrees refuses first.
+    const { wt, root, socketPath } = stopRepo("dt-rpc92c-", (r) => [
+      "  api:",
       "    tier: isolated",
-      `    command: "python3 -m http.server $WEB_PORT --bind 127.0.0.1 --directory ${r}"`,
-      "    ports: [WEB_PORT]",
-      ...apiLines(r),
+      `    command: "python3 ${sleeper(r, "api")}"`,
+      "    readiness_probe:",
+      "      exec:",
+      `        command: "test -f ${join(r, "ready")}"`,
+      "      period_seconds: 1",
+      "      failure_threshold: 100000",
+      "  app:",
+      "    tier: isolated",
+      `    command: "python3 ${sleeper(r, "app")}"`,
+      "    depends_on:",
+      "      api:",
+      "        condition: process_healthy",
     ]);
-    const first = up(wt);
-    expect(first.code, first.stdout).toBe(0);
-    const port = Number((first.doc as UpDoc).up.env.WEB_PORT);
-    const webNeedle = `--directory ${root}`;
-    const apiNeedle = join(root, "api.py");
-    expect(await waitForListener(port, 10_000), "web should serve").toBe(true);
-    const apiPids = pidsMatching(apiNeedle);
+    devtrees(wt, ["up", "--json", "--wait-timeout", "5"]);
+    expect(existsSync(socketPath), "the instance should be running").toBe(true);
+    const apiPids = pidsMatching(join(root, "api.py"));
     expect(apiPids.length).toBeGreaterThan(0);
 
-    const stop = devtrees(wt, ["stop", "web", "--json"]);
-    expect(stop.code, `stop failed: ${stop.stderr} ${stop.stdout}`).toBe(0);
-    const doc = (stop.doc as StopDoc).stop;
-    expect(doc).toMatchObject({ stopped: ["web"], not_running: [], transient: true });
-    expect(doc.force_killed).toEqual([]);
-    // `stop` returns once web is gone, not merely once it was asked to stop.
-    expect(pidsMatching(webNeedle)).toEqual([]);
-    expect(await httpStatus(port)).toBe(0);
-    // Only web: the rest of the instance keeps running, untouched.
-    expect(pidsMatching(apiNeedle)).toEqual(apiPids);
-    // The human output says the stop is transient too.
-    expect(devtrees(wt, ["stop", "web"]).stdout).toContain("next `devtrees up`");
-
-    const again = up(wt);
-    expect(again.code, `up should bring web back: ${again.stderr} ${again.stdout}`).toBe(0);
-    expect((again.doc as { up: { restarted: string[] } }).up.restarted).toEqual(["web"]);
-    expect(await waitForListener(port, 10_000), "web should serve again").toBe(true);
-    expect(pidsMatching(apiNeedle)).toEqual(apiPids);
-    expect(devtrees(wt, ["down", "--json"]).code).toBe(0);
-  }, 120_000);
-
-  it("scenario 91: a shutdown.command that never stops web is bounded and force-killed", async () => {
-    const { wt, root } = stopRepo("dt-rpc91-", (r) => {
-      const hold = join(r, "web");
-      writeFileSync(hold, "");
-      return [
-        "  web:",
-        "    tier: isolated",
-        `    command: "tail -f ${hold}"`,
-        "    shutdown:",
-        '      command: "echo bye"',
-        "      timeout_seconds: 1",
-        ...apiLines(r),
-      ];
-    });
-    expect(up(wt).code).toBe(0);
-    const webNeedle = join(root, "web");
-    expect(await waitForPid(webNeedle, 10_000)).toBe(true);
-    const webPids = pidsMatching(webNeedle);
-    const apiPids = pidsMatching(join(root, "api.py"));
-
-    const started = Date.now();
-    const stop = devtrees(wt, ["stop", "web", "--json"], STOP_BUDGET);
-    const elapsed = Date.now() - started;
-    expect(stop.code, `stop should finish, not hang: ${stop.stderr} ${stop.stdout}`).toBe(0);
-    const doc = (stop.doc as StopDoc).stop;
-    expect(doc.stopped).toEqual(["web"]);
-    expect(doc.force_killed).toHaveLength(1);
-    expect(doc.force_killed[0]).toMatchObject({ service: "web" });
-    expect(webPids).toContain(doc.force_killed[0]!.pid);
-    // Budget (3s + 1s) plus the grace and the sweep, not a hang.
-    expect(elapsed).toBeLessThan(30_000);
-    expect(await waitForNoPids(webNeedle, 5_000)).toEqual([]);
+    // `restart` refuses it up front (#222): its stop would strand it.
+    const restartStarted = Date.now();
+    const restart = devtrees(wt, ["restart", "app", "--json"]);
+    expect(Date.now() - restartStarted, "refused up front").toBeLessThan(15_000);
+    expect(restart.code, restart.stdout).toBe(1);
+    const restartError = (restart.doc as ErrorDoc).error;
+    expect(restartError.code).toBe("SERVICE_PENDING");
+    expect(restart.stderr).toMatch(/devtrees restart: app is still waiting/);
+    expect(restartError.details).toMatchObject({ services: ["app"], waiting_on: ["api"] });
     expect(pidsMatching(join(root, "api.py"))).toEqual(apiPids);
-    expect(orphanedServices(root)).toEqual([]);
-    expect(devtrees(wt, ["down", "--json"], STOP_BUDGET).code).toBe(0);
-  }, 120_000);
+    const after = (devtrees(wt, ["ls", "--json"]).doc as LsDoc).ls.instances
+      .find((i) => i.id === wtId(wt))
+      ?.services.find((s) => s.name === "app");
+    expect(after?.status).toBe("Pending");
 
-  it("scenario 92: stopping the last running processes fails LAST_SERVICES_RUNNING and stops nothing", async () => {
-    const { wt, root, socketPath } = stopRepo("dt-rpc92-", (r) => [
-      // A finished one-shot does not count as running.
-      "  seed:",
-      "    tier: isolated",
-      '    command: "true"',
-      "  web:",
-      "    tier: isolated",
-      `    command: "python3 ${sleeper(r, "web")}"`,
-      ...apiLines(r),
-    ]);
-    expect(up(wt).code).toBe(0);
-    // With api stopped, web is the last running process.
-    expect(devtrees(wt, ["stop", "api", "--json"]).code).toBe(0);
-    const webPids = pidsMatching(join(root, "web.py"));
-    expect(webPids.length).toBeGreaterThan(0);
-
-    for (const args of [["web"], ["web", "api"]]) {
-      const refused = devtrees(wt, ["stop", ...args, "--json"]);
-      expect(refused.code).toBe(1);
-      const error = (refused.doc as ErrorDoc).error;
-      expect(error.code).toBe("LAST_SERVICES_RUNNING");
-      expect(error.details).toMatchObject({ services: ["web"], remedy: "devtrees down" });
-      expect(refused.stderr).toContain("devtrees down");
-    }
-    // Nothing was stopped, and the instance is still up.
-    expect(pidsMatching(join(root, "web.py"))).toEqual(webPids);
-    expect(existsSync(socketPath)).toBe(true);
+    // Once its dependency is healthy, app starts as if nothing had happened.
+    writeFileSync(join(root, "ready"), "");
+    expect(await waitForPid(join(root, "app.py"), 20_000), "app should start").toBe(true);
     expect(devtrees(wt, ["down", "--json"]).code).toBe(0);
   }, 120_000);
 
-  it("scenario 92b: a Pending dependent of the service being stopped does not count as running (B1)", async () => {
+  it("scenario 112: restarting the only running service is refused LAST_SERVICES_RUNNING when its dependent is Pending (B1)", async () => {
     // `app` waits for `api` to be healthy, which it never is: process-compose
-    // shows `app` Pending (is_running false). Stopping `api` would leave
-    // nothing running, `app` would never start, and process-compose would
-    // exit, taking the instance with it.
-    const { wt, root, socketPath } = stopRepo("dt-rpc92b-", (r) => [
+    // shows `app` Pending (is_running false). Restarting `api` stops it first,
+    // which would leave nothing running; `app` would never start, and
+    // process-compose would exit, taking the instance with it.
+    const { wt, root, socketPath } = stopRepo("dt-rpc112-", (r) => [
       "  api:",
       "    tier: isolated",
       `    command: "python3 ${sleeper(r, "api")}"`,
@@ -2539,182 +2463,40 @@ describe.skipIf(!ENABLED)("real-pc smoke — stop <service...> (#223)", () => {
     expect(apiPids.length).toBeGreaterThan(0);
     expect(pidsMatching(join(root, "app.py")), "app is still Pending").toEqual([]);
 
-    const refused = devtrees(wt, ["stop", "api", "--json"]);
+    const started = Date.now();
+    const refused = devtrees(wt, ["restart", "api", "--json"]);
+    expect(Date.now() - started, "refused up front").toBeLessThan(15_000);
     expect(refused.code, refused.stdout).toBe(1);
-    expect((refused.doc as ErrorDoc).error.code).toBe("LAST_SERVICES_RUNNING");
-    // Nothing was stopped, and the instance is still there.
+    const error = (refused.doc as ErrorDoc).error;
+    expect(error.code).toBe("LAST_SERVICES_RUNNING");
+    expect(error.details).toMatchObject({ worktree_id: wtId(wt), services: ["api"] });
+    // Nothing was restarted, and the instance is still there.
     expect(pidsMatching(join(root, "api.py"))).toEqual(apiPids);
     expect(existsSync(socketPath)).toBe(true);
     expect(devtrees(wt, ["down", "--json"]).code).toBe(0);
   }, 120_000);
 
-  it("scenario 92c: stopping or restarting a Pending service fails SERVICE_PENDING, touches nothing, and it still starts later (B3, #222)", async () => {
-    // `app` waits for `api` to be healthy; api becomes healthy only once
-    // `ready` exists. process-compose would accept `process stop app` and
-    // leave it Terminating with no process for good; devtrees refuses first.
-    const { wt, root, socketPath } = stopRepo("dt-rpc92c-", (r) => [
-      "  api:",
-      "    tier: isolated",
-      `    command: "python3 ${sleeper(r, "api")}"`,
-      "    readiness_probe:",
-      "      exec:",
-      `        command: "test -f ${join(r, "ready")}"`,
-      "      period_seconds: 1",
-      "      failure_threshold: 100000",
-      "  app:",
-      "    tier: isolated",
-      `    command: "python3 ${sleeper(r, "app")}"`,
-      "    depends_on:",
-      "      api:",
-      "        condition: process_healthy",
-    ]);
-    devtrees(wt, ["up", "--json", "--wait-timeout", "5"]);
-    expect(existsSync(socketPath), "the instance should be running").toBe(true);
-    const apiPids = pidsMatching(join(root, "api.py"));
-    expect(apiPids.length).toBeGreaterThan(0);
-
-    const started = Date.now();
-    const refused = devtrees(wt, ["stop", "app", "--json"]);
-    expect(Date.now() - started, "refused up front, not after the budget").toBeLessThan(15_000);
-    expect(refused.code, refused.stdout).toBe(1);
-    const error = (refused.doc as ErrorDoc).error;
-    expect(error.code).toBe("SERVICE_PENDING");
-    expect(error.details).toMatchObject({ services: ["app"], waiting_on: ["api"] });
-    // Nothing was touched: api is the same process, app is still Pending.
-    expect(pidsMatching(join(root, "api.py"))).toEqual(apiPids);
-    const ls = devtrees(wt, ["ls", "--json"]).doc as LsDoc;
-    const app = ls.ls.instances
-      .find((i) => i.id === wtId(wt))
-      ?.services.find((s) => s.name === "app");
-    expect(app?.status).toBe("Pending");
-
-    // `restart` refuses it the same way (#222): its stop would strand it too.
-    const restartStarted = Date.now();
-    const restart = devtrees(wt, ["restart", "app", "--json"]);
-    expect(Date.now() - restartStarted, "refused up front").toBeLessThan(15_000);
-    expect(restart.code, restart.stdout).toBe(1);
-    const restartError = (restart.doc as ErrorDoc).error;
-    expect(restartError.code).toBe("SERVICE_PENDING");
-    expect(restart.stderr).toMatch(/devtrees restart: app is still waiting/);
-    expect(restartError.details).toMatchObject({ services: ["app"], waiting_on: ["api"] });
-    expect(pidsMatching(join(root, "api.py"))).toEqual(apiPids);
-    const after = (devtrees(wt, ["ls", "--json"]).doc as LsDoc).ls.instances
-      .find((i) => i.id === wtId(wt))
-      ?.services.find((s) => s.name === "app");
-    expect(after?.status).toBe("Pending");
-
-    // Once its dependency is healthy, app starts as if nothing had happened.
-    writeFileSync(join(root, "ready"), "");
-    expect(await waitForPid(join(root, "app.py"), 20_000), "app should start").toBe(true);
-    expect(devtrees(wt, ["down", "--json"]).code).toBe(0);
-  }, 120_000);
-
-  it("scenario 93: stopping twice is idempotent; bad names fail before anything is touched", async () => {
-    const { wt, root } = stopRepo("dt-rpc93-", (r) => [
-      "  db:",
-      "    tier: shared",
-      `    command: "python3 ${sleeper(r, "db")}"`,
+  it("scenario 110: `devtrees stop` is an unknown command and touches nothing", async () => {
+    const { wt, root, socketPath } = stopRepo("dt-rpc110-", (r) => [
       "  web:",
       "    tier: isolated",
       `    command: "python3 ${sleeper(r, "web")}"`,
-      "  sim:",
+      "  api:",
       "    tier: isolated",
-      "    namespace: mobile",
-      `    command: "python3 ${sleeper(r, "sim")}"`,
-      ...apiLines(r),
+      `    command: "python3 ${sleeper(r, "api")}"`,
     ]);
-    cleanupStack.push(() => devtrees(wt, ["down", "--shared"]));
-    const none = devtrees(wt, ["stop", "web", "--json"]);
-    expect((none.doc as ErrorDoc).error.code).toBe("INSTANCE_NOT_FOUND");
-    expect(up(wt).code).toBe(0);
+    expect(devtrees(wt, ["up", "--json", "--wait-timeout", "10"]).code).toBe(0);
+    expect(existsSync(socketPath), "the instance should be running").toBe(true);
+    const webPids = pidsMatching(join(root, "web.py"));
+    expect(webPids.length).toBeGreaterThan(0);
 
-    const bare = devtrees(wt, ["stop", "--json"]);
-    expect((bare.doc as ErrorDoc).error.code).toBe("INVALID_ARGS");
-    const unknown = devtrees(wt, ["stop", "web", "nope", "--json"]);
-    expect((unknown.doc as ErrorDoc).error).toMatchObject({
-      code: "SERVICE_NOT_FOUND",
-      details: { service: "nope", valid_services: expect.arrayContaining(["api", "web", "sim"]) },
-    });
-    const shared = devtrees(wt, ["stop", "db", "--json"]);
-    expect((shared.doc as ErrorDoc).error).toMatchObject({
-      code: "SHARED_SERVICE_REFUSED",
-      details: { services: ["db"], remedy: "devtrees down --shared && devtrees up" },
-    });
-    // sim's namespace was not booted: the same rule as `up -n` (ADR-0008).
-    const unbooted = devtrees(wt, ["stop", "web", "sim", "--json"]);
-    expect((unbooted.doc as ErrorDoc).error).toMatchObject({
-      code: "NAMESPACE_NOT_RUNNING",
-      details: {
-        namespaces: ["mobile"],
-        services: ["sim"],
-        remedy: "devtrees down && devtrees up -n default -n mobile",
-      },
-    });
-    // None of those touched web.
-    expect(pidsMatching(join(root, "web.py")).length).toBeGreaterThan(0);
-
-    const first = devtrees(wt, ["stop", "web", "--json"]);
-    expect(first.code, first.stdout).toBe(0);
-    expect((first.doc as StopDoc).stop).toMatchObject({ stopped: ["web"], not_running: [] });
-    const second = devtrees(wt, ["stop", "web", "--json"]);
-    expect(second.code, `a second stop should succeed: ${second.stdout}`).toBe(0);
-    expect((second.doc as StopDoc).stop).toMatchObject({ stopped: [], not_running: ["web"] });
-    expect(pidsMatching(join(root, "web.py"))).toEqual([]);
-    expect(pidsMatching(join(root, "db.py")).length, "shared db untouched").toBeGreaterThan(0);
-    expect(devtrees(wt, ["down", "--json"]).code).toBe(0);
-  }, 120_000);
-
-  it("scenario 94: a listener web detached with setsid is never killed; stop fails SERVICE_STOP_INCOMPLETE naming it", async () => {
-    const { wt, root } = stopRepo("dt-rpc94-", (r) => {
-      const listener = join(r, "listener.py");
-      writeFileSync(
-        listener,
-        [
-          "import os, socket, sys",
-          "if os.fork() > 0: sys.exit(0)",
-          "os.setsid()",
-          "if os.fork() > 0: sys.exit(0)",
-          "s = socket.socket()",
-          "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)",
-          "s.bind(('127.0.0.1', int(sys.argv[1])))",
-          "s.listen(5)",
-          "while True:",
-          "    c, _ = s.accept()",
-          "    c.close()",
-          "",
-        ].join("\n"),
-      );
-      return [
-        "  web:",
-        "    tier: isolated",
-        "    ports: [WEB_PORT]",
-        `    command: "sh -c 'python3 ${listener} $WEB_PORT; exec sleep 300'"`,
-        ...apiLines(r),
-      ];
-    });
-    const first = up(wt);
-    expect(first.code, first.stdout).toBe(0);
-    const port = Number((first.doc as UpDoc).up.env.WEB_PORT);
-    expect(await waitForListener(port, 10_000)).toBe(true);
-    const listener = join(root, "listener.py");
-    const [escapee] = pidsMatching(listener);
-
-    const stop = devtrees(wt, ["stop", "web", "--json"]);
-    expect(stop.code, "stop must not report success").toBe(1);
-    const error = (stop.doc as ErrorDoc).error;
-    expect(error.code).toBe("SERVICE_STOP_INCOMPLETE");
-    expect(error.details?.survivors).toMatchObject([
-      { service: "web", port_name: "WEB_PORT", port, pid: escapee },
-    ]);
-    // Left alone, as `down` leaves it (#155): only the port check names it.
-    expect(pidsMatching(listener)).toEqual([escapee]);
-
-    // The remedy converges: once it is gone, the same stop succeeds.
-    process.kill(escapee!, "SIGKILL");
-    expect(await waitForNoPids(listener, 5_000)).toEqual([]);
-    const again = devtrees(wt, ["stop", "web", "--json"]);
-    expect(again.code, again.stdout).toBe(0);
-    expect((again.doc as StopDoc).stop.not_running).toEqual(["web"]);
+    const stop = devtrees(wt, ["stop", "web"]);
+    expect(stop.code).toBe(1);
+    expect(stop.stderr).toContain("stop");
+    expect(devtrees(wt, ["--help"]).stdout).not.toMatch(/devtrees stop/);
+    // Nothing was stopped: web is the same process, and the instance is up.
+    expect(pidsMatching(join(root, "web.py"))).toEqual(webPids);
+    expect(existsSync(socketPath)).toBe(true);
     expect(devtrees(wt, ["down", "--json"]).code).toBe(0);
   }, 120_000);
 });
@@ -3058,23 +2840,16 @@ describe.skipIf(!ENABLED)("real-pc smoke — restart <service...> (#222)", () =>
   }, 120_000);
 });
 
-// Issue #224 (ADR-0009): `stop -n` and `restart -n` expand a namespace to its
-// isolated services and go through the per-service paths; shared services in
-// the namespace are skipped and reported.
-describe.skipIf(!ENABLED)("real-pc smoke — stop -n / restart -n (#224)", () => {
+// Issue #224 (ADR-0009): `restart -n` expands a namespace to its isolated
+// services and goes through the per-service path; shared services in the
+// namespace are skipped and reported.
+describe.skipIf(!ENABLED)("real-pc smoke — restart -n (#224)", () => {
   interface VerbDoc {
-    readonly stop?: {
-      readonly stopped: string[];
-      readonly not_running: string[];
-      readonly skipped_shared: string[];
-      readonly transient: boolean;
-    };
     readonly restart?: {
       readonly restarted: string[];
       readonly skipped_shared: string[];
       readonly services: ReadonlyArray<LsServiceRow>;
     };
-    readonly up?: { readonly restarted: string[] };
     readonly error?: { readonly code: string; readonly details?: Record<string, unknown> };
   }
   const docOf = (r: CliResult): VerbDoc => r.doc as VerbDoc;
@@ -3155,32 +2930,6 @@ describe.skipIf(!ENABLED)("real-pc smoke — stop -n / restart -n (#224)", () =>
   const snapshot = (pids: (name: string) => number[], names: ReadonlyArray<string>) =>
     Object.fromEntries(names.map((n) => [n, pids(n)]));
 
-  it("scenario 100: stop -n ios stops only sim, transiently; up -n ios brings it back", async () => {
-    const { wt, pids } = nsRepo("dt-rpc100-");
-    const env = upNs(wt, ["default", "app", "ios"]);
-    expect(pids("sim").length, "sim should run").toBeGreaterThan(0);
-    const others = snapshot(pids, ["api", "web", "worker", "db"]);
-
-    // A name and the namespace naming it again: the union, once.
-    const stop = devtrees(wt, ["stop", "sim", "-n", "ios", "--json"]);
-    expect(stop.code, `stop failed: ${stop.stderr} ${stop.stdout}`).toBe(0);
-    expect(docOf(stop).stop).toMatchObject({
-      stopped: ["sim"],
-      not_running: [],
-      skipped_shared: [],
-      transient: true,
-    });
-    expect(pids("sim")).toEqual([]);
-    expect(snapshot(pids, ["api", "web", "worker", "db"])).toEqual(others);
-    expect(await httpStatus(Number(env.WEB_PORT))).toBe(200);
-
-    const again = devtrees(wt, ["up", "--json", "--wait-timeout", "30", "-n", "ios"]);
-    expect(again.code, `up -n ios failed: ${again.stderr} ${again.stdout}`).toBe(0);
-    expect(docOf(again).up?.restarted).toEqual(["sim"]);
-    expect(pids("sim").length, "sim should run again").toBeGreaterThan(0);
-    expect(snapshot(pids, ["api", "web", "worker", "db"])).toEqual(others);
-  }, 180_000);
-
   it("scenario 101: restart -n app restarts api then web in depends_on order, on the same ports, touching nothing else", async () => {
     const { wt, root, pids } = nsRepo("dt-rpc101-");
     const env = upNs(wt, ["default", "app", "ios"]);
@@ -3218,55 +2967,56 @@ describe.skipIf(!ENABLED)("real-pc smoke — stop -n / restart -n (#224)", () =>
     upNs(wt, ["default", "app"]);
     const pidsBefore = pidsMatching(root).sort((a, b) => a - b);
 
-    for (const verb of ["stop", "restart"]) {
-      const err = docOf(devtrees(wt, [verb, "worker", "-n", "ios", "--json"])).error;
-      expect(err, verb).toMatchObject({
-        code: "NAMESPACE_NOT_RUNNING",
-        details: {
-          worktree_id: wtId(wt),
-          namespaces: ["ios"],
-          services: ["sim"],
-          remedy: "devtrees down && devtrees up -n app -n default -n ios",
-        },
-      });
-      const none = docOf(devtrees(wt, [verb, "-n", "nope", "--json"])).error;
-      expect(none, verb).toMatchObject({
-        code: "NO_SERVICES_SELECTED",
-        details: { selected_namespaces: ["nope"], namespaces: ["app", "default", "ios"] },
-      });
-    }
+    const err = docOf(devtrees(wt, ["restart", "worker", "-n", "ios", "--json"])).error;
+    expect(err).toMatchObject({
+      code: "NAMESPACE_NOT_RUNNING",
+      details: {
+        worktree_id: wtId(wt),
+        namespaces: ["ios"],
+        services: ["sim"],
+        remedy: "devtrees down && devtrees up -n app -n default -n ios",
+      },
+    });
+    const none = docOf(devtrees(wt, ["restart", "-n", "nope", "--json"])).error;
+    expect(none).toMatchObject({
+      code: "NO_SERVICES_SELECTED",
+      details: { selected_namespaces: ["nope"], namespaces: ["app", "default", "ios"] },
+    });
     expect(pidsMatching(root).sort((a, b) => a - b)).toEqual(pidsBefore);
   }, 180_000);
 
-  it("scenario 103: stop -n default skips and reports the shared db, leaving it running; naming db is still refused", async () => {
-    const { wt, pids } = nsRepo("dt-rpc103-");
+  it("scenario 111: restart -n default restarts worker, skips and reports the shared db, leaving it running; naming db is still refused", async () => {
+    const { wt, pids } = nsRepo("dt-rpc111-");
     upNs(wt, ["default", "app"]);
     const db = pids("db");
     expect(db.length, "db should run").toBeGreaterThan(0);
+    const worker = pids("worker");
+    expect(worker.length, "worker should run").toBeGreaterThan(0);
     const app = snapshot(pids, ["api", "web"]);
 
-    const stop = devtrees(wt, ["stop", "-n", "default", "--json"]);
-    expect(stop.code, `stop failed: ${stop.stderr} ${stop.stdout}`).toBe(0);
-    expect(docOf(stop).stop).toMatchObject({ stopped: ["worker"], skipped_shared: ["db"] });
-    expect(pids("worker")).toEqual([]);
+    const result = devtrees(wt, ["restart", "-n", "default", "--json", "--wait-timeout", "30"]);
+    expect(result.code, `restart failed: ${result.stderr} ${result.stdout}`).toBe(0);
+    expect(docOf(result).restart).toMatchObject({ restarted: ["worker"], skipped_shared: ["db"] });
+    const now = pids("worker");
+    expect(now.length, "worker should run again").toBeGreaterThan(0);
+    expect(
+      now.some((pid) => worker.includes(pid)),
+      "worker is a new run",
+    ).toBe(false);
     expect(pids("db")).toEqual(db);
     expect(snapshot(pids, ["api", "web"])).toEqual(app);
 
-    // Human output reports the skip too; a repeated stop is idempotent.
-    const human = devtrees(wt, ["stop", "-n", "default"]);
+    // Human output reports the skip too.
+    const human = devtrees(wt, ["restart", "-n", "default", "--wait-timeout", "30"]);
     expect(human.code, human.stderr).toBe(0);
-    expect(human.stdout).toContain("not running, nothing to stop: worker.");
     expect(human.stdout).toContain("skipped shared service db");
 
-    const refused = docOf(devtrees(wt, ["stop", "db", "-n", "default", "--json"])).error;
+    const refused = docOf(devtrees(wt, ["restart", "db", "-n", "default", "--json"])).error;
     expect(refused).toMatchObject({
       code: "SHARED_SERVICE_REFUSED",
       details: { services: ["db"] },
     });
     expect(pids("db")).toEqual(db);
-
-    upNs(wt, ["default"]);
-    expect(pids("worker").length, "up -n default brings worker back").toBeGreaterThan(0);
   }, 180_000);
 });
 

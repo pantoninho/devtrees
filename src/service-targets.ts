@@ -1,9 +1,8 @@
 /**
  * Named-service targets for the per-service lifecycle verbs (ADR-0009).
  *
- * `devtrees restart <service...>` (#222) and `devtrees stop <service...>`
- * (#223) both act on services the caller names, and check the names the
- * same way before anything is touched. The declared services are the
+ * `devtrees restart <service...>` (#222) acts on services the caller names,
+ * and checks the names before anything is touched. The declared services are the
  * running instance's derived config, the file process-compose was booted
  * with (or last reloaded from), not `devtrees.yaml`, which may have been
  * edited since. This module decides; the errors are built in

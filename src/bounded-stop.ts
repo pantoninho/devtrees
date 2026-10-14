@@ -1,5 +1,6 @@
 /**
- * Bounded per-service stop for `devtrees stop <service...>` (ADR-0009, #223).
+ * Bounded per-service stop: the first half of `devtrees restart
+ * <service...>` (ADR-0009, #222, #223).
  *
  * Reuses `down`'s machinery from src/bounded-down.ts (#190, #208, #219): the
  * pre-stop snapshot with start-time identity, the grace period, the
@@ -47,8 +48,6 @@ export interface ServiceStopTarget {
   readonly unsignalled?: ReadonlySet<string>;
   /** The worktree id, for the error raised when process-compose exits. */
   readonly instance: string;
-  /** The command stopping them, for its errors. Default `stop`; `restart` (#222). */
-  readonly command?: "stop" | "restart";
   /**
    * Has process-compose exited (its control socket no longer answers)? Asked
    * whenever a `process list` read fails. Default: never.
@@ -78,7 +77,7 @@ export class StopRefusedError extends Error {
     /** process-compose's own complaint (`restart` reports it as is, #222). */
     readonly reason: string,
   ) {
-    super(`devtrees stop: process-compose refused to stop ${services.join(", ")}: ${reason}`);
+    super(`devtrees restart: process-compose refused to stop ${services.join(", ")}: ${reason}`);
     this.name = "StopRefusedError";
   }
 }
@@ -123,7 +122,7 @@ export async function boundedStopServices(
   const settled = async (): Promise<boolean> => {
     rows = await driver.getServiceStatuses(target.socketPath).catch(() => undefined);
     if (rows === undefined && (await target.instanceGone?.())) {
-      throw instanceExitedError(target.instance, target.services, target.command);
+      throw instanceExitedError(target.instance, target.services);
     }
     return rows !== undefined && activeAmong(rows, target.services).length === 0;
   };

@@ -94,19 +94,15 @@ import {
   type PortSurvivorSeams,
 } from "./down-survivors.js";
 import { sharedExtendedFields, sharedStackHash, stackHash } from "./hash.js";
-import { boundedStopServices } from "./bounded-stop.js";
 import { boundedRestart } from "./bounded-restart.js";
 import {
   assertNotLastRunning,
   assertNotPending,
-  clearStopIncomplete,
+  clearLegacyStopMarker,
   instanceExitedError,
   instanceNotRunningError,
   partitionRunning,
-  readStopIncomplete,
-  serviceStopIncomplete,
   stopTimeoutMs,
-  updateStopIncomplete,
 } from "./stop-services.js";
 import {
   declaredServices,
@@ -1323,7 +1319,7 @@ function resolveProbe(deps: CommandDeps): LivenessProbe {
 /** Which command is asking, and about which instance — for the #186 envelope. */
 interface LivenessContext {
   readonly command: "up" | "down" | NamedServiceCommand;
-  /** The exact command to retry, when it is more than the verb (`devtrees stop web`). */
+  /** The exact command to retry, when it is more than the verb (`devtrees restart web`). */
   readonly retry?: string;
   /** Worktree id, or `SHARED_INSTANCE_ID` for the shared instance. */
   readonly instance: string;
@@ -1640,11 +1636,11 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     ensureLogsDir(stack, logsDir(anchor.anchor, anchor.worktreeId), "isolated");
     writeFileSync(paths.configPath, stringifyYaml(derived.config), "utf8");
     // A pending-reload marker (#191) describes an instance that is gone now,
-    // and so do a DOWN_INCOMPLETE (#155) and a SERVICE_STOP_INCOMPLETE (#223)
-    // marker.
+    // and so does a DOWN_INCOMPLETE (#155) marker.
     clearPendingReload(anchor.anchor, anchor.worktreeId);
     clearDownIncomplete(anchor.anchor, anchor.worktreeId);
-    clearStopIncomplete(anchor.anchor, anchor.worktreeId);
+    // A 0.2.0 `stop` marker (removed in 0.3.0); drop after 0.3.x.
+    clearLegacyStopMarker(anchor.anchor, anchor.worktreeId);
 
     // Shared-health wait: gate the worktree start on the shared services'
     // readiness probes whenever this worktree drops a cross-tier `depends_on`
@@ -2554,9 +2550,8 @@ export async function runDown(
       // The instance is gone either way, and with it any reload still pending
       // in it (#191). Not reached when the stop throws (DOWN_TIMEOUT keeps it).
       clearPendingReload(anchor.anchor, anchor.worktreeId);
-      // So is what an incomplete `stop` left to re-check (#223): its ports
-      // are `down`'s business now (DOWN_INCOMPLETE).
-      clearStopIncomplete(anchor.anchor, anchor.worktreeId);
+      // A 0.2.0 `stop` marker (removed in 0.3.0); drop after 0.3.x.
+      clearLegacyStopMarker(anchor.anchor, anchor.worktreeId);
       // Still under the lock, so a concurrent `up` cannot start listeners that
       // would pass for survivors (#155).
       if (stopped === undefined || stopped.supervisorExited) return { stopped };
@@ -2771,131 +2766,6 @@ function downTimeoutRemedy(
   );
 }
 
-/** What `runStop` stopped (#223). */
-export interface StopServicesResult {
-  readonly worktreeId: string;
-  /** The named services this call stopped, in `depends_on` order. */
-  readonly stopped: ReadonlyArray<string>;
-  /**
-   * The named services that were already not running: stopped, done or
-   * dead. Not an error: a repeated `stop` succeeds (ADR-0009).
-   */
-  readonly notRunning: ReadonlyArray<string>;
-  /** Processes devtrees signalled to finish the stop (`down`'s `force_killed`). */
-  readonly forceKilled: ReadonlyArray<ForceKilled>;
-  /** Shared services in a `-n` namespace, not stopped (#224). */
-  readonly skippedShared: ReadonlyArray<string>;
-}
-
-/**
- * `devtrees stop <service...>` (ADR-0009, #223): stop named isolated
- * services of this worktree's instance and wait until they have exited.
- *
- * Under the worktree's lifecycle lock (as `up` and `down`), every check
- * runs before anything is touched: the names (`resolveNamedServices`:
- * `SERVICE_NOT_FOUND`, `SHARED_SERVICE_REFUSED`, `INSTANCE_NOT_FOUND`,
- * `NAMESPACE_NOT_RUNNING`), a hot-reload still pending (#191, #206:
- * `CONFIG_DRIFT` with `reload_pending`, as `up` refuses, since the pending
- * update would bring a stopped service back), and a stop that would leave
- * no process running (`LAST_SERVICES_RUNNING`: process-compose would exit
- * and take the instance with it). Named services that are not running are
- * skipped, so a repeated stop succeeds. The rest are stopped with `down`'s
- * bounded escalation (`boundedStopServices`); process-compose exiting
- * meanwhile fails `INSTANCE_NOT_FOUND`. Then the ports of the services this
- * call stopped, and of those an earlier incomplete stop left to re-check,
- * are checked as `down` checks them. Anything still alive or listening
- * fails `SERVICE_STOP_INCOMPLETE`.
- *
- * `options.namespaces` (`-n`, #224) adds every isolated service of each
- * namespace to the names (`resolveNamedServices`); shared services in them
- * are skipped and reported in `skippedShared`.
- *
- * The stop is transient: process-compose reports a stopped service like a
- * crashed one, so the next `up` covering it restarts it.
- */
-export async function runStop(
-  deps: CommandDeps,
-  options: {
-    readonly services: ReadonlyArray<string>;
-    readonly namespaces?: ReadonlyArray<string>;
-  },
-): Promise<StopServicesResult> {
-  const { anchor } = resolve(deps);
-  const lifecycleLock = deps.withLifecycleLock ?? defaultWithLifecycleLock;
-  return lifecycleLock(anchor.anchor, anchor.worktreeId, async () => {
-    const target = await resolveNamedServices(deps, options.services, "stop", options.namespaces);
-    const id = anchor.worktreeId;
-    const names = target.services;
-    const { running, pending, notRunning } = partitionRunning(target.rows, names);
-    const declared = declaredServices(target.config?.processes as DerivedProcessMap | undefined);
-    assertNotPending(
-      pending,
-      (name) => declared.find((s) => s.name === name)?.dependsOn.map((d) => d.name) ?? [],
-      id,
-    );
-    assertNotLastRunning(target.rows, running, id);
-    const config = target.config;
-    const stopped =
-      running.length === 0
-        ? { forceKilled: [], survivors: [], unsettled: [] }
-        : await stopRunning(deps, target, running, config);
-    // Ports of what this call stopped, and of what an earlier incomplete stop
-    // left to re-check (its remedy is this same command): never those of a
-    // service merely found stopped, whose port may now be someone else's.
-    const recheck = readStopIncomplete(anchor.anchor, id).filter((n) => notRunning.includes(n));
-    const checked = [...running, ...recheck];
-    const listeners =
-      config === undefined ? [] : await findPortSurvivors(config, checked, portSurvivorSeams(deps));
-    const survivors: DownSurvivor[] = [
-      ...stopped.unsettled.map((u) => ({ service: u.service, pid: u.pid, command: null })),
-      ...stopped.survivors.map(processSurvivor),
-      ...listeners,
-    ];
-    const failed = [...new Set(survivors.map((s) => s.service))];
-    updateStopIncomplete(anchor.anchor, id, {
-      passed: checked.filter((n) => !failed.includes(n)),
-      failed,
-    });
-    if (survivors.length > 0) {
-      throw serviceStopIncomplete(id, checked, survivors, stopped.forceKilled);
-    }
-    return {
-      worktreeId: id,
-      stopped: running,
-      notRunning,
-      forceKilled: stopped.forceKilled,
-      skippedShared: target.skippedShared,
-    };
-  });
-}
-
-/** `boundedStopServices` for `runStop`, wired to the driver, the deps and the budget. */
-function stopRunning(
-  deps: CommandDeps,
-  target: NamedServices,
-  running: ReadonlyArray<string>,
-  config: DerivedConfig | undefined,
-) {
-  const driver = createDriver(deps.driver);
-  const read = statusReader(deps, driver);
-  return boundedStopServices(
-    {
-      socketPath: target.socketPath,
-      services: running,
-      statuses: target.rows,
-      timeoutMs: stopTimeoutMs(config, running, deps.stop?.baseTimeoutMs),
-      unsignalled: unsignalledServices(config),
-      instance: target.anchor.worktreeId,
-      instanceGone: () => isGone(probeOf(deps), target.socketPath),
-    },
-    {
-      stopProcesses: (socket, services) => driver.stopProcesses(socket, services),
-      getServiceStatuses: (socket) => read(socket),
-    },
-    deps.stop,
-  );
-}
-
 // --- restart (ADR-0009, #222) -----------------------------------------------
 
 export interface RestartResult {
@@ -2919,14 +2789,14 @@ export interface RestartResult {
  *
  * For each service in turn:
  *
- *  1. Under this worktree's lifecycle lock (the one `up`, `down` and `stop`
- *     take): run every check (`resolveNamedServices`, as `stop`, again for
- *     each service so what changed while the lock was released is caught),
+ *  1. Under this worktree's lifecycle lock (the one `up` and `down` take):
+ *     run every check (`resolveNamedServices`, again for each service so
+ *     what changed while the lock was released is caught),
  *     refuse the instance's last running process (`LAST_SERVICES_RUNNING`:
  *     its stop would make process-compose exit), then restart it
- *     (`boundedRestart`: `stop`'s bounded stop, then a start; old-run
+ *     (`boundedRestart`: a bounded stop, then a start; old-run
  *     processes it had to signal are reported in `forceKilled`). The lock
- *     is held for one service's restart: its stop (as `stop`'s budget: 30s
+ *     is held for one service's restart: its stop (budget: 30s
  *     plus its `shutdown.timeout_seconds`, then the escalation's grace) and
  *     its start (10s at most). A concurrent `up` or `down` waits ~10s for
  *     it, then fails `LOCK_CONTENTION`.
@@ -2973,9 +2843,9 @@ export async function runRestart(
       // one-shot that finished meanwhile may have left it the last one.
       const ahead = order.slice(i);
       // A service still `Pending` has not started: `process stop` would leave
-      // it `Terminating` with no process for good (as for `stop`, #223).
+      // it `Terminating` with no process for good (#223).
       const { pending } = partitionRunning(target.rows, ahead);
-      assertNotPending(pending, waitingOn(target), anchor.worktreeId, "restart");
+      assertNotPending(pending, waitingOn(target), anchor.worktreeId);
       assertRestartKeepsInstance(target, ahead, restarted);
       const name = order[i] ?? "";
       return { target, name, ...(await restartOne(target, name, driver, deps, restarted)) };
@@ -3010,7 +2880,7 @@ export async function runRestart(
 
 /**
  * `resolveNamedServices` for one restart step. Two things read differently
- * from `stop`'s: a process-compose that never answers the status read is
+ * from the resolver's own errors: a process-compose that never answers the status read is
  * `INSTANCE_UNRESPONSIVE` (nothing was touched; it is not a health wait),
  * and an instance gone after earlier steps restarted services (a concurrent
  * `down` between two lock windows) says which ones.
@@ -3049,7 +2919,7 @@ async function resolveRestartStep(
 
 /**
  * Refuse to restart a running service that is the instance's last running
- * process (`LAST_SERVICES_RUNNING`, ADR-0009), as `stop` refuses its stop:
+ * process (`LAST_SERVICES_RUNNING`, ADR-0009):
  * process-compose exits once nothing runs, taking the instance with it.
  * `process restart` is no way out: it starts the new run while the old one
  * may still hold the port, and the new run dies (and the instance with it)
@@ -3111,10 +2981,10 @@ async function restartOne(
   ).catch((err: unknown) => {
     // process-compose exited during the stop: name what was restarted before.
     if ((err as { code?: unknown }).code !== "INSTANCE_NOT_FOUND") throw err;
-    throw instanceExitedError(id, [name], "restart", done);
+    throw instanceExitedError(id, [name], done);
   });
   if (!outcome.ok) {
-    if (await gone()) throw instanceExitedError(id, [name], "restart", done);
+    if (await gone()) throw instanceExitedError(id, [name], done);
     throw restartFailedError(target, name, outcome.message, done);
   }
   return {
@@ -3669,7 +3539,8 @@ async function reapAndCleanupOrphan(
   rmSync(socketPath, { force: true });
   rmSync(paths.configPath, { force: true });
   clearPendingReload(anchor, orphan.id);
-  clearStopIncomplete(anchor, orphan.id);
+  // A 0.2.0 `stop` marker (removed in 0.3.0); drop after 0.3.x.
+  clearLegacyStopMarker(anchor, orphan.id);
   return { ...reapPart, forceKilled: stop.forceKilled };
 }
 
@@ -4067,7 +3938,7 @@ function serviceNotFoundError(
 }
 
 /** The verbs that act on named services of this worktree's instance (ADR-0009). */
-type NamedServiceCommand = "restart" | "stop";
+type NamedServiceCommand = "restart";
 
 /** What `resolveNamedServices` hands a per-service verb. */
 interface NamedServices {
@@ -4538,7 +4409,7 @@ function assertNoPendingReload(args: {
   readonly isolated: ReadonlyArray<Pick<ResolvedService, "name" | "namespace">>;
   readonly requested: ReadonlyArray<string>;
   readonly isAlive: (pid: number) => boolean;
-  /** Who is refusing (#223): a per-service verb refuses too, as the update would undo it. */
+  /** Who is refusing (#222): `restart` refuses too, as the update would wait on its new run forever. */
   readonly command?: "up" | NamedServiceCommand;
   /** What the remedy says to rerun once the reload is done. Default `devtrees up`. */
   readonly retry?: string;
@@ -4584,9 +4455,7 @@ function pendingRemedyUp(args: {
 }
 
 /**
- * Why a command refuses while a hot-reload is pending (#191). A stop (#223):
- * when the pending update finishes it starts the new copy, which would bring
- * a stopped service back without any `up`. A restart (#222): the update is
+ * Why a command refuses while a hot-reload is pending (#191). A restart (#222): the update is
  * waiting on the old run, and a run started now is one it does not know
  * about, so it would wait on it forever.
  */
@@ -4594,9 +4463,6 @@ const PENDING_RELOAD_CONSEQUENCE: Readonly<Record<"up" | NamedServiceCommand, st
   up:
     "Reloading again now would make process-compose start a second, untracked copy, " +
     "so nothing was reloaded and the instance is unchanged.",
-  stop:
-    "When that update finishes, process-compose starts the new copy, which would undo " +
-    "this command, so nothing was touched and the instance is unchanged.",
   restart:
     "The update is still waiting on the old run, and a run restarted now would be one it " +
     "does not know about and would wait on forever, so nothing was restarted and the " +
@@ -4623,8 +4489,6 @@ function reloadPendingError(
           `Wait a moment for process-compose to start the new one, then run ` +
             `\`${retry}\` again. If this persists, run \`${rebootCommand}\`.`,
         ];
-  // A stop is refused too (#223): when the pending update finishes it starts
-  // the new copy, which would bring a stopped service back without any `up`.
   const consequence = PENDING_RELOAD_CONSEQUENCE[command];
   return new ConfigDriftError(
     `devtrees ${command}: a previous hot-reload of '${worktreeId}' is still pending for ` +

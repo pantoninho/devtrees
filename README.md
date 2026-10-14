@@ -37,7 +37,6 @@ Commands (from the exported `COMMANDS` manifest in [`src/cli.ts`](src/cli.ts)):
 | ------------------- | ------------------------------------------------------------------------- |
 | `devtrees up`       | Bring up this worktree's stack                                            |
 | `devtrees down`     | Stop this worktree's stack (`--shared` tears down the shared instance)    |
-| `devtrees stop`     | Stop named services (or `-n` namespaces) of this worktree's instance until the next `up` |
 | `devtrees restart`  | Restart named isolated services (or `-n` namespaces) in place; the rest of the stack keeps running |
 | `devtrees ls`       | List every instance with status, namespaces and ports (`--services`)     |
 | `devtrees attach`   | Attach a TUI to this worktree's instance (`--shared` for the shared one)  |
@@ -80,35 +79,16 @@ Flag highlights (run `devtrees <cmd> --help` for the full per-command surface):
   says why: `(unresponsive)`, `(unknown)`, `(stale)` or `(none)`. While a
   timed-out hot-reload is still pending, `ls` counts its services as booted,
   sets `reload_pending: true`, and notes it on stderr.
-- `devtrees stop <service...>` stops one or more named isolated services and
-  waits until they have exited, with `down`'s bounded force-kill. The stop is
-  **transient**: process-compose reports a stopped service exactly like a
-  crashed one, so the next `devtrees up` starts it again. That is the only way
-  back; there is no `start`. A bare `stop` fails `INVALID_ARGS` (use `down`),
-  and a stop that would leave nothing running fails `LAST_SERVICES_RUNNING`,
-  because process-compose exits once nothing runs. See
-  [ADR-0009](docs/adr/0009-per-service-and-per-namespace-lifecycle-control.md).
-- `stop` and `restart` take a repeatable `-n <namespace>`, alone or mixed
-  with names (`devtrees stop -n ios`, `devtrees restart -n app worker`). It
-  expands to every isolated service of that namespace in the running
-  instance (a service in several namespaces is in each); the union with the
-  names, each once, then goes through the same checks and the same stop or
-  restart. `stop -n` is transient like `stop`: `devtrees up -n ios` brings
-  the namespace back. Shared services, which have no namespace and so sit in
-  `default`, are skipped and reported (`skipped_shared` under `--json`);
-  naming one is still `SHARED_SERVICE_REFUSED`. A namespace the instance
-  did not boot fails `NAMESPACE_NOT_RUNNING`; one with no isolated service
-  fails `NO_SERVICES_SELECTED`.
 - `devtrees restart <service>...` restarts named isolated services of this
   worktree's running instance in place, one at a time in `depends_on` order:
-  it stops the service the way `stop` does (waiting for the old process to
-  exit, force-killing it after the same budget as `down`, named in
-  `force_killed`), starts it, and waits for it to be healthy before
-  restarting the services that depend on it (`--wait-timeout <seconds>`, one
-  budget for all of them, default 120s). The instance, the ports and every
-  other service keep running; dependents of a named service are not
-  restarted, and a stopped one is simply started. It refuses what `stop`
-  refuses before anything is touched (`SHARED_SERVICE_REFUSED`,
+  it stops the service (waiting for the old process to exit, force-killing
+  it after the same budget as `down`, named in `force_killed`), starts it,
+  and waits for it to be healthy before restarting the services that depend
+  on it (`--wait-timeout <seconds>`, one budget for all of them, default
+  120s). The instance, the ports and every other service keep running;
+  dependents of a named service are not restarted, and a stopped one is
+  simply started. It refuses before anything is touched
+  (`SHARED_SERVICE_REFUSED`,
   `CONFIG_DRIFT` for a pending reload, `NAMESPACE_NOT_RUNNING`,
   `SERVICE_PENDING` for a service still waiting on its dependencies), and the
   instance's last running process (`LAST_SERVICES_RUNNING`: its stop would
@@ -127,6 +107,20 @@ Flag highlights (run `devtrees <cmd> --help` for the full per-command surface):
   read which namespaces are running, the remedy boots every declared one,
   and the message says so. See
   [ADR-0009](docs/adr/0009-per-service-and-per-namespace-lifecycle-control.md).
+- `restart` takes a repeatable `-n <namespace>`, alone or mixed with names
+  (`devtrees restart -n app worker`). It expands to every isolated service
+  of that namespace in the running instance (a service in several
+  namespaces is in each); the union with the names, each once, then goes
+  through the same checks and the same restart. Shared services, which have
+  no namespace and so sit in `default`, are skipped and reported
+  (`skipped_shared` under `--json`); naming one is still
+  `SHARED_SERVICE_REFUSED`. A namespace the instance did not boot fails
+  `NAMESPACE_NOT_RUNNING`; one with no isolated service fails
+  `NO_SERVICES_SELECTED`.
+- There is no `devtrees stop` (removed in 0.3.0, see ADR-0009's amendment):
+  `restart` cycles a live-but-bad service, and to stop a service by hand
+  (to run it yourself on its port, say) use `devtrees attach` and stop it in
+  the process-compose TUI. The next `devtrees up` starts it again.
 - `down`, `attach`, and `logs` accept `--shared` to target the shared instance
   instead of this worktree's.
 - Every command accepts `--json` (see below).
@@ -306,18 +300,17 @@ footer lists the subset that command can actually emit.
 | `DOWN_INCOMPLETE`           | process-compose stopped, but something the instance started is still alive: a listener on a booted service's port, or a member of a service's process group that survived SIGKILL; `details.survivors` lists each `{service, pid, command, port_name?, port?, port_forwarder?}`, `details.remedy` says what to do. A retried `down` checks the same ports again. |
 | `SERVICE_NOT_FOUND`         | The named service does not exist in the target instance; `details.valid_services` lists the known ones. |
 | `HEALTH_TIMEOUT`            | Stack started but services did not report healthy before the wait window expired, or a selected service is dead, including one `up` or `restart` restarted (`details.dead_services`); after `restart`, `devtrees restart <service>` retries it. |
-| `NAMESPACE_NOT_RUNNING`     | `up -n` named a namespace the running instance was not booted with, or `stop` or `restart` named a service in one, or such a namespace with `-n`; `details` has `{worktree_id, namespaces, services, remedy}`, the remedy being the `down` + `up` that boots it. |
+| `NAMESPACE_NOT_RUNNING`     | `up -n` named a namespace the running instance was not booted with, or `restart` named a service in one, or such a namespace with `-n`; `details` has `{worktree_id, namespaces, services, remedy}`, the remedy being the `down` + `up` that boots it. |
 | `SHARED_SERVICE_DEAD`       | A shared service in the running shared instance is dead; it is not restarted from a worktree, run `details.remedy` (`devtrees down --shared && devtrees up`). |
 | `SERVICE_START_FAILED`      | `up` tried to restart a dead service on the running instance, or `restart` a named one, and process-compose refused; `details.services` names each one, `details.remedy` says what to run next. The instance is still running. |
-| `SHARED_SERVICE_REFUSED`    | A per-service command named a shared service; a worktree never stops the shared instance's services. Nothing was touched; `details` has `{services, remedy}`, the remedy being `devtrees down --shared && devtrees up` (for every worktree). |
-| `LAST_SERVICES_RUNNING`     | `stop` or `restart` would leave the instance with no running process (a `Pending` service does not count), and process-compose would then exit and take the instance down; nothing was touched. `details.services` names them, `details.remedy` is `devtrees down` for `stop`, and for `restart` the `down` + `up` that restarts the instance. |
-| `SERVICE_PENDING`           | `stop` or `restart` named a service still waiting on its dependencies (`Pending`): it has not started, so there is nothing to stop or restart, and nothing was touched. `details` has `{services, waiting_on, remedy}`: wait until it starts, or stop (restart) what it waits on. |
-| `SERVICE_STOP_INCOMPLETE`   | `stop` stopped the services, but after the bounded stop and the force-kill something is still alive or still holds one of their ports: a listener on a port (not necessarily one they started), a process that survived SIGKILL, or a service process-compose still reports running; `details.survivors` lists each `{service, pid, command, port_name?, port?, port_forwarder?}`, `details.force_killed` what devtrees signalled, `details.remedy` what to do. Rerunning the same `stop` checks the same ports again. |
+| `SHARED_SERVICE_REFUSED`    | `restart` named a shared service; a worktree never restarts the shared instance's services. Nothing was touched; `details` has `{services, remedy}`, the remedy being `devtrees down --shared && devtrees up` (for every worktree). |
+| `LAST_SERVICES_RUNNING`     | `restart` would have to stop the instance's last running process (a `Pending` service does not count), and process-compose would then exit and take the instance down; nothing was touched. `details.services` names them, `details.remedy` is the `down` + `up` that restarts the instance. |
+| `SERVICE_PENDING`           | `restart` named a service still waiting on its dependencies (`Pending`): it has not started, so there is nothing to restart, and nothing was touched. `details` has `{services, waiting_on, remedy}`: wait until it starts, or restart what it waits on. |
 | `CONFIG_DRIFT`              | Running config differs from devtrees.yaml and hot-reload failed, or an earlier reload is still pending; `details.reason` is `timeout`, `not_supported`, `error`, or `reload_pending` (nothing was reloaded: kill `details.pids`, then retry; empty `pids` means the old process is gone and process-compose is still starting the new one, so retry shortly). |
 | `SHARED_DRIFT`              | This worktree's shared services diverge from the running shared instance; bring shared down and up again. |
 | `SHARED_START_FAILED`       | The lazy-started shared instance died before binding its control socket; `details.config_path` is the config to run by hand. |
 | `WORKTREE_START_FAILED`     | This worktree's instance died before binding its control socket; `details.config_path` is the config to run by hand. |
-| `NO_SERVICES_SELECTED`      | The selection has no services: a bare `up` starts only the `default` namespace and it has none, or `-n` names only namespaces with none, or a `stop -n` / `restart -n` namespace has no isolated service (`details.selected_namespaces` names it; nothing was touched). `details.namespaces` lists the namespaces to pass with `-n`. |
+| `NO_SERVICES_SELECTED`      | The selection has no services: a bare `up` starts only the `default` namespace and it has none, or `-n` names only namespaces with none, or a `restart -n` namespace has no isolated service (`details.selected_namespaces` names it; nothing was touched). `details.namespaces` lists the namespaces to pass with `-n`. |
 | `SOCKET_PATH_TOO_LONG`      | The control socket path exceeds the platform's unix-socket limit; set `DEVTREES_RUNTIME_DIR` to a shorter directory. |
 | `STALE_PORT_BLOCK`          | Foreign listeners hold ports in this worktree's allocated block (likely orphans); `details.collisions[]` lists each `{port_name, port, pid, command, accepts_connections, port_forwarder}`. Never kill a holder with `accepts_connections: false` or `port_forwarder: true`. |
 | `LOCK_CONTENTION`           | Another devtrees process holds a devtrees lock (allocation registry or an instance's lifecycle lock). |
@@ -437,32 +430,25 @@ are. It never stops anything, and never attaches the TUI.
   instance stopped; the next `down` checks the same ports again.
 - A dead shared service fails `up` with `SHARED_SERVICE_DEAD`; run
   `devtrees down --shared && devtrees up`.
-- `devtrees stop <service...>` stops named services and keeps the rest of
-  the stack running (e.g. give a simulator back while the backend serves).
-  It waits until each one has exited, force-killing it after the same budget
-  as `down` (named in `force_killed`). The stop is **transient**: the next
-  `devtrees up` starts them again, and that is how you bring one back (there
-  is no `start`). Stopping a service that is not running succeeds. It refuses
-  a shared service (`SHARED_SERVICE_REFUSED`) and a stop that would leave
-  nothing running (`LAST_SERVICES_RUNNING`; use `devtrees down`).
-- `-n <namespace>` on `stop` or `restart` acts on every isolated service of
-  that namespace (`devtrees stop -n ios`, `devtrees restart -n app`), and can
-  be mixed with names. `devtrees up -n <namespace>` brings a stopped one
-  back. Shared services are skipped and listed in `skipped_shared`. A
-  namespace the stack was not booted with fails `NAMESPACE_NOT_RUNNING`, and
-  one with no isolated service `NO_SERVICES_SELECTED`.
 - To cycle one service without touching the rest (a wedged dev server, say),
   run `devtrees restart <service>...`. It restarts only the services it
   names, in `depends_on` order, keeps their ports and the instance, and
-  never restarts their dependents (name those too). Each one is stopped as
-  `stop` stops it, started again, and waited on like `up` (`--wait-timeout`)
-  before the next. Failures read the same: `HEALTH_TIMEOUT` leaves the stack
-  running (`devtrees restart <service>` tries again), `SERVICE_START_FAILED`
-  means process-compose refused. It refuses what `stop` refuses, and the
-  stack's last running process (`LAST_SERVICES_RUNNING`: use
-  `details.remedy`, a `down` + `up`). To restart the whole stack, use that
-  `down` + `up` too: a bare `devtrees restart` fails `INVALID_ARGS` and
-  prints it.
+  never restarts their dependents (name those too). Each one is stopped
+  (waiting until it has exited, force-killing it after the same budget as
+  `down`, named in `force_killed`), started again, and waited on like `up`
+  (`--wait-timeout`) before the next. Failures read the same:
+  `HEALTH_TIMEOUT` leaves the stack running (`devtrees restart <service>`
+  tries again), `SERVICE_START_FAILED` means process-compose refused. It
+  refuses a shared service (`SHARED_SERVICE_REFUSED`), a service still
+  waiting on its dependencies (`SERVICE_PENDING`), and the stack's last
+  running process (`LAST_SERVICES_RUNNING`: use `details.remedy`, a `down` +
+  `up`). To restart the whole stack, use that `down` + `up` too: a bare
+  `devtrees restart` fails `INVALID_ARGS` and prints it.
+- `-n <namespace>` on `restart` acts on every isolated service of that
+  namespace (`devtrees restart -n app`), and can be mixed with names. Shared
+  services are skipped and listed in `skipped_shared`. A namespace the stack
+  was not booted with fails `NAMESPACE_NOT_RUNNING`, and one with no
+  isolated service `NO_SERVICES_SELECTED`.
 
 ### Handling failures
 
@@ -481,15 +467,14 @@ Branch on `error.code`:
 | `SHARED_DRIFT`              | This worktree's shared services diverge from the running shared instance. Follow the message: `devtrees down --shared && devtrees up`. |
 | `CONFIG_DRIFT`              | The running config differs from `devtrees.yaml` and hot-reload failed, or an earlier reload is still pending. Branch on `details.reason`: `not_supported`/`error` → `devtrees down && devtrees up`. `timeout` → a changed service's old process won't stop: kill that process, then run `devtrees up` again to resync. Or run `devtrees down && devtrees up`: `down` force-kills that old process first and lists it in `force_killed`. `reload_pending` → that earlier reload is still waiting, so `up` reloaded nothing (another reload would start an untracked second copy): kill the old process (`details.pids`, for `details.services`), then run `devtrees up` again. Empty `details.pids` → the old process is gone and process-compose is still starting the new one: retry shortly; if it persists, follow the message's `devtrees down && devtrees up …`. |
 | `SERVICE_NOT_FOUND`         | You named a service that isn't in the instance. `details.valid_services` lists the real names; pick one. |
-| `NO_SERVICES_SELECTED`      | The selection has no services: a bare `up` starts only services with no `namespace:` and there are none, or `-n` names only namespaces with none (on `stop` or `restart`, any `-n` namespace with no isolated service, in `details.selected_namespaces`). `details.namespaces` lists the namespaces; retry with one of them. |
+| `NO_SERVICES_SELECTED`      | The selection has no services: a bare `up` starts only services with no `namespace:` and there are none, or `-n` names only namespaces with none (on `restart`, any `-n` namespace with no isolated service, in `details.selected_namespaces`). `details.namespaces` lists the namespaces; retry with one of them. |
 | `INSTANCE_NOT_FOUND`        | No instance is running for this worktree. Run `devtrees up` first.                            |
 | `INSTANCE_UNRESPONSIVE`     | The instance may be running but its process-compose did not answer (busy or frozen). Nothing changed. **Retry** in a moment; if it persists, follow `details.remedy`. Do not delete the socket by hand. |
 | `DOWN_TIMEOUT`              | `down` could not finish: process-compose was still running after devtrees force-killed the stuck services (`details.stuck_services`; empty when it is waiting on a `shutdown.command` that does not exit), or a timed-out hot-reload was still being applied, so `down` did not start the stop (`details.pending_reload`; `details.remedy` names the old process to kill by hand first, which is safe because no stop is running). Nothing was removed. **Retry** `down` once; if it fails again, **surface it to the human** with `details.remedy`, which names the process-compose pid to stop by hand, or for a pending reload the old process to kill. |
 | `DOWN_INCOMPLETE`           | `down` stopped process-compose, but something the instance started is still alive (`details.survivors`): a listener on a booted service's port (a container whose `shutdown.command` did not remove it, say), or a member of a service's process group that survived SIGKILL. Run `devtrees down` **once more**: with process-compose gone it runs every `shutdown.command` itself, checks the same ports again, and succeeds once they are free. If it fails the same way, **surface the survivors to the human** with `details.remedy`. Never kill a survivor with `port_forwarder: true`; stop the container that publishes its port. |
-| `SHARED_SERVICE_REFUSED`    | You asked `stop` for a shared service. Nothing was touched; a worktree never stops what other worktrees share. Leave it, or stop the shared instance with `devtrees down --shared`. |
-| `LAST_SERVICES_RUNNING`     | `stop` or `restart` would leave nothing running, and process-compose would then exit and take the whole stack down. Nothing was touched. To stop everything, run `devtrees down`; to restart it, run `details.remedy` (`devtrees down && devtrees up …`). |
-| `SERVICE_PENDING`           | You asked `stop` or `restart` for a service still waiting on its dependencies: it has not started, so nothing was touched. Wait until it starts, or stop what it waits on (`details.waiting_on`, the command is in `details.remedy`). |
-| `SERVICE_STOP_INCOMPLETE`   | `stop` stopped the services, but something they started is still alive (`details.survivors`): usually a listener on one of their ports that left the process group. **Surface the survivors to the human** with `details.remedy`; rerun the same `stop` once they are gone. Never kill a survivor with `port_forwarder: true`. |
+| `SHARED_SERVICE_REFUSED`    | You asked `restart` for a shared service. Nothing was touched; a worktree never restarts what other worktrees share. Leave it, or restart the shared instance with `details.remedy` (`devtrees down --shared && devtrees up`). |
+| `LAST_SERVICES_RUNNING`     | `restart` would have to stop the last running process, and process-compose would then exit and take the whole stack down. Nothing was touched. To restart the stack, run `details.remedy` (`devtrees down && devtrees up …`). |
+| `SERVICE_PENDING`           | You asked `restart` for a service still waiting on its dependencies: it has not started, so nothing was touched. Wait until it starts, or restart what it waits on (`details.waiting_on`, the command is in `details.remedy`). |
 | `PROCESS_COMPOSE_NOT_FOUND` | The `process-compose` binary is missing. **Surface this to the human** — it's an environment setup gap you can't fix.   |
 | `PROCESS_COMPOSE_TOO_OLD`   | The installed `process-compose` is below the minimum (v1.122.0). **Surface this to the human** — they need to upgrade it. |
 | `CONFIG_INVALID` / `INVALID_ARGS` | The config or your arguments are malformed. Fix the input; don't retry blindly.        |
