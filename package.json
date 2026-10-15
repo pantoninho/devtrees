@@ -1,6 +1,6 @@
 {
   "name": "devtrees",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Run a project's process-compose stack across multiple git worktrees without collision.",
   "homepage": "https://github.com/pantoninho/devtrees#readme",
   "bugs": {
