@@ -3369,6 +3369,168 @@ describe.skipIf(!ENABLED)("real-pc smoke — namespaced shared services (#236)",
   }, 120_000);
 });
 
+/**
+ * Dead shared services are restarted by `up` (#240, ADR-0008) against the
+ * real binary: `process start` on the shared socket, under the shared lock,
+ * health-waited, and never touching a running shared service.
+ */
+describe.skipIf(!ENABLED)("real-pc smoke — restarting dead shared services (#240)", () => {
+  interface SharedRestartUp {
+    readonly up: { readonly env: Record<string, string>; readonly shared_restarted: string[] };
+  }
+  interface ErrorDoc {
+    readonly error?: { code?: string; message?: string; details?: Record<string, unknown> };
+  }
+
+  /**
+   * Two worktrees (`login`, `billing`) over one stack: shared `pg` (an HTTP
+   * server with a readiness probe; argv `--directory <root>/pgdir`), shared
+   * `cache` (a sleeper), shared `crasher` (a sleeper that exits 4 once
+   * `<root>/crash-armed` exists) and an isolated `web`. Both worktrees are up.
+   */
+  function sharedStack(prefix: string) {
+    const repo = buildSmokeRepo(prefix, ["login", "billing"]);
+    currentCtx = { pidNeedle: repo.root, root: repo.root };
+    const login = repo.worktrees.login!;
+    const billing = repo.worktrees.billing!;
+    const pgDir = join(repo.root, "pgdir");
+    mkdirSync(pgDir, { recursive: true });
+    const armed = join(repo.root, "crash-armed");
+    const yaml = [
+      "services:",
+      "  pg:",
+      "    tier: shared",
+      // Slow to serve (3s), like a database warming up: the window in which
+      // pg runs but its probe has not passed is what scenario 122 races.
+      `    command: "sh -c 'sleep 3; exec python3 -m http.server $PG_PORT --bind 127.0.0.1 --directory ${pgDir}'"`,
+      "    ports: [PG_PORT]",
+      "    readiness_probe:",
+      "      exec:",
+      `        command: "sh -c 'curl -fsS --max-time 2 -o /dev/null http://127.0.0.1:$PG_PORT/'"`,
+      "      initial_delay_seconds: 1",
+      "      period_seconds: 1",
+      "      timeout_seconds: 3",
+      "      failure_threshold: 30",
+      "  cache:",
+      "    tier: shared",
+      `    command: "python3 ${sleeper(repo.root, "cache")}"`,
+      "  crasher:",
+      "    tier: shared",
+      `    command: "python3 ${sleeper(repo.root, "crasher", armed)}"`,
+      "  web:",
+      "    tier: isolated",
+      `    command: "python3 ${sleeper(repo.root, "web")}"`,
+      "",
+    ].join("\n");
+    writeFileSync(join(login, "devtrees.yaml"), yaml);
+    writeFileSync(join(billing, "devtrees.yaml"), yaml);
+    cleanupStack.push(() => devtrees(login, ["down", "--shared"]));
+    cleanupStack.push(() => devtrees(login, ["down"]));
+    cleanupStack.push(() => devtrees(billing, ["down"]));
+    const needles = {
+      pg: `--directory ${pgDir}`,
+      cache: join(repo.root, "cache.py"),
+      crasher: join(repo.root, "crasher.py"),
+      web: join(repo.root, "web.py"),
+    };
+    return { repo, login, billing, armed, needles };
+  }
+
+  const upJson = (wt: string, timeout = "60"): CliResult =>
+    devtrees(wt, ["up", "--json", "--wait-timeout", timeout]);
+
+  async function bothUp(s: ReturnType<typeof sharedStack>): Promise<number> {
+    const first = upJson(s.login);
+    expect(first.code, `login up: ${first.stderr} ${first.stdout}`).toBe(0);
+    const second = upJson(s.billing);
+    expect(second.code, `billing up: ${second.stderr} ${second.stdout}`).toBe(0);
+    const port = Number((first.doc as SharedRestartUp).up.env.PG_PORT);
+    expect(await httpStatusWithin(port, 10_000)).toBe(200);
+    return port;
+  }
+
+  async function kill(needle: string): Promise<void> {
+    const pids = pidsMatching(needle);
+    expect(pids.length, `${needle} should be running`).toBeGreaterThan(0);
+    reapPids(pids);
+    expect(await waitForNoPids(needle, 5000)).toEqual([]);
+  }
+
+  it("scenario 121: a killed shared service is restarted by another worktree's up; the other shared services keep their pids", async () => {
+    const s = sharedStack("dt-rpc121-");
+    const port = await bothUp(s);
+    const cachePids = pidsMatching(s.needles.cache);
+    const crasherPids = pidsMatching(s.needles.crasher);
+    const webPids = pidsMatching(s.needles.web);
+
+    await kill(s.needles.pg);
+    expect(await httpStatus(port)).toBe(0);
+
+    // billing restarts it and waits for its probe; nothing else is touched.
+    const again = upJson(s.billing);
+    expect(again.code, `billing re-up should restart pg: ${again.stderr} ${again.stdout}`).toBe(0);
+    expect((again.doc as SharedRestartUp).up.shared_restarted).toEqual(["pg"]);
+    expect(await httpStatusWithin(port, 5000)).toBe(200);
+    expect(pidsMatching(s.needles.pg)).toHaveLength(1);
+    expect(pidsMatching(s.needles.cache)).toEqual(cachePids);
+    expect(pidsMatching(s.needles.crasher)).toEqual(crasherPids);
+    expect(pidsMatching(s.needles.web)).toEqual(webPids);
+
+    // Converged: login's up finds it running and restarts nothing.
+    const login = upJson(s.login);
+    expect(login.code, `login re-up: ${login.stderr}`).toBe(0);
+    expect((login.doc as SharedRestartUp).up.shared_restarted).toEqual([]);
+  }, 180_000);
+
+  it("scenario 122: two concurrent ups from different worktrees restart the dead shared service once", async () => {
+    const s = sharedStack("dt-rpc122-");
+    const port = await bothUp(s);
+    const cachePids = pidsMatching(s.needles.cache);
+    await kill(s.needles.pg);
+
+    // Each up, as soon as it exits 0, must find pg serving: the one that did
+    // not restart it waits for its probe too, not just for it to run.
+    const upThenProbe = async (wt: string) => {
+      const r = await devtreesAsync(wt, ["up", "--json", "--wait-timeout", "60"]);
+      return { r, status: await httpStatus(port) };
+    };
+    const results = await Promise.all([upThenProbe(s.login), upThenProbe(s.billing)]);
+    for (const { r, status } of results) {
+      expect(r.code, `concurrent up: ${r.stderr} ${r.stdout}`).toBe(0);
+      expect(status, "pg must answer when up returns").toBe(200);
+    }
+    const restarted = results.map(({ r }) => (r.doc as SharedRestartUp).up.shared_restarted);
+    expect(restarted.flat()).toEqual(["pg"]);
+    expect(pidsMatching(s.needles.pg)).toHaveLength(1);
+    expect(pidsMatching(s.needles.cache)).toEqual(cachePids);
+  }, 180_000);
+
+  it("scenario 123: a restarted shared service that dies straight away fails fast with SHARED_SERVICE_DEAD died_again", async () => {
+    const s = sharedStack("dt-rpc123-");
+    await bothUp(s);
+    const cachePids = pidsMatching(s.needles.cache);
+    writeFileSync(s.armed, "");
+    await kill(s.needles.crasher);
+
+    const started = Date.now();
+    const again = upJson(s.billing);
+    const elapsed = Date.now() - started;
+    expect(again.code, `re-up should fail: ${again.stdout}`).toBe(1);
+    const err = (again.doc as ErrorDoc).error;
+    expect(err?.code).toBe("SHARED_SERVICE_DEAD");
+    expect(err?.message).toContain("crasher (Completed, exit 4)");
+    expect(err?.message).toContain("died again");
+    expect(err?.details).toMatchObject({
+      dead_services: [{ name: "crasher", exit_code: 4 }],
+      reason: "died_again",
+      remedy: "devtrees down --shared && devtrees up",
+    });
+    // Fail-fast: the restarted corpse is not waited on for the full window.
+    expect(elapsed).toBeLessThan(30_000);
+    expect(pidsMatching(s.needles.cache)).toEqual(cachePids);
+  }, 120_000);
+});
+
 if (!ENABLED) {
   describe("real-pc smoke — gated", () => {
     it.skip(SKIP_REASON, () => {});

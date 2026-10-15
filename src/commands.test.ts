@@ -38,7 +38,7 @@ import {
   type WithLifecycleLock,
   type WithSharedLock,
 } from "./commands.js";
-import { withLifecycleLock } from "./registry.js";
+import { withLifecycleLock, withSharedLock } from "./registry.js";
 import { deriveWorktreeId } from "./anchor.js";
 import { deriveSharedConfig, deriveWorktreeConfig, type DerivedConfig } from "./deriver.js";
 import type { RegistrySnapshot } from "./allocator.js";
@@ -291,6 +291,9 @@ function stubDeps(opts: {
     // stub — the default polls a real `process-compose` over the UDS, which
     // would hang the unit test. Tests that *do* care override this field.
     waitForHealth: () => Promise.resolve(),
+    // Same for the wait on an already-running shared instance's services
+    // (#240); the tests that care use the real one.
+    waitForSharedReady: () => Promise.resolve(),
     // Default verdict "running" preserves the pre-#80 semantics existing
     // tests fake liveness with (touching a plain file at the socket path).
     probeSocket: opts.probeSocket ?? (async () => "running" as const),
@@ -5752,7 +5755,11 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
     expect(err?.message).toContain("after 300ms");
   });
 
-  it("a dead shared service fails up with SHARED_SERVICE_DEAD and the down --shared remedy", async () => {
+  // These shared instances record no shared state (pre-#83): with no revision
+  // to check drift against, a dead shared service is reported, not restarted
+  // (#240). With state, `up` restarts it — see "restarting dead shared
+  // services (#240)" below.
+  it("a dead shared service in a stateless (pre-#83) shared instance fails SHARED_SERVICE_DEAD unknown_revision", async () => {
     const stack: ResolvedStack = {
       services: [shared("db", "postgres", ["DB_PORT"]), isolated("web", "node a.js")],
     };
@@ -5765,14 +5772,15 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
     expect(err?.message).toContain("db (Completed, exit -1)");
     expect(err?.details).toEqual({
       dead_services: [{ name: "db", status: "Completed", exit_code: -1 }],
+      reason: "unknown_revision",
       remedy: "devtrees down --shared && devtrees up",
     });
-    // Reported, never restarted (ADR-0008).
+    // Reported, not restarted.
     expect(spawned.filter((a) => a[0] !== "process")).toEqual([]);
     expect(spawned.filter((a) => a[1] === "start")).toEqual([]);
   });
 
-  it("a FRESH up against an already-running shared instance with a dead service fails SHARED_SERVICE_DEAD before spawning", async () => {
+  it("a FRESH up against a stateless running shared instance with a dead service fails SHARED_SERVICE_DEAD before spawning", async () => {
     // Same check, other path: after `down`, a fresh `up` used to start the
     // worktree over the dead shared service and report `is up`.
     const stack: ResolvedStack = {
@@ -8042,6 +8050,352 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
     const result = await runUp(again.deps);
     expect(result.sharedActivated).toEqual([]);
     expect(again.reloads).toEqual([]);
+  });
+
+  /**
+   * #240: `up` restarts a dead selected shared service instead of failing
+   * SHARED_SERVICE_DEAD — after the drift check, under the shared lock, with
+   * `process start` on the shared socket, in `depends_on` order — then waits
+   * for it. A running shared service is never touched.
+   */
+  describe("restarting dead shared services (#240)", () => {
+    const killedShared = (name: string, pid = 41, exitCode = -1): ServiceStatus => ({
+      name,
+      status: "Completed",
+      health: "unknown",
+      exitCode,
+      pid,
+    });
+    const isStart = (args: ReadonlyArray<string>) => args[0] === "process" && args[1] === "start";
+
+    /**
+     * One worktree's `up` deps against a running shared instance whose `dead`
+     * rows read as given until a `process start` of that service reaches the
+     * shared socket; then `afterStart` (default: running). `starts` records
+     * every `process start`; pass one array to several worktrees to share
+     * the instance's state between them.
+     */
+    function againstDead(
+      fixture: Fixture,
+      stack: ResolvedStack,
+      worktreeId: string,
+      opts: {
+        readonly namespaces: string[];
+        readonly dead: ServiceStatus[];
+        readonly afterStart?: (name: string) => ServiceStatus;
+        readonly refuse?: string;
+        readonly starts?: string[][];
+      },
+    ) {
+      const { deps, reloads, track } = wt(fixture, stack, worktreeId, {
+        namespaces: opts.namespaces,
+      });
+      const starts = opts.starts ?? [];
+      const sharedSock = sharedInstancePaths(fixture.sharedAnchor).socketPath;
+      const inner = deps.driver?.spawner;
+      const worktreeRows = deps.getServiceStatuses;
+      if (inner === undefined || worktreeRows === undefined) throw new Error("expected stubs");
+      const sharedRows = (): ServiceStatus[] => {
+        const started = new Set(starts.filter((a) => a.includes(sharedSock)).map((a) => a[2]));
+        return Object.keys(sharedConfigOf(fixture)).map((name) => {
+          const dead = opts.dead.find((r) => r.name === name);
+          if (dead === undefined) return runningRow(name);
+          if (!started.has(name)) return dead;
+          return opts.afterStart?.(name) ?? runningRow(name);
+        });
+      };
+      const withDead: CommandDeps = {
+        ...deps,
+        // The real wait on the shared services (#240), not the suite's no-op.
+        waitForSharedReady: undefined,
+        getServiceStatuses: async (socketPath, readOpts) =>
+          socketPath === sharedSock ? sharedRows() : worktreeRows(socketPath, readOpts),
+        driver: {
+          ...deps.driver,
+          spawner: (binary, args, options) => {
+            if (isStart(args)) {
+              starts.push([...args]);
+              if (opts.refuse !== undefined) return refusedStart(opts.refuse);
+            }
+            return inner(binary, args, options);
+          },
+        },
+      };
+      return { deps: withDead, starts, reloads, track, sharedSock };
+    }
+
+    /** Start the shared instance (postgres, db-shared) from a first worktree. */
+    async function sharedRunning(prefix: string, stack: ResolvedStack = base) {
+      const fixture = multiWorktreeFixture(prefix);
+      await runUp(wt(fixture, stack, "login", { namespaces: ["app", "db-shared"] }).deps);
+      return fixture;
+    }
+
+    it("a dead always-on shared service is restarted on the shared socket; running ones are untouched", async () => {
+      const fixture = await sharedRunning("dt-rds-basic-");
+      const configBefore = readFileSync(
+        sharedInstancePaths(fixture.sharedAnchor).configPath,
+        "utf8",
+      );
+      const billing = againstDead(fixture, base, "billing", {
+        namespaces: ["app", "db-shared"],
+        dead: [killedShared("postgres")],
+      });
+      const result = await runUp(billing.deps);
+
+      expect(billing.starts).toEqual([
+        ["process", "start", "postgres", "-U", "-u", billing.sharedSock],
+      ]);
+      expect(result.sharedRestarted).toEqual(["postgres"]);
+      expect(result.sharedStarted).toBe(false);
+      expect(result.sharedActivated).toEqual([]);
+      // db-shared, running, was not started, stopped or reloaded; neither was
+      // the shared instance itself.
+      expect(billing.reloads).toEqual([]);
+      expect(billing.track.invocations.some((i) => i.socketPath === billing.sharedSock)).toBe(
+        false,
+      );
+      expect(readFileSync(sharedInstancePaths(fixture.sharedAnchor).configPath, "utf8")).toBe(
+        configBefore,
+      );
+    });
+
+    it("restarts on the running-instance path too (the worktree instance is already up)", async () => {
+      const fixture = await sharedRunning("dt-rds-running-");
+      await runUp(wt(fixture, base, "billing", { namespaces: ["app", "db-shared"] }).deps);
+      const again = againstDead(fixture, base, "billing", {
+        namespaces: ["app", "db-shared"],
+        dead: [killedShared("db-shared")],
+      });
+      const result = await runUp(again.deps);
+      expect(again.starts.map((a) => a[2])).toEqual(["db-shared"]);
+      expect(result.sharedRestarted).toEqual(["db-shared"]);
+      expect(result.restarted).toEqual([]);
+    });
+
+    it("drift first: a drifted selected service fails SHARED_DRIFT and nothing is restarted", async () => {
+      const fixture = await sharedRunning("dt-rds-drift-");
+      const billing = againstDead(fixture, drifted, "billing", {
+        namespaces: ["app", "db-shared"],
+        dead: [killedShared("postgres"), killedShared("db-shared")],
+      });
+      const err = await failure(runUp(billing.deps));
+      expect(err?.code).toBe("SHARED_DRIFT");
+      expect(billing.starts).toEqual([]);
+    });
+
+    it("a dead namespaced shared service this up does not select is left dead", async () => {
+      const fixture = await sharedRunning("dt-rds-unselected-");
+      const billing = againstDead(fixture, base, "billing", {
+        namespaces: ["app", "db"],
+        dead: [killedShared("db-shared")],
+      });
+      const result = await runUp(billing.deps);
+      expect(billing.starts).toEqual([]);
+      expect(result.sharedRestarted).toEqual([]);
+    });
+
+    it("an exit-0 one-shot is done, and a Restarting service is left to process-compose", async () => {
+      const fixture = await sharedRunning("dt-rds-done-");
+      const billing = againstDead(fixture, base, "billing", {
+        namespaces: ["app", "db-shared"],
+        dead: [
+          { name: "postgres", status: "Completed", health: "unknown", exitCode: 0 },
+          { name: "db-shared", status: "Restarting", health: "unknown", exitCode: -1 },
+        ],
+      });
+      // Nothing is started; up still waits for the Restarting service, and
+      // fails not_healthy when it never comes back.
+      const err = await failure(runUp({ ...billing.deps, waitTimeoutMs: 300 }));
+      expect(billing.starts).toEqual([]);
+      expect(err?.code).toBe("SHARED_SERVICE_DEAD");
+      expect(err?.details).toMatchObject({
+        reason: "not_healthy",
+        unhealthy_services: ["db-shared"],
+      });
+    });
+
+    it("an up that restarts nothing still waits for a running shared service that is not ready yet", async () => {
+      // Another worktree's up restarted db-shared: Running, its probe not passed yet.
+      const probed: ResolvedStack = {
+        services: base.services.map((s) =>
+          s.name === "db-shared" ? { ...s, readinessProbe: { exec: { command: "x" } } } : s,
+        ),
+      };
+      const fixture = await sharedRunning("dt-rds-notready-", probed);
+      const billing = againstDead(fixture, probed, "billing", {
+        namespaces: ["app", "db-shared"],
+        dead: [],
+      });
+      const rows = billing.deps.getServiceStatuses;
+      if (rows === undefined) throw new Error("expected stub");
+      let sharedReads = 0;
+      const result = await runUp({
+        ...billing.deps,
+        getServiceStatuses: async (socketPath, o) => {
+          if (socketPath !== billing.sharedSock) return rows(socketPath, o);
+          sharedReads += 1;
+          const ready = sharedReads >= 4;
+          return [
+            runningRow("postgres"),
+            { name: "db-shared", status: "Running", health: ready ? "ready" : "not_ready" },
+          ];
+        },
+      });
+      expect(billing.starts).toEqual([]);
+      expect(result.sharedRestarted).toEqual([]);
+      // It returned only once the probe passed.
+      expect(sharedReads).toBeGreaterThanOrEqual(4);
+    });
+
+    it("on the running path the shared wait runs outside the worktree lifecycle lock; on the fresh path inside it", async () => {
+      const fixture = await sharedRunning("dt-rds-lock-");
+      // A `down` of the same worktree must get the lock while up waits on shared.
+      const lockFreeDuringWait = async (deps: CommandDeps, id: string): Promise<boolean> => {
+        let free: boolean | undefined;
+        await runUp({
+          ...deps,
+          waitForSharedReady: async () => {
+            free = await withLifecycleLock(fixture.sharedAnchor, id, async () => true, {
+              retries: 0,
+            }).catch(() => false);
+          },
+        });
+        if (free === undefined) throw new Error("the shared wait did not run");
+        return free;
+      };
+      const fresh = wt(fixture, base, "billing", { namespaces: ["app", "db-shared"] });
+      const id = idFor(fixture.wtRoot, "billing");
+      expect(await lockFreeDuringWait(fresh.deps, id)).toBe(false);
+      const running = wt(fixture, base, "billing", { namespaces: ["app", "db-shared"] });
+      expect(await lockFreeDuringWait(running.deps, id)).toBe(true);
+    });
+
+    it("dead shared services are started in depends_on order", async () => {
+      const chain: ResolvedStack = {
+        services: [
+          { ...shared("api-shared", "api", ["SAPI_PORT"]), dependsOn: [{ name: "pg" }] },
+          shared("pg", "postgres", ["PG_PORT"]),
+          inNs(isolated("api", "node api.js", ["API_PORT"]), "app"),
+        ],
+      };
+      const fixture = await sharedRunning("dt-rds-order-", chain);
+      const billing = againstDead(fixture, chain, "billing", {
+        namespaces: ["app"],
+        dead: [killedShared("api-shared"), killedShared("pg")],
+      });
+      const result = await runUp(billing.deps);
+      expect(billing.starts.map((a) => a[2])).toEqual(["pg", "api-shared"]);
+      expect(result.sharedRestarted).toEqual(["pg", "api-shared"]);
+    });
+
+    it("a refused start fails SHARED_SERVICE_DEAD start_refused with process-compose's message", async () => {
+      const fixture = await sharedRunning("dt-rds-refused-");
+      const billing = againstDead(fixture, base, "billing", {
+        namespaces: ["app", "db-shared"],
+        dead: [killedShared("postgres")],
+        refuse: 'FTL failed to start process postgres error="boom"',
+      });
+      const err = await failure(runUp(billing.deps));
+      expect(err?.code).toBe("SHARED_SERVICE_DEAD");
+      expect(err?.message).toContain("process-compose refused to start it again");
+      expect(err?.details).toEqual({
+        dead_services: [{ name: "postgres", status: "Completed", exit_code: -1 }],
+        reason: "start_refused",
+        start_failures: [
+          { name: "postgres", message: 'FTL failed to start process postgres error="boom"' },
+        ],
+        remedy: "devtrees down --shared && devtrees up",
+      });
+      expect(classifyError(err as Error).code).toBe("SHARED_SERVICE_DEAD");
+    });
+
+    it("a start answered 'already running' is not a failure and not reported as restarted", async () => {
+      const fixture = await sharedRunning("dt-rds-already-");
+      const billing = againstDead(fixture, base, "billing", {
+        namespaces: ["app", "db-shared"],
+        dead: [killedShared("postgres")],
+        refuse: "FTL failed to start process postgres: process postgres is already running",
+      });
+      const result = await runUp(billing.deps);
+      expect(billing.starts).toHaveLength(1);
+      expect(result.sharedRestarted).toEqual([]);
+    });
+
+    it("a restarted shared service that dies again fails fast with SHARED_SERVICE_DEAD died_again", async () => {
+      const fixture = await sharedRunning("dt-rds-dies-");
+      const billing = againstDead(fixture, base, "billing", {
+        namespaces: ["app", "db-shared"],
+        dead: [killedShared("postgres", 41)],
+        afterStart: (name) => killedShared(name, 77, 1),
+      });
+      const started = Date.now();
+      const err = await failure(runUp({ ...billing.deps, waitTimeoutMs: 60_000 }));
+      expect(Date.now() - started).toBeLessThan(10_000);
+      expect(err?.code).toBe("SHARED_SERVICE_DEAD");
+      expect(err?.message).toContain("devtrees restarted postgres, and it died again");
+      expect(err?.details).toMatchObject({
+        dead_services: [{ name: "postgres", status: "Completed", exit_code: 1 }],
+        reason: "died_again",
+        remedy: "devtrees down --shared && devtrees up",
+      });
+      expect(billing.starts).toHaveLength(1);
+    });
+
+    it("two concurrent ups from different worktrees start the dead service once", async () => {
+      const fixture = await sharedRunning("dt-rds-race-");
+      const starts: string[][] = [];
+      // The real file lock, not the suite's pass-through: without it both ups
+      // read postgres dead and both start it.
+      const realLock: WithSharedLock = (anchor, fn) => withSharedLock(anchor, fn);
+      const opts = { namespaces: ["app", "db-shared"], dead: [killedShared("postgres")], starts };
+      const one = againstDead(fixture, base, "billing", opts);
+      const two = againstDead(fixture, base, "orders", opts);
+      const results = await Promise.all([
+        runUp({ ...one.deps, withSharedLock: realLock }),
+        runUp({ ...two.deps, withSharedLock: realLock }),
+      ]);
+      expect(starts.map((a) => a[2])).toEqual(["postgres"]);
+      expect(results.flatMap((r) => r.sharedRestarted)).toEqual(["postgres"]);
+    });
+
+    it("restarts a dead service before adding a newly selected one", async () => {
+      const fixture = multiWorktreeFixture("dt-rds-add-");
+      await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+      const billing = againstDead(fixture, base, "billing", {
+        namespaces: ["app", "db-shared"],
+        dead: [killedShared("postgres")],
+      });
+      const result = await runUp(billing.deps);
+      expect(result.sharedRestarted).toEqual(["postgres"]);
+      expect(result.sharedActivated).toEqual(["db-shared"]);
+      expect(billing.starts.map((a) => a[2])).toEqual(["postgres"]);
+    });
+
+    it("up --dry-run previews the dead shared services up would restart, and starts nothing", async () => {
+      const fixture = await sharedRunning("dt-rds-dry-");
+      const billing = againstDead(fixture, base, "billing", {
+        namespaces: ["app", "db-shared"],
+        dead: [killedShared("postgres")],
+      });
+      const preview = await runUpDryRun(billing.deps);
+      expect(preview.wouldRestartShared).toEqual(["postgres"]);
+      expect(billing.starts).toEqual([]);
+
+      // Not selected: not previewed.
+      const narrow = againstDead(fixture, base, "billing", {
+        namespaces: ["app", "db"],
+        dead: [killedShared("db-shared")],
+      });
+      expect((await runUpDryRun(narrow.deps)).wouldRestartShared).toEqual([]);
+
+      // Drifted: the real up would fail SHARED_DRIFT and restart nothing.
+      const drift = againstDead(fixture, drifted, "billing", {
+        namespaces: ["app", "db-shared"],
+        dead: [killedShared("db-shared")],
+      });
+      expect((await runUpDryRun(drift.deps)).wouldRestartShared).toEqual([]);
+    });
   });
 
   it("a shared instance with no shared state (pre-#83) cannot have a namespaced service added: SHARED_ACTIVATION_FAILED", async () => {
