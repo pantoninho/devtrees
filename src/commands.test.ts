@@ -58,10 +58,10 @@ import {
   runDir,
   sharedInstancePaths,
 } from "./paths.js";
-import { sharedStackHash, stackHash } from "./hash.js";
+import { sharedServiceHash, sharedStackHash, stackHash } from "./hash.js";
 import { readSharedState } from "./shared-state.js";
 import { readPendingReload, writePendingReload, type PendingReload } from "./reload-pending.js";
-import type { ResolvedStack, ServiceDependency } from "./stack.js";
+import type { ResolvedService, ResolvedStack, ServiceDependency } from "./stack.js";
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
@@ -6463,9 +6463,13 @@ describe("runUp / runEnv — shared port map persistence & drift (#83)", () => {
       shared("postgres", "postgres -D ./pgdata", ["DB_PORT"]),
     ],
   };
-  // Worktree B's branch adds a shared service — a semantic divergence.
+  // Worktree B's branch edits a shared service — a semantic divergence.
   const stackBDivergent: ResolvedStack = {
-    services: [...stackA.services, shared("mq", "rabbitmq-server", ["MQ_PORT"])],
+    services: [
+      shared("postgres", "postgres -D ./pgdata -c fsync=off", ["DB_PORT"]),
+      shared("redis", "redis-server", ["CACHE_PORT"]),
+      isolated("web", "node server.js", ["WEB_PORT"]),
+    ],
   };
 
   /** deps for one worktree against a common anchor/registry fixture. */
@@ -6551,6 +6555,16 @@ describe("runUp / runEnv — shared port map persistence & drift (#83)", () => {
     expect(err.code).toBe("SHARED_DRIFT");
     // The remediation is explicit: bring shared down and up again.
     expect(err.message).toMatch(/down --shared/);
+    // #236: the drifted service is named, with both revisions.
+    expect(err.message).toMatch(/'postgres' \(running [0-9a-f]{12}, this worktree [0-9a-f]{12}\)/);
+    const details = (err as Error & { details?: Record<string, unknown> }).details;
+    expect(details?.services).toEqual([
+      {
+        service: "postgres",
+        running_hash: sharedServiceHash(stackA.services[0] as ResolvedService),
+        local_hash: sharedServiceHash(stackBDivergent.services[0] as ResolvedService),
+      },
+    ]);
     // #111: the message must not embed its own `devtrees:` prefix — the
     // output formatter is the single seam that owns it, so an embedded one
     // renders the doubled `devtrees: devtrees:` on stderr.
@@ -6579,15 +6593,16 @@ describe("runUp / runEnv — shared port map persistence & drift (#83)", () => {
 
     const b = await runUp(bDeps);
     expect(b.sharedStarted).toBe(true);
-    expect(b.env.MQ_PORT).toBeDefined();
 
     const state = readSharedState(fixture.sharedAnchor);
     expect(state?.hash).toBe(sharedStackHash(stackBDivergent));
     expect(state?.ports).toEqual({
       DB_PORT: Number(b.env.DB_PORT),
       CACHE_PORT: Number(b.env.CACHE_PORT),
-      MQ_PORT: Number(b.env.MQ_PORT),
     });
+    expect(state?.services?.postgres?.hash).toBe(
+      sharedServiceHash(stackBDivergent.services[0] as ResolvedService),
+    );
   });
 
   describe("shared-only field edits (#185)", () => {
@@ -7611,5 +7626,451 @@ describe("STALE_PORT_BLOCK holders that refuse connections (#155)", () => {
     );
     // An accepting port forwarder is labelled too (#217's wildcard probe sees OrbStack forwards).
     expect(first.message).toContain("never this process");
+  });
+});
+
+/**
+ * Namespaced shared services and selection-scoped SHARED_DRIFT (#236,
+ * ADR-0010). One shared instance still serves every worktree; a shared
+ * service with a `namespace:` joins it only once an `up` selects that
+ * namespace, and drift is checked only for the shared services an `up`
+ * selects.
+ */
+describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", () => {
+  const inNs = <S extends ResolvedService>(service: S, namespace: string): S => ({
+    ...service,
+    namespace,
+  });
+  // `postgres` is always on; `db-shared` (shared) and `db` (isolated) are the
+  // two database tiers a consumer picks between with `-n`.
+  const stackOf = (dbSharedCommand = "supabase start"): ResolvedStack => ({
+    services: [
+      shared("postgres", "postgres -D ./pgdata", ["DB_PORT"]),
+      inNs(shared("db-shared", dbSharedCommand, ["SB_PORT"]), "db-shared"),
+      inNs(isolated("db", "supabase start --isolated", ["ISO_DB_PORT"]), "db"),
+      inNs(isolated("api", "node api.js", ["API_PORT"]), "app"),
+    ],
+  });
+  const base = stackOf();
+  const drifted = stackOf("supabase start --debug");
+  const runningRow = (name: string): ServiceStatus => ({
+    name,
+    status: "Running",
+    health: "ready",
+  });
+
+  type Fixture = ReturnType<typeof multiWorktreeFixture>;
+
+  /**
+   * Deps for one worktree against a shared fixture, recording every
+   * hot-reload request. The worktree's own project reports its selected
+   * isolated services as running; the shared one reports what its derived
+   * config lists.
+   */
+  function wt(
+    fixture: Fixture,
+    stack: ResolvedStack,
+    worktreeId: string,
+    opts: { reloadStatus?: number; namespaces?: string[]; track?: StubSpawn } = {},
+  ) {
+    const reloads: ControlRequest[] = [];
+    const track = opts.track ?? { invocations: [], touchSocket: true };
+    const deps = stubDeps({
+      stack,
+      worktreeId,
+      anchorOverride: fixture.sharedAnchor,
+      worktreeRootOverride: fixture.wtRoot,
+      registryRef: fixture.registryRef,
+      track,
+    });
+    const sharedConfig = sharedInstancePaths(fixture.sharedAnchor).configPath;
+    const withDriver: CommandDeps = {
+      ...deps,
+      ...(opts.namespaces !== undefined ? { namespaces: opts.namespaces } : {}),
+      driver: {
+        ...deps.driver,
+        controlRequest: reloadAnswering(opts.reloadStatus ?? 200, reloads),
+      },
+      getServiceStatuses: async (socketPath) => {
+        if (socketPath.endsWith("/shared.sock")) {
+          return Object.keys(sharedProcesses(sharedConfig)).map(runningRow);
+        }
+        const ns = opts.namespaces ?? [];
+        return stack.services
+          .filter((s) => s.tier === "isolated" && ns.includes(String(s.namespace)))
+          .map((s) => runningRow(s.name));
+      },
+    };
+    return { deps: withDriver, reloads, track };
+  }
+
+  function sharedProcesses(configPath: string): Record<string, unknown> {
+    if (!existsSync(configPath)) return {};
+    const doc = parseYaml(readFileSync(configPath, "utf8")) as { processes?: object };
+    return (doc.processes ?? {}) as Record<string, unknown>;
+  }
+
+  const sharedConfigOf = (fixture: Fixture) =>
+    sharedProcesses(sharedInstancePaths(fixture.sharedAnchor).configPath);
+
+  async function failure(p: Promise<unknown>) {
+    return p.then(
+      () => undefined,
+      (e: unknown) => e as Error & { code?: string; details?: Record<string, unknown> },
+    );
+  }
+
+  it("an up that does not select a namespaced shared service does not start it", async () => {
+    const fixture = multiWorktreeFixture("dt-nss-unselected-");
+    const result = await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+
+    expect(result.sharedStarted).toBe(true);
+    expect(Object.keys(sharedConfigOf(fixture))).toEqual(["postgres"]);
+    expect(Object.keys(readSharedState(fixture.sharedAnchor)?.services ?? {})).toEqual([
+      "postgres",
+    ]);
+    // Connection info is still injected for every shared service (unchanged).
+    expect(result.env.SB_PORT).toBeDefined();
+  });
+
+  it("a fresh up selecting the namespace starts the shared service with the shared instance", async () => {
+    const fixture = multiWorktreeFixture("dt-nss-fresh-");
+    const result = await runUp(
+      wt(fixture, base, "login", { namespaces: ["app", "db-shared"] }).deps,
+    );
+    expect(result.sharedStarted).toBe(true);
+    expect(result.sharedActivated).toEqual([]);
+    expect(Object.keys(sharedConfigOf(fixture))).toEqual(["postgres", "db-shared"]);
+  });
+
+  it("with only namespaced shared services and none selected, the shared instance is not started", async () => {
+    const fixture = multiWorktreeFixture("dt-nss-none-");
+    const onlyNamespaced: ResolvedStack = {
+      services: base.services.filter((s) => s.name !== "postgres"),
+    };
+    const { deps, track } = wt(fixture, onlyNamespaced, "login", { namespaces: ["app", "db"] });
+    const result = await runUp(deps);
+    expect(result.sharedStarted).toBe(false);
+    expect(track.invocations.some((i) => i.socketPath.endsWith("/shared.sock"))).toBe(false);
+  });
+
+  it("a later up selecting it adds it to the running shared instance, leaving the others as they were", async () => {
+    const fixture = multiWorktreeFixture("dt-nss-activate-");
+    const first = await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+    const postgresBefore = sharedConfigOf(fixture).postgres;
+
+    const second = wt(fixture, base, "billing", { namespaces: ["app", "db-shared"] });
+    const result = await runUp(second.deps);
+
+    expect(result.sharedStarted).toBe(false);
+    expect(result.sharedActivated).toEqual(["db-shared"]);
+    // One reload, sent to the shared instance: process-compose re-reads its config.
+    expect(second.reloads).toHaveLength(1);
+    expect(second.reloads[0]).toMatchObject({
+      socketPath: sharedInstancePaths(fixture.sharedAnchor).socketPath,
+      method: "POST",
+      path: "/project/configuration",
+    });
+    // No second shared spawn, and postgres's process is byte-for-byte unchanged,
+    // so the reload leaves it running.
+    expect(second.track.invocations.some((i) => i.socketPath.endsWith("/shared.sock"))).toBe(false);
+    const after = sharedConfigOf(fixture);
+    expect(Object.keys(after)).toEqual(["postgres", "db-shared"]);
+    expect(after.postgres).toEqual(postgresBefore);
+    // The port the first worktree was told about is the one that was bound.
+    expect(result.env.SB_PORT).toBe(first.env.SB_PORT);
+    const state = readSharedState(fixture.sharedAnchor);
+    expect(state?.ports.SB_PORT).toBe(Number(first.env.SB_PORT));
+    expect(state?.services?.["db-shared"]?.hash).toBe(
+      sharedServiceHash(base.services[1] as ResolvedService),
+    );
+    // The pre-#236 hash stays the always-on subset's, so an older devtrees
+    // beside this one keeps matching.
+    expect(state?.hash).toBe(sharedStackHash({ services: [base.services[0] as ResolvedService] }));
+  });
+
+  it("an up that already finds it running adds nothing", async () => {
+    const fixture = multiWorktreeFixture("dt-nss-noop-");
+    await runUp(wt(fixture, base, "login", { namespaces: ["app", "db-shared"] }).deps);
+    const second = wt(fixture, base, "billing", { namespaces: ["app", "db-shared"] });
+    const result = await runUp(second.deps);
+    expect(result.sharedActivated).toEqual([]);
+    expect(second.reloads).toEqual([]);
+  });
+
+  it("drift in a namespaced shared service does not block an up that does not select it", async () => {
+    const fixture = multiWorktreeFixture("dt-nss-drift-scoped-");
+    await runUp(wt(fixture, base, "login", { namespaces: ["app", "db-shared"] }).deps);
+
+    const result = await runUp(wt(fixture, drifted, "billing", { namespaces: ["app", "db"] }).deps);
+    expect(result.sharedStarted).toBe(false);
+
+    const env = await runEnv(wt(fixture, drifted, "billing").deps);
+    expect(env.env.SB_PORT).toBe(String(readSharedState(fixture.sharedAnchor)?.ports.SB_PORT));
+  });
+
+  it("drift in a namespaced shared service fails an up that selects it, naming only that service", async () => {
+    const fixture = multiWorktreeFixture("dt-nss-drift-selected-");
+    await runUp(wt(fixture, base, "login", { namespaces: ["app", "db-shared"] }).deps);
+
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const err = await failure(
+      runUp(wt(fixture, drifted, "billing", { namespaces: ["app", "db-shared"], track }).deps),
+    );
+    expect(err?.code).toBe("SHARED_DRIFT");
+    expect(err?.message).toMatch(
+      /'db-shared' \(running [0-9a-f]{12}, this worktree [0-9a-f]{12}\)/,
+    );
+    expect(err?.message).not.toMatch(/'postgres'/);
+    expect(err?.details?.services).toEqual([
+      {
+        service: "db-shared",
+        running_hash: sharedServiceHash(base.services[1] as ResolvedService),
+        local_hash: sharedServiceHash(drifted.services[1] as ResolvedService),
+      },
+    ]);
+    expect(err?.details?.remedy).toBe("devtrees down --shared && devtrees up");
+    // Nothing was spawned for the divergent worktree.
+    expect(track.invocations).toEqual([]);
+  });
+
+  it("a bare up on a running instance re-selects the namespaced shared services of the namespaces it booted", async () => {
+    const fixture = multiWorktreeFixture("dt-nss-bare-");
+    // `db-shared` shares the `app` namespace with an isolated service here, so
+    // the boot selection is observable in the worktree project.
+    const appShared = (cmd: string): ResolvedStack => ({
+      services: [
+        shared("postgres", "postgres -D ./pgdata", ["DB_PORT"]),
+        inNs(shared("db-shared", cmd, ["SB_PORT"]), "app"),
+        inNs(isolated("api", "node api.js", ["API_PORT"]), "app"),
+        isolated("web", "node web.js", ["WEB_PORT"]),
+      ],
+    });
+    await runUp(wt(fixture, appShared("supabase start"), "login", { namespaces: ["app"] }).deps);
+
+    // A worktree booted with `-n app`, now on a branch that edited `db-shared`:
+    // its bare re-up reads `app` back and so checks `db-shared`.
+    await runUp(wt(fixture, appShared("supabase start"), "billing", { namespaces: ["app"] }).deps);
+    const bare = wt(fixture, appShared("supabase start --debug"), "billing");
+    const boot = bare.deps.getServiceStatuses;
+    const err = await failure(
+      runUp({
+        ...bare.deps,
+        getServiceStatuses: async (socketPath) =>
+          socketPath.endsWith("/shared.sock") ? (boot?.(socketPath) ?? []) : [runningRow("api")],
+      }),
+    );
+    expect(err?.code).toBe("SHARED_DRIFT");
+
+    // A worktree booted without `app` is not affected by the same edit.
+    await runUp(wt(fixture, appShared("supabase start"), "orders").deps);
+    const other = wt(fixture, appShared("supabase start --debug"), "orders");
+    const ok = await runUp({
+      ...other.deps,
+      getServiceStatuses: async (socketPath) =>
+        socketPath.endsWith("/shared.sock")
+          ? (other.deps.getServiceStatuses?.(socketPath) ?? [])
+          : [runningRow("web")],
+    });
+    expect(ok.sharedActivated).toEqual([]);
+  });
+
+  it("a selected shared service's shared dependency is selected with it", async () => {
+    const fixture = multiWorktreeFixture("dt-nss-closure-");
+    const withDep: ResolvedStack = {
+      services: [
+        inNs(shared("auth-shared", "gotrue", ["AUTH_PORT"]), "auth"),
+        {
+          ...inNs(shared("db-shared", "supabase start", ["SB_PORT"]), "db-shared"),
+          dependsOn: [{ name: "auth-shared" }],
+        },
+        inNs(isolated("api", "node api.js", ["API_PORT"]), "app"),
+      ],
+    };
+    await runUp(wt(fixture, withDep, "login", { namespaces: ["app", "db-shared"] }).deps);
+    expect(Object.keys(sharedConfigOf(fixture))).toEqual(["auth-shared", "db-shared"]);
+  });
+
+  it("a refused reload fails SHARED_ACTIVATION_FAILED, restores the shared config and records nothing", async () => {
+    const fixture = multiWorktreeFixture("dt-nss-refused-");
+    await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+    const configPath = sharedInstancePaths(fixture.sharedAnchor).configPath;
+    const before = readFileSync(configPath, "utf8");
+
+    const err = await failure(
+      runUp(
+        wt(fixture, base, "billing", { namespaces: ["app", "db-shared"], reloadStatus: 500 }).deps,
+      ),
+    );
+    expect(err?.code).toBe("SHARED_ACTIVATION_FAILED");
+    expect(err?.details).toMatchObject({ services: ["db-shared"], reason: "error" });
+    expect(readFileSync(configPath, "utf8")).toBe(before);
+    expect(readSharedState(fixture.sharedAnchor)?.services?.["db-shared"]).toBeUndefined();
+    expect(classifyError(err as Error).code).toBe("SHARED_ACTIVATION_FAILED");
+  });
+
+  it("a not-yet-running service whose port a running shared service owns is SHARED_DRIFT", async () => {
+    const fixture = multiWorktreeFixture("dt-nss-port-");
+    await runUp(wt(fixture, base, "login", { namespaces: ["app", "db-shared"] }).deps);
+    // A branch that renamed `db-shared` but kept its port name.
+    const renamed: ResolvedStack = {
+      services: base.services.map((s) => (s.name === "db-shared" ? { ...s, name: "supabase" } : s)),
+    };
+    const err = await failure(
+      runUp(wt(fixture, renamed, "billing", { namespaces: ["app", "db-shared"] }).deps),
+    );
+    expect(err?.code).toBe("SHARED_DRIFT");
+    expect(err?.details?.port_conflicts).toEqual([
+      { service: "supabase", port: "SB_PORT", owner: "db-shared" },
+    ]);
+  });
+
+  it("drift in an always-on shared service still fails every up and env", async () => {
+    const fixture = multiWorktreeFixture("dt-nss-always-on-");
+    await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+    const edited: ResolvedStack = {
+      services: base.services.map((s) =>
+        s.name === "postgres" ? { ...s, command: "postgres -D ./other" } : s,
+      ),
+    };
+    const err = await failure(
+      runUp(wt(fixture, edited, "billing", { namespaces: ["app", "db"] }).deps),
+    );
+    expect(err?.code).toBe("SHARED_DRIFT");
+    expect((await failure(runEnv(wt(fixture, edited, "billing").deps)))?.code).toBe("SHARED_DRIFT");
+  });
+
+  describe("a shared-state.json written before #236 (no per-service records)", () => {
+    function legacy(fixture: Fixture, hash: string): void {
+      const state = readSharedState(fixture.sharedAnchor);
+      if (state === undefined) throw new Error("expected shared state");
+      writeFileSync(
+        join(fixture.sharedAnchor, "devtrees", "shared-state.json"),
+        JSON.stringify({ hash, ports: state.ports }),
+        "utf8",
+      );
+    }
+
+    it("is attributed to this worktree's definitions when they match it, so adding a service works", async () => {
+      const fixture = multiWorktreeFixture("dt-nss-legacy-");
+      await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+      legacy(fixture, sharedStackHash({ services: [base.services[0] as ResolvedService] }));
+
+      const result = await runUp(
+        wt(fixture, base, "billing", { namespaces: ["app", "db-shared"] }).deps,
+      );
+      expect(result.sharedActivated).toEqual(["db-shared"]);
+      expect(Object.keys(readSharedState(fixture.sharedAnchor)?.services ?? {})).toEqual([
+        "postgres",
+        "db-shared",
+      ]);
+    });
+
+    it("drifts with an unknown revision when they do not match it", async () => {
+      const fixture = multiWorktreeFixture("dt-nss-legacy-drift-");
+      await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+      legacy(fixture, "not-this-stack");
+
+      const err = await failure(
+        runUp(wt(fixture, base, "billing", { namespaces: ["app", "db"] }).deps),
+      );
+      expect(err?.code).toBe("SHARED_DRIFT");
+      expect(err?.message).toMatch(/'postgres' \(running unknown/);
+    });
+  });
+
+  it("up --dry-run reports the shared services the selection includes and previews only those", async () => {
+    const fixture = multiWorktreeFixture("dt-nss-dry-");
+    const without = await runUpDryRun(
+      wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps,
+    );
+    expect(without.selectedSharedServices).toEqual(["postgres"]);
+    expect(Object.keys(without.sharedConfig?.processes ?? {})).toEqual(["postgres"]);
+
+    const withShared = await runUpDryRun(
+      wt(fixture, base, "login", { namespaces: ["app", "db-shared"] }).deps,
+    );
+    expect(withShared.selectedSharedServices).toEqual(["postgres", "db-shared"]);
+    expect(Object.keys(withShared.sharedConfig?.processes ?? {})).toEqual([
+      "postgres",
+      "db-shared",
+    ]);
+  });
+
+  it("a timed-out add is recorded and fails SHARED_ACTIVATION_FAILED; the retried up re-sends the reload", async () => {
+    const fixture = multiWorktreeFixture("dt-nss-timeout-");
+    await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+
+    // process-compose never answers the reload within its budget.
+    const hanging = wt(fixture, base, "billing", { namespaces: ["app", "db-shared"] });
+    const hangingRequest: ControlRequester = (request) =>
+      new Promise((_resolve, reject) => {
+        request.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+      });
+    const onlyPostgres = async (socketPath: string): Promise<ServiceStatus[]> =>
+      socketPath.endsWith("/shared.sock") ? [runningRow("postgres")] : [runningRow("api")];
+    const err = await failure(
+      runUp({
+        ...hanging.deps,
+        driver: { ...hanging.deps.driver, controlRequest: hangingRequest, reloadTimeoutMs: 20 },
+        getServiceStatuses: onlyPostgres,
+      }),
+    );
+    expect(err?.code).toBe("SHARED_ACTIVATION_FAILED");
+    expect(err?.details).toMatchObject({
+      services: ["db-shared"],
+      reason: "timeout",
+      remedy: "retry `devtrees up`",
+    });
+    // Kept and recorded: process-compose may still apply it.
+    expect(Object.keys(sharedConfigOf(fixture))).toEqual(["postgres", "db-shared"]);
+    expect(readSharedState(fixture.sharedAnchor)?.services?.["db-shared"]).toBeDefined();
+
+    // The reload never landed: the instance still runs postgres alone. The
+    // retry must not trust the record — it re-sends the reload.
+    const retry = wt(fixture, base, "billing", { namespaces: ["app", "db-shared"] });
+    const result = await runUp({ ...retry.deps, getServiceStatuses: onlyPostgres });
+    expect(result.sharedActivated).toEqual(["db-shared"]);
+    expect(retry.reloads).toHaveLength(1);
+    expect(Object.keys(sharedConfigOf(fixture))).toEqual(["postgres", "db-shared"]);
+  });
+
+  it("a recorded service the instance runs is not re-added", async () => {
+    const fixture = multiWorktreeFixture("dt-nss-present-");
+    await runUp(wt(fixture, base, "login", { namespaces: ["app", "db-shared"] }).deps);
+    const again = wt(fixture, base, "billing", { namespaces: ["app", "db-shared"] });
+    const result = await runUp(again.deps);
+    expect(result.sharedActivated).toEqual([]);
+    expect(again.reloads).toEqual([]);
+  });
+
+  it("a shared instance with no shared state (pre-#83) cannot have a namespaced service added: SHARED_ACTIVATION_FAILED", async () => {
+    const fixture = multiWorktreeFixture("dt-nss-pre83-");
+    const dir = runDir(fixture.sharedAnchor);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "shared.sock"), "");
+
+    // Always-on only: the old positional fallback still applies.
+    const ok = await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+    expect(ok.sharedStarted).toBe(false);
+
+    const err = await failure(
+      runUp(wt(fixture, base, "billing", { namespaces: ["app", "db-shared"] }).deps),
+    );
+    expect(err?.code).toBe("SHARED_ACTIVATION_FAILED");
+    expect(err?.details).toMatchObject({ services: ["db-shared"], reason: "not_supported" });
+  });
+
+  it("SHARED_DRIFT keeps running_hash/local_hash as the always-on whole-subset hashes", async () => {
+    const fixture = multiWorktreeFixture("dt-nss-hashes-");
+    await runUp(wt(fixture, base, "login", { namespaces: ["app", "db-shared"] }).deps);
+    const err = await failure(
+      runUp(wt(fixture, drifted, "billing", { namespaces: ["app", "db-shared"] }).deps),
+    );
+    const alwaysOn = { services: [base.services[0] as ResolvedService] };
+    expect(err?.details).toMatchObject({
+      running_hash: sharedStackHash(alwaysOn),
+      local_hash: sharedStackHash(alwaysOn),
+    });
   });
 });

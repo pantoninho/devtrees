@@ -10,6 +10,7 @@
 import { describe, expect, it } from "vite-plus/test";
 import {
   ERROR_CODES,
+  ERROR_CODE_DESCRIPTIONS,
   SCHEMA_VERSION,
   classifyError,
   formatDown,
@@ -965,6 +966,36 @@ describe("output formatter — dropped cross-namespace depends_on edges (#179)",
     expect(formatUp({ ...up, sharedFieldChanges: [change] }, "human")).toEqual(
       formatUp(up, "human"),
     );
+  });
+
+  it("up: JSON carries shared_activated, always present; human output names the added services (#236)", () => {
+    const up: UpPayload = { worktreeId: "login", env: {}, sharedStarted: false };
+    const parse = (p: UpPayload) =>
+      JSON.parse(formatUp(p, "json").stdout) as { up: { shared_activated: unknown } };
+    expect(parse({ ...up, sharedActivated: ["sb"] }).up.shared_activated).toEqual(["sb"]);
+    expect(parse(up).up.shared_activated).toEqual([]);
+    expect(formatUp({ ...up, sharedActivated: ["sb"] }, "human").stdout).toMatch(
+      /added shared service\(s\) to the shared instance: sb\./,
+    );
+  });
+
+  it("up --dry-run: JSON carries selected_shared_services, always present; human names them on stderr (#236)", () => {
+    const parse = (p: UpDryRunPayload) =>
+      JSON.parse(formatUpDryRun(p, "json").stdout) as {
+        up_dry_run: { selected_shared_services: unknown };
+      };
+    expect(
+      parse({ ...dry, selectedSharedServices: ["pg", "sb"] }).up_dry_run.selected_shared_services,
+    ).toEqual(["pg", "sb"]);
+    expect(parse(dry).up_dry_run.selected_shared_services).toEqual([]);
+    expect(formatUpDryRun({ ...dry, selectedSharedServices: ["pg"] }, "human").stderr).toMatch(
+      /up would use shared service\(s\): pg/,
+    );
+  });
+
+  it("SHARED_ACTIVATION_FAILED is a documented error code (#236)", () => {
+    expect(ERROR_CODES).toContain("SHARED_ACTIVATION_FAILED");
+    expect(ERROR_CODE_DESCRIPTIONS.SHARED_ACTIVATION_FAILED).toMatch(/untouched/);
   });
 });
 

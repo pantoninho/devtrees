@@ -2,6 +2,8 @@
 
 Devtrees runs two kinds of process-compose instance: a **worktree instance** per worktree (isolated services) and a single **shared instance** for all `shared` services. The shared instance is anchored at — rooted in and discovered via — the repo's git common dir (`git rev-parse --git-common-dir`), which is the main worktree in a normal repo and the bare repo dir in a bare-repo worktree setup. Its lifecycle is independent of any worktree: lazily started by the first worktree that needs it, never stopped when a worktree goes down, torn down only by an explicit command.
 
+> **Amended by [ADR-0010](0010-namespaced-shared-services-and-scoped-drift.md):** the lifecycle above stands, but the instance no longer always runs every shared service. A shared service with a `namespace:` is added to the running instance when an `up` first selects it, and stays until the explicit teardown.
+
 ## Considered Options
 
 - **Host-worktree ownership** (whichever worktree starts first runs the shared services): rejected — `devtrees down` in that worktree kills services other worktrees are actively using.

@@ -16,6 +16,7 @@ import {
 } from "./allocator.js";
 import { resolveAnchor, type GitProbe } from "./anchor.js";
 import {
+  DEVTREES_METADATA_KEY,
   bracedEnvVars,
   deriveSharedConfig,
   deriveWorktreeConfig,
@@ -123,8 +124,22 @@ import {
   sharedFieldChanges,
   writeSharedState,
   type SharedFieldChange,
+  type SharedServiceRecord,
   type SharedState,
 } from "./shared-state.js";
+import {
+  UNKNOWN_REVISION,
+  hasNamespacedShared,
+  isAlwaysOnShared,
+  planSharedSelection,
+  resolveSharedPorts,
+  selectSharedServices,
+  sharedRecords,
+  sharedServicesOf,
+  withServiceRecords,
+  type SharedBlock,
+  type SharedPlan,
+} from "./shared-selection.js";
 import {
   createWaitForHealth,
   createWaitForSharedHealth,
@@ -212,15 +227,24 @@ class ConfigDriftError extends Error {
 }
 
 /**
- * Thrown when this worktree's shared subset (its `shared`-tier services)
- * diverges from what the running shared instance was started with
- * (issue #83) — typically a branch that added, removed, or edited a shared
- * service. Injecting this worktree's recomputed numbers would not match the
- * ports the shared instance actually bound, so `up`/`env` fail loudly with
- * the `SHARED_DRIFT` envelope instead of silently injecting wrong
- * connection info. Remediation mirrors the worktree-level `CONFIG_DRIFT`
- * UX: `devtrees down --shared && devtrees up` restarts shared from this
+ * Thrown when a shared service this `up` selects diverges from the revision
+ * the running shared instance runs (issue #83) — typically a branch that
+ * edited a shared service. Injecting this worktree's recomputed numbers would
+ * not match the ports the shared instance actually bound, so `up`/`env` fail
+ * loudly with the `SHARED_DRIFT` envelope instead of silently injecting wrong
+ * connection info. Remediation mirrors the worktree-level `CONFIG_DRIFT` UX:
+ * `devtrees down --shared && devtrees up` restarts shared from this
  * worktree's config and re-persists the new map.
+ *
+ * Scoped to the selection since #236 (ADR-0010): a shared service the `up`
+ * does not select never trips it, however far it has drifted.
+ * `details.services` names each drifted service with both revisions;
+ * `details.port_conflicts` each named port a not-yet-running selected service
+ * declares that a running shared service already owns. `running_hash` /
+ * `local_hash` keep their pre-#236 meaning, the whole-subset hash
+ * (`sharedStackHash`) of the shared instance's always-on services and of this
+ * worktree's: for a stack with no namespaced shared service, exactly what
+ * they always were. Per-service revisions are only in `services[]`.
  */
 class SharedDriftError extends Error {
   readonly code = "SHARED_DRIFT" as const;
@@ -228,17 +252,45 @@ class SharedDriftError extends Error {
     readonly worktree_id: string;
     readonly running_hash: string;
     readonly local_hash: string;
-  };
-  constructor(
-    message: string,
-    details: {
-      readonly worktree_id: string;
+    readonly services: ReadonlyArray<{
+      readonly service: string;
       readonly running_hash: string;
       readonly local_hash: string;
-    },
-  ) {
+    }>;
+    readonly port_conflicts: ReadonlyArray<{
+      readonly service: string;
+      readonly port: string;
+      readonly owner: string;
+    }>;
+    readonly remedy: string;
+  };
+  constructor(message: string, details: SharedDriftError["details"]) {
     super(message);
     this.name = "SharedDriftError";
+    this.details = details;
+  }
+}
+
+/**
+ * Thrown when adding a selected namespaced shared service to the running
+ * shared instance fails (#236, ADR-0010): process-compose refused the config
+ * reload, could not be reached, or did not finish within its budget. The
+ * services the instance already ran are untouched — the reload only adds
+ * processes. On a refusal the shared derived config is restored; on a timeout
+ * it is kept, because process-compose may still apply it. `details` carries
+ * `{services, reason, config_path, remedy}`.
+ */
+class SharedActivationFailedError extends Error {
+  readonly code = "SHARED_ACTIVATION_FAILED" as const;
+  readonly details: {
+    readonly services: ReadonlyArray<string>;
+    readonly reason: "not_supported" | "error" | "timeout";
+    readonly config_path: string;
+    readonly remedy: string;
+  };
+  constructor(message: string, details: SharedActivationFailedError["details"]) {
+    super(message);
+    this.name = "SharedActivationFailedError";
     this.details = details;
   }
 }
@@ -466,9 +518,10 @@ class InstanceUnresponsiveError extends Error {
  * Throws `NoServicesSelectedError` when the selection resolves to zero
  * isolated services — bare or explicit `-n` (#203: an empty instance is
  * useless, and process-compose exits after reloading one). Only isolated
- * services are counted: namespace selection applies to this worktree's
- * instance only (shared services cannot declare a namespace, #130). A stack
- * with no isolated services at all keeps starting (shared only).
+ * services are counted: the worktree instance holds only those, and one with
+ * nothing selected is useless even when the selection includes namespaced
+ * shared services (#236). A stack with no isolated services at all keeps
+ * starting (shared only).
  *
  * Not used on the running-instance path: what a bare `up` targets there is
  * #177's to define; `assertExplicitSelectionNotEmpty` covers explicit `-n`.
@@ -505,46 +558,106 @@ function assertExplicitSelectionNotEmpty(
   resolveFreshSelection(stack, worktreeId, requested);
 }
 
-/**
- * Compare this worktree's shared subset against the persisted identity of
- * the running shared instance; throw `SharedDriftError` on mismatch. The
- * hash is order-insensitive (`sharedStackHash`), so pure reordering in
- * `devtrees.yaml` never trips it — only semantic divergence does.
- */
-function assertSharedSubsetMatches(
-  stack: ResolvedStack,
-  state: SharedState,
-  worktreeId: string,
-): void {
-  const localHash = sharedStackHash(stack);
-  if (localHash === state.hash) return;
-  throw new SharedDriftError(
-    `this worktree's shared services diverge from what the running shared instance ` +
-      `was started with (likely a branch that added, removed, or edited a shared service). ` +
-      `Refusing to inject port numbers the shared instance never bound. ` +
-      `Run \`devtrees down --shared && devtrees up\` to restart shared from this worktree's config.`,
-    { worktree_id: worktreeId, running_hash: state.hash, local_hash: localHash },
-  );
+/** Remedy for drift in the shared instance: restart it from this worktree's config. */
+const SHARED_DRIFT_REMEDY = "devtrees down --shared && devtrees up";
+
+/** First 12 hex chars of a revision, for prose; the envelope carries it whole. */
+function shortRevision(hash: string): string {
+  return hash === UNKNOWN_REVISION ? "unknown (started by an older devtrees)" : hash.slice(0, 12);
 }
 
 /**
- * The name→port map the shared instance binds: every shared service's
- * declared named port, resolved through the repo-wide shared block. This is
- * what gets persisted at shared start and injected into every worktree.
+ * Throw `SHARED_DRIFT` when a selected shared service runs at another
+ * revision than this worktree defines, or would take a named port a running
+ * shared service owns (#83, scoped to the selection by #236). Revisions are
+ * per service (`sharedServiceHash`), so reordering `devtrees.yaml` never
+ * trips it, and neither does any edit to a shared service this `up` does not
+ * select.
  */
-function collectSharedPorts(
+function assertSharedPlanClean(
+  plan: SharedPlan,
+  ctx: {
+    readonly worktreeId: string;
+    readonly state: SharedState;
+    readonly stack: ResolvedStack;
+  },
+): void {
+  if (plan.drifted.length === 0 && plan.portConflicts.length === 0) return;
+  const drifted = plan.drifted.map(
+    (d) =>
+      `'${d.service}' (running ${shortRevision(d.runningHash)}, ` +
+      `this worktree ${shortRevision(d.localHash)})`,
+  );
+  const conflicts = plan.portConflicts.map(
+    (c) => `'${c.service}' declares ${c.port}, which running shared service '${c.owner}' owns`,
+  );
+  throw new SharedDriftError(
+    `the shared instance runs a different definition of shared services this up selects: ` +
+      `${[...drifted, ...conflicts].join("; ")} ` +
+      `(likely a branch that edited a shared service). ` +
+      `Refusing to inject port numbers the shared instance never bound. ` +
+      `An up that does not select these services is unaffected. ` +
+      `Run \`${SHARED_DRIFT_REMEDY}\` to restart shared from this worktree's config ` +
+      `(this stops the shared instance for every worktree).`,
+    {
+      worktree_id: ctx.worktreeId,
+      running_hash: ctx.state.hash,
+      local_hash: sharedStackHash({
+        ...ctx.stack,
+        services: sharedServicesOf(ctx.stack).filter(isAlwaysOnShared),
+      }),
+      services: plan.drifted.map((d) => ({
+        service: d.service,
+        running_hash: d.runningHash,
+        local_hash: d.localHash,
+      })),
+      port_conflicts: plan.portConflicts.map((c) => ({ ...c })),
+      remedy: SHARED_DRIFT_REMEDY,
+    },
+  );
+}
+
+/** Persisted shared state with its per-service records always present (#236). */
+type RecordedSharedState = SharedState & {
+  readonly services: Readonly<Record<string, SharedServiceRecord>>;
+};
+
+/**
+ * The persisted shared state with per-service records (#236): as written, or
+ * reconstructed for a pre-#236 state from the processes the instance runs —
+ * read from its derived config, or, when that cannot be read, taken to be
+ * this stack's always-on shared services. `undefined` when no state exists.
+ */
+function readRecordedSharedState(
+  anchor: string,
   stack: ResolvedStack,
-  sharedPortFor: (name: string) => number | undefined,
-): Record<string, number> {
-  const ports: Record<string, number> = {};
-  for (const service of stack.services) {
-    if (service.tier !== "shared") continue;
-    for (const name of service.ports) {
-      const port = sharedPortFor(name);
-      if (port !== undefined) ports[name] = port;
-    }
+): RecordedSharedState | undefined {
+  const state = readSharedState(anchor);
+  if (state === undefined) return undefined;
+  const processes = readDerivedConfig(sharedInstancePaths(anchor).configPath)?.processes;
+  const running =
+    processes !== undefined
+      ? Object.keys(processes)
+      : sharedServicesOf(stack)
+          .filter(isAlwaysOnShared)
+          .map((s) => s.name);
+  const recorded = withServiceRecords(state, stack, running);
+  return { ...recorded, services: recorded.services ?? {} };
+}
+
+/** The entries of `record` whose key is in `keys`. */
+function pick<V>(record: Readonly<Record<string, V>>, keys: Iterable<string>): Record<string, V> {
+  const out: Record<string, V> = {};
+  for (const key of keys) {
+    const value = record[key];
+    if (value !== undefined) out[key] = value;
   }
-  return ports;
+  return out;
+}
+
+/** Every named port the given services declare. */
+function portNamesOf(services: ReadonlyArray<ResolvedService>): string[] {
+  return services.flatMap((s) => s.ports);
 }
 
 /** Type of the lock-guarded mutator the caller passes for testability. */
@@ -964,6 +1077,13 @@ export interface UpResult {
   /** True iff this `up` triggered the lazy start of the shared instance. */
   readonly sharedStarted: boolean;
   /**
+   * Namespaced shared services this `up` added to an already-running shared
+   * instance because its selection includes them (#236, ADR-0010). Empty
+   * when it started the shared instance itself (`sharedStarted`) or added
+   * nothing.
+   */
+  readonly sharedActivated: ReadonlyArray<string>;
+  /**
    * Base port of this worktree's allocation block (issue #30). The `env`
    * named-port numbers all fall within `[blockBase, blockBase + blockSize)`;
    * `block_base` in the `up --json` envelope is this value.
@@ -1088,6 +1208,14 @@ export interface DryRunResult {
    * restart, in `depends_on` order. Always empty on a fresh preview.
    */
   readonly wouldRestart: ReadonlyArray<string>;
+  /**
+   * The shared services the selection includes (#236, ADR-0010), in
+   * declaration order: every shared service with no `namespace:` (always
+   * on), every namespaced one in a selected namespace, and the shared
+   * services those depend on. Empty when the stack has no shared tier.
+   * `sharedConfig` carries exactly these.
+   */
+  readonly selectedSharedServices: ReadonlyArray<string>;
   /** `${NAME}` references to injected variables in service commands (#200). */
   readonly bracedEnvVars: ReadonlyArray<BracedEnvVar>;
 }
@@ -1443,7 +1571,6 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
   )();
 
   const options = resolveAllocatorOptions(stack, deps.allocator ?? DEFAULT_ALLOCATOR);
-  const sharedNeeded = hasTier(stack, "shared");
 
   // Lock-guarded read-modify-write: allocate (or look up) both the worktree's
   // own block and — if the stack has shared services — the repo-wide shared
@@ -1452,7 +1579,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
   // consistent regardless of which worktree got there first (acceptance:
   // "shared instance appears in the allocation registry as an anchor-keyed
   // entry with its own block", PRD US-32).
-  const { blockBase, portFor, sharedPortFor } = await allocateAndBuildPortMaps({
+  const { blockBase, sharedBase, portFor, sharedPortFor } = await allocateAndBuildPortMaps({
     anchor: anchor.anchor,
     worktreeId: anchor.worktreeId,
     stack,
@@ -1545,44 +1672,33 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     // divergence (reordered services) cannot skew the injected numbers — and
     // semantic divergence fails with SHARED_DRIFT before anything is derived
     // or spawned for this worktree.
-    let sharedStarted = false;
-    let sharedChanges: ReadonlyArray<SharedFieldChange> = [];
-    let effectiveSharedPortFor = sharedPortFor;
-    if (sharedNeeded) {
-      const ensured = await ensureSharedStarted(
-        anchor.anchor,
-        stack,
-        anchor.worktreeId,
-        sharedPortFor,
-        sharedLock,
-        { driver, probe: seams.probe, socketTimeoutMs: deps.sharedSocketTimeoutMs, warn },
-      );
-      sharedStarted = ensured.started;
-      sharedChanges = ensured.fieldChanges;
-      if (ensured.ports !== undefined) {
-        const ports = ensured.ports;
-        effectiveSharedPortFor = (name) => ports[name];
-      }
-      // A shared instance found already running may be carrying a dead
-      // service (ADR-0008). Fail here, on the fresh path as much as the
-      // running one, before this worktree derives or spawns anything against
-      // it. One read; reported, never restarted. A shared instance this call
-      // just started is covered by the shared-health wait instead.
-      if (!sharedStarted) {
-        await assertSharedServicesAlive(
-          stack,
-          sharedInstancePaths(anchor.anchor).socketPath,
-          statusReader(deps, driver),
-        );
-      }
-    }
+    //
+    // Only the shared services this `up` selects are started, added or checked
+    // for drift (#236, ADR-0010): the always-on ones (no `namespace:`) and the
+    // namespaced ones in the selection. The fresh path selects what it is
+    // about to boot; the running path what `-n` names, or for a bare `up` the
+    // namespaces the instance booted.
+    const shared = await prepareShared({
+      stack,
+      anchor,
+      namespaces:
+        freshSelection?.namespaces ??
+        (await runningSharedNamespaces({ stack, anchor, socketPath: paths.socketPath, deps })),
+      seed: { positional: sharedPortFor, block: sharedBlockOf(sharedBase, options) },
+      sharedLock,
+      driver,
+      deps,
+      probe: seams.probe,
+      warn,
+    });
+    const { started: sharedStarted, fieldChanges: sharedChanges } = shared;
 
     const derived = deriveWorktreeConfig(stack, {
       worktreeId: anchor.worktreeId,
       worktreeRoot: anchor.worktreeRoot,
       anchor: anchor.anchor,
       portFor,
-      sharedPortFor: effectiveSharedPortFor,
+      sharedPortFor: shared.portFor,
     });
 
     // Surface every cross-tier `depends_on` edge devtrees just dropped. Silent
@@ -1615,7 +1731,13 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
         readHash,
         writeHash,
       });
-      return { kind: "running", env: derived.env, sharedStarted, sharedChanges } as const;
+      return {
+        kind: "running",
+        env: derived.env,
+        sharedStarted,
+        sharedActivated: shared.activated,
+        sharedChanges,
+      } as const;
     }
 
     // Same-tier edges the fresh selection leaves dangling (ADR-0008, #179):
@@ -1647,9 +1769,12 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     // edge — orchestration-layer stand-in for the edge process-compose can't
     // express across instances (ADR-0003). Skipped when there are no such edges
     // (a stack with shared services nobody isolated depends on doesn't need it).
-    if (derived.droppedEdges.length > 0) {
+    // Only the selected shared services are waited on (#236): an unselected
+    // namespaced one is not running for this worktree, so an edge to it is
+    // dropped like any other cross-tier edge and gates nothing.
+    if (derived.droppedEdges.length > 0 && shared.selected.length > 0) {
       const sharedPaths = sharedInstancePaths(anchor.anchor);
-      const sharedServices = stack.services.filter((s) => s.tier === "shared");
+      const sharedServices = shared.selected;
       const sharedNames = sharedServices.map((s) => s.name);
       warn(formatHealthWaitNotice(sharedNames));
       const wait =
@@ -1691,6 +1816,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
       kind: "started",
       env: derived.env,
       sharedStarted,
+      sharedActivated: shared.activated,
       sharedChanges,
       selected: freshSelection.services,
       namespaces: freshSelection.namespaces,
@@ -1703,6 +1829,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     socketPath: paths.socketPath,
     env: outcome.env,
     sharedStarted: outcome.sharedStarted,
+    sharedActivated: outcome.sharedActivated,
     sharedFieldChanges: outcome.sharedChanges,
     bracedEnvVars: braced,
     blockBase,
@@ -1911,6 +2038,10 @@ export async function runUpDryRun(deps: CommandDeps = {}): Promise<DryRunResult>
   // Only the reload filter needs the new derived config; every error is raised above.
   const plan = withoutReloadRestarted(preview, derivedWt.config);
 
+  // The shared services the previewed `up` selects (#236): the always-on ones
+  // plus the namespaced ones in the effective selection, as the real `up`
+  // decides them.
+  const selectedShared = selectSharedServices(stack, plan.namespaces).map((s) => s.name);
   const base: DryRunResult = {
     worktreeId: anchor.worktreeId,
     worktreeRoot: anchor.worktreeRoot,
@@ -1919,15 +2050,19 @@ export async function runUpDryRun(deps: CommandDeps = {}): Promise<DryRunResult>
     config: derivedWt.config,
     droppedEdges: derivedWt.droppedEdges,
     ...plan,
+    selectedSharedServices: selectedShared,
     bracedEnvVars: bracedEnvVars(stack),
   };
 
   if (!sharedNeeded) return base;
 
+  // What a lazy start of the shared instance would spawn: the selected shared
+  // services only (#236).
   const derivedShared = deriveSharedConfig(stack, {
     workingDir: anchor.anchor,
     anchor: anchor.anchor,
     portFor: sharedPortFor,
+    services: selectedShared,
   });
   return {
     ...base,
@@ -2147,26 +2282,190 @@ export async function runAttach(
   await driver.attach({ configPath: paths.configPath, socketPath: paths.socketPath });
 }
 
+/** The shared-tier outcome of one `up` (#236): what it started, added and injects. */
+interface SharedOutcome {
+  /** This `up` lazy-started the shared instance. */
+  readonly started: boolean;
+  /** Namespaced shared services this `up` added to the running shared instance. */
+  readonly activated: ReadonlyArray<string>;
+  readonly fieldChanges: ReadonlyArray<SharedFieldChange>;
+  /** Shared named port → the number to inject. */
+  readonly portFor: (name: string) => number | undefined;
+  /** The shared services this `up` selects, in declaration order. */
+  readonly selected: ReadonlyArray<ResolvedService>;
+}
+
+/**
+ * Bring the shared tier to what this `up` selects (#236, ADR-0010): lazy-start
+ * the shared instance or add the selected namespaced shared services it lacks
+ * (`ensureSharedStarted`), then check the selected ones it already ran are
+ * alive (ADR-0008). A shared instance found already running may be carrying
+ * a dead service: fail here, on the fresh path as much as the running one,
+ * before this worktree derives or spawns anything against it. One read;
+ * reported, never restarted. Services this call just started or added are
+ * covered by the shared-health wait instead.
+ */
+async function prepareShared(args: {
+  readonly stack: ResolvedStack;
+  readonly anchor: { readonly anchor: string; readonly worktreeId: string };
+  readonly namespaces: ReadonlyArray<string>;
+  readonly seed: SharedPortSeed;
+  readonly sharedLock: WithSharedLock;
+  readonly driver: ReturnType<typeof createDriver>;
+  readonly deps: CommandDeps;
+  readonly probe: LivenessProbe;
+  readonly warn: (message: string) => void;
+}): Promise<SharedOutcome> {
+  const { stack, anchor, seed, driver, deps } = args;
+  if (!hasTier(stack, "shared")) {
+    return {
+      started: false,
+      activated: [],
+      fieldChanges: [],
+      portFor: seed.positional,
+      selected: [],
+    };
+  }
+  const selected = selectSharedServices(stack, args.namespaces);
+  const ensured = await ensureSharedStarted(
+    anchor.anchor,
+    stack,
+    anchor.worktreeId,
+    selected,
+    seed,
+    args.sharedLock,
+    {
+      driver,
+      probe: args.probe,
+      socketTimeoutMs: deps.sharedSocketTimeoutMs,
+      warn: args.warn,
+      readSharedRows: () =>
+        statusReader(
+          deps,
+          driver,
+        )(sharedInstancePaths(anchor.anchor).socketPath).catch(() => undefined),
+    },
+  );
+  if (!ensured.started) {
+    const added = new Set(ensured.activated);
+    await assertSharedServicesAlive(
+      selected.filter((s) => !added.has(s.name)).map((s) => s.name),
+      sharedInstancePaths(anchor.anchor).socketPath,
+      statusReader(deps, driver),
+    );
+  }
+  const ports = ensured.ports;
+  return {
+    started: ensured.started,
+    activated: ensured.activated,
+    fieldChanges: ensured.fieldChanges,
+    portFor: ports === undefined ? seed.positional : (name) => ports[name],
+    selected,
+  };
+}
+
+/** The repo-wide shared block for the allocator's block size, if one was allocated. */
+function sharedBlockOf(
+  sharedBase: number | undefined,
+  options: AllocatorOptions,
+): SharedBlock | undefined {
+  return sharedBase === undefined ? undefined : { base: sharedBase, size: options.blockSize };
+}
+
+/**
+ * The namespaces whose namespaced shared services an `up` on a RUNNING
+ * worktree instance selects (#236): `-n` verbatim when given, else the
+ * namespaces the instance booted, read back from process-compose as a bare
+ * `up` reads them (ADR-0008) — against the project as a pending hot-reload
+ * would leave it, the way `up --dry-run` projects it (#210). A namespace
+ * whose only services are shared is not observable in the worktree project,
+ * so a bare `up` does not re-select it; pass `-n` for it.
+ *
+ * Only read when the stack declares a namespaced shared service: otherwise
+ * the selection cannot change which shared services run, and the running
+ * path makes no extra `process list` read. A failed read selects no
+ * namespace (always-on shared services only); the health wait that follows
+ * reports the unreadable instance.
+ */
+async function runningSharedNamespaces(args: {
+  readonly stack: ResolvedStack;
+  readonly anchor: { readonly anchor: string; readonly worktreeId: string };
+  readonly socketPath: string;
+  readonly deps: CommandDeps;
+}): Promise<ReadonlyArray<string>> {
+  const { stack, anchor, deps } = args;
+  if (deps.namespaces !== undefined && deps.namespaces.length > 0) return deps.namespaces;
+  if (!hasNamespacedShared(stack)) return [];
+  const rows = await statusReader(
+    deps,
+    createDriver(deps.driver),
+  )(args.socketPath).catch(() => undefined);
+  if (rows === undefined) return [];
+  const readHash = deps.readStoredHash ?? defaultReadStoredHash;
+  const { configPath } = instancePaths(anchor.anchor, anchor.worktreeId);
+  const previous = derivedProcesses(
+    existsSync(configPath) ? readFileSync(configPath, "utf8") : undefined,
+  );
+  const reload =
+    previous !== undefined && readHash(anchor.anchor, anchor.worktreeId) !== stackHash(stack);
+  const projected = reload ? rowsAfterReload(stack, previous, rows) : rows;
+  const isolated = stack.services.filter((s) => s.tier === "isolated");
+  return resolveRunningSelection(isolated, new Set(projected.map((r) => r.name)), undefined)
+    .namespaces;
+}
+
 /**
  * Outcome of `ensureSharedStarted`: whether THIS call lazy-started the shared
- * instance, and the authoritative name→port map worktrees must inject for
+ * instance, which selected shared services it added to the running one
+ * (#236), and the authoritative name→port map worktrees must inject for
  * shared services (issue #83). `ports` is `undefined` only on the legacy
  * fallback — a shared instance started by a pre-#83 devtrees whose anchor
  * state has no persisted map; the caller falls back to positional offsets.
  */
 interface EnsuredShared {
   readonly started: boolean;
+  /**
+   * Shared services this call added to an already-running shared
+   * instance (#236), in declaration order: selected services it did not run,
+   * including ones recorded by an earlier add whose reload timed out and never
+   * landed. Empty when it started the instance (`started`), or when everything
+   * selected was already running.
+   */
+  readonly activated: ReadonlyArray<string>;
   /** Extended shared fields edited since the running instance started (#185). */
   readonly fieldChanges: ReadonlyArray<SharedFieldChange>;
   readonly ports?: Readonly<Record<string, number>>;
 }
 
+/** How a shared named port resolves before the running instance is consulted. */
+interface SharedPortSeed {
+  /** This worktree's positional number for a shared named port. */
+  readonly positional: (name: string) => number | undefined;
+  /** The repo-wide shared block; `undefined` when the stack has no shared tier. */
+  readonly block: SharedBlock | undefined;
+}
+
+/** What `ensureSharedStarted` needs besides the stack and the selection. */
+interface EnsureSharedDeps {
+  readonly driver: ReturnType<typeof createDriver>;
+  readonly probe: LivenessProbe;
+  /** Socket-bind wait window for the lazy start (issue #92). Default: 3s. */
+  readonly socketTimeoutMs?: number;
+  /** Sink for the shared-field-change warnings (#185). */
+  readonly warn: (message: string) => void;
+  /**
+   * One `process list` read of the running shared instance; `undefined` when
+   * it cannot be read. Lets a retried `up` see a service a timed-out add
+   * recorded but process-compose never started (#236).
+   */
+  readonly readSharedRows: () => Promise<ServiceStatus[] | undefined>;
+}
+
 /**
- * Idempotently lazy-start the shared instance: under the shared lifecycle lock,
- * if its control socket is held by a live listener do nothing; otherwise write
- * a fresh derived shared config and spawn `process-compose` against it. The
- * lock is the gate — two simultaneous callers see a consistent answer and at
- * most one actually starts the instance.
+ * Idempotently lazy-start the shared instance with the shared services this
+ * `up` selects, or add the selected ones it does not run yet. Under the shared
+ * lifecycle lock, so two simultaneous callers see a consistent answer and at
+ * most one starts (or extends) the instance.
  *
  * Liveness is probed, not inferred from the socket file (#80): a SIGKILLed
  * shared instance leaves its socket behind, and trusting the file would make
@@ -2175,27 +2474,30 @@ interface EnsuredShared {
  *
  * The running instance is the source of truth for shared ports (issue #83):
  *
- *  - On start, the name→port map it binds and the shared-subset hash it was
- *    derived from are persisted in anchor state (`shared-state.json`).
- *  - On the already-running branch, this worktree's shared subset is checked
- *    against that persisted hash — divergence throws `SharedDriftError`
- *    (`SHARED_DRIFT`) instead of letting the caller inject numbers the
- *    instance never bound — and the persisted map is returned for injection.
+ *  - On start, the name→port map it binds and the revision of each shared
+ *    service it runs are persisted in anchor state (`shared-state.json`).
+ *  - On the already-running branch, each SELECTED shared service is checked
+ *    against its recorded revision — divergence throws `SHARED_DRIFT` instead
+ *    of letting the caller inject numbers the instance never bound (#83);
+ *    a shared service the `up` does not select is not checked (#236) — and
+ *    the persisted map is returned for injection.
+ *  - A selected namespaced shared service the instance does not run yet is
+ *    added to it (#236, ADR-0010): its process is appended to the shared
+ *    derived config and process-compose re-reads it. The processes already in
+ *    that config are kept byte-for-byte, so process-compose leaves them
+ *    running; it only starts the new ones.
+ *
+ * With nothing selected (every shared service is namespaced and none is
+ * selected) a stopped shared instance is not started.
  */
 async function ensureSharedStarted(
   anchor: string,
   stack: ResolvedStack,
   worktreeId: string,
-  sharedPortFor: (name: string) => number | undefined,
+  selected: ReadonlyArray<ResolvedService>,
+  seed: SharedPortSeed,
   sharedLock: WithSharedLock,
-  deps: {
-    driver: ReturnType<typeof createDriver>;
-    probe: LivenessProbe;
-    /** Socket-bind wait window for the lazy start (issue #92). Default: 3s. */
-    socketTimeoutMs?: number;
-    /** Sink for the shared-field-change warnings (#185). */
-    warn: (message: string) => void;
-  },
+  deps: EnsureSharedDeps,
 ): Promise<EnsuredShared> {
   return await sharedLock(anchor, async () => {
     const paths = sharedInstancePaths(anchor);
@@ -2205,60 +2507,261 @@ async function ensureSharedStarted(
       command: "up",
       instance: SHARED_INSTANCE_ID,
     });
-    if (live) {
-      const state = readSharedState(anchor);
-      // Legacy fallback: a pre-#83 shared instance left no persisted map.
-      // Positional computation is all we have — same behaviour as before.
-      if (state === undefined) return { started: false, fieldChanges: [] };
-      assertSharedSubsetMatches(stack, state, worktreeId);
-      const fieldChanges = sharedFieldChanges(state, sharedExtendedFields(stack));
-      for (const change of fieldChanges) deps.warn(formatSharedFieldChangeWarning(change));
-      return { started: false, ports: state.ports, fieldChanges };
-    }
-
-    // Same bind-site guard the worktree instance gets (issue #156) — the
-    // shared socket lives in the same run dir, so a run dir that is too long
-    // for `sun_path` breaks both instances and must say so, not time out.
-    assertSocketPathFits(paths.socketPath);
-
-    const derived = deriveSharedConfig(stack, {
-      workingDir: anchor,
-      anchor,
-      portFor: sharedPortFor,
-    });
-
-    // The run dir now lives outside the git dir (issue #156), so the anchor
-    // state dir the derived config goes in has to be created on its own.
-    mkdirSync(paths.stateDir, { recursive: true });
-    ensureRunDir(anchor);
-    // Create the shared instance's logs dir so process-compose can open any
-    // `log_location` file the derived config points at (issue #136). Only the
-    // shared services land in this instance, so scope dir creation to them.
-    ensureLogsDir(stack, logsDir(anchor, SHARED_INSTANCE_ID), "shared");
-    writeFileSync(paths.configPath, stringifyYaml(derived.config), "utf8");
-
-    await deps.driver.up({ configPath: paths.configPath, socketPath: paths.socketPath });
-    // `driver.up` is fire-and-forget: spawn returns before the child binds the
-    // UDS. Hold the shared lock until the socket is observable on disk so a
-    // concurrent `up` from another worktree sees the lazy-start as complete and
-    // doesn't race a second stub against ours (the loser's exit-time cleanup
-    // would unlink the winner's socket). Throws `SHARED_START_FAILED` on
-    // deadline (issue #92): a socket that never appears means the instance
-    // died before binding, and reporting `shared_started: true` for a corpse
-    // would leave the agent debugging healthy-looking output.
-    await waitForSharedSocket(paths.socketPath, paths.configPath, deps.socketTimeoutMs);
-
-    // Make the running instance the source of truth: persist what it was
-    // started with so every subsequent `up`/`env` — on any branch — injects
-    // these numbers, not its own positional recomputation (issue #83).
-    const ports = collectSharedPorts(stack, sharedPortFor);
-    writeSharedState(anchor, {
-      hash: sharedStackHash(stack),
-      ports,
-      extended: sharedExtendedFields(stack),
-    });
-    return { started: true, ports, fieldChanges: [] };
+    if (live) return await reconcileLiveShared({ anchor, stack, worktreeId, selected, seed, deps });
+    if (selected.length === 0) return { started: false, activated: [], fieldChanges: [] };
+    return await startShared({ anchor, stack, selected, seed, deps });
   });
+}
+
+/** Inputs shared by the start and reconcile branches of `ensureSharedStarted`. */
+interface SharedStep {
+  readonly anchor: string;
+  readonly stack: ResolvedStack;
+  readonly selected: ReadonlyArray<ResolvedService>;
+  readonly seed: SharedPortSeed;
+  readonly deps: EnsureSharedDeps;
+}
+
+/**
+ * The shared instance is running: check the selected shared services against
+ * what it runs, then add the selected ones it lacks (#236).
+ */
+async function reconcileLiveShared(
+  step: SharedStep & { readonly worktreeId: string },
+): Promise<EnsuredShared> {
+  const { anchor, stack, selected, seed, deps } = step;
+  const state = readRecordedSharedState(anchor, stack);
+  // Legacy fallback: a pre-#83 shared instance left no persisted map.
+  // Positional computation is all we have — same behaviour as before, as long
+  // as nothing has to be added: what that instance runs cannot be known.
+  if (state === undefined) return legacySharedInstance(selected, anchor);
+  const plan = planSharedSelection(selected, state.services);
+  assertSharedPlanClean(plan, { worktreeId: step.worktreeId, state, stack });
+  const selectedNames = selected.map((s) => s.name);
+  const fieldChanges = sharedFieldChanges(state, pick(sharedExtendedFields(stack), selectedNames));
+  for (const change of fieldChanges) deps.warn(formatSharedFieldChangeWarning(change));
+  const ports = resolveSharedPorts({
+    services: sharedServicesOf(stack),
+    bound: state.ports,
+    ...seed,
+  });
+  const toAdd = await servicesToAdd(selected, plan, state, deps);
+  if (toAdd.length > 0) {
+    await activateShared({ ...step, state, missing: toAdd, ports });
+  }
+  return {
+    started: false,
+    activated: toAdd.map((s) => s.name),
+    ports,
+    fieldChanges,
+  };
+}
+
+/**
+ * The selected shared services to add to the running instance: the ones it
+ * has no record of, plus — when its `process list` can be read — recorded
+ * ones it does not actually run. The second kind is a service an earlier add
+ * recorded after its reload timed out, which process-compose never applied:
+ * a retried `up` re-sends the reload rather than trusting the record. A
+ * missing row is otherwise invisible: the dead-service check counts "no row"
+ * as not dead.
+ */
+async function servicesToAdd(
+  selected: ReadonlyArray<ResolvedService>,
+  plan: SharedPlan,
+  state: RecordedSharedState,
+  deps: EnsureSharedDeps,
+): Promise<ResolvedService[]> {
+  const missing = new Set(plan.missing.map((s) => s.name));
+  const recorded = selected.filter((s) => !missing.has(s.name) && state.services[s.name]);
+  const rows = recorded.length > 0 ? await deps.readSharedRows() : undefined;
+  const present = new Set((rows ?? []).map((r) => r.name));
+  const absent = new Set(
+    rows === undefined ? [] : recorded.filter((s) => !present.has(s.name)).map((s) => s.name),
+  );
+  return selected.filter((s) => missing.has(s.name) || absent.has(s.name));
+}
+
+/**
+ * A running shared instance started by a devtrees older than #83 left no
+ * state, so what it runs is unknown. Always-on shared services keep the old
+ * positional fallback; a selected namespaced one cannot be added safely and
+ * fails `SHARED_ACTIVATION_FAILED` instead of an `up` that silently runs
+ * without it.
+ */
+function legacySharedInstance(
+  selected: ReadonlyArray<ResolvedService>,
+  anchor: string,
+): EnsuredShared {
+  const namespaced = selected.filter((s) => !isAlwaysOnShared(s)).map((s) => s.name);
+  if (namespaced.length > 0) {
+    throw new SharedActivationFailedError(
+      `devtrees up: cannot add shared service(s) ${namespaced.map((s) => `'${s}'`).join(", ")} ` +
+        `to the running shared instance: it was started by a devtrees that records no shared ` +
+        `state, so what it runs is unknown. Nothing was changed. Next: ` +
+        `${SHARED_DRIFT_REMEDY} (for every worktree).`,
+      {
+        services: namespaced,
+        reason: "not_supported",
+        config_path: sharedInstancePaths(anchor).configPath,
+        remedy: `${SHARED_DRIFT_REMEDY} (for every worktree)`,
+      },
+    );
+  }
+  return { started: false, activated: [], fieldChanges: [] };
+}
+
+/** Lazy-start the shared instance with exactly the selected shared services. */
+async function startShared(step: SharedStep): Promise<EnsuredShared> {
+  const { anchor, stack, selected, seed, deps } = step;
+  const paths = sharedInstancePaths(anchor);
+  // Same bind-site guard the worktree instance gets (issue #156) — the
+  // shared socket lives in the same run dir, so a run dir that is too long
+  // for `sun_path` breaks both instances and must say so, not time out.
+  assertSocketPathFits(paths.socketPath);
+
+  // Nothing is bound yet, so this is the positional map.
+  const ports = resolveSharedPorts({ services: sharedServicesOf(stack), bound: {}, ...seed });
+  const derived = deriveSharedConfig(stack, {
+    workingDir: anchor,
+    anchor,
+    portFor: (name) => ports[name],
+    services: selected.map((s) => s.name),
+  });
+
+  // The run dir now lives outside the git dir (issue #156), so the anchor
+  // state dir the derived config goes in has to be created on its own.
+  mkdirSync(paths.stateDir, { recursive: true });
+  ensureRunDir(anchor);
+  // Create the shared instance's logs dir so process-compose can open any
+  // `log_location` file the derived config points at (issue #136). Only the
+  // shared services land in this instance, so scope dir creation to them.
+  ensureLogsDir(stack, logsDir(anchor, SHARED_INSTANCE_ID), "shared");
+  writeFileSync(paths.configPath, stringifyYaml(derived.config), "utf8");
+
+  await deps.driver.up({ configPath: paths.configPath, socketPath: paths.socketPath });
+  // `driver.up` is fire-and-forget: spawn returns before the child binds the
+  // UDS. Hold the shared lock until the socket is observable on disk so a
+  // concurrent `up` from another worktree sees the lazy-start as complete and
+  // doesn't race a second stub against ours (the loser's exit-time cleanup
+  // would unlink the winner's socket). Throws `SHARED_START_FAILED` on
+  // deadline (issue #92): a socket that never appears means the instance
+  // died before binding, and reporting `shared_started: true` for a corpse
+  // would leave the agent debugging healthy-looking output.
+  await waitForSharedSocket(paths.socketPath, paths.configPath, deps.socketTimeoutMs);
+
+  // Make the running instance the source of truth: persist what it was
+  // started with so every subsequent `up`/`env` — on any branch — injects
+  // these numbers, not its own positional recomputation (issue #83).
+  const subset = { ...stack, services: [...selected] };
+  writeSharedState(anchor, {
+    // The pre-#236 whole-subset hash, over the always-on shared services
+    // only: a devtrees older than #236 compares its own (always-on only)
+    // shared subset against this, so it keeps working beside this instance.
+    hash: sharedStackHash({ ...stack, services: selected.filter(isAlwaysOnShared) }),
+    ports: pick(ports, portNamesOf(selected)),
+    extended: sharedExtendedFields(subset),
+    services: sharedRecords(selected),
+  });
+  return { started: true, activated: [], ports, fieldChanges: [] };
+}
+
+/**
+ * Add `missing` shared services to the running shared instance (#236,
+ * ADR-0010). The shared derived config on disk is what the instance runs; its
+ * processes are kept exactly as they are and the new ones appended, so
+ * process-compose's reload sees the old ones unchanged and leaves them
+ * running (verified on v1.122.0: same PIDs before and after) while it starts
+ * the new ones. Then the new services are recorded in the shared state.
+ *
+ * On a refused reload the previous config is restored and nothing is
+ * recorded. On a timed-out one the new config stays and the services are
+ * recorded: process-compose may still be applying it, and a later reload
+ * from a config without them would stop them again. A retried `up` that
+ * finds a recorded service absent from the instance re-sends the reload
+ * (`servicesToAdd`); it is idempotent, the config already holds the process.
+ */
+async function activateShared(
+  step: SharedStep & {
+    readonly state: RecordedSharedState;
+    readonly missing: ReadonlyArray<ResolvedService>;
+    readonly ports: Readonly<Record<string, number>>;
+  },
+): Promise<void> {
+  const { anchor, stack, state, missing, ports, deps } = step;
+  const paths = sharedInstancePaths(anchor);
+  const names = missing.map((s) => s.name);
+  const previousYaml = existsSync(paths.configPath)
+    ? readFileSync(paths.configPath, "utf8")
+    : undefined;
+  const previous = previousYaml === undefined ? undefined : readDerivedConfig(paths.configPath);
+  if (previousYaml === undefined || previous === undefined) {
+    throw activationFailed(names, "error", paths.configPath, "its derived config is missing");
+  }
+  const added = deriveSharedConfig(stack, {
+    workingDir: anchor,
+    anchor,
+    portFor: (name) => ports[name],
+    services: names,
+  }).config;
+  ensureLogsDir(stack, logsDir(anchor, SHARED_INSTANCE_ID), "shared");
+  const merged = mergeDerived(previous, added);
+  writeFileSync(paths.configPath, stringifyYaml(merged), "utf8");
+
+  // Same budget as a worktree hot-reload (#188): the base plus the merged
+  // config's shutdown timeouts. An add stops nothing, so it rarely matters.
+  const reload = await deps.driver.reloadConfig(
+    { configPath: paths.configPath, socketPath: paths.socketPath },
+    { timeoutMs: reloadTimeoutMs(merged) },
+  );
+  if (!reload.ok && reload.reason !== "timeout") {
+    writeFileSync(paths.configPath, previousYaml, "utf8");
+    throw activationFailed(names, reload.reason, paths.configPath, reload.message);
+  }
+  writeSharedState(anchor, {
+    hash: state.hash,
+    ports: { ...state.ports, ...pick(ports, portNamesOf(missing)) },
+    extended: { ...state.extended, ...sharedExtendedFields({ ...stack, services: [...missing] }) },
+    services: { ...state.services, ...sharedRecords(missing) },
+  });
+  if (!reload.ok) {
+    throw activationFailed(names, reload.reason, paths.configPath, reload.message);
+  }
+}
+
+/**
+ * A derived config with `added`'s processes appended to `base`'s. `base`'s
+ * own processes are kept as they are, so a reload restarts none of them.
+ */
+function mergeDerived(base: DerivedConfig, added: DerivedConfig): DerivedConfig {
+  const baseMeta = base[DEVTREES_METADATA_KEY]?.ports_by_service ?? {};
+  const addedMeta = added[DEVTREES_METADATA_KEY].ports_by_service;
+  return {
+    ...base,
+    processes: { ...base.processes, ...added.processes },
+    [DEVTREES_METADATA_KEY]: { ports_by_service: { ...baseMeta, ...addedMeta } },
+  };
+}
+
+function activationFailed(
+  services: ReadonlyArray<string>,
+  reason: "not_supported" | "error" | "timeout",
+  configPath: string,
+  cause: string | undefined,
+): SharedActivationFailedError {
+  const outcome =
+    reason === "timeout"
+      ? "did not finish within its budget; process-compose may still be starting them"
+      : "was refused, and the shared config was restored";
+  const remedy =
+    reason === "timeout" ? "retry `devtrees up`" : `${SHARED_DRIFT_REMEDY} (for every worktree)`;
+  return new SharedActivationFailedError(
+    `devtrees up: adding shared service(s) ${services.map((s) => `'${s}'`).join(", ")} ` +
+      `to the running shared instance ${outcome}` +
+      `${cause !== undefined ? ` (${cause})` : ""}. The shared services it already ran are ` +
+      `untouched. Next: ${remedy}.`,
+    { services: [...services], reason, config_path: configPath, remedy },
+  );
 }
 
 /**
@@ -3697,16 +4200,25 @@ export async function runEnv(deps: CommandDeps = {}): Promise<EnvResult> {
   // Shared ports come from the running instance, not positional offsets
   // (issue #83): when the shared socket is live and a persisted map exists,
   // report the numbers the instance actually bound — and fail with
-  // SHARED_DRIFT when this worktree's shared subset diverges, exactly as
-  // `up` would, instead of reporting connection info that is wrong. With no
-  // running instance, a future `up` would lazy-start shared from THIS
-  // worktree's stack, so the positional computation is the right prediction.
+  // SHARED_DRIFT when an always-on shared service diverges, exactly as `up`
+  // would, instead of reporting connection info that is wrong. `env` takes no
+  // `-n`, so only the always-on shared services (no `namespace:`) are checked
+  // (#236); a namespaced one reports the number it is bound to, or the one
+  // adding it would bind. With no running instance, a future `up` would
+  // lazy-start shared from THIS worktree's stack, so the positional
+  // computation is the right prediction.
   let effectiveSharedPortFor = sharedPortFor;
   if (sharedNeeded && existsSync(sharedInstancePaths(anchor.anchor).socketPath)) {
-    const state = readSharedState(anchor.anchor);
+    const state = readRecordedSharedState(anchor.anchor, stack);
     if (state !== undefined) {
-      assertSharedSubsetMatches(stack, state, anchor.worktreeId);
-      const ports = state.ports;
+      const plan = planSharedSelection(selectSharedServices(stack, []), state.services);
+      assertSharedPlanClean(plan, { worktreeId: anchor.worktreeId, state, stack });
+      const ports = resolveSharedPorts({
+        services: sharedServicesOf(stack),
+        bound: state.ports,
+        positional: sharedPortFor,
+        block: sharedBlockOf(sharedBlock?.base, options),
+      });
       effectiveSharedPortFor = (name) => ports[name];
     }
   }
@@ -4786,24 +5298,24 @@ function namespaceNotRunningError(
 }
 
 /**
- * Fail with `SHARED_SERVICE_DEAD` when a declared shared service is dead in
- * an already-running shared instance (ADR-0008). Runs on the fresh and the
- * running path alike, inside the lifecycle lock right after
- * `ensureSharedStarted`. One read, no wait: shared services
- * are reported, not restarted or waited on. Every declared shared service is
- * checked — the shared instance is booted without `-n`, so namespace
- * selection does not narrow it. A failed read is not evidence of a dead
- * service, so it passes.
+ * Fail with `SHARED_SERVICE_DEAD` when one of `names` — the selected shared
+ * services — is dead in an already-running shared instance (ADR-0008). Runs
+ * on the fresh and the running path alike, inside the lifecycle lock right
+ * after `ensureSharedStarted`. One read, no wait: shared services are
+ * reported, not restarted or waited on. Since #236 only the shared services
+ * this `up` selects are checked: a dead namespaced shared service this
+ * worktree does not use is some other `up`'s business. A failed read is not
+ * evidence of a dead service, so it passes.
  */
 async function assertSharedServicesAlive(
-  stack: ResolvedStack,
+  names: ReadonlyArray<string>,
   sharedSocketPath: string,
   fetch: (socketPath: string) => Promise<ServiceStatus[]>,
 ): Promise<void> {
+  if (names.length === 0) return;
   const rows = await fetch(sharedSocketPath).catch(() => undefined);
   if (rows === undefined) return;
-  const names = stack.services.filter((s) => s.tier === "shared").map((s) => s.name);
-  const dead = findDeadServices(rows, names);
+  const dead = findDeadServices(rows, [...names]);
   if (dead.length > 0) throw sharedServiceDeadError(dead);
 }
 

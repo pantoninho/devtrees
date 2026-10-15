@@ -73,6 +73,20 @@ describe("shared-state store", () => {
     expect(readSharedState(anchor)).toEqual({ hash: "h", ports: { DB_PORT: 1 } });
   });
 
+  it("round-trips the per-service records (#236) and drops a malformed map", () => {
+    const anchor = tmpAnchor();
+    const services = { pg: { hash: "abc", ports: ["DB_PORT"] } };
+    writeSharedState(anchor, { hash: "h", ports: { DB_PORT: 1 }, services });
+    expect(readSharedState(anchor)?.services).toEqual(services);
+
+    writeFileSync(
+      join(anchor, "devtrees", "shared-state.json"),
+      `{"hash":"h","ports":{"DB_PORT":1},"services":{"pg":{"hash":1}}}`,
+      "utf8",
+    );
+    expect(readSharedState(anchor)).toEqual({ hash: "h", ports: { DB_PORT: 1 } });
+  });
+
   it("sharedFieldChanges names each changed field and ignores older state", () => {
     const state = { hash: "h", ports: {}, extended: { pg: { shutdown: null, is_daemon: false } } };
     expect(

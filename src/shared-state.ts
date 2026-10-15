@@ -38,6 +38,23 @@ export interface SharedState {
    * lack it, and then no change can be detected.
    */
   readonly extended?: Readonly<Record<string, Readonly<Record<string, unknown>>>>;
+  /**
+   * Per shared service the instance runs, its revision (`sharedServiceHash`)
+   * and the named ports it owns (#236). This is what scopes `SHARED_DRIFT` to
+   * the shared services an `up` selects, and what lets a later `up` add a
+   * namespaced shared service to the running instance without touching the
+   * others. Optional: state written before #236 lacks it, and the caller
+   * reconstructs it from `hash` when that still matches.
+   */
+  readonly services?: Readonly<Record<string, SharedServiceRecord>>;
+}
+
+/** One shared service the running shared instance runs (#236). */
+export interface SharedServiceRecord {
+  /** `sharedServiceHash` of the definition the instance runs. */
+  readonly hash: string;
+  /** The named ports (env var names) this service owns in `SharedState.ports`. */
+  readonly ports: ReadonlyArray<string>;
 }
 
 /** One extended field of a shared service that changed since shared started. */
@@ -78,21 +95,41 @@ function sharedStateFile(anchor: string): string {
 /** Narrow an unknown parse result to a `SharedState`, or `undefined`. */
 function asSharedState(parsed: unknown): SharedState | undefined {
   if (parsed === null || typeof parsed !== "object") return undefined;
-  const { hash, ports, extended } = parsed as {
+  const { hash, ports, extended, services } = parsed as {
     hash?: unknown;
     ports?: unknown;
     extended?: unknown;
+    services?: unknown;
   };
   if (typeof hash !== "string") return undefined;
   if (!isPlainObject(ports) || !Object.values(ports).every((v) => typeof v === "number")) {
     return undefined;
   }
   const parsedExtended = asExtended(extended);
+  const parsedServices = asServices(services);
   return {
     hash,
     ports: ports as Readonly<Record<string, number>>,
     ...(parsedExtended !== undefined ? { extended: parsedExtended } : {}),
+    ...(parsedServices !== undefined ? { services: parsedServices } : {}),
   };
+}
+
+const isServiceRecord = (v: unknown): v is SharedServiceRecord =>
+  isPlainObject(v) &&
+  typeof v.hash === "string" &&
+  Array.isArray(v.ports) &&
+  v.ports.every((p) => typeof p === "string");
+
+/**
+ * A malformed `services` map is dropped, not fatal: the caller then treats
+ * the state as pre-#236 and falls back to the whole-subset `hash`.
+ */
+function asServices(value: unknown): SharedState["services"] {
+  if (!isPlainObject(value)) return undefined;
+  return Object.values(value).every(isServiceRecord)
+    ? (value as NonNullable<SharedState["services"]>)
+    : undefined;
 }
 
 const isPlainObject = (v: unknown): v is Record<string, unknown> =>

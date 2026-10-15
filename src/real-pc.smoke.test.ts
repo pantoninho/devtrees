@@ -3283,6 +3283,92 @@ describe.skipIf(!ENABLED)("real-pc smoke — bare restart (#225)", () => {
   }, 120_000);
 });
 
+/**
+ * Namespaced shared services (#236, ADR-0010) against the real binary: a
+ * namespaced shared service joins the running shared instance through a
+ * config reload that must leave the shared services already running alone,
+ * and its drift fails only an `up` that selects it.
+ */
+describe.skipIf(!ENABLED)("real-pc smoke — namespaced shared services (#236)", () => {
+  it("scenario 120: a later up adds a namespaced shared service without restarting the running ones; its drift fails only an up that selects it", async () => {
+    const repo = buildSmokeRepo("dt-rpc120-", ["login", "billing"]);
+    currentCtx = { pidNeedle: repo.root, root: repo.root };
+    const login = repo.worktrees.login!;
+    const billing = repo.worktrees.billing!;
+    const [holdPg, holdSb, holdSbEdited, holdApi] = [
+      "hold-pg",
+      "hold-sb",
+      "hold-sb2",
+      "hold-api",
+    ].map((n) => join(repo.root, n));
+    for (const hold of [holdPg, holdSb, holdSbEdited, holdApi]) writeFileSync(hold!, "");
+    const writeStack = (wt: string, sbHold: string): void =>
+      writeFileSync(
+        join(wt, "devtrees.yaml"),
+        [
+          "services:",
+          "  pg:",
+          "    tier: shared",
+          `    command: "tail -f ${holdPg}"`,
+          "    ports: [PG_PORT]",
+          "  sb:",
+          "    tier: shared",
+          "    namespace: db-shared",
+          `    command: "tail -f ${sbHold}"`,
+          "    ports: [SB_PORT]",
+          "  api:",
+          "    tier: isolated",
+          "    namespace: app",
+          `    command: "tail -f ${holdApi}"`,
+          "    ports: [API_PORT]",
+          "",
+        ].join("\n"),
+      );
+    writeStack(login, holdSb!);
+    writeStack(billing, holdSb!);
+    cleanupStack.push(() => devtrees(login, ["down", "--shared"]));
+    cleanupStack.push(() => devtrees(login, ["down"]));
+    cleanupStack.push(() => devtrees(billing, ["down"]));
+    const upWith = (wt: string, ...ns: string[]): CliResult =>
+      devtrees(wt, ["up", "--json", "--wait-timeout", "30", ...ns.flatMap((n) => ["-n", n])]);
+
+    // login does not select db-shared: the shared instance runs pg only.
+    const first = upWith(login, "app");
+    expect(first.code, `login up: ${first.stderr}`).toBe(0);
+    expect((first.doc as UpDoc).up.shared_started).toBe(true);
+    expect(await waitForPid(holdPg!, 10_000), "pg should be running").toBe(true);
+    expect(pidsMatching(holdSb!)).toEqual([]);
+    const pgPids = pidsMatching(holdPg!);
+
+    // billing selects it: it is added to the running shared instance, and pg
+    // keeps running as the same process.
+    const second = upWith(billing, "app", "db-shared");
+    expect(second.code, `billing up: ${second.stderr}`).toBe(0);
+    const secondUp = (second.doc as UpDoc & { up: { shared_activated: string[] } }).up;
+    expect(secondUp.shared_started).toBe(false);
+    expect(secondUp.shared_activated).toEqual(["sb"]);
+    expect(await waitForPid(holdSb!, 10_000), "sb should be running").toBe(true);
+    expect(pidsMatching(holdPg!)).toEqual(pgPids);
+    expect(secondUp.env.SB_PORT).toBe((first.doc as UpDoc).up.env.SB_PORT);
+
+    // A branch that edits sb: an up that does not select it is unaffected...
+    writeStack(login, holdSbEdited!);
+    const unaffected = upWith(login, "app");
+    expect(unaffected.code, `scoped drift should not block: ${unaffected.stderr}`).toBe(0);
+
+    // ...and one that selects it fails SHARED_DRIFT naming sb alone, touching nothing.
+    writeStack(billing, holdSbEdited!);
+    const blocked = upWith(billing, "app", "db-shared");
+    expect(blocked.code).not.toBe(0);
+    const err = (
+      blocked.doc as { error: { code: string; details: { services: Array<{ service: string }> } } }
+    ).error;
+    expect(err.code).toBe("SHARED_DRIFT");
+    expect(err.details.services.map((s) => s.service)).toEqual(["sb"]);
+    expect(pidsMatching(holdPg!)).toEqual(pgPids);
+  }, 120_000);
+});
+
 if (!ENABLED) {
   describe("real-pc smoke — gated", () => {
     it.skip(SKIP_REASON, () => {});

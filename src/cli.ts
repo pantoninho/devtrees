@@ -131,6 +131,8 @@ export interface ExecuteDeps {
     socketPath: string;
     env: Record<string, string>;
     sharedStarted?: boolean;
+    /** Namespaced shared services this `up` added to the shared instance (#236). */
+    sharedActivated?: ReadonlyArray<string>;
     blockBase?: number;
     services?: ReadonlyArray<LsServiceRow>;
     /** `depends_on` edges lost to namespace selection (#179). */
@@ -182,6 +184,8 @@ export interface ExecuteDeps {
     instance?: "fresh" | "running";
     wouldReload?: boolean;
     wouldRestart?: ReadonlyArray<string>;
+    /** The shared services the selection includes (#236). */
+    selectedSharedServices?: ReadonlyArray<string>;
   }>;
   down: (options: { shared: boolean }) => Promise<{
     worktreeId?: string;
@@ -374,6 +378,7 @@ class UpCommand extends DevtreesCommand {
       "CONFIG_DRIFT",
       "SHARED_DRIFT",
       "SHARED_START_FAILED",
+      "SHARED_ACTIVATION_FAILED",
       "WORKTREE_START_FAILED",
       "NO_SERVICES_SELECTED",
       "SOCKET_PATH_TOO_LONG",
@@ -535,6 +540,7 @@ function dryRunPayload(result: DryRunResultView): UpDryRunPayload {
     droppedEdges: result.droppedEdges ?? [],
     droppedNamespaceEdges: result.droppedNamespaceEdges ?? [],
     bracedEnvVars: result.bracedEnvVars ?? [],
+    selectedSharedServices: result.selectedSharedServices ?? [],
     ...dryRunPlanPayload(result),
   };
 }

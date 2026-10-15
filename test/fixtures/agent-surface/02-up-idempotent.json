@@ -18,6 +18,7 @@
       }
     ],
     "shared_started": false,
+    "shared_activated": [],
     "dropped_namespace_edges": [],
     "braced_env_vars": [],
     "shared_config_changes": [],

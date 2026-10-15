@@ -163,9 +163,9 @@ export interface DroppedNamespaceEdge {
  * service process-compose does not keep, in declaration order. `stackServices`
  * is the whole stack (to resolve each target), `selected` the services the
  * `up` targets — the fresh selection, or the effective one on a running
- * instance. Edges to shared services are not namespace edges (the shared
- * instance runs regardless of `-n`, #130); they are the deriver's cross-tier
- * drops.
+ * instance. Edges to shared services are not namespace edges: they cross
+ * into the shared instance and are the deriver's cross-tier drops (ADR-0003),
+ * whether or not the `up` selects the shared target (ADR-0010).
  *
  * `kept` is the set of services process-compose actually has in the project;
  * an edge is dropped only when its target is absent from it. It defaults to

@@ -75,6 +75,11 @@ are. It never stops anything, and never attaches the TUI.
 - \`-n\` cannot add a namespace the running stack was not booted with: \`up\`
   fails with \`NAMESPACE_NOT_RUNNING\`. Boot with it: \`devtrees down && devtrees
   up -n …\` (the message names the exact command).
+- If the stack has **namespaced shared services** (\`tier: shared\` with a
+  \`namespace:\`), **always pass \`-n\`**, every time, naming the same
+  namespaces you booted with. A bare \`up\` cannot tell that a namespace holding
+  only shared services was booted, so it does not select them: it neither
+  checks them for drift nor adds them back after \`down --shared\`.
 - A dead selected service (crashed, killed, or exited non-zero) is started
   again, and \`up\` names it (\`restarted\` in the \`--json\` envelope). Several
   dead services are started in \`depends_on\` order, without waiting between
@@ -155,7 +160,8 @@ Branch on \`error.code\`:
 | \`SHARED_SERVICE_DEAD\`       | A shared service is dead. devtrees will not restart it from one worktree; run \`devtrees down --shared && devtrees up\`. |
 | \`SERVICE_START_FAILED\`      | \`up\` tried to restart a dead service, or \`restart\` a named one, and process-compose refused. \`details.services\` carries each one with process-compose's message; read it, then run \`details.remedy\` (\`devtrees down && devtrees up …\`). |
 | \`STALE_PORT_BLOCK\`          | Foreign listeners hold this worktree's ports. \`details.collisions[]\` lists \`{port_name, port, pid, command, accepts_connections, port_forwarder}\` (the message lists them too). Kill the orphaned holders and retry, but **never** kill one with \`port_forwarder: true\` (a container runtime's forwarder, such as OrbStack Helper, serving every instance: stop the container that publishes the port, \`docker ps --filter publish=<port>\`) or \`accepts_connections: false\` (usually a stale port forward). Holders that all refuse connections do not fail \`up\`; it warns and goes on. |
-| \`SHARED_DRIFT\`              | This worktree's shared services diverge from the running shared instance. Follow the message: \`devtrees down --shared && devtrees up\`. |
+| \`SHARED_DRIFT\`              | A shared service this \`up\` selects (\`details.services\`) runs at another revision than this worktree defines. An \`up\` that does not select it is unaffected. Follow the message: \`devtrees down --shared && devtrees up\` (it stops the shared instance for every worktree). |
+| \`SHARED_ACTIVATION_FAILED\`  | \`up\` could not add a namespaced shared service to the running shared instance; nothing that was running changed. \`reason: timeout\` → retry \`devtrees up\`. Otherwise **surface it to the human** with \`details.remedy\`. |
 | \`CONFIG_DRIFT\`              | The running config differs from \`devtrees.yaml\` and hot-reload failed, or an earlier reload is still pending. Branch on \`details.reason\`: \`not_supported\`/\`error\` → \`devtrees down && devtrees up\`. \`timeout\` → a changed service's old process won't stop: kill that process, then run \`devtrees up\` again to resync. Or run \`devtrees down && devtrees up\`: \`down\` force-kills that old process first and lists it in \`force_killed\`. \`reload_pending\` → that earlier reload is still waiting, so \`up\` reloaded nothing (another reload would start an untracked second copy): kill the old process (\`details.pids\`, for \`details.services\`), then run \`devtrees up\` again. Empty \`details.pids\` → the old process is gone and process-compose is still starting the new one: retry shortly; if it persists, follow the message's \`devtrees down && devtrees up …\`. |
 | \`SERVICE_NOT_FOUND\`         | You named a service that isn't in the instance. \`details.valid_services\` lists the real names; pick one. |
 | \`NO_SERVICES_SELECTED\`      | The selection has no services: a bare \`up\` starts only services with no \`namespace:\` and there are none, or \`-n\` names only namespaces with none (on \`restart\`, any \`-n\` namespace with no isolated service, in \`details.selected_namespaces\`). \`details.namespaces\` lists the namespaces; retry with one of them. |

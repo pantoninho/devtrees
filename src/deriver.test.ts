@@ -230,6 +230,32 @@ describe("config deriver — shared instance", () => {
     expect(pg.environment).toContain("DB_PORT=19000");
   });
 
+  it("emits only the named services when given a subset (#236), still injecting every shared port", () => {
+    const withNamespaced: ResolvedStack = {
+      services: [
+        ...stack.services,
+        {
+          name: "sb",
+          tier: "shared",
+          namespace: "db-shared",
+          command: "supabase start",
+          ports: ["SB_PORT"],
+          dependsOn: [],
+          environment: [],
+        },
+      ],
+    };
+    const portFor = (n: string) => ({ DB_PORT: 19000, SB_PORT: 19001 })[n];
+    const out = deriveSharedConfig(withNamespaced, {
+      workingDir: "/anchor",
+      portFor,
+      services: ["postgres"],
+    });
+    expect(Object.keys(out.config.processes)).toEqual(["postgres"]);
+    expect(out.config.processes.postgres?.environment).toContain("SB_PORT=19001");
+    expect(out.config["x-devtrees"].ports_by_service).toEqual({ postgres: { DB_PORT: 19000 } });
+  });
+
   it("pins working_dir to the anchor — shared services have no worktree of their own", () => {
     const out = deriveSharedConfig(stack, {
       workingDir: "/anchor",
