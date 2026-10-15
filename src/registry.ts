@@ -91,6 +91,35 @@ function lifecycleLockFile(anchor: string, instanceId: string): string {
   return join(devtreesDir(anchor), `${instanceId}.lock`);
 }
 
+/** Lock files in the anchor state dir that are not a worktree's lifecycle lock. */
+const NON_WORKTREE_LOCKS = new Set([`${SHARED_INSTANCE_ID}.lock`, "registry.lock", "hashes.lock"]);
+
+/**
+ * The worktree ids whose lifecycle lock is held now by a live process: an
+ * `up`, `down` or `restart` in flight in that worktree. Read-only: takes no
+ * lock and steals nothing. A lock whose content is not a pid counts as held,
+ * as `stealIfStale` never steals one either; one left by a dead process does
+ * not. The shared, registry and hashes locks are not a worktree's and are
+ * skipped. Shared by `prune --shared-ports` (#238) and `down --shared -n`
+ * (#239), both of which run it under the shared lock.
+ */
+export function heldWorktreeLocks(anchor: string): string[] {
+  const dir = devtreesDir(anchor);
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir).flatMap((entry) => {
+    if (!entry.endsWith(".lock") || NON_WORKTREE_LOCKS.has(entry)) return [];
+    let content: string;
+    try {
+      content = readFileSync(join(dir, entry), "utf8");
+    } catch {
+      return []; // released between the listing and the read
+    }
+    const pid = Number.parseInt(content.trim(), 10);
+    const held = !Number.isInteger(pid) || pid <= 0 || isPidAlive(pid);
+    return held ? [entry.slice(0, -".lock".length)] : [];
+  });
+}
+
 /**
  * Read the persisted snapshot for this anchor; empty object if none exists yet.
  *
@@ -347,24 +376,10 @@ export async function withSharedLock<T>(
  * shared ports under the shared lock but writes its worktree config after
  * releasing it, under its own lifecycle lock, so a name it just recorded is
  * only provably in use once that lock is gone. A lock left by a dead process
- * does not count. The shared and registry locks are not lifecycle locks of a
- * worktree and are skipped.
+ * does not count. The shared, registry and hashes locks are skipped
+ * (`heldWorktreeLocks`).
  */
 export function assertNoWorktreeLifecycleLocks(anchor: string): void {
-  const dir = devtreesDir(anchor);
-  if (!existsSync(dir)) return;
-  for (const entry of readdirSync(dir)) {
-    if (!entry.endsWith(".lock")) continue;
-    if (entry === `${SHARED_INSTANCE_ID}.lock` || entry === "registry.lock") continue;
-    const path = join(dir, entry);
-    let pid: number;
-    try {
-      pid = Number.parseInt(readFileSync(path, "utf8").trim(), 10);
-    } catch {
-      continue; // released between the listing and the read
-    }
-    if (!Number.isInteger(pid) || pid <= 0 || isPidAlive(pid)) {
-      throw new LockContentionError(path);
-    }
-  }
+  const [held] = heldWorktreeLocks(anchor);
+  if (held !== undefined) throw new LockContentionError(lifecycleLockFile(anchor, held));
 }

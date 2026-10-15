@@ -33,7 +33,8 @@ import { request } from "node:http";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { deriveWorktreeId } from "./anchor.js";
-import { instancePaths } from "./paths.js";
+import { instancePaths, sharedInstancePaths } from "./paths.js";
+import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { readPendingReload } from "./reload-pending.js";
 
 // ---------------------------------------------------------------------------
@@ -3741,6 +3742,349 @@ describe.skipIf(!ENABLED)("real-pc smoke — stable shared ports (#238)", () => 
     ).ls.instances.find((i) => i.kind === "shared");
     expect(sharedRow?.services.map((s) => s.name).sort()).toEqual(["pg", "y"]);
   }, 120_000);
+});
+
+/**
+ * `down --shared -n` (#239, ADR-0012) against the real binary: the named
+ * namespaces' shared services are stopped and removed by a config reload
+ * that leaves the other shared services running, and a later `up -n`
+ * adds them back fresh.
+ */
+describe.skipIf(!ENABLED)("real-pc smoke — namespaced shared teardown (#239)", () => {
+  interface NsDownDoc {
+    readonly down: {
+      readonly stopped: boolean;
+      readonly services: string[];
+      readonly inactive_namespaces: string[];
+      readonly instance_stopped: boolean;
+      readonly forced_dependants: Array<{ instance: string; service: string | null }>;
+    };
+  }
+  interface NsUpDoc {
+    readonly up: {
+      readonly env: Record<string, string>;
+      readonly shared_started: boolean;
+      readonly shared_activated: string[];
+    };
+  }
+  interface ErrDoc {
+    readonly error: { code: string; details: Record<string, unknown> };
+  }
+
+  /**
+   * Two worktrees over one stack: always-on shared `pg`, shared `sa` in
+   * namespace `a` and `sb` in `b`, an isolated `web` in `app`, and an
+   * isolated `worker` in `a` that `depends_on: sa`. Every process is a
+   * `tail -f <hold file>`, so its argv identifies it.
+   */
+  function nsStack(prefix: string) {
+    const repo = buildSmokeRepo(prefix, ["login", "billing"]);
+    currentCtx = { pidNeedle: repo.root, root: repo.root };
+    const hold = (n: string): string => {
+      const path = join(repo.root, `hold-${n}`);
+      writeFileSync(path, "");
+      return path;
+    };
+    const holds = {
+      pg: hold("pg"),
+      sa: hold("sa"),
+      sa2: hold("edited"),
+      sb: hold("sb"),
+      web: hold("web"),
+      worker: hold("worker"),
+    };
+    const write = (wt: string, saHold: string): void =>
+      writeFileSync(
+        join(wt, "devtrees.yaml"),
+        [
+          "services:",
+          "  pg:",
+          "    tier: shared",
+          `    command: "tail -f ${holds.pg}"`,
+          "    ports: [PG_PORT]",
+          "  sa:",
+          "    tier: shared",
+          "    namespace: a",
+          `    command: "tail -f ${saHold}"`,
+          "    ports: [SA_PORT]",
+          "  sb:",
+          "    tier: shared",
+          "    namespace: b",
+          `    command: "tail -f ${holds.sb}"`,
+          "    ports: [SB_PORT]",
+          "  web:",
+          "    tier: isolated",
+          "    namespace: app",
+          `    command: "tail -f ${holds.web}"`,
+          "    ports: [WEB_PORT]",
+          "  worker:",
+          "    tier: isolated",
+          "    namespace: a",
+          `    command: "tail -f ${holds.worker}"`,
+          "    depends_on:",
+          "      sa:",
+          "        condition: process_started",
+          "",
+        ].join("\n"),
+      );
+    const login = repo.worktrees.login!;
+    const billing = repo.worktrees.billing!;
+    write(login, holds.sa);
+    write(billing, holds.sa);
+    cleanupStack.push(() => devtrees(login, ["down", "--shared"]));
+    cleanupStack.push(() => devtrees(login, ["down"]));
+    cleanupStack.push(() => devtrees(billing, ["down"]));
+    return { login, billing, holds, write };
+  }
+
+  const upWith = (wt: string, ...ns: string[]): CliResult =>
+    devtrees(wt, ["up", "--json", "--wait-timeout", "30", ...ns.flatMap((n) => ["-n", n])]);
+  const nsDown = (wt: string, ...args: string[]): CliResult =>
+    devtrees(wt, ["down", "--shared", "--json", ...args]);
+  const anchorOf = (wt: string): string =>
+    execGit(wt, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+
+  it("scenario 124: down --shared -n a stops only a's shared services; b's keep their pids and ports, and up -n a adds a back fresh with no SHARED_DRIFT", async () => {
+    const s = nsStack("dt-rpc124-");
+    const first = upWith(s.billing, "app", "b");
+    expect(first.code, `billing up: ${first.stderr}`).toBe(0);
+    const second = upWith(s.login, "app", "a");
+    expect(second.code, `login up: ${second.stderr}`).toBe(0);
+    expect((second.doc as NsUpDoc).up.shared_activated).toEqual(["sa"]);
+    for (const h of [s.holds.pg, s.holds.sa, s.holds.sb]) {
+      expect(await waitForPid(h, 10_000), `${h} should run`).toBe(true);
+    }
+    // login's worker depends on sa: take login down first, so nothing does.
+    expect(devtrees(s.login, ["down", "--json"]).code).toBe(0);
+
+    // A worktree with a lifecycle command in flight (its lock held by a live
+    // process, no socket yet) blocks the teardown.
+    const inFlight = join(anchorOf(s.login), "devtrees", `${deriveWorktreeId("/x/racer")}.lock`);
+    writeFileSync(inFlight, `${process.pid}\n`);
+    const racing = nsDown(s.login, "-n", "a");
+    expect((racing.doc as ErrDoc).error.code).toBe("SHARED_IN_USE");
+    expect((racing.doc as ErrDoc).error.details).toMatchObject({
+      dependants: [{ source: "lifecycle_in_progress", service: null }],
+    });
+    rmSync(inFlight, { force: true });
+    const pg = pidsMatching(s.holds.pg);
+    const sb = pidsMatching(s.holds.sb);
+    const saPort = (second.doc as NsUpDoc).up.env.SA_PORT;
+    const sbPort = (first.doc as NsUpDoc).up.env.SB_PORT;
+
+    // The dry run previews it and changes nothing.
+    const dry = nsDown(s.login, "-n", "a", "-n", "nope", "--dry-run");
+    expect(dry.code, dry.stdout).toBe(0);
+    expect((dry.doc as { down_dry_run: unknown }).down_dry_run).toMatchObject({
+      running: true,
+      services: ["sa"],
+      inactive_namespaces: ["nope"],
+      would_stop_instance: false,
+      dependants: [],
+      blocked: false,
+    });
+    expect(pidsMatching(s.holds.sa)).toHaveLength(1);
+
+    const down = nsDown(s.login, "-n", "a", "-n", "nope");
+    expect(down.code, `down --shared -n a: ${down.stdout} ${down.stderr}`).toBe(0);
+    expect((down.doc as NsDownDoc).down).toMatchObject({
+      stopped: true,
+      services: ["sa"],
+      inactive_namespaces: ["nope"],
+      instance_stopped: false,
+      forced_dependants: [],
+    });
+    expect(await waitForNoPids(s.holds.sa)).toEqual([]);
+    expect(pidsMatching(s.holds.pg)).toEqual(pg);
+    expect(pidsMatching(s.holds.sb)).toEqual(sb);
+
+    // b is untouched: billing's re-up adds nothing and injects the same port.
+    const again = upWith(s.billing, "app", "b");
+    expect(again.code, `billing re-up: ${again.stderr}`).toBe(0);
+    expect((again.doc as NsUpDoc).up.shared_activated).toEqual([]);
+    expect((again.doc as NsUpDoc).up.env.SB_PORT).toBe(sbPort);
+    expect(pidsMatching(s.holds.sb)).toEqual(sb);
+
+    // A retry is a no-op.
+    const retry = nsDown(s.login, "-n", "a");
+    expect(retry.code).toBe(0);
+    expect((retry.doc as NsDownDoc).down).toMatchObject({ stopped: false, services: [] });
+
+    // The stable port map (#238) still holds sa's number, but nothing binds it.
+    type EnvDoc = { shared_ports: Record<string, { port: number; origin: string }> };
+    const between = devtrees(s.login, ["env", "--json"]);
+    expect(between.code, between.stdout).toBe(0);
+    expect((between.doc as EnvDoc).shared_ports.SA_PORT).toEqual({
+      port: Number(saPort),
+      origin: "recorded",
+    });
+
+    // login now defines sa differently: the drift record went with it, so
+    // up -n a adds the new definition, on the same port, with no SHARED_DRIFT.
+    s.write(s.login, s.holds.sa2);
+    const back = upWith(s.login, "app", "a");
+    expect(back.code, `login up -n a: ${back.stdout} ${back.stderr}`).toBe(0);
+    expect((back.doc as NsUpDoc).up.shared_activated).toEqual(["sa"]);
+    expect((back.doc as NsUpDoc).up.env.SA_PORT).toBe(saPort);
+    expect(await waitForPid(s.holds.sa2, 10_000), "the new sa should run").toBe(true);
+    const after = devtrees(s.login, ["env", "--json"]);
+    expect((after.doc as EnvDoc).shared_ports.SA_PORT).toEqual({
+      port: Number(saPort),
+      origin: "active",
+    });
+    expect(pidsMatching(s.holds.sa)).toEqual([]);
+    expect(pidsMatching(s.holds.pg)).toEqual(pg);
+    expect(pidsMatching(s.holds.sb)).toEqual(sb);
+  }, 180_000);
+
+  it("scenario 125: a running worktree that depends on a's shared service blocks it with SHARED_IN_USE; --force removes it anyway", async () => {
+    const s = nsStack("dt-rpc125-");
+    const up = upWith(s.login, "app", "a");
+    expect(up.code, `login up: ${up.stderr}`).toBe(0);
+    expect(await waitForPid(s.holds.worker, 10_000), "worker should run").toBe(true);
+    const sa = pidsMatching(s.holds.sa);
+    const worker = pidsMatching(s.holds.worker);
+    const id = wtId(s.login);
+
+    const dry = nsDown(s.billing, "-n", "a", "--dry-run");
+    expect(dry.code, dry.stdout).toBe(0);
+    expect((dry.doc as { down_dry_run: unknown }).down_dry_run).toMatchObject({
+      services: ["sa"],
+      dependants: [
+        { instance: id, service: "worker", depends_on: ["sa"], source: "derived_config" },
+      ],
+      blocked: true,
+    });
+
+    const refused = nsDown(s.billing, "-n", "a");
+    expect(refused.code).not.toBe(0);
+    const err = (refused.doc as ErrDoc).error;
+    expect(err.code).toBe("SHARED_IN_USE");
+    expect(err.details).toMatchObject({
+      services: ["sa"],
+      dependants: [{ instance: id, service: "worker", depends_on: ["sa"] }],
+      forceable: true,
+    });
+    expect(pidsMatching(s.holds.sa)).toEqual(sa);
+
+    const forced = nsDown(s.billing, "-n", "a", "--force");
+    expect(forced.code, `--force: ${forced.stdout}`).toBe(0);
+    expect((forced.doc as NsDownDoc).down).toMatchObject({
+      stopped: true,
+      services: ["sa"],
+      instance_stopped: false,
+      forced_dependants: [{ instance: id, service: "worker" }],
+    });
+    expect(await waitForNoPids(s.holds.sa)).toEqual([]);
+    // The dependant itself is not touched; pg keeps the shared instance up.
+    expect(pidsMatching(s.holds.worker)).toEqual(worker);
+    expect(pidsMatching(s.holds.pg)).toHaveLength(1);
+  }, 180_000);
+
+  it("scenario 127: an up re-adding a service a timed-out removal left stopped in process-compose starts it again", async () => {
+    const s = nsStack("dt-rpc127-");
+    expect(upWith(s.billing, "app", "b").code).toBe(0);
+    expect(upWith(s.login, "app", "a").code).toBe(0);
+    expect(await waitForPid(s.holds.sa, 10_000), "sa should run").toBe(true);
+    expect(devtrees(s.login, ["down"]).code).toBe(0);
+    const pg = pidsMatching(s.holds.pg);
+    const sb = pidsMatching(s.holds.sb);
+
+    // What a removing reload that timed out and never landed leaves: sa stopped
+    // and still in the project, gone from the derived config and the state.
+    const anchor = anchorOf(s.login);
+    const shared = sharedInstancePaths(anchor);
+    const stop = spawnSync("process-compose", [
+      "process",
+      "stop",
+      "sa",
+      "-U",
+      "-u",
+      shared.socketPath,
+    ]);
+    expect(stop.status, String(stop.stderr)).toBe(0);
+    expect(await waitForNoPids(s.holds.sa)).toEqual([]);
+    const config = parseYaml(readFileSync(shared.configPath, "utf8")) as {
+      processes: Record<string, unknown>;
+    };
+    delete config.processes.sa;
+    writeFileSync(shared.configPath, stringifyYaml(config));
+    const statePath = join(anchor, "devtrees", "shared-state.json");
+    const state = JSON.parse(readFileSync(statePath, "utf8")) as {
+      services: Record<string, unknown>;
+    };
+    delete state.services.sa;
+    writeFileSync(statePath, JSON.stringify(state));
+
+    const back = upWith(s.login, "app", "a");
+    expect(back.code, `re-up: ${back.stdout} ${back.stderr}`).toBe(0);
+    const doc = back.doc as NsUpDoc & { up: { shared_restarted: string[] } };
+    expect(doc.up.shared_activated).toEqual(["sa"]);
+    expect(doc.up.shared_restarted).toEqual(["sa"]);
+    expect(await waitForPid(s.holds.sa, 10_000), "sa should run again").toBe(true);
+    expect(pidsMatching(s.holds.pg)).toEqual(pg);
+    expect(pidsMatching(s.holds.sb)).toEqual(sb);
+  }, 180_000);
+
+  it("scenario 126: removing the last running shared services stops the shared instance, as down --shared does", async () => {
+    const repo = buildSmokeRepo("dt-rpc126-", ["login"]);
+    currentCtx = { pidNeedle: repo.root, root: repo.root };
+    const login = repo.worktrees.login!;
+    const holdSa = join(repo.root, "hold-sa");
+    const holdWeb = join(repo.root, "hold-web");
+    for (const h of [holdSa, holdWeb]) writeFileSync(h, "");
+    writeFileSync(
+      join(login, "devtrees.yaml"),
+      [
+        "services:",
+        "  sa:",
+        "    tier: shared",
+        "    namespace: a",
+        `    command: "tail -f ${holdSa}"`,
+        "    ports: [SA_PORT]",
+        "  web:",
+        "    tier: isolated",
+        `    command: "tail -f ${holdWeb}"`,
+        "",
+      ].join("\n"),
+    );
+    cleanupStack.push(() => devtrees(login, ["down", "--shared"]));
+    cleanupStack.push(() => devtrees(login, ["down"]));
+    const up = upWith(login, "default", "a");
+    expect(up.code, `up: ${up.stderr}`).toBe(0);
+    expect(await waitForPid(holdSa, 10_000)).toBe(true);
+
+    const dry = nsDown(login, "-n", "a", "--dry-run");
+    expect((dry.doc as { down_dry_run: unknown }).down_dry_run).toMatchObject({
+      services: ["sa"],
+      would_stop_instance: true,
+    });
+
+    const down = nsDown(login, "-n", "a");
+    expect(down.code, `down: ${down.stdout} ${down.stderr}`).toBe(0);
+    expect((down.doc as NsDownDoc).down).toMatchObject({
+      stopped: true,
+      services: ["sa"],
+      instance_stopped: true,
+    });
+    expect(await waitForNoPids(holdSa)).toEqual([]);
+    const ls = devtrees(login, ["ls", "--json"]);
+    const listed = (ls.doc as { ls: { instances: Array<{ kind: string }> } }).ls.instances;
+    const kinds = listed.map((i) => i.kind);
+    expect(kinds).not.toContain("shared");
+    expect(pidsMatching(holdWeb)).toHaveLength(1);
+
+    // Nothing left: a retry, or any namespace, is a no-op.
+    const again = nsDown(login, "-n", "a");
+    expect(again.code).toBe(0);
+    expect((again.doc as NsDownDoc).down).toMatchObject({ stopped: false, services: [] });
+
+    // And the next up starts a fresh shared instance with it.
+    const back = upWith(login, "default", "a");
+    expect(back.code, `re-up: ${back.stderr}`).toBe(0);
+    expect((back.doc as NsUpDoc).up.shared_started).toBe(true);
+    expect(await waitForPid(holdSa, 10_000)).toBe(true);
+  }, 180_000);
 });
 
 if (!ENABLED) {

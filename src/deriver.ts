@@ -120,6 +120,16 @@ export interface DroppedEdge {
  */
 export interface DerivedMetadata {
   readonly ports_by_service: Readonly<Record<string, Readonly<Record<string, number>>>>;
+  /**
+   * A worktree instance's cross-tier `depends_on` edges (#239): each isolated
+   * service mapped to the shared services it depends on, the edges the
+   * derived config dropped (ADR-0003). `down --shared -n` reads it to find a
+   * running worktree that still uses a shared service it would remove.
+   * Always present in a worktree config written since #239 (`{}` when no edge
+   * was dropped), never in the shared config. Absence therefore means a
+   * config written before #239, whose edges must be read from elsewhere.
+   */
+  readonly shared_depends_on?: Readonly<Record<string, ReadonlyArray<string>>>;
 }
 
 /** Well-known key the derived config stores `DerivedMetadata` under. */
@@ -249,14 +259,28 @@ export function deriveWorktreeConfig(stack: ResolvedStack, ctx: DeriveContext): 
     extraEnvLines: envLines(env),
   });
 
+  const sharedDependsOn = sharedDependsOnOf(droppedEdges);
   return {
     config: {
       processes,
-      [DEVTREES_METADATA_KEY]: { ports_by_service: collectPortsByService(isolated, ctx.portFor) },
+      [DEVTREES_METADATA_KEY]: {
+        ports_by_service: collectPortsByService(isolated, ctx.portFor),
+        shared_depends_on: sharedDependsOn,
+      },
     },
     env,
     droppedEdges,
   };
+}
+
+/** The dropped isolated → shared edges, grouped by isolated service (#239); `{}` when none. */
+function sharedDependsOnOf(dropped: ReadonlyArray<DroppedEdge>): Record<string, string[]> {
+  const byService: Record<string, string[]> = {};
+  for (const edge of dropped) {
+    if (edge.fromTier !== "isolated" || edge.toTier !== "shared") continue;
+    (byService[edge.from] ??= []).push(edge.to);
+  }
+  return byService;
 }
 
 /** Context for the shared instance: the anchor (working dir) and the repo-wide port resolver. */

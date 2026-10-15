@@ -27,6 +27,7 @@ import {
 import {
   discoverInstances,
   PROBE_RETRY_DELAYS_MS,
+  type DiscoverDeps,
   probeSocket as defaultProbeSocket,
   probeUntilDefinitive,
   readDeclaredPorts,
@@ -77,6 +78,7 @@ import {
 } from "./driver.js";
 import {
   assertNoWorktreeLifecycleLocks,
+  heldWorktreeLocks,
   readRegistry,
   withLifecycleLock,
   withRegistryLock,
@@ -103,6 +105,20 @@ import {
 } from "./down-survivors.js";
 import { sharedExtendedFields, sharedStackHash, stackHash } from "./hash.js";
 import { boundedRestart } from "./bounded-restart.js";
+import { boundedStopServices, StopRefusedError } from "./bounded-stop.js";
+import {
+  inProgressDependants,
+  planSharedDown,
+  recordedSharedEdges,
+  removesLastRunning,
+  stackSharedEdges,
+  withoutProcesses,
+  withoutServiceRecords,
+  worktreeDependants,
+  type SharedDependant,
+  type SharedDownPlan,
+  type WorktreeEdges,
+} from "./shared-down.js";
 import {
   assertNotLastRunning,
   assertNotPending,
@@ -337,6 +353,54 @@ class SharedActivationFailedError extends Error {
     super(message);
     this.name = "SharedActivationFailedError";
     this.details = details;
+  }
+}
+
+/**
+ * `down --shared -n` (#239) refused: a live worktree instance has a booted
+ * isolated service that `depends_on` a shared service it would remove
+ * (overridable with `--force`), or a shared service it would keep does
+ * (never overridable: removing the dependency would edit a running shared
+ * service's definition, which restarts it). Nothing was stopped.
+ */
+class SharedInUseError extends Error {
+  readonly code = "SHARED_IN_USE" as const;
+  constructor(
+    message: string,
+    readonly details: {
+      readonly namespaces: ReadonlyArray<string>;
+      readonly services: ReadonlyArray<string>;
+      readonly dependants: ReadonlyArray<SharedDependant>;
+      /** False when a shared dependant blocks: `--force` would not help. */
+      readonly forceable: boolean;
+      readonly remedy: string;
+    },
+  ) {
+    super(message);
+    this.name = "SharedInUseError";
+  }
+}
+
+/**
+ * `down --shared -n` (#239) could not finish removing the shared services:
+ * process-compose refused to stop them or they did not stop
+ * (`stop_refused`, `stop_incomplete`: nothing was removed), or it refused or
+ * timed out on the config reload that removes them (`not_supported`,
+ * `error`, `timeout`). The other shared services are untouched either way.
+ */
+class SharedRemovalFailedError extends Error {
+  readonly code = "SHARED_REMOVAL_FAILED" as const;
+  constructor(
+    message: string,
+    readonly details: {
+      readonly services: ReadonlyArray<string>;
+      readonly reason: "stop_refused" | "stop_incomplete" | "not_supported" | "error" | "timeout";
+      readonly config_path: string;
+      readonly remedy: string;
+    },
+  ) {
+    super(message);
+    this.name = "SharedRemovalFailedError";
   }
 }
 
@@ -606,6 +670,32 @@ function assertExplicitSelectionNotEmpty(
 /** Remedy for drift in the shared instance: restart it from this worktree's config. */
 const SHARED_DRIFT_REMEDY = "devtrees down --shared && devtrees up";
 
+/**
+ * The remedy for broken or drifted shared services (#239): when every one is
+ * namespaced, `down --shared -n` for their namespaces then the same `up`,
+ * which leaves the other shared services running; otherwise the full
+ * teardown. A service's namespace is the one this `up` selects it by, or its
+ * own first one when it came in as a dependency.
+ */
+function sharedRemedyFor(
+  stack: ResolvedStack,
+  upNamespaces: ReadonlyArray<string>,
+): (services: ReadonlyArray<string>) => string {
+  return (names) => {
+    const byName = new Map(sharedServicesOf(stack).map((s) => [s.name, s]));
+    const services = names.map((n) => byName.get(n));
+    if (services.length === 0 || services.some((s) => s === undefined || isAlwaysOnShared(s))) {
+      return SHARED_DRIFT_REMEDY;
+    }
+    const ns = (services as ResolvedService[]).map((s) => {
+      const own = serviceNamespaces(s);
+      return own.find((n) => upNamespaces.includes(n)) ?? own[0] ?? DEFAULT_NAMESPACE;
+    });
+    const down = ["devtrees down --shared", ...[...new Set(ns)].map((n) => `-n ${n}`)].join(" ");
+    return `${down} && ${formatUpCommand(stack.services, upNamespaces)}`;
+  };
+}
+
 /** First 12 hex chars of a revision, for prose; the envelope carries it whole. */
 function shortRevision(hash: string): string {
   return hash === UNKNOWN_REVISION ? "unknown (started by an older devtrees)" : hash.slice(0, 12);
@@ -625,6 +715,8 @@ function assertSharedPlanClean(
     readonly worktreeId: string;
     readonly state: SharedState;
     readonly stack: ResolvedStack;
+    /** The remedy for the drifted services (#239); default: the full teardown. */
+    readonly remedyFor?: (services: ReadonlyArray<string>) => string;
   },
 ): void {
   if (plan.drifted.length === 0 && plan.portConflicts.length === 0) return;
@@ -636,14 +728,24 @@ function assertSharedPlanClean(
   const conflicts = plan.portConflicts.map(
     (c) => `'${c.service}' declares ${c.port}, which running shared service '${c.owner}' owns`,
   );
+  // A port conflict needs the owner gone too: only the full teardown is sure to.
+  const remedy =
+    plan.portConflicts.length === 0 && ctx.remedyFor !== undefined
+      ? ctx.remedyFor(plan.drifted.map((d) => d.service))
+      : SHARED_DRIFT_REMEDY;
+  const advice =
+    remedy === SHARED_DRIFT_REMEDY
+      ? `Run \`${SHARED_DRIFT_REMEDY}\` to restart shared from this worktree's config ` +
+        `(this stops the shared instance for every worktree).`
+      : `Run \`${remedy}\` to restart only those shared services from this worktree's ` +
+        `config (the others keep running), or \`${SHARED_DRIFT_REMEDY}\` to restart the ` +
+        `whole shared instance (this stops it for every worktree).`;
   throw new SharedDriftError(
     `the shared instance runs a different definition of shared services this up selects: ` +
       `${[...drifted, ...conflicts].join("; ")} ` +
       `(likely a branch that edited a shared service). ` +
       `Refusing to inject port numbers the shared instance never bound. ` +
-      `An up that does not select these services is unaffected. ` +
-      `Run \`${SHARED_DRIFT_REMEDY}\` to restart shared from this worktree's config ` +
-      `(this stops the shared instance for every worktree).`,
+      `An up that does not select these services is unaffected. ${advice}`,
     {
       worktree_id: ctx.worktreeId,
       running_hash: ctx.state.hash,
@@ -657,7 +759,7 @@ function assertSharedPlanClean(
         local_hash: d.localHash,
       })),
       port_conflicts: plan.portConflicts.map((c) => ({ ...c })),
-      remedy: SHARED_DRIFT_REMEDY,
+      remedy,
     },
   );
 }
@@ -1217,6 +1319,12 @@ export interface CommandDeps {
    * processes.
    */
   readonly isProcessAlive?: (pid: number) => boolean;
+  /**
+   * Discover every instance at the anchor. `down --shared -n` (#239) walks the
+   * live worktree instances for isolated services that still depend on a
+   * shared service it would remove. Default: `discoverInstances`.
+   */
+  readonly discover?: (anchor: string, deps: DiscoverDeps) => Promise<InstanceInfo[]>;
 }
 
 export interface UpResult {
@@ -1969,6 +2077,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
         socketPath: sharedPaths.socketPath,
         sharedServiceNames: sharedNames,
         probedServiceNames: probedNames(sharedServices),
+        remedyFor: sharedRemedyFor(stack, freshSelection.namespaces),
       });
     }
 
@@ -2621,6 +2730,7 @@ async function prepareShared(args: {
           deps,
           driver,
         )(sharedInstancePaths(anchor.anchor).socketPath).catch(() => undefined),
+      remedyFor: sharedRemedyFor(stack, args.namespaces),
     },
   );
   const wait = ensured.started ? ready : () => waitSharedReady(args, selected, ensured.restarted);
@@ -2648,6 +2758,8 @@ async function waitSharedReady(
     readonly driver: ReturnType<typeof createDriver>;
     readonly deps: CommandDeps;
     readonly warn: (message: string) => void;
+    readonly stack: ResolvedStack;
+    readonly namespaces: ReadonlyArray<string>;
   },
   selected: ReadonlyArray<ResolvedService>,
   restarted: ReadonlyArray<RestartedService>,
@@ -2671,6 +2783,7 @@ async function waitSharedReady(
     restarted,
     probedServiceNames: probedNames(selected),
     timeoutMs: deps.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS,
+    remedyFor: sharedRemedyFor(args.stack, args.namespaces),
   });
 }
 
@@ -2775,6 +2888,8 @@ interface EnsureSharedDeps {
    * recorded but process-compose never started (#236).
    */
   readonly readSharedRows: () => Promise<ServiceStatus[] | undefined>;
+  /** The remedy for broken or drifted selected shared services (#239). */
+  readonly remedyFor?: (services: ReadonlyArray<string>) => string;
 }
 
 /**
@@ -2877,7 +2992,12 @@ async function reconcileLiveShared(
   // Drift first (#240): a drifted selected service fails SHARED_DRIFT before
   // anything is restarted or added, since a restart would run the instance's
   // definition, not this worktree's.
-  assertSharedPlanClean(plan, { worktreeId: step.worktreeId, state, stack });
+  assertSharedPlanClean(plan, {
+    worktreeId: step.worktreeId,
+    state,
+    stack,
+    ...(deps.remedyFor !== undefined ? { remedyFor: deps.remedyFor } : {}),
+  });
   const selectedNames = selected.map((s) => s.name);
   const fieldChanges = sharedFieldChanges(state, pick(sharedExtendedFields(stack), selectedNames));
   for (const change of fieldChanges) deps.warn(formatSharedFieldChangeWarning(change));
@@ -2899,17 +3019,46 @@ async function reconcileLiveShared(
     names: selectedNames.filter((name) => !toAdd.some((s) => s.name === name)),
     socketPath: sharedInstancePaths(anchor).socketPath,
     driver: deps.driver,
+    remedyFor: deps.remedyFor,
   });
-  if (toAdd.length > 0) {
-    await activateShared({ ...step, state, missing: toAdd, ports });
+  if (toAdd.length === 0) {
+    return { started: false, activated: [], restarted, ports, fieldChanges };
   }
+  // Read before the add: a process the instance already lists is one a
+  // removal (`down --shared -n`, #239) stopped but whose reload never landed.
+  const before = rows ?? (await deps.readSharedRows());
+  await activateShared({ ...step, state, missing: toAdd, ports });
+  const revived = await reviveReAdded(step, toAdd, before ?? []);
   return {
     started: false,
     activated: toAdd.map((s) => s.name),
-    restarted,
+    restarted: [...restarted, ...revived],
     ports,
     fieldChanges,
   };
+}
+
+/**
+ * Start the added services the shared instance already listed, stopped
+ * (#239): a `down --shared -n` stopped them, and its removing reload timed
+ * out and never landed. The add re-sends their unchanged definition, so
+ * process-compose's reload leaves them as they are, stopped. Started like a
+ * dead shared service (#240), and waited on with them.
+ */
+async function reviveReAdded(
+  step: SharedStep,
+  added: ReadonlyArray<ResolvedService>,
+  before: ReadonlyArray<ServiceStatus>,
+): Promise<RestartedService[]> {
+  const listed = new Set(before.map((r) => r.name));
+  return await restartDeadShared({
+    stack: step.stack,
+    rows: before,
+    names: added.map((s) => s.name).filter((name) => listed.has(name)),
+    socketPath: sharedInstancePaths(step.anchor).socketPath,
+    driver: step.deps.driver,
+    remedyFor: step.deps.remedyFor,
+  });
 }
 
 /**
@@ -2977,6 +3126,7 @@ async function restartDeadShared(args: {
   readonly names: ReadonlyArray<string>;
   readonly socketPath: string;
   readonly driver: ReturnType<typeof createDriver>;
+  readonly remedyFor?: ((services: ReadonlyArray<string>) => string) | undefined;
 }): Promise<RestartedService[]> {
   const dead = findDeadServices(args.rows, args.names);
   if (dead.length === 0) return [];
@@ -2988,11 +3138,12 @@ async function restartDeadShared(args: {
     ),
   });
   if (failed.length > 0) {
-    const refused = new Set(failed.map((f) => f.name));
-    throw sharedServiceDeadError(
-      dead.filter((d) => refused.has(d.name)),
-      { reason: "start_refused", startFailures: failed },
-    );
+    const refused = dead.filter((d) => failed.some((f) => f.name === d.name));
+    throw sharedServiceDeadError(refused, {
+      reason: "start_refused",
+      startFailures: failed,
+      remedy: args.remedyFor?.(refused.map((d) => d.name)),
+    });
   }
   return restarted;
 }
@@ -3524,6 +3675,527 @@ export async function runDown(
     forceKilled: stop.stopped?.forceKilled ?? [],
     ...(warning !== undefined ? { warning } : {}),
   };
+}
+
+// --- down --shared -n (#239, ADR-0012) --------------------------------------
+
+/** `down --shared -n <namespace>...` (#239): which namespaces, and whether to override worktree dependants. */
+export interface SharedNamespaceDownOptions {
+  readonly namespaces: ReadonlyArray<string>;
+  /** Remove the services even though a live worktree's isolated service depends on them. */
+  readonly force?: boolean;
+}
+
+/** What `down --shared -n` did (#239). */
+export interface SharedNamespaceDownResult {
+  readonly shared: true;
+  /**
+   * devtrees stopped a running shared process (or the whole instance). `false`
+   * on the no-op, and when it only removed services that were already stopped.
+   */
+  readonly stopped: boolean;
+  readonly namespaces: ReadonlyArray<string>;
+  /** The shared services of the named namespaces, in config order. */
+  readonly services: ReadonlyArray<string>;
+  /**
+   * What left the shared instance: `services`, plus leftovers of an earlier
+   * removal whose reload timed out. Empty on the no-op.
+   */
+  readonly removed: ReadonlyArray<string>;
+  /** Named namespaces with no shared service in the shared instance: nothing to do for them. */
+  readonly inactiveNamespaces: ReadonlyArray<string>;
+  /** They were the last running shared services: the whole shared instance was stopped. */
+  readonly instanceStopped: boolean;
+  /** Worktree dependants `--force` overrode (empty without `--force`). */
+  readonly dependants: ReadonlyArray<SharedDependant>;
+  readonly forceKilled: ReadonlyArray<ForceKilled>;
+}
+
+/** What `down --shared -n --dry-run` previews (#239): the same reads, no lock, no effect. */
+export interface SharedNamespaceDownPreview {
+  readonly namespaces: ReadonlyArray<string>;
+  /** Whether a live shared instance answered. */
+  readonly running: boolean;
+  readonly services: ReadonlyArray<string>;
+  readonly inactiveNamespaces: ReadonlyArray<string>;
+  readonly wouldStopInstance: boolean;
+  /** Every dependant found, shared and worktree alike. */
+  readonly dependants: ReadonlyArray<SharedDependant>;
+  /** The real run would fail `SHARED_IN_USE` (with the same `--force`). */
+  readonly blocked: boolean;
+}
+
+/** What a namespaced shared teardown found, under the shared lock or (dry run) without it. */
+interface SharedDownInspection {
+  readonly live: boolean;
+  readonly config: DerivedConfig | undefined;
+  readonly rows: ReadonlyArray<ServiceStatus>;
+  readonly plan: SharedDownPlan;
+  /** Processes the shared instance still lists that its config no longer holds: a timed-out removal. */
+  readonly leftovers: ReadonlyArray<string>;
+  readonly dependants: ReadonlyArray<SharedDependant>;
+  /** Removing the targets leaves nothing running, so it is a full `down --shared`. */
+  readonly last: boolean;
+  /** The command that retries this teardown. */
+  readonly retry: string;
+}
+
+/** The command to retry, and the one `INSTANCE_UNRESPONSIVE` names. */
+function sharedDownCommand(namespaces: ReadonlyArray<string>, force?: boolean): string {
+  const ns = namespaces.map((n) => `-n ${n}`).join(" ");
+  return `devtrees down --shared ${ns}${force === true ? " --force" : ""}`;
+}
+
+/**
+ * Stop and remove only the shared services of `namespaces` (#239,
+ * ADR-0012), under the shared lifecycle lock, so it never interleaves with
+ * an `up` that is adding or restarting shared services (#236, #240):
+ *
+ *  1. Probe the shared instance; not running is the idempotent no-op.
+ *  2. Pick the targets from the shared derived config (`planSharedDown`).
+ *     None is the same no-op: a namespace with no running shared service is
+ *     reported in `inactiveNamespaces`, never an error.
+ *  3. Refuse `SHARED_IN_USE` while something still depends on a target.
+ *  4. When the targets are the last running shared services, stop the whole
+ *     shared instance, exactly as `down --shared`.
+ *  5. Otherwise stop the targets with the bounded per-service stop
+ *     (`restart`'s first half: shutdown hooks, then a force-kill after the
+ *     budget), remove their processes from the shared derived config, and
+ *     ask process-compose to re-read it (the reload activation uses). The
+ *     processes left in the file are unchanged, so process-compose keeps
+ *     them running. Last, drop the targets' revision records from the shared
+ *     state, keeping their ports reserved (`withoutServiceRecords`).
+ */
+export async function runSharedNamespaceDown(
+  deps: CommandDeps,
+  options: SharedNamespaceDownOptions,
+): Promise<SharedNamespaceDownResult> {
+  const { anchor } = resolve(deps);
+  const sharedLock = deps.withSharedLock ?? defaultWithSharedLock;
+  const driver = createDriver(deps.driver);
+  return await sharedLock(anchor.anchor, async () => {
+    const seen = await inspectSharedDown(deps, anchor.anchor, options, { readOnly: false });
+    const result = {
+      shared: true as const,
+      namespaces: [...options.namespaces],
+      services: [...seen.plan.targets],
+      inactiveNamespaces: seen.plan.inactiveNamespaces,
+      dependants: [] as SharedDependant[],
+      forceKilled: [] as ForceKilled[],
+      removed: [] as string[],
+    };
+    if (!seen.live || (seen.plan.targets.length === 0 && seen.leftovers.length === 0)) {
+      return { ...result, stopped: false, instanceStopped: false };
+    }
+    const removed = [...seen.plan.targets, ...seen.leftovers];
+    assertSharedNotInUse(seen, options);
+    const overridden = { dependants: [...seen.dependants], removed };
+    if (seen.last) {
+      const forceKilled = await stopWholeShared(driver, anchor.anchor, deps);
+      return { ...result, ...overridden, stopped: true, instanceStopped: true, forceKilled };
+    }
+    const stop = await stopSharedTargets(deps, driver, anchor.anchor, seen);
+    const { forceKilled } = stop;
+    if (stop.instanceGone) {
+      rmSync(sharedInstancePaths(anchor.anchor).configPath, { force: true });
+      return { ...result, ...overridden, stopped: true, instanceStopped: true, forceKilled };
+    }
+    await removeSharedProcesses(driver, anchor.anchor, seen);
+    return { ...result, ...overridden, stopped: stop.stopped, instanceStopped: false, forceKilled };
+  });
+}
+
+/**
+ * Preview `down --shared -n` (#239): the same reads as the real run, without
+ * the shared lock, and with a stale socket file left in place. Nothing is
+ * stopped, reloaded or written.
+ */
+export async function runSharedNamespaceDownDryRun(
+  deps: CommandDeps,
+  options: SharedNamespaceDownOptions,
+): Promise<SharedNamespaceDownPreview> {
+  const { anchor } = resolve(deps);
+  const seen = await inspectSharedDown(deps, anchor.anchor, options, { readOnly: true });
+  return {
+    namespaces: [...options.namespaces],
+    running: seen.live,
+    services: seen.plan.targets,
+    inactiveNamespaces: seen.plan.inactiveNamespaces,
+    wouldStopInstance: seen.last,
+    dependants: seen.dependants,
+    blocked: blockingDependants(seen.dependants, options.force).length > 0,
+  };
+}
+
+/** Read what a namespaced shared teardown acts on (#239). */
+async function inspectSharedDown(
+  deps: CommandDeps,
+  anchor: string,
+  options: SharedNamespaceDownOptions,
+  opts: { readonly readOnly: boolean },
+): Promise<SharedDownInspection> {
+  const paths = sharedInstancePaths(anchor);
+  const retry = sharedDownCommand(options.namespaces, options.force);
+  const context = { command: "down" as const, instance: SHARED_INSTANCE_ID, retry };
+  const live = await socketIsLive(paths.socketPath, resolveProbe(deps), context, opts);
+  if (!live) {
+    const plan = planSharedDown(undefined, options.namespaces);
+    return {
+      live,
+      config: undefined,
+      rows: [],
+      plan,
+      leftovers: [],
+      dependants: [],
+      last: false,
+      retry,
+    };
+  }
+  const config = readDerivedConfig(paths.configPath);
+  const rows = await readSharedRowsOrFail(deps, paths.socketPath, context);
+  const plan = planSharedDown(config, options.namespaces);
+  const leftovers = rows.map((r) => r.name).filter((name) => !(name in (config?.processes ?? {})));
+  const dependants =
+    plan.targets.length === 0
+      ? []
+      : [...plan.sharedDependants, ...(await findWorktreeDependants(deps, anchor, plan.targets))];
+  const last = plan.targets.length > 0 && removesLastRunning(rows, plan.remaining);
+  return { live, config, rows, plan, leftovers, dependants, last, retry };
+}
+
+/** One bounded `process list` of the shared instance; one that never answers is `INSTANCE_UNRESPONSIVE`. */
+async function readSharedRowsOrFail(
+  deps: CommandDeps,
+  socketPath: string,
+  context: LivenessContext,
+): Promise<ServiceStatus[]> {
+  const read = statusReader(deps, createDriver(deps.driver));
+  try {
+    return await readStatusesWithin({ getServiceStatuses: read }, socketPath, READ_TIMEOUT_MS, {
+      probe: probeOf(deps),
+    });
+  } catch (err) {
+    if ((err as { code?: unknown }).code !== "HEALTH_TIMEOUT") throw err;
+    throw new InstanceUnresponsiveError("down", {
+      instance: SHARED_INSTANCE_ID,
+      socket_path: socketPath,
+      attempts: 1,
+      remedy: unresponsiveRemedy(socketPath, context),
+    });
+  }
+}
+
+/**
+ * The booted isolated services of live worktree instances that `depends_on`
+ * a target (#239). Every worktree instance whose socket is not definitively
+ * stale is checked, the caller's own included. Its edges come from its
+ * derived config (`x-devtrees.shared_depends_on`, the cross-tier edges the
+ * deriver dropped), or, for an instance started before #239, from its
+ * worktree's `devtrees.yaml`; when neither can be read, the instance itself
+ * is a dependant (`source: unknown`).
+ *
+ * A worktree whose lifecycle lock is held by a live process is a dependant
+ * too (`source: lifecycle_in_progress`): an `up` there may already be past
+ * its shared step, waiting for shared health or spawning, with no socket
+ * yet. The locks are read after the discovery, so an `up` is seen either by
+ * its socket or by its lock. No lock is taken.
+ */
+async function findWorktreeDependants(
+  deps: CommandDeps,
+  anchor: string,
+  targets: ReadonlyArray<string>,
+): Promise<SharedDependant[]> {
+  const discover = deps.discover ?? discoverInstances;
+  const read = statusReader(deps, createDriver(deps.driver));
+  const probe = probeOf(deps);
+  const instances = await discover(anchor, {
+    getServiceStatuses: (socketPath) =>
+      readStatusesWithin({ getServiceStatuses: read }, socketPath, READ_TIMEOUT_MS, { probe }),
+    probeSocket: probe,
+    ...(deps.probeRetryDelaysMs !== undefined
+      ? { probeRetryDelaysMs: deps.probeRetryDelaysMs }
+      : {}),
+  });
+  const live = instances.filter((i) => i.kind === "worktree" && i.status !== "stale");
+  const found = worktreeDependants(
+    live.map((i) => worktreeEdgesOf(deps, anchor, i)),
+    targets,
+  );
+  return [...found, ...inProgressDependants(heldWorktreeLocks(anchor), found)];
+}
+
+/**
+ * One live worktree instance's isolated → shared edges and booted services.
+ * A service a pending hot-reload is applying (#191) is booted even though
+ * process-compose does not list it: its old run is still alive, as `ls`
+ * counts it (`bootedNamespaces`).
+ */
+function worktreeEdgesOf(deps: CommandDeps, anchor: string, info: InstanceInfo): WorktreeEdges {
+  const configPath = instancePaths(anchor, info.id).configPath;
+  const pending = readPendingReload(anchor, info.id)?.services ?? [];
+  const booted =
+    info.servicesRead === "ok"
+      ? new Set([...info.services.map((s) => s.name), ...pending])
+      : undefined;
+  const recorded = recordedSharedEdges(readDerivedConfig(configPath));
+  if (recorded !== undefined) {
+    return { instance: info.id, edges: recorded, source: "derived_config", booted };
+  }
+  const root = readWorktreePath(configPath);
+  let edges: WorktreeEdges["edges"];
+  try {
+    edges = root === "" ? undefined : stackSharedEdges((deps.readStack ?? loadStack)(root));
+  } catch {
+    edges = undefined;
+  }
+  return { instance: info.id, edges, source: "devtrees_yaml", booted };
+}
+
+/** The dependants that block: shared ones always, worktree ones unless `--force`. */
+function blockingDependants(
+  dependants: ReadonlyArray<SharedDependant>,
+  force: boolean | undefined,
+): SharedDependant[] {
+  return dependants.filter((d) => d.instance === SHARED_INSTANCE_ID || force !== true);
+}
+
+/** `instance/service (depends on a, b)`, for prose. */
+function describeDependant(d: SharedDependant): string {
+  if (d.source === "lifecycle_in_progress") {
+    return `worktree '${d.instance}' (an \`up\`, \`down\` or \`restart\` is in progress there)`;
+  }
+  if (d.service === null) {
+    return `worktree '${d.instance}' (its dependencies could not be read)`;
+  }
+  const who =
+    d.instance === SHARED_INSTANCE_ID
+      ? `shared service '${d.service}'`
+      : `'${d.instance}/${d.service}'`;
+  return `${who} (depends on ${d.depends_on.join(", ")})`;
+}
+
+/** Throw `SHARED_IN_USE` when something still depends on a target (#239). */
+function assertSharedNotInUse(
+  seen: SharedDownInspection,
+  options: SharedNamespaceDownOptions,
+): void {
+  const blocking = blockingDependants(seen.dependants, options.force);
+  if (blocking.length === 0) return;
+  const shared = blocking.filter((d) => d.instance === SHARED_INSTANCE_ID);
+  const { remedy, advice } = sharedInUseRemedy(shared, seen.config, options);
+  const targets = seen.plan.targets.map((t) => `'${t}'`).join(", ");
+  const plural = options.namespaces.length === 1 ? "" : "s";
+  throw new SharedInUseError(
+    `devtrees down: cannot remove shared service(s) ${targets} ` +
+      `(namespace${plural} ${options.namespaces.join(", ")}): ` +
+      `still in use by ${blocking.map(describeDependant).join("; ")}. Nothing was stopped. ` +
+      `Next: ${advice}`,
+    {
+      namespaces: [...options.namespaces],
+      services: [...seen.plan.targets],
+      dependants: blocking,
+      forceable: shared.length === 0,
+      remedy,
+    },
+  );
+}
+
+/**
+ * What to do about a `SHARED_IN_USE`: `remedy` is one runnable command, as
+ * every `details.remedy` is (#238); `advice` is the prose around it. A shared
+ * dependant: name its namespaces too (or tear the whole shared instance down,
+ * for an always-on one). A worktree dependant: stop those worktrees, or
+ * `--force`.
+ */
+function sharedInUseRemedy(
+  shared: ReadonlyArray<SharedDependant>,
+  config: DerivedConfig | undefined,
+  options: SharedNamespaceDownOptions,
+): { readonly remedy: string; readonly advice: string } {
+  if (shared.length > 0) {
+    const procs = shared.map((d) => config?.processes[d.service ?? ""]);
+    if (procs.some((p) => p?.namespace === undefined)) {
+      const remedy = "devtrees down --shared";
+      return {
+        remedy,
+        advice:
+          "an always-on shared service depends on them, so only the whole shared instance " +
+          `can go: \`${remedy}\` (this stops it for every worktree). \`--force\` does not ` +
+          "override this.",
+      };
+    }
+    const more = procs.flatMap((p) => (p === undefined ? [] : serviceNamespaces(p)));
+    const remedy = sharedDownCommand([...new Set([...options.namespaces, ...more])], options.force);
+    return {
+      remedy,
+      advice:
+        `name their namespaces too: \`${remedy}\`. \`--force\` does not override a shared ` +
+        "dependant: removing the dependency would restart a running shared service.",
+    };
+  }
+  const remedy = sharedDownCommand(options.namespaces, true);
+  return {
+    remedy,
+    advice:
+      "stop those worktrees first (`devtrees down` in each), or remove the services anyway " +
+      `with \`${remedy}\` (those services keep running without them).`,
+  };
+}
+
+/** The last running shared services: stop the whole shared instance, as `down --shared` does. */
+async function stopWholeShared(
+  driver: StopDriver,
+  anchor: string,
+  deps: CommandDeps,
+): Promise<ReadonlyArray<ForceKilled>> {
+  const paths = sharedInstancePaths(anchor);
+  const stopped = await stopInstance(driver, paths, SHARED_INSTANCE_ID, "down", deps.stop);
+  rmSync(paths.configPath, { force: true });
+  return stopped.forceKilled;
+}
+
+/**
+ * Stop the running targets with the bounded per-service stop (#239), then
+ * run the shutdown hooks process-compose skips for a daemon whose launch
+ * had exited (#155), from the anchor. A refused or unfinished stop fails
+ * `SHARED_REMOVAL_FAILED` with nothing removed, so a retry finds them again.
+ * `instanceGone` when process-compose exited during the stop (nothing else
+ * was running after all): the shared instance is down.
+ */
+async function stopSharedTargets(
+  deps: CommandDeps,
+  driver: ReturnType<typeof createDriver>,
+  anchor: string,
+  seen: SharedDownInspection,
+): Promise<{
+  readonly forceKilled: ReadonlyArray<ForceKilled>;
+  readonly instanceGone: boolean;
+  /** Some target was running, and was stopped. */
+  readonly stopped: boolean;
+}> {
+  const { socketPath, configPath } = sharedInstancePaths(anchor);
+  const targets = seen.plan.targets;
+  const { running } = partitionRunning(seen.rows, targets);
+  if (running.length === 0) return { forceKilled: [], instanceGone: false, stopped: false };
+  const read = statusReader(deps, driver);
+  const outcome = await boundedStopServices(
+    {
+      socketPath,
+      services: running,
+      statuses: seen.rows,
+      timeoutMs: stopTimeoutMs(seen.config, running, deps.stop?.baseTimeoutMs),
+      unsignalled: unsignalledServices(seen.config),
+      instance: SHARED_INSTANCE_ID,
+      instanceGone: () => isGone(probeOf(deps), socketPath),
+    },
+    {
+      stopProcesses: (socket, services) => driver.stopProcesses(socket, services),
+      getServiceStatuses: (socket) => read(socket),
+    },
+    deps.stop,
+  ).catch((err: unknown) => {
+    if ((err as { code?: unknown }).code === "INSTANCE_NOT_FOUND") return undefined;
+    if (!(err instanceof StopRefusedError)) throw err;
+    throw removalFailed(targets, "stop_refused", configPath, err.reason, seen.retry);
+  });
+  if (outcome === undefined) return { forceKilled: [], instanceGone: true, stopped: true };
+  if (outcome.unsettled.length > 0) {
+    const names = outcome.unsettled.map((u) => `${u.service} (pid ${u.pid ?? "unknown"})`);
+    throw removalFailed(
+      targets,
+      "stop_incomplete",
+      configPath,
+      `still running: ${names.join(", ")}`,
+      seen.retry,
+    );
+  }
+  const warn = deps.warn ?? defaultWarn;
+  warnSurvivors(outcome.survivors, warn);
+  await reapSkippedSharedHooks(deps, anchor, seen, warn);
+  return { forceKilled: outcome.forceKilled, instanceGone: false, stopped: true };
+}
+
+/** Run the targets' daemon shutdown hooks process-compose skipped (#155); a failure only warns. */
+async function reapSkippedSharedHooks(
+  deps: CommandDeps,
+  anchor: string,
+  seen: SharedDownInspection,
+  warn: (message: string) => void,
+): Promise<void> {
+  if (seen.config === undefined) return;
+  const targets = { ...seen.config, processes: pick(seen.config.processes, seen.plan.targets) };
+  const skipped = daemonHooksSkipped(targets, seen.rows);
+  if (skipped === undefined) return;
+  const outcome = await (deps.reap ?? reapShutdownHooks)(skipped, { cwd: anchor });
+  for (const f of outcome.failures) {
+    warn(`devtrees down: shutdown hook of shared service '${f.process}' failed (${f.reason}).`);
+  }
+}
+
+/**
+ * Remove the stopped targets (and any leftovers of a timed-out removal) from
+ * the shared instance (#239): rewrite its derived config without them and
+ * reload it, the mechanism activation uses (ADR-0010). Then drop their
+ * revision records. A refused reload restores the previous config and keeps
+ * the records (the services stay listed, stopped; a retry removes them). A
+ * timed-out one keeps the new config and drops the records, because
+ * process-compose may still apply it; a retry re-sends the reload while the
+ * instance still lists a process the config no longer holds.
+ */
+async function removeSharedProcesses(
+  driver: ReturnType<typeof createDriver>,
+  anchor: string,
+  seen: SharedDownInspection,
+): Promise<void> {
+  const paths = sharedInstancePaths(anchor);
+  const targets = seen.plan.targets;
+  if (seen.config === undefined) return;
+  const previousYaml = readFileSync(paths.configPath, "utf8");
+  const next = withoutProcesses(seen.config, targets);
+  writeFileSync(paths.configPath, stringifyYaml(next), "utf8");
+  const reload = await driver.reloadConfig(
+    { configPath: paths.configPath, socketPath: paths.socketPath },
+    { timeoutMs: reloadTimeoutMs(next) },
+  );
+  const retry = seen.retry;
+  if (!reload.ok && reload.reason !== "timeout") {
+    writeFileSync(paths.configPath, previousYaml, "utf8");
+    throw removalFailed(targets, reload.reason, paths.configPath, reload.message, retry);
+  }
+  const state = readSharedState(anchor);
+  if (state !== undefined) writeSharedState(anchor, withoutServiceRecords(state, targets));
+  if (!reload.ok) throw removalFailed(targets, "timeout", paths.configPath, reload.message, retry);
+}
+
+/** The `SHARED_REMOVAL_FAILED` a namespaced shared teardown raises (#239). */
+function removalFailed(
+  services: ReadonlyArray<string>,
+  reason: SharedRemovalFailedError["details"]["reason"],
+  configPath: string,
+  cause: string | undefined,
+  retry: string,
+): SharedRemovalFailedError {
+  const outcome: Record<typeof reason, string> = {
+    stop_refused: "process-compose refused to stop them; nothing was removed",
+    stop_incomplete: "they did not stop within the budget; nothing was removed",
+    not_supported: "process-compose refused the config reload; they are stopped but still listed",
+    error: "process-compose refused the config reload; they are stopped but still listed",
+    timeout:
+      "the config reload did not finish within its budget; process-compose may still apply it",
+  };
+  // One runnable command, as every `details.remedy` is (#238); the fallback is prose.
+  const remedy = retry;
+  const advice =
+    reason === "stop_refused" || reason === "stop_incomplete"
+      ? `retry \`${retry}\`; if it fails again, \`devtrees down --shared\` (this stops the ` +
+        "shared instance for every worktree)"
+      : `retry \`${retry}\``;
+  return new SharedRemovalFailedError(
+    `devtrees down: removing shared service(s) ${services.map((s) => `'${s}'`).join(", ")} ` +
+      `failed: ${outcome[reason]}${cause !== undefined ? ` (${cause})` : ""}. The other shared ` +
+      `services are untouched. Next: ${advice}.`,
+    { services: [...services], reason, config_path: configPath, remedy },
+  );
 }
 
 /** `lsof`'s cap when `down` names a surviving listener (#155): hooks may still load the machine. */

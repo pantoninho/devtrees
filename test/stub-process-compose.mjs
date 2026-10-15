@@ -16,6 +16,9 @@
  *   process start <name> -U -u <socket>
  *        Records <name> as restarted, so `process list` reports it running
  *        again (issue #178). See the `process list` notes for the env knobs.
+ *   process stop <name...> -U -u <socket>
+ *        Records the names as stopped, so `process list` reports them
+ *        `Completed` until a reload drops them from the config (#239).
  *   version
  *        Prints a version (`$STUB_PC_VERSION`, default v1.122.0; `--short`
  *        prints it bare) so the presence and minimum-version probes work.
@@ -195,6 +198,7 @@ if (cmd === "up") {
     }
     try {
       rmSync(`${socketPath}.started`, { force: true });
+      rmSync(`${socketPath}.stopped`, { force: true });
     } catch {
       // ignore
     }
@@ -229,7 +233,20 @@ if (cmd === "up") {
     if (req.method === "POST" && req.url === "/project/configuration") {
       // Hot-reload: persist the re-read config alongside the socket so a
       // follow-up `process list` reflects the new service set.
-      writeFileSync(`${socketPath}.config`, readFileSync(configPath, "utf8"));
+      const reread = readFileSync(configPath, "utf8");
+      writeFileSync(`${socketPath}.config`, reread);
+      // A process the reload removed is forgotten, its stopped state with it
+      // (#239): re-added later, it starts as a new process.
+      try {
+        const kept = Object.keys(parseYaml(reread)?.processes ?? {});
+        const stopped = JSON.parse(readFileSync(`${socketPath}.stopped`, "utf8"));
+        writeFileSync(
+          `${socketPath}.stopped`,
+          JSON.stringify(stopped.filter((n) => kept.includes(n))),
+        );
+      } catch {
+        // nothing stopped
+      }
       res.writeHead(200, { "content-type": "application/json" });
       res.end("{}");
       return;
@@ -373,6 +390,13 @@ if (cmd === "up") {
     const deadNames = namesFrom(process.env.DEVTREES_STUB_DEAD);
     const doneNames = namesFrom(process.env.DEVTREES_STUB_DONE);
     const diesAgain = namesFrom(process.env.DEVTREES_STUB_DIES_AGAIN);
+    // `process stop` (#239) records names in `<socket>.stopped`.
+    let stoppedNames = new Set();
+    try {
+      stoppedNames = new Set(JSON.parse(readFileSync(`${socketPath}.stopped`, "utf8")));
+    } catch {
+      stoppedNames = new Set();
+    }
     let started = new Set();
     try {
       started = new Set(JSON.parse(readFileSync(`${socketPath}.started`, "utf8")));
@@ -390,6 +414,7 @@ if (cmd === "up") {
         pid,
         is_running: false,
       });
+      if (stoppedNames.has(name)) return stopped(-1, 1000);
       if (started.has(name)) return diesAgain.has(name) ? stopped(1, 2000) : undefined;
       if (deadNames.has(name)) return stopped(-1, 1000);
       if (doneNames.has(name)) return stopped(0, 1000);
@@ -448,7 +473,35 @@ if (cmd === "up") {
     }
     if (!started.includes(service)) started.push(service);
     writeFileSync(`${socketPath}.started`, JSON.stringify(started));
+    // A started process is no longer the stopped run `process stop` left (#239).
+    try {
+      const stopped = JSON.parse(readFileSync(`${socketPath}.stopped`, "utf8"));
+      writeFileSync(`${socketPath}.stopped`, JSON.stringify(stopped.filter((n) => n !== service)));
+    } catch {
+      // nothing stopped
+    }
     process.stdout.write(`Process ${service} started\n`);
+    process.exit(0);
+  }
+  if (sub === "stop") {
+    // `process stop <name...> -U -u <socket>` (#239): record the names in
+    // `<socket>.stopped`, so `process list` reports them as a stopped run
+    // ("Completed", exit_code -1, not running). The children are left to the
+    // instance's `down`, which reaps every pid it spawned.
+    const end = process.argv.indexOf("-U");
+    const names = process.argv.slice(4, end < 0 ? undefined : end);
+    if (!existsSync(`${socketPath}.config`)) {
+      process.stderr.write(`stub-process-compose: no instance at ${socketPath}\n`);
+      process.exit(1);
+    }
+    let stopped = [];
+    try {
+      stopped = JSON.parse(readFileSync(`${socketPath}.stopped`, "utf8"));
+    } catch {
+      stopped = [];
+    }
+    for (const name of names) if (!stopped.includes(name)) stopped.push(name);
+    writeFileSync(`${socketPath}.stopped`, JSON.stringify(stopped));
     process.exit(0);
   }
   process.stderr.write(`stub-process-compose: unknown subcommand 'process ${sub}'\n`);
@@ -500,6 +553,7 @@ if (cmd === "up") {
   rmSync(`${socketPath}.config`, { force: true });
   rmSync(`${socketPath}.namespaces`, { force: true });
   rmSync(`${socketPath}.started`, { force: true });
+  rmSync(`${socketPath}.stopped`, { force: true });
   rmSync(socketPath, { force: true });
   process.exit(0);
 } else {

@@ -144,7 +144,20 @@ describe("devtrees CLI", () => {
     ],
     // `down` serializes on a lifecycle lock (worktree or shared) → LOCK_CONTENTION;
     // a socket that never answers the probes → INSTANCE_UNRESPONSIVE (#186).
-    ["down", ["PROCESS_COMPOSE_NOT_FOUND", "LOCK_CONTENTION", "INSTANCE_UNRESPONSIVE", "UNKNOWN"]],
+    // `--shared -n` (#239): a dependant → SHARED_IN_USE, a failed stop or
+    // reload → SHARED_REMOVAL_FAILED, a bad flag combination → INVALID_ARGS.
+    [
+      "down",
+      [
+        "PROCESS_COMPOSE_NOT_FOUND",
+        "LOCK_CONTENTION",
+        "INSTANCE_UNRESPONSIVE",
+        "SHARED_IN_USE",
+        "SHARED_REMOVAL_FAILED",
+        "INVALID_ARGS",
+        "UNKNOWN",
+      ],
+    ],
     // `restart` (#222): every check before anything is touched, the restarts
     // under the lifecycle lock, and an `up`-style health wait.
     [
@@ -197,6 +210,8 @@ describe("devtrees CLI", () => {
     "SHARED_DRIFT",
     "SHARED_START_FAILED",
     "SHARED_PORT_CONFLICT",
+    "SHARED_IN_USE",
+    "SHARED_REMOVAL_FAILED",
     "WORKTREE_START_FAILED",
     "NO_SERVICES_SELECTED",
     "SOCKET_PATH_TOO_LONG",
@@ -1785,6 +1800,170 @@ describe("devtrees CLI — CONFIG_INVALID / LOCK_CONTENTION envelopes (#84)", ()
  * reconciled-away orphans as identity-only entries `{id, kind, worktreePath}`
  * under `prune.pruned[]`. Human output for both is unchanged.
  */
+describe("devtrees CLI — down --shared -n (#239)", () => {
+  const result = {
+    namespaces: ["a"],
+    stopped: true,
+    services: ["sa"],
+    inactiveNamespaces: [],
+    instanceStopped: false,
+    dependants: [],
+    forceKilled: [],
+  };
+
+  it("routes `down --shared -n a -n b --force` to downSharedNamespaces, not down", async () => {
+    const down = vi.fn();
+    const downSharedNamespaces = vi.fn().mockResolvedValue(result);
+    const out = await execute(["down", "--shared", "-n", "a", "-n", "b", "--force", "--json"], {
+      up: vi.fn(),
+      down,
+      downSharedNamespaces,
+    });
+    expect(out.code).toBe(0);
+    expect(down).not.toHaveBeenCalled();
+    expect(downSharedNamespaces).toHaveBeenCalledWith({ namespaces: ["a", "b"], force: true });
+    expect(JSON.parse(out.stdout)).toEqual({
+      schema_version: "1",
+      down: {
+        shared: true,
+        stopped: true,
+        force_killed: [],
+        namespaces: ["a"],
+        services: ["sa"],
+        removed: ["sa"],
+        inactive_namespaces: [],
+        instance_stopped: false,
+        forced_dependants: [],
+      },
+    });
+  });
+
+  it("says what it stopped, and warns on stderr about a forced removal and an inactive namespace", async () => {
+    const downSharedNamespaces = vi.fn().mockResolvedValue({
+      ...result,
+      inactiveNamespaces: ["nope"],
+      dependants: [{ instance: "login-1", service: "worker", depends_on: ["sa"], source: "x" }],
+    });
+    const out = await execute(["down", "--shared", "-n", "a", "-n", "nope", "--force"], {
+      up: vi.fn(),
+      down: vi.fn(),
+      downSharedNamespaces,
+    });
+    expect(out.stdout).toBe(
+      "devtrees down: stopped and removed shared sa; the other shared services keep running.\n",
+    );
+    expect(out.stderr).toContain("no shared service of namespace nope was running");
+    expect(out.stderr).toContain("--force removed shared services still used by login-1/worker");
+  });
+
+  it("says when it only removed services that were already stopped, or only leftovers", async () => {
+    const run = (payload: Record<string, unknown>) =>
+      execute(["down", "--shared", "-n", "a"], {
+        up: vi.fn(),
+        down: vi.fn(),
+        downSharedNamespaces: vi.fn().mockResolvedValue({ ...result, ...payload }),
+      });
+    const stale = await run({ stopped: false, removed: ["sa"] });
+    expect(stale.stdout).toBe(
+      "devtrees down: removed shared sa, already stopped; the other shared services keep running.\n",
+    );
+    const leftover = await run({ stopped: false, services: [], removed: ["old"] });
+    expect(leftover.stdout).toBe(
+      "devtrees down: removed shared old, already stopped; the other shared services keep running.\n",
+    );
+    expect(leftover.stdout).not.toContain("shared ;");
+  });
+
+  it("renders the no-op and the last-namespace teardown", async () => {
+    const noop = await execute(["down", "--shared", "-n", "a"], {
+      up: vi.fn(),
+      down: vi.fn(),
+      downSharedNamespaces: vi.fn().mockResolvedValue({
+        ...result,
+        stopped: false,
+        services: [],
+        removed: [],
+        inactiveNamespaces: ["a"],
+      }),
+    });
+    expect(noop.code).toBe(0);
+    expect(noop.stdout).toBe(
+      "devtrees down: no shared service of namespace a is running; nothing to do.\n",
+    );
+    const last = await execute(["down", "--shared", "-n", "a"], {
+      up: vi.fn(),
+      down: vi.fn(),
+      downSharedNamespaces: vi.fn().mockResolvedValue({ ...result, instanceStopped: true }),
+    });
+    expect(last.stdout).toContain("so the shared instance stopped");
+  });
+
+  it("`--dry-run --json` previews through downSharedNamespacesDryRun and exits 0 even when blocked", async () => {
+    const downSharedNamespaces = vi.fn();
+    const downSharedNamespacesDryRun = vi.fn().mockResolvedValue({
+      namespaces: ["a"],
+      running: true,
+      services: ["sa"],
+      inactiveNamespaces: [],
+      wouldStopInstance: false,
+      dependants: [
+        { instance: "login-1", service: "worker", depends_on: ["sa"], source: "derived_config" },
+      ],
+      blocked: true,
+    });
+    const out = await execute(["down", "--shared", "-n", "a", "--dry-run", "--json"], {
+      up: vi.fn(),
+      down: vi.fn(),
+      downSharedNamespaces,
+      downSharedNamespacesDryRun,
+    });
+    expect(out.code).toBe(0);
+    expect(downSharedNamespaces).not.toHaveBeenCalled();
+    expect(downSharedNamespacesDryRun).toHaveBeenCalledWith({ namespaces: ["a"], force: false });
+    expect(JSON.parse(out.stdout)).toEqual({
+      schema_version: "1",
+      down_dry_run: {
+        shared: true,
+        namespaces: ["a"],
+        running: true,
+        services: ["sa"],
+        inactive_namespaces: [],
+        would_stop_instance: false,
+        dependants: [
+          { instance: "login-1", service: "worker", depends_on: ["sa"], source: "derived_config" },
+        ],
+        blocked: true,
+      },
+    });
+  });
+
+  it.each([
+    [["down", "-n", "a"], "needs `--shared`"],
+    [["down", "--force"], "applies only to"],
+    [["down", "--shared", "--force"], "applies only to"],
+    [["down", "--dry-run"], "applies only to"],
+    [["down", "--shared", "--dry-run"], "applies only to"],
+  ])("`%s` fails INVALID_ARGS before anything runs", async (argv, said) => {
+    const down = vi.fn();
+    const downSharedNamespaces = vi.fn();
+    const out = await execute([...argv, "--json"], { up: vi.fn(), down, downSharedNamespaces });
+    expect(out.code).toBe(1);
+    const parsed = JSON.parse(out.stdout) as { error: { code: string; message: string } };
+    expect(parsed.error.code).toBe("INVALID_ARGS");
+    expect(parsed.error.message).toContain(said);
+    expect(down).not.toHaveBeenCalled();
+    expect(downSharedNamespaces).not.toHaveBeenCalled();
+  });
+
+  it("a plain `down --shared` still goes to down, unchanged", async () => {
+    const down = vi.fn().mockResolvedValue({});
+    const downSharedNamespaces = vi.fn();
+    await execute(["down", "--shared"], { up: vi.fn(), down, downSharedNamespaces });
+    expect(down).toHaveBeenCalledWith({ shared: true });
+    expect(downSharedNamespaces).not.toHaveBeenCalled();
+  });
+});
+
 describe("devtrees CLI — down/prune --json envelopes (#48)", () => {
   it("`down --json` emits the worktree-teardown envelope: {down:{worktreeId}} and nothing else", async () => {
     const down = vi.fn().mockResolvedValue({ worktreeId: "login" });

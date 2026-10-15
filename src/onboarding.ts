@@ -84,6 +84,16 @@ are. It never stops anything, and never attaches the TUI.
   any \`up\` has recorded it. \`env --json\` reports each one's origin in
   \`shared_ports\` (\`active\`, \`recorded\`, or \`predicted\`: no \`up\` has
   recorded it yet, so run \`up\` before relying on it).
+- To recover or redefine the shared services of one namespace without
+  stopping the others (a drifted or wedged one, say), run
+  \`devtrees down --shared -n <namespace>\`. It stops and removes only those
+  services; every other shared service keeps its pid and port. It refuses
+  with \`SHARED_IN_USE\` while a running worktree still depends on one of them
+  (\`details.dependants\`). The next \`up -n <namespace>\` adds them back with
+  the current definition, on the same ports. Preview it with
+  \`--dry-run --json\`. A namespace with no running shared service is a no-op.
+  \`SHARED_DRIFT\` and \`SHARED_SERVICE_DEAD\` name it as \`details.remedy\` when
+  the services involved are namespaced.
 - A dead selected service (crashed, killed, or exited non-zero) is started
   again, and \`up\` names it (\`restarted\` in the \`--json\` envelope). Several
   dead services are started in \`depends_on\` order, without waiting between
@@ -173,6 +183,8 @@ Branch on \`error.code\`:
 | \`SHARED_DRIFT\`              | A shared service this \`up\` selects (\`details.services\`) runs at another revision than this worktree defines. An \`up\` that does not select it is unaffected. Follow the message: \`devtrees down --shared && devtrees up\` (it stops the shared instance for every worktree). |
 | \`SHARED_ACTIVATION_FAILED\`  | \`up\` could not add a namespaced shared service to the running shared instance; nothing that was running changed. \`reason: timeout\` → retry \`devtrees up\`. Otherwise **surface it to the human** with \`details.remedy\`. |
 | \`SHARED_PORT_CONFLICT\`      | A shared port is claimed by two names, a running shared service holds a different number than the one recorded for it, or the shared block has no free number left (\`details.conflicts[].reason\`). Nothing was started or recorded. \`block_full\` → run \`details.remedy\` (\`devtrees prune --shared-ports\`) and retry. Otherwise **surface it to the human** with \`details.remedy\` (\`devtrees down --shared && devtrees up\`, which stops the shared instance for every worktree). If the message says two map entries share a port, that is for the human to fix; never edit \`shared-ports.json\` or ports by hand yourself. |
+| \`SHARED_IN_USE\`             | \`down --shared -n\` refused: a running worktree's service, or a shared service it would keep, still depends on one it would remove (\`details.dependants\`). Nothing was stopped. Stop those worktrees first (\`devtrees down\` in each), or, when \`details.forceable\` is true and they can run without it, rerun with \`--force\`. Otherwise follow \`details.remedy\`. |
+| \`SHARED_REMOVAL_FAILED\`     | \`down --shared -n\` could not finish removing the services (\`details.reason\`); the other shared services are untouched. **Retry** \`details.remedy\` once; if it fails again, **surface it to the human**. |
 | \`CONFIG_DRIFT\`              | The running config differs from \`devtrees.yaml\` and hot-reload failed, or an earlier reload is still pending. Branch on \`details.reason\`: \`not_supported\`/\`error\` → \`devtrees down && devtrees up\`. \`timeout\` → a changed service's old process won't stop: kill that process, then run \`devtrees up\` again to resync. Or run \`devtrees down && devtrees up\`: \`down\` force-kills that old process first and lists it in \`force_killed\`. \`reload_pending\` → that earlier reload is still waiting, so \`up\` reloaded nothing (another reload would start an untracked second copy): kill the old process (\`details.pids\`, for \`details.services\`), then run \`devtrees up\` again. Empty \`details.pids\` → the old process is gone and process-compose is still starting the new one: retry shortly; if it persists, follow the message's \`devtrees down && devtrees up …\`. |
 | \`SERVICE_NOT_FOUND\`         | You named a service that isn't in the instance. \`details.valid_services\` lists the real names; pick one. |
 | \`NO_SERVICES_SELECTED\`      | The selection has no services: a bare \`up\` starts only services with no \`namespace:\` and there are none, or \`-n\` names only namespaces with none (on \`restart\`, any \`-n\` namespace with no isolated service, in \`details.selected_namespaces\`). \`details.namespaces\` lists the namespaces; retry with one of them. |
