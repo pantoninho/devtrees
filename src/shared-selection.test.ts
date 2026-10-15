@@ -1,8 +1,8 @@
 /**
  * Shared-service selection tests (#236, ADR-0010): which shared services an
  * `up` selects, what a running shared instance must add or reports as
- * drifted, how a pre-#236 shared state is attributed, and how shared ports
- * are resolved beside a running instance.
+ * drifted, and how a pre-#236 shared state is attributed. Shared port
+ * resolution is `shared-ports.test.ts` (#238).
  */
 
 import { describe, expect, it } from "vite-plus/test";
@@ -11,7 +11,6 @@ import {
   UNKNOWN_REVISION,
   hasNamespacedShared,
   planSharedSelection,
-  resolveSharedPorts,
   selectSharedServices,
   sharedRecords,
   withServiceRecords,
@@ -119,42 +118,6 @@ describe("withServiceRecords (a pre-#236 shared state)", () => {
     expect(state.services).toEqual({
       pg: { hash: UNKNOWN_REVISION, ports: ["PG_PORT"] },
       gone: { hash: UNKNOWN_REVISION, ports: [] },
-    });
-  });
-});
-
-describe("resolveSharedPorts", () => {
-  const block = { base: 20_000, size: 10 };
-  const positional = (name: string) =>
-    ({ PG_PORT: 20_000, SB_PORT: 20_001, CACHE_PORT: 20_002 })[name];
-  const services = [pg, sb, cache];
-
-  it("is the positional map when nothing is bound", () => {
-    expect(resolveSharedPorts({ services, bound: {}, positional, block })).toEqual({
-      PG_PORT: 20_000,
-      SB_PORT: 20_001,
-      CACHE_PORT: 20_002,
-    });
-  });
-
-  it("keeps every bound port's number", () => {
-    const bound = { PG_PORT: 20_005, SB_PORT: 20_001 };
-    expect(resolveSharedPorts({ services, bound, positional, block })).toEqual({
-      PG_PORT: 20_005,
-      SB_PORT: 20_001,
-      CACHE_PORT: 20_002,
-    });
-  });
-
-  it("moves an unbound port off a number already taken, to the lowest free one", () => {
-    // Another branch's running service bound 20_001 under another name. SB
-    // moves to the lowest free number, which then pushes CACHE on as well:
-    // every port the map hands out is distinct.
-    const bound = { OTHER_PORT: 20_001, PG_PORT: 20_000 };
-    expect(resolveSharedPorts({ services, bound, positional, block })).toEqual({
-      PG_PORT: 20_000,
-      SB_PORT: 20_002,
-      CACHE_PORT: 20_003,
     });
   });
 });

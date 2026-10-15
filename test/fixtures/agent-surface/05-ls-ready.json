@@ -55,6 +55,12 @@
         ],
         "block_base": 0
       }
-    ]
+    ],
+    "shared_ports": {
+      "DB_PORT": {
+        "port": 0,
+        "origin": "active"
+      }
+    }
   }
 }

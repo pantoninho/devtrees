@@ -261,7 +261,8 @@ function devtrees(
  * explicit so a reviewer can see exactly what's normalised — adding a new
  * non-deterministic field is a conscious decision, not a silent drift.
  */
-const NORMALISED_NUMBER_FIELDS = new Set(["WEB_PORT", "DB_PORT", "block_base"]);
+// `port` is a shared port map entry's number (`ls.shared_ports`, #238).
+const NORMALISED_NUMBER_FIELDS = new Set(["WEB_PORT", "DB_PORT", "block_base", "port"]);
 
 /** Rewrite an `env` map: port entries to `0`, worktree-id injection to `<WT>`. */
 function normaliseEnv(env: Record<string, string>): Record<string, number | string> {
@@ -3528,6 +3529,217 @@ describe.skipIf(!ENABLED)("real-pc smoke — restarting dead shared services (#2
     // Fail-fast: the restarted corpse is not waited on for the full window.
     expect(elapsed).toBeLessThan(30_000);
     expect(pidsMatching(s.needles.cache)).toEqual(cachePids);
+  }, 120_000);
+});
+
+/**
+ * Stable shared ports (#238, ADR-0011) against the real binary: two branches
+ * whose `devtrees.yaml` lay out the shared services differently — `login`
+ * declares pg + x, `billing` pg + y + x, so by position login's X_PORT and
+ * billing's Y_PORT share a slot — must agree on every shared port in either
+ * activation order, and the numbers really are what gets bound.
+ */
+describe.skipIf(!ENABLED)("real-pc smoke — stable shared ports (#238)", () => {
+  interface PortsUp {
+    readonly up: {
+      readonly env: Record<string, string>;
+      readonly shared_activated: string[];
+      readonly shared_started: boolean;
+    };
+  }
+
+  /** A two-branch repo: `login` (pg + x) and `billing` (pg + y + x). */
+  function crossBranchRepo(prefix: string) {
+    const repo = buildSmokeRepo(prefix, ["login", "billing"]);
+    currentCtx = { pidNeedle: repo.root, root: repo.root };
+    const login = repo.worktrees.login!;
+    const billing = repo.worktrees.billing!;
+    const holdPg = join(repo.root, "hold-pg");
+    const holdApi = join(repo.root, "hold-api");
+    writeFileSync(holdApi, "");
+    writeFileSync(holdPg, "");
+    const http = (port: string): string =>
+      `    command: "python3 -m http.server $${port} --bind 127.0.0.1 --directory ${repo.root}"`;
+    const svc = (name: string, ns: string, port: string): string[] => [
+      `  ${name}:`,
+      "    tier: shared",
+      `    namespace: ${ns}`,
+      http(port),
+      `    ports: [${port}]`,
+    ];
+    const common = [
+      "  pg:",
+      "    tier: shared",
+      `    command: "tail -f ${holdPg}"`,
+      "    ports: [PG_PORT]",
+    ];
+    const api = [
+      "  api:",
+      "    namespace: app",
+      `    command: "tail -f ${holdApi}"`,
+      "    ports: [API_PORT]",
+    ];
+    const yaml = (lines: string[]) => ["services:", ...lines, ""].join("\n");
+    writeFileSync(
+      join(login, "devtrees.yaml"),
+      yaml([...common, ...svc("x", "xs", "X_PORT"), ...api]),
+    );
+    writeFileSync(
+      join(billing, "devtrees.yaml"),
+      yaml([...common, ...svc("y", "ys", "Y_PORT"), ...svc("x", "xs", "X_PORT"), ...api]),
+    );
+    cleanupStack.push(() => devtrees(login, ["down", "--shared"]));
+    cleanupStack.push(() => devtrees(login, ["down"]));
+    cleanupStack.push(() => devtrees(billing, ["down"]));
+    const upWith = (wt: string, ...ns: string[]): CliResult =>
+      devtrees(wt, ["up", "--json", "--wait-timeout", "30", ...ns.flatMap((n) => ["-n", n])]);
+    return { repo, login, billing, holdPg, upWith };
+  }
+
+  const envOf = (r: CliResult): Record<string, string> => (r.doc as PortsUp).up.env;
+
+  for (const order of ["login first", "billing first"] as const) {
+    const n = order === "login first" ? "130a" : "130b";
+    it(`scenario ${n}: different shared layouts agree on every shared port (${order})`, async () => {
+      const { login, billing, upWith } = crossBranchRepo(`dt-rpc${n}-`);
+      // login never selects xs, billing activates y: the issue's case 1.
+      const steps =
+        order === "login first"
+          ? [() => upWith(login, "app"), () => upWith(billing, "app", "ys")]
+          : [() => upWith(billing, "app", "ys"), () => upWith(login, "app")];
+      const results = steps.map((step) => step());
+      for (const r of results) expect(r.code, `up: ${r.stderr}`).toBe(0);
+      const [loginUp, billingUp] = order === "login first" ? results : [results[1], results[0]];
+      const loginEnv = envOf(loginUp!);
+      const billingEnv = envOf(billingUp!);
+      expect(loginEnv.X_PORT).toBe(billingEnv.X_PORT);
+      expect(loginEnv.PG_PORT).toBe(billingEnv.PG_PORT);
+      expect(billingEnv.Y_PORT).not.toBe(billingEnv.X_PORT);
+
+      // y really binds Y_PORT, and nothing answers on the X_PORT login was given.
+      expect(await waitForListener(Number(billingEnv.Y_PORT), 10_000), "y listens").toBe(true);
+      expect(await waitForListener(Number(loginEnv.X_PORT), 500), "X_PORT still free").toBe(false);
+
+      // Activating x from login binds exactly the number both branches injected.
+      const activated = upWith(login, "app", "xs");
+      expect(activated.code, `activate x: ${activated.stderr}`).toBe(0);
+      expect((activated.doc as PortsUp).up.shared_activated).toEqual(["x"]);
+      expect(envOf(activated).X_PORT).toBe(loginEnv.X_PORT);
+      expect(await waitForListener(Number(loginEnv.X_PORT), 10_000), "x listens").toBe(true);
+
+      // env --json from billing reports both as active now.
+      const env = devtrees(billing, ["env", "--json"]);
+      const origins = (env.doc as { shared_ports: Record<string, { origin: string }> })
+        .shared_ports;
+      expect(origins.X_PORT?.origin).toBe("active");
+      expect(origins.Y_PORT?.origin).toBe("active");
+    }, 120_000);
+  }
+
+  it("scenario 131: a shared instance with no map (0.4.0) is seeded from its live ports, with no restart and no drift", async () => {
+    const { repo, login, billing, holdPg, upWith } = crossBranchRepo("dt-rpc131-");
+    const first = upWith(login, "app");
+    expect(first.code, `login up: ${first.stderr}`).toBe(0);
+    expect(await waitForPid(holdPg, 10_000), "pg should be running").toBe(true);
+    const pgPids = pidsMatching(`tail -f ${holdPg}`);
+    // What a 0.4.0 instance leaves behind: shared state, but no map.
+    const mapPath = join(repo.root, "main", ".git", "devtrees", "shared-ports.json");
+    expect(existsSync(mapPath)).toBe(true);
+    rmSync(mapPath);
+
+    const second = upWith(billing, "app");
+    expect(second.code, `billing up: ${second.stderr}`).toBe(0);
+    expect((second.doc as PortsUp).up.shared_started).toBe(false);
+    expect(pidsMatching(`tail -f ${holdPg}`)).toEqual(pgPids);
+    expect(envOf(second).PG_PORT).toBe(envOf(first).PG_PORT);
+    // login's X_PORT prediction was in pg's env, so it is the number kept.
+    expect(envOf(second).X_PORT).toBe(envOf(first).X_PORT);
+    const recorded = JSON.parse(readFileSync(mapPath, "utf8")) as { ports: Record<string, number> };
+    expect(recorded.ports.PG_PORT).toBe(Number(envOf(first).PG_PORT));
+    expect(recorded.ports.X_PORT).toBe(Number(envOf(first).X_PORT));
+  }, 120_000);
+
+  it("scenario 133: a shared instance the real devtrees@0.4.0 started is seeded by this build, with no restart", async () => {
+    // The published 0.4.0, installed from npm into a throwaway dir: the real
+    // pre-#238 writer of the shared state, not a simulation of it.
+    const legacyDir = mkdtempSync(join(TMP_BASE, "dt-rpc133-legacy-"));
+    cleanupStack.push(() => rmSync(legacyDir, { recursive: true, force: true }));
+    execFileSync(
+      "npm",
+      ["install", "--silent", "--no-save", "--prefix", legacyDir, "devtrees@0.4.0"],
+      {
+        stdio: "pipe",
+        timeout: 120_000,
+      },
+    );
+    const legacyCli = join(legacyDir, "node_modules", "devtrees", "dist", "cli.mjs");
+    const legacy = (cwd: string, args: ReadonlyArray<string>): CliResult => {
+      const out = spawnSync(process.execPath, [legacyCli, ...args], {
+        cwd,
+        encoding: "utf8",
+        timeout: 60_000,
+      });
+      let doc: unknown;
+      try {
+        doc = JSON.parse(out.stdout);
+      } catch {
+        doc = undefined;
+      }
+      return { code: out.status ?? -1, stdout: out.stdout, stderr: out.stderr, doc };
+    };
+    const { repo, login, billing, holdPg, upWith } = crossBranchRepo("dt-rpc133-");
+
+    // 0.4.0 boots login: pg only, with its positional X_PORT prediction in pg's env.
+    const old = legacy(login, ["up", "--json", "--wait-timeout", "30", "-n", "app"]);
+    expect(old.code, `0.4.0 up: ${old.stderr}`).toBe(0);
+    expect(await waitForPid(holdPg, 10_000), "pg should be running").toBe(true);
+    const pgPids = pidsMatching(`tail -f ${holdPg}`);
+    const mapPath = join(repo.root, "main", ".git", "devtrees", "shared-ports.json");
+    expect(existsSync(mapPath), "0.4.0 writes no map").toBe(false);
+    const oldEnv = envOf(old);
+
+    // This build, from billing (whose layout puts Y_PORT on that same slot):
+    // it seeds the map from 0.4.0's live numbers and restarts nothing.
+    const next = upWith(billing, "app", "ys");
+    expect(next.code, `PR build up: ${next.stderr}`).toBe(0);
+    expect((next.doc as PortsUp).up.shared_started).toBe(false);
+    expect(pidsMatching(`tail -f ${holdPg}`)).toEqual(pgPids);
+    const nextEnv = envOf(next);
+    expect(nextEnv.PG_PORT).toBe(oldEnv.PG_PORT);
+    expect(nextEnv.X_PORT).toBe(oldEnv.X_PORT);
+    expect(nextEnv.Y_PORT).not.toBe(oldEnv.X_PORT);
+    expect(await waitForListener(Number(nextEnv.Y_PORT), 10_000), "y listens").toBe(true);
+
+    // Activating x from login binds the number 0.4.0 injected.
+    const activated = upWith(login, "app", "xs");
+    expect(activated.code, `activate x: ${activated.stderr}`).toBe(0);
+    expect(envOf(activated).X_PORT).toBe(oldEnv.X_PORT);
+    expect(await waitForListener(Number(oldEnv.X_PORT), 10_000), "x listens").toBe(true);
+  }, 240_000);
+
+  it("scenario 132: a recorded port another name holds fails SHARED_PORT_CONFLICT and starts nothing", async () => {
+    const { repo, login, billing, upWith } = crossBranchRepo("dt-rpc132-");
+    const first = upWith(billing, "app", "ys");
+    expect(first.code, `billing up: ${first.stderr}`).toBe(0);
+    const yPort = Number(envOf(first).Y_PORT);
+    const mapPath = join(repo.root, "main", ".git", "devtrees", "shared-ports.json");
+    const map = JSON.parse(readFileSync(mapPath, "utf8")) as { ports: Record<string, number> };
+    map.ports.X_PORT = yPort;
+    writeFileSync(mapPath, JSON.stringify(map));
+
+    const blocked = upWith(login, "app", "xs");
+    expect(blocked.code).not.toBe(0);
+    const err = (blocked.doc as { error: { code: string; details: { conflicts: unknown[] } } })
+      .error;
+    expect(err.code).toBe("SHARED_PORT_CONFLICT");
+    expect(err.details.conflicts).toContainEqual(
+      expect.objectContaining({ reason: "port_taken", port: yPort }),
+    );
+    const ls = devtrees(login, ["ls", "--json", "--services"]);
+    const sharedRow = (
+      ls.doc as { ls: { instances: Array<{ kind: string; services: Array<{ name: string }> }> } }
+    ).ls.instances.find((i) => i.kind === "shared");
+    expect(sharedRow?.services.map((s) => s.name).sort()).toEqual(["pg", "y"]);
   }, 120_000);
 });
 

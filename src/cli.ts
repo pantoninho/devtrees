@@ -23,6 +23,7 @@ import type { LogEvent } from "./driver.js";
 import type { BracedEnvVar, DerivedConfig, DroppedEdge } from "./deriver.js";
 import type { DroppedNamespaceEdge } from "./selection.js";
 import type { SharedFieldChange } from "./shared-state.js";
+import type { SharedPortEntry } from "./shared-ports.js";
 import { maybeInitHint } from "./init-hint.js";
 import {
   classifyError,
@@ -34,6 +35,7 @@ import {
   formatLogLine,
   formatLs,
   formatPrune,
+  formatPruneSharedPorts,
   formatRestart,
   formatUp,
   formatUpDryRun,
@@ -210,15 +212,30 @@ export interface ExecuteDeps {
    * the booted namespaces. Best-effort; never throws.
    */
   bareRestartRemedy?: () => Promise<BareRestartRemedyRow>;
-  ls?: () => Promise<{ anchor: string; instances: ReadonlyArray<LsInstanceRow> }>;
+  ls?: () => Promise<{
+    anchor: string;
+    instances: ReadonlyArray<LsInstanceRow>;
+    /** The shared port map with origins (#238). */
+    sharedPorts?: Readonly<Record<string, SharedPortEntry>>;
+  }>;
   attach?: (options: { shared: boolean }) => Promise<void>;
+  /** `prune --shared-ports` (#238): drop shared port map names no instance holds. */
+  pruneSharedPorts?: () => Promise<{
+    dropped: ReadonlyArray<string>;
+    kept: ReadonlyArray<string>;
+  }>;
   prune?: () => Promise<{
     anchor: string;
     pruned: ReadonlyArray<PrunedRow>;
     warnings?: ReadonlyArray<ReapWarningRow>;
     unreclaimed?: ReadonlyArray<UnreclaimedRow>;
   }>;
-  env?: () => Promise<{ worktreeId: string; env: Record<string, string> }>;
+  env?: () => Promise<{
+    worktreeId: string;
+    env: Record<string, string>;
+    /** Each shared port with its origin (#238). */
+    sharedPorts?: Readonly<Record<string, SharedPortEntry>>;
+  }>;
   logs?: (options: LogsCliOptions) => Promise<{
     services: ReadonlyArray<string>;
     events: AsyncIterable<LogEvent>;
@@ -383,6 +400,7 @@ class UpCommand extends DevtreesCommand {
       "SHARED_DRIFT",
       "SHARED_START_FAILED",
       "SHARED_ACTIVATION_FAILED",
+      "SHARED_PORT_CONFLICT",
       "WORKTREE_START_FAILED",
       "NO_SERVICES_SELECTED",
       "SOCKET_PATH_TOO_LONG",
@@ -768,7 +786,9 @@ class LsCommand extends DevtreesCommand {
       "`reload_pending`, and each service's `namespaces`, `tier`, `state` and `pid` next " +
       "to process-compose's own `status`. Each instance is read for at most 5s; one that " +
       "does not answer is listed with its namespaces and services unknown " +
-      "(`services_read: unresponsive`). In the tables `?` means not known and `-` means " +
+      "(`services_read: unresponsive`). `--json` also carries `shared_ports`, the stable " +
+      "shared port map (#238), each port `active` (bound by the running shared instance) " +
+      "or `recorded`. In the tables `?` means not known and `-` means " +
       "none.\n\n" +
       errorCodeFooter(["UNKNOWN"]),
   });
@@ -781,7 +801,10 @@ class LsCommand extends DevtreesCommand {
     return this.dispatch(async () => {
       if (!this.context.deps.ls) return 0;
       const result = await this.context.deps.ls();
-      const out = formatLs(result.instances, this.mode, { services: this.services });
+      const out = formatLs(result.instances, this.mode, {
+        services: this.services,
+        sharedPorts: result.sharedPorts,
+      });
       this.emit(out);
       return 0;
     });
@@ -815,11 +838,27 @@ class PruneCommand extends DevtreesCommand {
   static override usage = Command.Usage({
     description: "Reconcile against `git worktree list` and clean up orphaned instances.",
     // Drops orphan registry entries under the registry lock → LOCK_CONTENTION.
-    details: errorCodeFooter(["LOCK_CONTENTION", "UNKNOWN"]),
+    details:
+      "With `--shared-ports`, prune only the stable shared port map (#238) instead: drop " +
+      "every recorded name that no instance holds (no running shared service binds it and " +
+      "no derived config on disk carries it), freeing shared block numbers after " +
+      "an `up` failed because the shared block is full (`block_full`). Refused while any " +
+      "worktree's `up` or `down` is in flight.\n\n" +
+      errorCodeFooter(["LOCK_CONTENTION", "UNKNOWN"]),
+  });
+
+  sharedPorts = Option.Boolean("--shared-ports", false, {
+    description: "Drop shared port map names no instance holds, instead of pruning orphans.",
   });
 
   override async execute(): Promise<number> {
     return this.dispatch(async () => {
+      if (this.sharedPorts) {
+        if (!this.context.deps.pruneSharedPorts) return 0;
+        const result = await this.context.deps.pruneSharedPorts();
+        this.emit(formatPruneSharedPorts(result, this.mode));
+        return 0;
+      }
       if (!this.context.deps.prune) return 0;
       const result = await this.context.deps.prune();
       // Issue #148: a failed orphan reap surfaces as a stderr warning (human) /
@@ -846,14 +885,19 @@ class EnvCommand extends DevtreesCommand {
     // Loads devtrees.yaml (CONFIG_INVALID) and reports shared-tier divergence
     // (SHARED_DRIFT, #83) but is lock-free — `runEnv` is a pure registry
     // read, so LOCK_CONTENTION cannot occur here.
-    details: errorCodeFooter(["SHARED_DRIFT", "CONFIG_INVALID", "UNKNOWN"]),
+    details:
+      "Shared ports come from the stable shared port map (#238): `--json` adds " +
+      "`shared_ports`, each shared port with its `origin`: `active` (a running shared " +
+      "service binds it), `recorded` (in the map) or `predicted` (no `up` recorded it " +
+      "yet; `env` never writes the map).\n\n" +
+      errorCodeFooter(["SHARED_DRIFT", "SHARED_PORT_CONFLICT", "CONFIG_INVALID", "UNKNOWN"]),
   });
 
   override async execute(): Promise<number> {
     return this.dispatch(async () => {
       if (!this.context.deps.env) return 0;
       const result = await this.context.deps.env();
-      const out = formatEnv(result.env, this.mode);
+      const out = formatEnv(result.env, this.mode, result.sharedPorts);
       this.emit(out);
       return 0;
     });
@@ -1299,6 +1343,7 @@ if (isEntrypoint(import.meta.url, process.argv[1])) {
     runLs,
     runAttach,
     runPrune,
+    runPruneSharedPorts,
     runLogs,
     runInit,
   } = await import("./commands.js");
@@ -1325,6 +1370,7 @@ if (isEntrypoint(import.meta.url, process.argv[1])) {
     ls: () => runLs(),
     attach: ({ shared }) => runAttach({}, { shared }),
     prune: () => runPrune({ stop: stopSeamsFromEnv() }),
+    pruneSharedPorts: () => runPruneSharedPorts(),
     env: () => runEnv(),
     logs: (opts) =>
       runLogs(
