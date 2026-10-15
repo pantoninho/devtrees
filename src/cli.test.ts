@@ -125,6 +125,7 @@ describe("devtrees CLI", () => {
         "CONFIG_DRIFT",
         "SHARED_DRIFT",
         "SHARED_START_FAILED",
+        "SHARED_PORT_CONFLICT",
         "WORKTREE_START_FAILED",
         "NO_SERVICES_SELECTED",
         "SOCKET_PATH_TOO_LONG",
@@ -172,7 +173,7 @@ describe("devtrees CLI", () => {
     ["prune", ["LOCK_CONTENTION", "UNKNOWN"]],
     // `env` loads devtrees.yaml (CONFIG_INVALID) and reports shared-tier
     // divergence (SHARED_DRIFT, #83) but is lock-free (pure registry read).
-    ["env", ["SHARED_DRIFT", "CONFIG_INVALID", "UNKNOWN"]],
+    ["env", ["SHARED_DRIFT", "SHARED_PORT_CONFLICT", "CONFIG_INVALID", "UNKNOWN"]],
     // `logs` validates the service name against the derived config (#109).
     ["logs", ["INSTANCE_NOT_FOUND", "SERVICE_NOT_FOUND", "INVALID_ARGS", "UNKNOWN"]],
     // `init --agents` validates the required --agents flag (INVALID_ARGS) and
@@ -195,6 +196,7 @@ describe("devtrees CLI", () => {
     "CONFIG_DRIFT",
     "SHARED_DRIFT",
     "SHARED_START_FAILED",
+    "SHARED_PORT_CONFLICT",
     "WORKTREE_START_FAILED",
     "NO_SERVICES_SELECTED",
     "SOCKET_PATH_TOO_LONG",

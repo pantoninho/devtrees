@@ -275,6 +275,31 @@ services:
 - `env` takes no `-n`, so it checks only the always-on shared services.
 - Every `up` and `env` still injects every shared service's ports, selected or
   not.
+- **Shared ports are stable by name.** The first `up` that sees a shared
+  named port records its number in the shared port map
+  (`<git-common-dir>/devtrees/shared-ports.json`), under the shared lock, and
+  every later `up` and `env`, on any branch, uses that number. So two
+  worktrees whose branches declare different shared services still agree on
+  each one's port, and adding a namespaced shared service never moves a port
+  some worktree was already given. A name seen for the first time takes its
+  positional number in the shared block, or the lowest free one if a recorded
+  name holds it. The map survives `down --shared`, like the shared block
+  ([ADR-0011](docs/adr/0011-shared-ports-are-stable-by-name.md)).
+- `env --json` reports each shared port's origin in `shared_ports`
+  (`{NAME: {port, origin}}`): `active` (a running shared service binds it),
+  `recorded` (in the map) or `predicted` (no `up` recorded it yet; `env` and
+  `up --dry-run` read the map but never write it). `ls --json` lists the map
+  as `ls.shared_ports`, `active` or `recorded`.
+- devtrees never hands one port to two names. When the map records a number
+  another name holds, a running shared service binds a name at another
+  number, or a service this `up` would add has a port a running shared
+  process was given a different number for, `up` fails with
+  `SHARED_PORT_CONFLICT` and changes nothing. Its remedy is
+  `devtrees down --shared && devtrees up`. A stale number in a running shared
+  process's env that nothing this `up` starts depends on is only warned about.
+- A shared instance started by devtrees 0.4.0 or older has no map: the first
+  `up` seeds it from the instance's live numbers (its bound ports and the env
+  of its processes), restarting nothing.
 - **Always pass `-n` when a stack has namespaced shared services.** On a
   running instance, a bare `up` selects the namespaces the instance booted,
   read back from process-compose. A namespace that holds only shared
@@ -383,6 +408,7 @@ footer lists the subset that command can actually emit.
 | `SHARED_DRIFT`              | A shared service this `up` selects diverges from the revision the running shared instance runs (an `up` that does not select it is unaffected); `details.services` lists each `{service, running_hash, local_hash}`, `details.port_conflicts` each named port a running shared service already owns, `details.remedy` is `devtrees down --shared && devtrees up` (for every worktree). |
 | `SHARED_START_FAILED`       | The lazy-started shared instance died before binding its control socket; `details.config_path` is the config to run by hand. |
 | `SHARED_ACTIVATION_FAILED`  | Adding a selected namespaced shared service to the running shared instance failed (process-compose refused or timed out on the config reload); the shared services it already ran are untouched. `details` has `{services, reason, config_path, remedy}`. |
+| `SHARED_PORT_CONFLICT`      | A shared named port cannot be resolved without handing one port to two names or moving a recorded one (the stable shared port map, #238): `details.conflicts` lists each `{reason, port_name, port, recorded_port?, holder?, process?}` (`reason`: `port_taken`, `bound_mismatch` or `stale_env`); nothing was started, added or recorded. `details.remedy` is the `down --shared` + `up` that clears it; `details.map_path` is the map. |
 | `WORKTREE_START_FAILED`     | This worktree's instance died before binding its control socket; `details.config_path` is the config to run by hand. |
 | `NO_SERVICES_SELECTED`      | The selection has no services: a bare `up` starts only the `default` namespace and it has none, or `-n` names only namespaces with none, or a `restart -n` namespace has no isolated service (`details.selected_namespaces` names it; nothing was touched). `details.namespaces` lists the namespaces to pass with `-n`. |
 | `SOCKET_PATH_TOO_LONG`      | The control socket path exceeds the platform's unix-socket limit; set `DEVTREES_RUNTIME_DIR` to a shorter directory. |
@@ -463,6 +489,10 @@ are. It never stops anything, and never attaches the TUI.
   namespaces you booted with. A bare `up` cannot tell that a namespace holding
   only shared services was booted, so it does not select them: it neither
   checks them for drift nor adds them back after `down --shared`.
+- A shared port keeps its number for good, in every worktree and branch, once
+  any `up` has recorded it. `env --json` reports each one's origin in
+  `shared_ports` (`active`, `recorded`, or `predicted`: no `up` has
+  recorded it yet, so run `up` before relying on it).
 - A dead selected service (crashed, killed, or exited non-zero) is started
   again, and `up` names it (`restarted` in the `--json` envelope). Several
   dead services are started in `depends_on` order, without waiting between
@@ -551,6 +581,7 @@ Branch on `error.code`:
 | `STALE_PORT_BLOCK`          | Foreign listeners hold this worktree's ports. `details.collisions[]` lists `{port_name, port, pid, command, accepts_connections, port_forwarder}` (the message lists them too). Kill the orphaned holders and retry, but **never** kill one with `port_forwarder: true` (a container runtime's forwarder, such as OrbStack Helper, serving every instance: stop the container that publishes the port, `docker ps --filter publish=<port>`) or `accepts_connections: false` (usually a stale port forward). Holders that all refuse connections do not fail `up`; it warns and goes on. |
 | `SHARED_DRIFT`              | A shared service this `up` selects (`details.services`) runs at another revision than this worktree defines. An `up` that does not select it is unaffected. Follow the message: `devtrees down --shared && devtrees up` (it stops the shared instance for every worktree). |
 | `SHARED_ACTIVATION_FAILED`  | `up` could not add a namespaced shared service to the running shared instance; nothing that was running changed. `reason: timeout` → retry `devtrees up`. Otherwise **surface it to the human** with `details.remedy`. |
+| `SHARED_PORT_CONFLICT`      | A shared port is claimed by two names, or a running shared service holds a different number than the one recorded for it (`details.conflicts`). Nothing was started or recorded. **Surface it to the human** with `details.remedy` (`devtrees down --shared && devtrees up`, which stops the shared instance for every worktree); never edit ports by hand to get past it. |
 | `CONFIG_DRIFT`              | The running config differs from `devtrees.yaml` and hot-reload failed, or an earlier reload is still pending. Branch on `details.reason`: `not_supported`/`error` → `devtrees down && devtrees up`. `timeout` → a changed service's old process won't stop: kill that process, then run `devtrees up` again to resync. Or run `devtrees down && devtrees up`: `down` force-kills that old process first and lists it in `force_killed`. `reload_pending` → that earlier reload is still waiting, so `up` reloaded nothing (another reload would start an untracked second copy): kill the old process (`details.pids`, for `details.services`), then run `devtrees up` again. Empty `details.pids` → the old process is gone and process-compose is still starting the new one: retry shortly; if it persists, follow the message's `devtrees down && devtrees up …`. |
 | `SERVICE_NOT_FOUND`         | You named a service that isn't in the instance. `details.valid_services` lists the real names; pick one. |
 | `NO_SERVICES_SELECTED`      | The selection has no services: a bare `up` starts only services with no `namespace:` and there are none, or `-n` names only namespaces with none (on `restart`, any `-n` namespace with no isolated service, in `details.selected_namespaces`). `details.namespaces` lists the namespaces; retry with one of them. |

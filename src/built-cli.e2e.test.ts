@@ -490,6 +490,116 @@ describe("built CLI e2e — argv→commands wiring over the stub process-compose
     expect(existsSync(sock), "no control socket").toBe(false);
   }, 60_000);
 
+  it("two branches with different shared layouts agree on shared ports; a conflict fails SHARED_PORT_CONFLICT (#238)", () => {
+    // Branch `login` declares pg + x; branch `billing` declares pg + y + x.
+    // By position, login's X_PORT and billing's Y_PORT share a slot.
+    const sharedSvc = (name: string, ns: string | undefined, port: string): string[] => [
+      `  ${name}:`,
+      "    tier: shared",
+      ...(ns === undefined ? [] : [`    namespace: ${ns}`]),
+      '    command: "sleep 300"',
+      `    ports: [${port}]`,
+    ];
+    const api = [
+      "  api:",
+      "    namespace: app",
+      '    command: "sleep 300"',
+      "    ports: [API_PORT]",
+    ];
+    const login = setupRepoWithStack(
+      "dt-bc238-",
+      [
+        "services:",
+        ...sharedSvc("pg", undefined, "PG_PORT"),
+        ...sharedSvc("x", "xs", "X_PORT"),
+        ...api,
+        "",
+      ].join("\n"),
+    );
+    cleanups.push(() => devtrees(login.wt, ["down", "--shared"]));
+    const billingWt = join(login.wt, "..", "billing");
+    execFileSync("git", ["worktree", "add", "-q", billingWt, "-b", "billing"], {
+      cwd: join(login.wt, "..", "main"),
+    });
+    writeFileSync(
+      join(billingWt, "devtrees.yaml"),
+      [
+        "services:",
+        ...sharedSvc("pg", undefined, "PG_PORT"),
+        ...sharedSvc("y", "ys", "Y_PORT"),
+        ...sharedSvc("x", "xs", "X_PORT"),
+        ...api,
+        "",
+      ].join("\n"),
+    );
+    cleanups.push(() => devtrees(billingWt, ["down"]));
+    type EnvDoc = {
+      env: Record<string, string>;
+      shared_ports: Record<string, { port: number; origin: string }>;
+    };
+
+    const a = devtrees(login.wt, ["up", "--json", "--wait-timeout", "30", "-n", "app"]);
+    expect(a.code, `login up: ${a.stderr}`).toBe(0);
+    const xPort = Number((a.doc as UpDoc).up.env.X_PORT);
+
+    // billing reads login's recorded X_PORT; Y_PORT is only predicted, and
+    // `env` wrote nothing, so the prediction is not recorded yet.
+    const env = devtrees(billingWt, ["env", "--json"]);
+    expect(env.code, `billing env: ${env.stderr}`).toBe(0);
+    const ports = (env.doc as EnvDoc).shared_ports;
+    expect(ports.X_PORT).toEqual({ port: xPort, origin: "recorded" });
+    expect(ports.PG_PORT?.origin).toBe("active");
+    expect(ports.Y_PORT?.origin).toBe("predicted");
+    expect(ports.Y_PORT?.port).not.toBe(xPort);
+    const mapPath = join(login.anchor, "devtrees", "shared-ports.json");
+    expect(Object.keys(JSON.parse(readFileSync(mapPath, "utf8")).ports)).toEqual([
+      "PG_PORT",
+      "X_PORT",
+    ]);
+
+    const b = devtrees(billingWt, [
+      "up",
+      "--json",
+      "--wait-timeout",
+      "30",
+      "-n",
+      "app",
+      "-n",
+      "ys",
+    ]);
+    expect(b.code, `billing up: ${b.stderr}`).toBe(0);
+    const bEnv = (b.doc as UpDoc).up.env;
+    expect(Number(bEnv.X_PORT)).toBe(xPort);
+    expect(bEnv.Y_PORT).toBe(String(ports.Y_PORT?.port));
+
+    const ls = devtrees(login.wt, ["ls", "--json"]);
+    expect(ls.code, `ls: ${ls.stderr}`).toBe(0);
+    const lsPorts = (ls.doc as { ls: { shared_ports: EnvDoc["shared_ports"] } }).ls.shared_ports;
+    expect(lsPorts.Y_PORT?.origin).toBe("active");
+    expect(lsPorts.X_PORT).toEqual({ port: xPort, origin: "recorded" });
+
+    // A map that gives X_PORT the number y binds: adding x would hand one
+    // port to two names, so `up` refuses and records nothing.
+    const map = JSON.parse(readFileSync(mapPath, "utf8")) as { ports: Record<string, number> };
+    map.ports.X_PORT = Number(bEnv.Y_PORT);
+    writeFileSync(mapPath, JSON.stringify(map));
+    const blocked = devtrees(login.wt, [
+      "up",
+      "--json",
+      "--wait-timeout",
+      "30",
+      "-n",
+      "app",
+      "-n",
+      "xs",
+    ]);
+    expect(blocked.code).not.toBe(0);
+    const err = (blocked.doc as ErrorDoc).error as { code?: string; details?: { remedy?: string } };
+    expect(err.code).toBe("SHARED_PORT_CONFLICT");
+    expect(err.details?.remedy).toContain("devtrees down --shared && devtrees up");
+    expect(JSON.parse(readFileSync(mapPath, "utf8"))).toEqual(map);
+  }, 90_000);
+
   it("up refuses a process-compose older than v1.122.0 before starting anything (#173)", () => {
     const { wt, id, sock, stateDir: devtreesDir } = setupScenario("dt-bcold-", { webProbe: false });
     const env = { STUB_PC_VERSION: "v1.110.0" };

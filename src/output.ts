@@ -22,6 +22,7 @@ import { stringify as stringifyYaml } from "yaml";
 import type { BracedEnvVar, DerivedConfig, DroppedEdge } from "./deriver.js";
 import type { DroppedNamespaceEdge } from "./selection.js";
 import type { SharedFieldChange } from "./shared-state.js";
+import type { SharedPortEntry } from "./shared-ports.js";
 
 export const SCHEMA_VERSION = "1";
 
@@ -50,6 +51,7 @@ export const ERROR_CODES = [
   "SHARED_DRIFT",
   "SHARED_START_FAILED",
   "SHARED_ACTIVATION_FAILED",
+  "SHARED_PORT_CONFLICT",
   "WORKTREE_START_FAILED",
   "NO_SERVICES_SELECTED",
   "SOCKET_PATH_TOO_LONG",
@@ -108,6 +110,8 @@ export const ERROR_CODE_DESCRIPTIONS: Readonly<Record<ErrorCode, string>> = {
     "The lazy-started shared instance died before binding its control socket; `details.config_path` is the config to run by hand.",
   SHARED_ACTIVATION_FAILED:
     "Adding a selected namespaced shared service to the running shared instance failed (process-compose refused or timed out on the config reload); the shared services it already ran are untouched. `details` has `{services, reason, config_path, remedy}`.",
+  SHARED_PORT_CONFLICT:
+    "A shared named port cannot be resolved without handing one port to two names or moving a recorded one (the stable shared port map, #238): `details.conflicts` lists each `{reason, port_name, port, recorded_port?, holder?, process?}` (`reason`: `port_taken`, `bound_mismatch` or `stale_env`); nothing was started, added or recorded. `details.remedy` is the `down --shared` + `up` that clears it; `details.map_path` is the map.",
   WORKTREE_START_FAILED:
     "This worktree's instance died before binding its control socket; `details.config_path` is the config to run by hand.",
   NO_SERVICES_SELECTED:
@@ -191,6 +195,8 @@ export interface LsInstanceRow {
 export interface LsFormatOptions {
   /** `--services`: one row per service instead of one per instance (#226). */
   readonly services?: boolean;
+  /** The shared port map with origins (#238), emitted as `ls.shared_ports` under `--json`. */
+  readonly sharedPorts?: Readonly<Record<string, SharedPortEntry>>;
 }
 
 // --- ls ---------------------------------------------------------------------
@@ -382,7 +388,7 @@ export function formatLs(
   if (mode === "json") {
     const doc = {
       schema_version: SCHEMA_VERSION,
-      ls: { instances: instances.map(lsInstanceJson) },
+      ls: { instances: instances.map(lsInstanceJson), shared_ports: options.sharedPorts ?? {} },
     };
     return { stdout: `${JSON.stringify(doc)}\n`, stderr: "" };
   }
@@ -1165,11 +1171,21 @@ export function formatInit(payload: InitPayload, mode: FormatMode): OutputResult
  *
  *   - `human`: one `KEY=value` line per entry — suitable for
  *     `eval $(devtrees env)`. Empty map renders as empty stdout.
- *   - `json`: `{schema_version, env: { KEY: "value", ... }}`.
+ *   - `json`: `{schema_version, env: { KEY: "value", ... }}`, plus
+ *     `shared_ports: {NAME: {port, origin}}` when the stack has a shared tier
+ *     (#238): each shared port's origin, `active`, `recorded` or `predicted`.
  */
-export function formatEnv(env: Readonly<Record<string, string>>, mode: FormatMode): OutputResult {
+export function formatEnv(
+  env: Readonly<Record<string, string>>,
+  mode: FormatMode,
+  sharedPorts?: Readonly<Record<string, SharedPortEntry>>,
+): OutputResult {
   if (mode === "json") {
-    const doc = { schema_version: SCHEMA_VERSION, env };
+    const doc = {
+      schema_version: SCHEMA_VERSION,
+      env,
+      ...(sharedPorts === undefined ? {} : { shared_ports: sharedPorts }),
+    };
     return { stdout: `${JSON.stringify(doc)}\n`, stderr: "" };
   }
   const entries = Object.entries(env);

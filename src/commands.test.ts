@@ -60,6 +60,7 @@ import {
 } from "./paths.js";
 import { sharedServiceHash, sharedStackHash, stackHash } from "./hash.js";
 import { readSharedState } from "./shared-state.js";
+import { readSharedPortMap, sharedPortMapFile, writeSharedPortMap } from "./shared-ports.js";
 import { readPendingReload, writePendingReload, type PendingReload } from "./reload-pending.js";
 import type { ResolvedService, ResolvedStack, ServiceDependency } from "./stack.js";
 
@@ -8050,6 +8051,191 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
     const result = await runUp(again.deps);
     expect(result.sharedActivated).toEqual([]);
     expect(again.reloads).toEqual([]);
+  });
+
+  /**
+   * #238 (ADR-0011): shared ports are stable by name. The shared port map is
+   * recorded under the shared lock the first time an `up` sees a name, and
+   * every later `up` and `env`, on any branch, reuses it.
+   */
+  describe("stable shared ports by name (#238)", () => {
+    // Branch A declares postgres + x; branch B declares postgres + y + x. By
+    // position, A's X_PORT and B's Y_PORT both take the shared block's second
+    // slot: the cross-branch collision #238 reports.
+    const x = inNs(shared("x", "x-server", ["X_PORT"]), "xs");
+    const y = inNs(shared("y", "y-server", ["Y_PORT"]), "ys");
+    const postgres = shared("postgres", "postgres -D ./pgdata", ["DB_PORT"]);
+    const branchA: ResolvedStack = {
+      services: [postgres, x, inNs(isolated("api", "node api.js", ["API_PORT"]), "app")],
+    };
+    const branchB: ResolvedStack = {
+      services: [postgres, y, x, inNs(isolated("api", "node api.js", ["API_PORT"]), "app")],
+    };
+    const mapOf = (fixture: Fixture) => readSharedPortMap(fixture.sharedAnchor);
+
+    for (const order of ["A then B", "B then A"] as const) {
+      it(`two branches with different shared layouts agree on every port (${order})`, async () => {
+        const fixture = multiWorktreeFixture("dt-238-order-");
+        const [first, second] =
+          order === "A then B"
+            ? [
+                { stack: branchA, id: "login", ns: ["app"] },
+                { stack: branchB, id: "billing", ns: ["app", "ys"] },
+              ]
+            : [
+                { stack: branchB, id: "billing", ns: ["app", "ys"] },
+                { stack: branchA, id: "login", ns: ["app"] },
+              ];
+        const one = await runUp(wt(fixture, first.stack, first.id, { namespaces: first.ns }).deps);
+        const two = await runUp(
+          wt(fixture, second.stack, second.id, { namespaces: second.ns }).deps,
+        );
+        const [envA, envB] = order === "A then B" ? [one.env, two.env] : [two.env, one.env];
+        expect(envA.X_PORT).toBe(envB.X_PORT);
+        expect(envA.DB_PORT).toBe(envB.DB_PORT);
+        expect(new Set([envB.DB_PORT, envB.X_PORT, envB.Y_PORT]).size).toBe(3);
+
+        // Activating x from either branch binds the number both were told.
+        const activate = await runUp(
+          wt(fixture, branchA, "login", { namespaces: ["app", "xs"] }).deps,
+        );
+        expect(activate.sharedActivated).toEqual(["x"]);
+        expect(activate.env.X_PORT).toBe(envB.X_PORT);
+        expect(readSharedState(fixture.sharedAnchor)?.ports.X_PORT).toBe(Number(envA.X_PORT));
+        expect(mapOf(fixture)).toEqual({
+          DB_PORT: Number(envB.DB_PORT),
+          X_PORT: Number(envB.X_PORT),
+          Y_PORT: Number(envB.Y_PORT),
+        });
+      });
+    }
+
+    it("env and up --dry-run read the map and never write it; their origins say so", async () => {
+      const fixture = multiWorktreeFixture("dt-238-readonly-");
+      const deps = wt(fixture, branchA, "login", { namespaces: ["app"] }).deps;
+      const before = await runEnv(deps);
+      await runUpDryRun(deps);
+      expect(mapOf(fixture)).toBeUndefined();
+      expect(before.sharedPorts?.X_PORT?.origin).toBe("predicted");
+
+      const up = await runUp(deps);
+      expect(Number(up.env.X_PORT)).toBe(before.sharedPorts?.X_PORT?.port);
+      const after = await runEnv(deps);
+      expect(after.sharedPorts).toEqual({
+        DB_PORT: { port: Number(up.env.DB_PORT), origin: "active" },
+        X_PORT: { port: Number(up.env.X_PORT), origin: "recorded" },
+      });
+    });
+
+    it("the map survives down --shared, so the next shared start binds the same numbers", async () => {
+      const fixture = multiWorktreeFixture("dt-238-down-");
+      const a = await runUp(wt(fixture, branchA, "login", { namespaces: ["app"] }).deps);
+      await runDown(wt(fixture, branchA, "login").deps, { shared: true });
+      // The stub process-compose leaves its socket file behind; a real down does not.
+      rmSync(sharedInstancePaths(fixture.sharedAnchor).socketPath, { force: true });
+      const b = await runUp(wt(fixture, branchB, "billing", { namespaces: ["app", "ys"] }).deps);
+      expect(b.sharedStarted).toBe(true);
+      expect(b.env.X_PORT).toBe(a.env.X_PORT);
+      expect(b.env.Y_PORT).not.toBe(a.env.X_PORT);
+    });
+
+    it("a 0.4.0 shared instance (no map) is seeded from its live numbers: no reload, no drift", async () => {
+      const fixture = multiWorktreeFixture("dt-238-migrate-");
+      const first = await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+      rmSync(sharedPortMapFile(fixture.sharedAnchor));
+      const configBefore = sharedConfigOf(fixture);
+
+      const second = wt(fixture, base, "billing", { namespaces: ["app", "db"] });
+      const result = await runUp(second.deps);
+      expect(result.sharedStarted).toBe(false);
+      expect(second.reloads).toEqual([]);
+      expect(sharedConfigOf(fixture)).toEqual(configBefore);
+      expect(result.env.DB_PORT).toBe(first.env.DB_PORT);
+      expect(result.env.SB_PORT).toBe(first.env.SB_PORT);
+      expect(mapOf(fixture)).toEqual({
+        DB_PORT: Number(first.env.DB_PORT),
+        SB_PORT: Number(first.env.SB_PORT),
+      });
+    });
+
+    it("seeds a 0.4.0 prediction from the running processes' env, not this branch's layout", async () => {
+      // 0.4.0 started postgres from a branch that predicted SB_PORT one slot
+      // further on; that number is in postgres's env, so it is the one kept.
+      const fixture = multiWorktreeFixture("dt-238-migrate-env-");
+      const first = await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+      const predicted = Number(first.env.SB_PORT) + 5;
+      rewriteSharedEnv(fixture, "postgres", "SB_PORT", predicted);
+      rmSync(sharedPortMapFile(fixture.sharedAnchor));
+
+      const result = await runUp(wt(fixture, base, "billing", { namespaces: ["app", "db"] }).deps);
+      expect(Number(result.env.SB_PORT)).toBe(predicted);
+      expect(mapOf(fixture)?.SB_PORT).toBe(predicted);
+    });
+
+    it("a recorded port another running service binds fails SHARED_PORT_CONFLICT and changes nothing", async () => {
+      // An older devtrees beside this one bound DB_PORT on SB_PORT's
+      // recorded number: handing it out would give one port to two names.
+      const fixture = multiWorktreeFixture("dt-238-conflict-");
+      const first = await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+      writeSharedPortMap(fixture.sharedAnchor, {
+        DB_PORT: Number(first.env.SB_PORT),
+        SB_PORT: Number(first.env.SB_PORT),
+      });
+      const mapBefore = readFileSync(sharedPortMapFile(fixture.sharedAnchor), "utf8");
+
+      const blocked = wt(fixture, base, "billing", { namespaces: ["app", "db-shared"] });
+      const err = await failure(runUp(blocked.deps));
+      expect(err?.code).toBe("SHARED_PORT_CONFLICT");
+      expect(err?.details?.conflicts).toContainEqual({
+        reason: "port_taken",
+        port_name: "SB_PORT",
+        port: Number(first.env.SB_PORT),
+        holder: "DB_PORT",
+      });
+      expect(err?.details?.remedy).toBe(
+        "devtrees down --shared && devtrees up (for every worktree)",
+      );
+      expect(blocked.reloads).toEqual([]);
+      expect(readFileSync(sharedPortMapFile(fixture.sharedAnchor), "utf8")).toBe(mapBefore);
+      // `env` reports the same conflict instead of a wrong number.
+      expect((await failure(runEnv(blocked.deps)))?.code).toBe("SHARED_PORT_CONFLICT");
+    });
+
+    it("a running process holding a stale number blocks only the up that would add its service", async () => {
+      // 0.4.0 left postgres with SB_PORT=<DB_PORT>: a number another name holds.
+      const fixture = multiWorktreeFixture("dt-238-stale-");
+      const first = await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+      rewriteSharedEnv(fixture, "postgres", "SB_PORT", Number(first.env.DB_PORT));
+      rmSync(sharedPortMapFile(fixture.sharedAnchor));
+
+      const warnings: string[] = [];
+      const unaffected = wt(fixture, base, "billing", { namespaces: ["app", "db"] });
+      await runUp({ ...unaffected.deps, warn: (m) => warnings.push(m) });
+      expect(warnings.some((w) => w.includes("'postgres'") && w.includes("SB_PORT"))).toBe(true);
+
+      const adding = wt(fixture, base, "billing", { namespaces: ["app", "db-shared"] });
+      const err = await failure(runUp(adding.deps));
+      expect(err?.code).toBe("SHARED_PORT_CONFLICT");
+      expect(err?.details?.conflicts).toEqual([
+        expect.objectContaining({ reason: "stale_env", port_name: "SB_PORT", process: "postgres" }),
+      ]);
+      expect(adding.reloads).toEqual([]);
+      expect(Object.keys(sharedConfigOf(fixture))).toEqual(["postgres"]);
+    });
+
+    /** Rewrite one shared process's injected value for `name`, as a 0.4.0 prediction would. */
+    function rewriteSharedEnv(fixture: Fixture, process: string, name: string, port: number) {
+      const path = sharedInstancePaths(fixture.sharedAnchor).configPath;
+      const doc = parseYaml(readFileSync(path, "utf8")) as {
+        processes: Record<string, { environment: string[] }>;
+      };
+      const proc = doc.processes[process];
+      if (proc === undefined) throw new Error(`no process ${process}`);
+      proc.environment = proc.environment.map((e) =>
+        e.startsWith(`${name}=`) ? `${name}=${port}` : e,
+      );
+      writeFileSync(path, stringifyYaml(doc), "utf8");
+    }
   });
 
   /**
