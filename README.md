@@ -152,8 +152,10 @@ Namespaces are **opt-in** and selection is **exact**
   (`"instance": "running"`) that is the namespaces it was booted with for a bare
   `up`, whether the changed config would be hot-reloaded (`would_reload`), which
   dead services would be restarted (`would_restart`), and the same errors
-  (`NAMESPACE_NOT_RUNNING`, `CONFIG_DRIFT` with `reload_pending`). It only reads
-  the running instance: nothing is reloaded, restarted or written. A drifted
+  (`NAMESPACE_NOT_RUNNING`, `CONFIG_DRIFT` with `reload_pending`). On either
+  path, when the shared instance is running, `would_restart_shared` lists the
+  dead selected shared services `up` would restart. It only reads the running
+  instances: nothing is reloaded, restarted or written. A drifted
   stack is previewed as the hot-reload would leave it, since the real `up`
   reloads before it checks. The read of the instance is capped at 5s (or
   `--wait-timeout`), so a process-compose too slow to answer fails
@@ -257,6 +259,13 @@ services:
   `SHARED_DRIFT` names each drifted service with both revisions. An `up` that
   does not select a drifted shared service does not fail. Drift in an
   always-on shared service still fails every `up`.
+- An `up` **restarts a dead shared service it selects**, from any worktree,
+  and waits for it to be healthy; the result lists it in `shared_restarted`.
+  It never stops, restarts or reloads a shared service that is running, and
+  it checks drift first: on `SHARED_DRIFT` it restarts nothing. Two worktrees
+  running `up` at once restart it once. If process-compose refuses the start,
+  or the restarted service dies again, `up` fails with `SHARED_SERVICE_DEAD`
+  (`details.reason`); if it never becomes healthy, with `HEALTH_TIMEOUT`.
 - `env` takes no `-n`, so it checks only the always-on shared services.
 - Every `up` and `env` still injects every shared service's ports, selected or
   not.
@@ -357,9 +366,9 @@ footer lists the subset that command can actually emit.
 | `DOWN_TIMEOUT`              | The stop did not finish within its budget and process-compose was still running after devtrees force-killed the stuck services, or a timed-out hot-reload never finished so the stop was not started (`details.pending_reload`); the socket and config were kept, `details` names the stuck services, their pids and the process-compose pid, `details.remedy` says what to do. |
 | `DOWN_INCOMPLETE`           | process-compose stopped, but something the instance started is still alive: a listener on a booted service's port, or a member of a service's process group that survived SIGKILL; `details.survivors` lists each `{service, pid, command, port_name?, port?, port_forwarder?}`, `details.remedy` says what to do. A retried `down` checks the same ports again. |
 | `SERVICE_NOT_FOUND`         | The named service does not exist in the target instance; `details.valid_services` lists the known ones. |
-| `HEALTH_TIMEOUT`            | Stack started but services did not report healthy before the wait window expired, or a selected service is dead, including one `up` or `restart` restarted (`details.dead_services`); after `restart`, `devtrees restart <service>` retries it. |
+| `HEALTH_TIMEOUT`            | Stack started but services did not report healthy before the wait window expired, or a selected service is dead, including one `up` or `restart` restarted (`details.dead_services`); after `restart`, `devtrees restart <service>` retries it. A dead shared service `up` restarted that never became healthy is this code too, with `details.instance: "shared"` and the shared `details.remedy`. |
 | `NAMESPACE_NOT_RUNNING`     | `up -n` named a namespace the running instance was not booted with, or `restart` named a service in one, or such a namespace with `-n`; `details` has `{worktree_id, namespaces, services, remedy}`, the remedy being the `down` + `up` that boots it. |
-| `SHARED_SERVICE_DEAD`       | A shared service in the running shared instance is dead; it is not restarted from a worktree, run `details.remedy` (`devtrees down --shared && devtrees up`). |
+| `SHARED_SERVICE_DEAD`       | A dead shared service `up` could not repair (`details.reason`): process-compose refused to restart it (`start_refused`, `details.start_failures`), it died again after `up` restarted it (`died_again`), it died during the shared-health wait (`died_while_waiting`), or the shared instance records no state to check it against (`unknown_revision`). Other dead shared services `up` restarts itself. Run `details.remedy` (`devtrees down --shared && devtrees up`). |
 | `SERVICE_START_FAILED`      | `up` tried to restart a dead service on the running instance, or `restart` a named one, and process-compose refused; `details.services` names each one, `details.remedy` says what to run next. The instance is still running. |
 | `SHARED_SERVICE_REFUSED`    | `restart` named a shared service; a worktree never restarts the shared instance's services. Nothing was touched; `details` has `{services, remedy}`, the remedy being `devtrees down --shared && devtrees up` (for every worktree). |
 | `LAST_SERVICES_RUNNING`     | `restart` would have to stop the instance's last running process (a `Pending` service does not count), and process-compose would then exit and take the instance down; nothing was touched. `details.services` names them, `details.remedy` is the `down` + `up` that restarts the instance. |
@@ -492,8 +501,13 @@ are. It never stops anything, and never attaches the TUI.
   booted service's port still accepts connections after the stop, `down`
   fails with `DOWN_INCOMPLETE` naming the holder, instead of reporting the
   instance stopped; the next `down` checks the same ports again.
-- A dead shared service fails `up` with `SHARED_SERVICE_DEAD`; run
-  `devtrees down --shared && devtrees up`.
+- A dead shared service `up` selects is restarted too, whichever worktree
+  runs it, and named in `shared_restarted`. A running shared service is never
+  touched. If process-compose refuses the start, or the restarted service
+  dies again, `up` fails with `SHARED_SERVICE_DEAD`; if it never becomes
+  healthy, with `HEALTH_TIMEOUT` (`details.instance: "shared"`). Both name
+  `devtrees down --shared && devtrees up`, which stops the shared instance
+  for every worktree.
 - To cycle one service without touching the rest (a wedged dev server, say),
   run `devtrees restart <service>...`. It restarts only the services it
   names, in `depends_on` order, keeps their ports and the instance, and
@@ -523,9 +537,9 @@ Branch on `error.code`:
 | Code                        | What it means and what to do                                                                 |
 | --------------------------- | -------------------------------------------------------------------------------------------- |
 | `LOCK_CONTENTION`           | Another devtrees process holds a lock. Wait briefly and **retry** `up`/`down`.               |
-| `HEALTH_TIMEOUT`            | A service never reported ready, or is still dead after `up` or `restart` restarted it (`details.dead_services`). The stack is **left running** — read `devtrees logs <service> --tail=N` to see why, then retry or follow the message (`devtrees down && devtrees up …`). |
+| `HEALTH_TIMEOUT`            | A service never reported ready, or is still dead after `up` or `restart` restarted it (`details.dead_services`). The stack is **left running** — read `devtrees logs <service> --tail=N` to see why, then retry or follow the message (`devtrees down && devtrees up …`). With `details.instance: "shared"` it is a shared service `up` restarted: read `devtrees logs --shared <service>`, and the remedy is `details.remedy` (`devtrees down --shared && devtrees up`). |
 | `NAMESPACE_NOT_RUNNING`     | You asked `-n` for a namespace the running stack was not booted with. Run `details.remedy` (`devtrees down && devtrees up -n …`). |
-| `SHARED_SERVICE_DEAD`       | A shared service is dead. devtrees will not restart it from one worktree; run `devtrees down --shared && devtrees up`. |
+| `SHARED_SERVICE_DEAD`       | A dead shared service `up` could not repair: process-compose refused to restart it, or it died again after `up` restarted it (`details.reason`). Read why with `devtrees logs --shared <service> --tail=N`, then run `devtrees down --shared && devtrees up` (it stops the shared instance for every worktree). |
 | `SERVICE_START_FAILED`      | `up` tried to restart a dead service, or `restart` a named one, and process-compose refused. `details.services` carries each one with process-compose's message; read it, then run `details.remedy` (`devtrees down && devtrees up …`). |
 | `STALE_PORT_BLOCK`          | Foreign listeners hold this worktree's ports. `details.collisions[]` lists `{port_name, port, pid, command, accepts_connections, port_forwarder}` (the message lists them too). Kill the orphaned holders and retry, but **never** kill one with `port_forwarder: true` (a container runtime's forwarder, such as OrbStack Helper, serving every instance: stop the container that publishes the port, `docker ps --filter publish=<port>`) or `accepts_connections: false` (usually a stale port forward). Holders that all refuse connections do not fail `up`; it warns and goes on. |
 | `SHARED_DRIFT`              | A shared service this `up` selects (`details.services`) runs at another revision than this worktree defines. An `up` that does not select it is unaffected. Follow the message: `devtrees down --shared && devtrees up` (it stops the shared instance for every worktree). |

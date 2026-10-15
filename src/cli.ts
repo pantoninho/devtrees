@@ -133,6 +133,8 @@ export interface ExecuteDeps {
     sharedStarted?: boolean;
     /** Namespaced shared services this `up` added to the shared instance (#236). */
     sharedActivated?: ReadonlyArray<string>;
+    /** Dead shared services this `up` restarted (#240). */
+    sharedRestarted?: ReadonlyArray<string>;
     blockBase?: number;
     services?: ReadonlyArray<LsServiceRow>;
     /** `depends_on` edges lost to namespace selection (#179). */
@@ -184,6 +186,8 @@ export interface ExecuteDeps {
     instance?: "fresh" | "running";
     wouldReload?: boolean;
     wouldRestart?: ReadonlyArray<string>;
+    /** Dead selected shared services the real `up` would restart (#240). */
+    wouldRestartShared?: ReadonlyArray<string>;
     /** The shared services the selection includes (#236). */
     selectedSharedServices?: ReadonlyArray<string>;
   }>;
@@ -443,6 +447,7 @@ class UpCommand extends DevtreesCommand {
       "allocated ports and the full process-compose document off stdout. If this worktree's instance " +
       "is running, previews what `up` would do to it (read-only): the namespaces it targets, whether it " +
       "would hot-reload, which dead services it would restart, and the same errors (e.g. NAMESPACE_NOT_RUNNING). " +
+      "If the shared instance is running, also previews which dead selected shared services `up` would restart. " +
       "(Port allocation may briefly take the registry lock to pick a non-colliding block.)",
   });
 
@@ -541,6 +546,7 @@ function dryRunPayload(result: DryRunResultView): UpDryRunPayload {
     droppedNamespaceEdges: result.droppedNamespaceEdges ?? [],
     bracedEnvVars: result.bracedEnvVars ?? [],
     selectedSharedServices: result.selectedSharedServices ?? [],
+    wouldRestartShared: result.wouldRestartShared ?? [],
     ...dryRunPlanPayload(result),
   };
 }

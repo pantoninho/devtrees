@@ -142,6 +142,7 @@ import {
 } from "./shared-selection.js";
 import {
   createWaitForHealth,
+  createWaitForRestartedShared,
   createWaitForSharedHealth,
   isGone,
   readStatusesWithin,
@@ -149,6 +150,7 @@ import {
   type RestartedService,
   type WaitForHealth,
   type WaitingCommand,
+  type WaitForRestartedShared,
   type WaitForSharedHealth,
 } from "./health.js";
 import {
@@ -916,6 +918,12 @@ export interface CommandDeps {
    */
   readonly waitForSharedHealth?: WaitForSharedHealth;
   /**
+   * Wait for the dead shared services `up` restarted to be healthy (#240).
+   * Default: `createWaitForRestartedShared` over the shared UDS, with
+   * `--wait-timeout`. Injected so tests can stub it.
+   */
+  readonly waitForRestartedShared?: WaitForRestartedShared;
+  /**
    * Wait for the worktree instance's services to be healthy after `driver.up`
    * — the gate that turns "up returned" into "the stack is serving traffic"
    * (PRD #26, ADR-0005). Default: polls the driver's `getServiceStatuses`
@@ -1084,6 +1092,13 @@ export interface UpResult {
    */
   readonly sharedActivated: ReadonlyArray<string>;
   /**
+   * Dead selected shared services this `up` restarted on the running shared
+   * instance and waited on (#240, ADR-0008), in the order started
+   * (`depends_on`). Empty when nothing was dead, when another `up` restarted
+   * them first, or when this `up` started the shared instance itself.
+   */
+  readonly sharedRestarted: ReadonlyArray<string>;
+  /**
    * Base port of this worktree's allocation block (issue #30). The `env`
    * named-port numbers all fall within `[blockBase, blockBase + blockSize)`;
    * `block_base` in the `up --json` envelope is this value.
@@ -1208,6 +1223,16 @@ export interface DryRunResult {
    * restart, in `depends_on` order. Always empty on a fresh preview.
    */
   readonly wouldRestart: ReadonlyArray<string>;
+  /**
+   * Dead selected shared services the real `up` would restart on the running
+   * shared instance (#240), in `depends_on` order. Read-only: one liveness
+   * probe and one `process list` read of the shared instance. Empty when the
+   * shared instance is not running (a fresh shared start runs everything), is
+   * not readable, was started by a devtrees that records no shared state, or
+   * runs a selected shared service at another revision (the real `up` would
+   * fail `SHARED_DRIFT` and restart nothing).
+   */
+  readonly wouldRestartShared: ReadonlyArray<string>;
   /**
    * The shared services the selection includes (#236, ADR-0010), in
    * declaration order: every shared service with no `namespace:` (always
@@ -1526,11 +1551,13 @@ function unresponsiveRemedy(socketPath: string, context: LivenessContext): strin
  * and one that does not become healthy fails with `HEALTH_TIMEOUT`. Never
  * attaches, never stops anything.
  *
- * Dead shared services (ADR-0008), on both paths: a shared instance found
- * already running is checked inside the lock right after
- * `ensureSharedStarted` and fails with `SHARED_SERVICE_DEAD`; one this call
- * lazy-started is covered by the shared-health wait, which fails fast with
- * the same code.
+ * Dead shared services (ADR-0008, #240), on both paths: in a shared instance
+ * found already running, the dead selected ones are restarted under the
+ * shared lock by `ensureSharedStarted`, after its drift check, and waited
+ * on; one that is refused or dies again fails with `SHARED_SERVICE_DEAD`, one
+ * that never becomes healthy with `HEALTH_TIMEOUT`. A running shared service
+ * is never touched. One this call lazy-started is covered by the
+ * shared-health wait, which fails fast with `SHARED_SERVICE_DEAD`.
  *
  * Pre-flight stale-port-block check (issue #58): when the worktree's
  * control socket is absent (first up — not the idempotent re-up path),
@@ -1736,6 +1763,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
         env: derived.env,
         sharedStarted,
         sharedActivated: shared.activated,
+        sharedRestarted: shared.restarted,
         sharedChanges,
       } as const;
     }
@@ -1817,6 +1845,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
       env: derived.env,
       sharedStarted,
       sharedActivated: shared.activated,
+      sharedRestarted: shared.restarted,
       sharedChanges,
       selected: freshSelection.services,
       namespaces: freshSelection.namespaces,
@@ -1830,6 +1859,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     env: outcome.env,
     sharedStarted: outcome.sharedStarted,
     sharedActivated: outcome.sharedActivated,
+    sharedRestarted: outcome.sharedRestarted,
     sharedFieldChanges: outcome.sharedChanges,
     bracedEnvVars: braced,
     blockBase,
@@ -2041,7 +2071,8 @@ export async function runUpDryRun(deps: CommandDeps = {}): Promise<DryRunResult>
   // The shared services the previewed `up` selects (#236): the always-on ones
   // plus the namespaced ones in the effective selection, as the real `up`
   // decides them.
-  const selectedShared = selectSharedServices(stack, plan.namespaces).map((s) => s.name);
+  const selectedSharedServices = selectSharedServices(stack, plan.namespaces);
+  const selectedShared = selectedSharedServices.map((s) => s.name);
   const base: DryRunResult = {
     worktreeId: anchor.worktreeId,
     worktreeRoot: anchor.worktreeRoot,
@@ -2050,6 +2081,12 @@ export async function runUpDryRun(deps: CommandDeps = {}): Promise<DryRunResult>
     config: derivedWt.config,
     droppedEdges: derivedWt.droppedEdges,
     ...plan,
+    wouldRestartShared: await previewSharedRestarts(
+      stack,
+      anchor.anchor,
+      selectedSharedServices,
+      deps,
+    ),
     selectedSharedServices: selectedShared,
     bracedEnvVars: bracedEnvVars(stack),
   };
@@ -2176,6 +2213,47 @@ async function previewRunning(
 const DRY_RUN_READ_TIMEOUT_MS = READ_TIMEOUT_MS;
 
 /**
+ * The dead selected shared services the real `up` would restart (#240),
+ * decided as `reconcileLiveShared` decides them but read-only: no lock, no
+ * start, no socket unlinked. Empty whenever the real `up` would restart
+ * nothing on the shared instance — it is not running or not readable (a
+ * liveness that stays unknown included; the real `up` would fail
+ * `INSTANCE_UNRESPONSIVE`), it records no state, or a selected service
+ * drifted (`SHARED_DRIFT`). It cannot preview a refused start or a restart
+ * that dies again.
+ */
+async function previewSharedRestarts(
+  stack: ResolvedStack,
+  anchor: string,
+  selected: ReadonlyArray<ResolvedService>,
+  deps: CommandDeps,
+): Promise<string[]> {
+  if (selected.length === 0) return [];
+  const { socketPath } = sharedInstancePaths(anchor);
+  const live = await socketIsLive(
+    socketPath,
+    resolveProbe(deps),
+    { command: "up", instance: SHARED_INSTANCE_ID },
+    { readOnly: true },
+  ).catch(() => false);
+  if (!live) return [];
+  const state = readRecordedSharedState(anchor, stack);
+  if (state === undefined) return [];
+  const plan = planSharedSelection(selected, state.services);
+  if (plan.drifted.length > 0 || plan.portConflicts.length > 0) return [];
+  const rows = await statusReader(deps, createDriver(deps.driver))(socketPath, {
+    timeoutMs: deps.waitTimeoutMs ?? DRY_RUN_READ_TIMEOUT_MS,
+  }).catch(() => undefined);
+  if (rows === undefined) return [];
+  const added = new Set(servicesToAdd(selected, plan, state, rows).map((s) => s.name));
+  const names = selected.map((s) => s.name).filter((name) => !added.has(name));
+  return dependencyOrder(
+    stack.services,
+    findDeadServices(rows, names).map((d) => d.name),
+  );
+}
+
+/**
  * A preview's plan, plus — for a running instance the preview assumes is
  * reloaded — the derived processes it runs now (`withoutReloadRestarted`
  * needs them once the new config is derived).
@@ -2288,6 +2366,8 @@ interface SharedOutcome {
   readonly started: boolean;
   /** Namespaced shared services this `up` added to the running shared instance. */
   readonly activated: ReadonlyArray<string>;
+  /** Dead selected shared services this `up` restarted and waited on (#240). */
+  readonly restarted: ReadonlyArray<string>;
   readonly fieldChanges: ReadonlyArray<SharedFieldChange>;
   /** Shared named port → the number to inject. */
   readonly portFor: (name: string) => number | undefined;
@@ -2297,13 +2377,21 @@ interface SharedOutcome {
 
 /**
  * Bring the shared tier to what this `up` selects (#236, ADR-0010): lazy-start
- * the shared instance or add the selected namespaced shared services it lacks
- * (`ensureSharedStarted`), then check the selected ones it already ran are
- * alive (ADR-0008). A shared instance found already running may be carrying
- * a dead service: fail here, on the fresh path as much as the running one,
- * before this worktree derives or spawns anything against it. One read;
- * reported, never restarted. Services this call just started or added are
- * covered by the shared-health wait instead.
+ * the shared instance or add the selected namespaced shared services it lacks,
+ * and restart the selected ones it runs that are dead (#240, ADR-0008), all
+ * under the shared lifecycle lock (`ensureSharedStarted`). Then wait for the
+ * restarted ones to become healthy, outside the shared lock, before this
+ * worktree derives or spawns anything against them — on the fresh path as
+ * much as the running one. A restarted service that dies again fails fast
+ * with `SHARED_SERVICE_DEAD`; one that never becomes healthy is
+ * `HEALTH_TIMEOUT`. Services this call just started or added are covered by
+ * the cross-tier shared-health wait instead.
+ *
+ * The wait runs inside this worktree's lifecycle lock (the caller's), like
+ * the fresh path's shared-health wait: on the fresh path the worktree must
+ * not start until its shared dependencies are back (ADR-0003). A concurrent
+ * `up` or `down` of the same worktree can see `LOCK_CONTENTION` meanwhile;
+ * other worktrees only take the shared lock, which is released by then.
  */
 async function prepareShared(args: {
   readonly stack: ResolvedStack;
@@ -2321,6 +2409,7 @@ async function prepareShared(args: {
     return {
       started: false,
       activated: [],
+      restarted: [],
       fieldChanges: [],
       portFor: seed.positional,
       selected: [],
@@ -2346,18 +2435,30 @@ async function prepareShared(args: {
         )(sharedInstancePaths(anchor.anchor).socketPath).catch(() => undefined),
     },
   );
-  if (!ensured.started) {
-    const added = new Set(ensured.activated);
-    await assertSharedServicesAlive(
-      selected.filter((s) => !added.has(s.name)).map((s) => s.name),
-      sharedInstancePaths(anchor.anchor).socketPath,
-      statusReader(deps, driver),
+  if (ensured.restarted.length > 0) {
+    const names = new Set(ensured.restarted.map((r) => r.name));
+    args.warn(
+      `devtrees up: restarted dead shared service(s): ${[...names].join(", ")}; ` +
+        `waiting for them to be healthy...`,
     );
+    const wait =
+      deps.waitForRestartedShared ??
+      createWaitForRestartedShared(
+        { getServiceStatuses: statusReader(deps, driver) },
+        { notify: args.warn, probe: probeOf(deps) },
+      );
+    await wait({
+      socketPath: sharedInstancePaths(anchor.anchor).socketPath,
+      restarted: ensured.restarted,
+      probedServiceNames: probedNames(selected.filter((s) => names.has(s.name))),
+      timeoutMs: deps.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS,
+    });
   }
   const ports = ensured.ports;
   return {
     started: ensured.started,
     activated: ensured.activated,
+    restarted: ensured.restarted.map((r) => r.name),
     fieldChanges: ensured.fieldChanges,
     portFor: ports === undefined ? seed.positional : (name) => ports[name],
     selected,
@@ -2432,6 +2533,12 @@ interface EnsuredShared {
    * selected was already running.
    */
   readonly activated: ReadonlyArray<string>;
+  /**
+   * Dead selected shared services this call started again on the running
+   * shared instance (#240), in the order started (`depends_on`), each with
+   * the pid of the run that died. Empty when it started the instance itself.
+   */
+  readonly restarted: ReadonlyArray<RestartedService>;
   /** Extended shared fields edited since the running instance started (#185). */
   readonly fieldChanges: ReadonlyArray<SharedFieldChange>;
   readonly ports?: Readonly<Record<string, number>>;
@@ -2508,7 +2615,9 @@ async function ensureSharedStarted(
       instance: SHARED_INSTANCE_ID,
     });
     if (live) return await reconcileLiveShared({ anchor, stack, worktreeId, selected, seed, deps });
-    if (selected.length === 0) return { started: false, activated: [], fieldChanges: [] };
+    if (selected.length === 0) {
+      return { started: false, activated: [], restarted: [], fieldChanges: [] };
+    }
     return await startShared({ anchor, stack, selected, seed, deps });
   });
 }
@@ -2534,8 +2643,11 @@ async function reconcileLiveShared(
   // Legacy fallback: a pre-#83 shared instance left no persisted map.
   // Positional computation is all we have — same behaviour as before, as long
   // as nothing has to be added: what that instance runs cannot be known.
-  if (state === undefined) return legacySharedInstance(selected, anchor);
+  if (state === undefined) return await legacySharedInstance(selected, anchor, deps);
   const plan = planSharedSelection(selected, state.services);
+  // Drift first (#240): a drifted selected service fails SHARED_DRIFT before
+  // anything is restarted or added, since a restart would run the instance's
+  // definition, not this worktree's.
   assertSharedPlanClean(plan, { worktreeId: step.worktreeId, state, stack });
   const selectedNames = selected.map((s) => s.name);
   const fieldChanges = sharedFieldChanges(state, pick(sharedExtendedFields(stack), selectedNames));
@@ -2545,36 +2657,64 @@ async function reconcileLiveShared(
     bound: state.ports,
     ...seed,
   });
-  const toAdd = await servicesToAdd(selected, plan, state, deps);
+  // One read, under the shared lock, decides both what to add and what to
+  // restart: a concurrent `up` from another worktree waits for this one and
+  // then reads the services it restarted as running.
+  const rows = await readSelectedSharedRows(selected, plan, state, deps);
+  const toAdd = servicesToAdd(selected, plan, state, rows);
+  // Restart before adding: a service being added may `depends_on` a dead one.
+  const restarted = await restartDeadShared({
+    stack,
+    rows: rows ?? [],
+    names: selectedNames.filter((name) => !toAdd.some((s) => s.name === name)),
+    socketPath: sharedInstancePaths(anchor).socketPath,
+    driver: deps.driver,
+  });
   if (toAdd.length > 0) {
     await activateShared({ ...step, state, missing: toAdd, ports });
   }
   return {
     started: false,
     activated: toAdd.map((s) => s.name),
+    restarted,
     ports,
     fieldChanges,
   };
 }
 
 /**
- * The selected shared services to add to the running instance: the ones it
- * has no record of, plus — when its `process list` can be read — recorded
- * ones it does not actually run. The second kind is a service an earlier add
- * recorded after its reload timed out, which process-compose never applied:
- * a retried `up` re-sends the reload rather than trusting the record. A
- * missing row is otherwise invisible: the dead-service check counts "no row"
- * as not dead.
+ * One `process list` read of the running shared instance, when some selected
+ * shared service is recorded as running there (`undefined` otherwise, or when
+ * the read fails). Nothing recorded means nothing to restart or re-add.
  */
-async function servicesToAdd(
+async function readSelectedSharedRows(
   selected: ReadonlyArray<ResolvedService>,
   plan: SharedPlan,
   state: RecordedSharedState,
   deps: EnsureSharedDeps,
-): Promise<ResolvedService[]> {
+): Promise<ServiceStatus[] | undefined> {
+  const missing = new Set(plan.missing.map((s) => s.name));
+  const recorded = selected.some((s) => !missing.has(s.name) && state.services[s.name]);
+  return recorded ? await deps.readSharedRows() : undefined;
+}
+
+/**
+ * The selected shared services to add to the running instance: the ones it
+ * has no record of, plus — when its `process list` could be read (`rows`) —
+ * recorded ones it does not actually run. The second kind is a service an
+ * earlier add recorded after its reload timed out, which process-compose
+ * never applied: a retried `up` re-sends the reload rather than trusting the
+ * record. A missing row is otherwise invisible: the dead-service check counts
+ * "no row" as not dead.
+ */
+function servicesToAdd(
+  selected: ReadonlyArray<ResolvedService>,
+  plan: SharedPlan,
+  state: RecordedSharedState,
+  rows: ReadonlyArray<ServiceStatus> | undefined,
+): ResolvedService[] {
   const missing = new Set(plan.missing.map((s) => s.name));
   const recorded = selected.filter((s) => !missing.has(s.name) && state.services[s.name]);
-  const rows = recorded.length > 0 ? await deps.readSharedRows() : undefined;
   const present = new Set((rows ?? []).map((r) => r.name));
   const absent = new Set(
     rows === undefined ? [] : recorded.filter((s) => !present.has(s.name)).map((s) => s.name),
@@ -2583,16 +2723,64 @@ async function servicesToAdd(
 }
 
 /**
+ * Restart the dead services among `names` — the selected shared services the
+ * running shared instance already runs — over its control socket (#240,
+ * ADR-0008). Called under the shared lifecycle lock, after the drift check,
+ * with rows read under that lock, so two worktrees racing start each dead
+ * service once: the second reads the first's restart as running.
+ *
+ * Dead versus done is `classifyService`'s: a crash, a kill or a non-zero
+ * exit is dead; an exit-0 one-shot is done and never rerun, and a service
+ * process-compose is already `Restarting` is left to it. Started in
+ * `depends_on` order, since `process start` ignores it. A running shared
+ * service is never stopped, restarted or reloaded: other worktrees use it.
+ *
+ * A start process-compose refuses fails `SHARED_SERVICE_DEAD` with
+ * `reason: "start_refused"` (the services it did start keep running); one it
+ * answers with "already running" was started by someone else and is not
+ * reported. Returns the services started, each with the pid of the run that
+ * died, for the health wait (`createWaitForRestartedShared`).
+ */
+async function restartDeadShared(args: {
+  readonly stack: ResolvedStack;
+  readonly rows: ReadonlyArray<ServiceStatus>;
+  readonly names: ReadonlyArray<string>;
+  readonly socketPath: string;
+  readonly driver: ReturnType<typeof createDriver>;
+}): Promise<RestartedService[]> {
+  const dead = findDeadServices(args.rows, args.names);
+  if (dead.length === 0) return [];
+  const { restarted, failed } = await startInOrder({
+    ...args,
+    names: dependencyOrder(
+      args.stack.services,
+      dead.map((d) => d.name),
+    ),
+  });
+  if (failed.length > 0) {
+    const refused = new Set(failed.map((f) => f.name));
+    throw sharedServiceDeadError(
+      dead.filter((d) => refused.has(d.name)),
+      { reason: "start_refused", startFailures: failed },
+    );
+  }
+  return restarted;
+}
+
+/**
  * A running shared instance started by a devtrees older than #83 left no
  * state, so what it runs is unknown. Always-on shared services keep the old
  * positional fallback; a selected namespaced one cannot be added safely and
  * fails `SHARED_ACTIVATION_FAILED` instead of an `up` that silently runs
- * without it.
+ * without it. A dead selected one is reported, not restarted
+ * (`SHARED_SERVICE_DEAD`, `reason: "unknown_revision"`): with no recorded
+ * revision there is no drift check to make before a restart (#240).
  */
-function legacySharedInstance(
+async function legacySharedInstance(
   selected: ReadonlyArray<ResolvedService>,
   anchor: string,
-): EnsuredShared {
+  deps: EnsureSharedDeps,
+): Promise<EnsuredShared> {
   const namespaced = selected.filter((s) => !isAlwaysOnShared(s)).map((s) => s.name);
   if (namespaced.length > 0) {
     throw new SharedActivationFailedError(
@@ -2608,7 +2796,13 @@ function legacySharedInstance(
       },
     );
   }
-  return { started: false, activated: [], fieldChanges: [] };
+  const rows = selected.length > 0 ? await deps.readSharedRows() : undefined;
+  const dead = findDeadServices(
+    rows ?? [],
+    selected.map((s) => s.name),
+  );
+  if (dead.length > 0) throw sharedServiceDeadError(dead, { reason: "unknown_revision" });
+  return { started: false, activated: [], restarted: [], fieldChanges: [] };
 }
 
 /** Lazy-start the shared instance with exactly the selected shared services. */
@@ -2663,7 +2857,7 @@ async function startShared(step: SharedStep): Promise<EnsuredShared> {
     extended: sharedExtendedFields(subset),
     services: sharedRecords(selected),
   });
-  return { started: true, activated: [], ports, fieldChanges: [] };
+  return { started: true, activated: [], restarted: [], ports, fieldChanges: [] };
 }
 
 /**
@@ -5033,8 +5227,8 @@ function reloadPendingError(
  *     instance passes on the first poll; a restarted service that never
  *     becomes healthy, or dies again, fails with `HEALTH_TIMEOUT` naming it.
  *
- * Dead shared services are checked earlier, inside the lifecycle lock, on
- * both paths (`assertSharedServicesAlive`), and are never restarted. Returns
+ * Dead shared services are handled earlier, on both paths: restarted under
+ * the shared lock and waited on (`prepareShared`, #240). Returns
  * the rows the last poll saw, so the envelope needs no extra read, the
  * names of the services it restarted, and the `depends_on` edges the
  * effective selection drops (#179), each already warned about.
@@ -5212,6 +5406,30 @@ async function startServices(args: {
   readonly driver: ReturnType<typeof createDriver>;
   readonly remedy: string;
 }): Promise<RestartedService[]> {
+  const { restarted, failed } = await startInOrder(args);
+  if (failed.length > 0) {
+    throw serviceStartFailedError(args.anchor.worktreeId, failed, args.remedy);
+  }
+  return restarted;
+}
+
+/**
+ * `process start` each of `names` on `socketPath`, in the order given, every
+ * one attempted even if an earlier one is refused. A service process-compose
+ * reports as already running was started by someone else and is left out of
+ * `restarted`; each started one carries the pid its dead row had (`rows`),
+ * for the health wait's stale-row rule. Shared by the isolated (#178) and
+ * shared (#240) restarts, which differ only in how a refusal is reported.
+ */
+async function startInOrder(args: {
+  readonly rows: ReadonlyArray<ServiceStatus>;
+  readonly names: ReadonlyArray<string>;
+  readonly socketPath: string;
+  readonly driver: ReturnType<typeof createDriver>;
+}): Promise<{
+  readonly restarted: RestartedService[];
+  readonly failed: Array<{ name: string; message: string }>;
+}> {
   const pids = new Map(args.rows.map((r) => [r.name, r.pid]));
   const restarted: RestartedService[] = [];
   const failed: Array<{ name: string; message: string }> = [];
@@ -5225,10 +5443,7 @@ async function startServices(args: {
     const stalePid = pids.get(name);
     restarted.push(stalePid === undefined ? { name } : { name, stalePid });
   }
-  if (failed.length > 0) {
-    throw serviceStartFailedError(args.anchor.worktreeId, failed, args.remedy);
-  }
-  return restarted;
+  return { restarted, failed };
 }
 
 function serviceStartFailedError(
@@ -5297,28 +5512,6 @@ function namespaceNotRunningError(
   );
 }
 
-/**
- * Fail with `SHARED_SERVICE_DEAD` when one of `names` — the selected shared
- * services — is dead in an already-running shared instance (ADR-0008). Runs
- * on the fresh and the running path alike, inside the lifecycle lock right
- * after `ensureSharedStarted`. One read, no wait: shared services are
- * reported, not restarted or waited on. Since #236 only the shared services
- * this `up` selects are checked: a dead namespaced shared service this
- * worktree does not use is some other `up`'s business. A failed read is not
- * evidence of a dead service, so it passes.
- */
-async function assertSharedServicesAlive(
-  names: ReadonlyArray<string>,
-  sharedSocketPath: string,
-  fetch: (socketPath: string) => Promise<ServiceStatus[]>,
-): Promise<void> {
-  if (names.length === 0) return;
-  const rows = await fetch(sharedSocketPath).catch(() => undefined);
-  if (rows === undefined) return;
-  const dead = findDeadServices(rows, [...names]);
-  if (dead.length > 0) throw sharedServiceDeadError(dead);
-}
-
 // --- default I/O implementations -------------------------------------------
 
 function defaultGit(cwd: string): GitProbe {
@@ -5328,7 +5521,16 @@ function defaultGit(cwd: string): GitProbe {
 const defaultWithRegistryLock: WithRegistryLock = (anchor, mutate) =>
   withRegistryLock(anchor, mutate);
 
-const defaultWithSharedLock: WithSharedLock = (anchor, fn) => withSharedLock(anchor, fn);
+/**
+ * The shared lifecycle lock gets the same ~10s budget as a worktree's
+ * (#240): besides a lazy start's spawn and socket wait, or an add's reload,
+ * its holder may now be restarting dead shared services (each `process
+ * start` bounded at 10s). A concurrent `up` from another worktree should wait
+ * that out and then find them running, not fail `LOCK_CONTENTION` after the
+ * registry lock's ~1s.
+ */
+const defaultWithSharedLock: WithSharedLock = (anchor, fn) =>
+  withSharedLock(anchor, fn, UP_LIFECYCLE_LOCK_OPTIONS);
 
 /**
  * Wait budget for the per-worktree lifecycle lock (issue #91), for `up` and

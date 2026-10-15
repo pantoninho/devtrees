@@ -1088,24 +1088,26 @@ describe("built CLI e2e — up verifies a running instance (#177)", () => {
     expect((r.doc as { up: { restarted: string[] } }).up.restarted).toEqual([]);
   }, 60_000);
 
-  it("a dead shared service fails the re-up with SHARED_SERVICE_DEAD and the down --shared remedy", () => {
+  interface SharedRestartDoc {
+    readonly up?: { readonly shared_restarted?: string[]; readonly restarted?: string[] };
+    readonly up_dry_run?: { readonly would_restart_shared?: string[] };
+  }
+
+  it("#240: a dead shared service is restarted by the re-up, which exits 0 and names it", () => {
     const { wt } = setupScenario("dt-bcv7-", { webProbe: false });
     expect(devtrees(wt, ["up", "--json", "--wait-timeout", "10"]).code).toBe(0);
     const r = devtrees(wt, ["up", "--json", "--wait-timeout", "10"], {
       env: { DEVTREES_STUB_DEAD: "db" },
     });
-    expect(r.code).toBe(1);
-    const err = (r.doc as VerifyErrorDoc).error;
-    expect(err?.code).toBe("SHARED_SERVICE_DEAD");
-    expect(err?.details).toEqual({
-      dead_services: [{ name: "db", status: "Completed", exit_code: -1 }],
-      remedy: "devtrees down --shared && devtrees up",
-    });
+    expect(r.code, `re-up failed: ${r.stdout} ${r.stderr}`).toBe(0);
+    expect((r.doc as SharedRestartDoc).up?.shared_restarted).toEqual(["db"]);
+    expect((r.doc as SharedRestartDoc).up?.restarted).toEqual([]);
+    expect(r.stderr).toContain("restarted dead shared service(s): db");
   }, 60_000);
 
-  it("a FRESH up against a running shared instance with a dead service fails SHARED_SERVICE_DEAD, not `is up`", () => {
-    // Review repro (a): after `down`, the worktree's next up is a fresh start
-    // over an already-running shared instance. It used to exit 0.
+  it("#240: a FRESH up against a running shared instance with a dead service restarts it, then starts the worktree", () => {
+    // After `down`, the worktree's next up is a fresh start over an
+    // already-running shared instance carrying a dead service.
     const { wt, sock } = setupScenario("dt-bcv8-", { webProbe: false });
     expect(devtrees(wt, ["up", "--json", "--wait-timeout", "10"]).code).toBe(0);
     expect(devtrees(wt, ["down"]).code).toBe(0);
@@ -1113,13 +1115,58 @@ describe("built CLI e2e — up verifies a running instance (#177)", () => {
     const r = devtrees(wt, ["up", "--json", "--wait-timeout", "10"], {
       env: { DEVTREES_STUB_DEAD: "db" },
     });
-    expect(r.code, `fresh up should fail: ${r.stdout} ${r.stderr}`).toBe(1);
+    expect(r.code, `fresh up failed: ${r.stdout} ${r.stderr}`).toBe(0);
+    expect((r.doc as SharedRestartDoc).up?.shared_restarted).toEqual(["db"]);
+    expect(existsSync(sock)).toBe(true);
+  }, 60_000);
+
+  it("#240: up --dry-run previews the dead shared service up would restart (would_restart_shared)", () => {
+    const { wt } = setupScenario("dt-bcva-", { webProbe: false });
+    expect(devtrees(wt, ["up", "--json", "--wait-timeout", "10"]).code).toBe(0);
+    const env = { DEVTREES_STUB_DEAD: "db" };
+    const dry = devtrees(wt, ["up", "--dry-run", "--json"], { env });
+    expect(dry.code, `dry run failed: ${dry.stdout} ${dry.stderr}`).toBe(0);
+    expect((dry.doc as SharedRestartDoc).up_dry_run?.would_restart_shared).toEqual(["db"]);
+    // Read-only: the real up still finds db dead and restarts it.
+    const r = devtrees(wt, ["up", "--json", "--wait-timeout", "10"], { env });
+    expect((r.doc as SharedRestartDoc).up?.shared_restarted).toEqual(["db"]);
+  }, 60_000);
+
+  it("#240: a refused shared restart fails SHARED_SERVICE_DEAD start_refused", () => {
+    const { wt } = setupScenario("dt-bcvb-", { webProbe: false });
+    expect(devtrees(wt, ["up", "--json", "--wait-timeout", "10"]).code).toBe(0);
+    const r = devtrees(wt, ["up", "--json", "--wait-timeout", "10"], {
+      env: { DEVTREES_STUB_DEAD: "db", DEVTREES_STUB_START_FAIL: "db" },
+    });
+    expect(r.code).toBe(1);
     const err = (r.doc as VerifyErrorDoc).error;
     expect(err?.code).toBe("SHARED_SERVICE_DEAD");
-    expect(err?.details).toMatchObject({ remedy: "devtrees down --shared && devtrees up" });
-    // Failed before spawning the worktree instance.
-    expect(existsSync(sock)).toBe(false);
+    expect(err?.details).toMatchObject({
+      dead_services: [{ name: "db", status: "Completed", exit_code: -1 }],
+      reason: "start_refused",
+      start_failures: [{ name: "db" }],
+      remedy: "devtrees down --shared && devtrees up",
+    });
   }, 60_000);
+
+  it("#240: a restarted shared service that dies again fails fast with SHARED_SERVICE_DEAD died_again", () => {
+    const { wt } = setupScenario("dt-bcvc-", { webProbe: false });
+    expect(devtrees(wt, ["up", "--json", "--wait-timeout", "10"]).code).toBe(0);
+    const started = Date.now();
+    const r = devtrees(wt, ["up", "--json", "--wait-timeout", "60"], {
+      env: { DEVTREES_STUB_DEAD: "db", DEVTREES_STUB_DIES_AGAIN: "db" },
+    });
+    expect(Date.now() - started).toBeLessThan(20_000);
+    expect(r.code).toBe(1);
+    const err = (r.doc as VerifyErrorDoc).error;
+    expect(err?.code).toBe("SHARED_SERVICE_DEAD");
+    expect(err?.message).toContain("died again");
+    expect(err?.details).toMatchObject({
+      dead_services: [{ name: "db", status: "Completed", exit_code: 1 }],
+      reason: "died_again",
+      remedy: "devtrees down --shared && devtrees up",
+    });
+  }, 90_000);
 
   it("a shared service dead right after this up lazy-started it fails fast with SHARED_SERVICE_DEAD (cross-tier wait)", () => {
     // Review repro (b): with a cross-tier edge the shared pre-wait used to sit
@@ -1151,6 +1198,7 @@ describe("built CLI e2e — up verifies a running instance (#177)", () => {
     expect(err?.code).toBe("SHARED_SERVICE_DEAD");
     expect(err?.details).toEqual({
       dead_services: [{ name: "db", status: "Completed", exit_code: -1 }],
+      reason: "died_while_waiting",
       remedy: "devtrees down --shared && devtrees up",
     });
     expect(existsSync(sock)).toBe(false);

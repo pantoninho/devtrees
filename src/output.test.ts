@@ -997,6 +997,38 @@ describe("output formatter — dropped cross-namespace depends_on edges (#179)",
     expect(ERROR_CODES).toContain("SHARED_ACTIVATION_FAILED");
     expect(ERROR_CODE_DESCRIPTIONS.SHARED_ACTIVATION_FAILED).toMatch(/untouched/);
   });
+
+  it("up: JSON carries shared_restarted, always present; human output names the restarted shared services (#240)", () => {
+    const up: UpPayload = { worktreeId: "login", env: {}, sharedStarted: false };
+    const parse = (p: UpPayload) =>
+      JSON.parse(formatUp(p, "json").stdout) as { up: { shared_restarted: unknown } };
+    expect(parse({ ...up, sharedRestarted: ["pg"] }).up.shared_restarted).toEqual(["pg"]);
+    expect(parse(up).up.shared_restarted).toEqual([]);
+    expect(formatUp({ ...up, sharedRestarted: ["pg"] }, "human").stdout).toMatch(
+      /devtrees up: restarted dead shared service\(s\): pg\.\n/,
+    );
+    expect(formatUp(up, "human").stdout).not.toMatch(/restarted/);
+  });
+
+  it("up --dry-run: JSON carries would_restart_shared, always present; human names them on stderr (#240)", () => {
+    const parse = (p: UpDryRunPayload) =>
+      JSON.parse(formatUpDryRun(p, "json").stdout) as {
+        up_dry_run: { would_restart_shared: unknown };
+      };
+    expect(parse({ ...dry, wouldRestartShared: ["pg"] }).up_dry_run.would_restart_shared).toEqual([
+      "pg",
+    ]);
+    expect(parse(dry).up_dry_run.would_restart_shared).toEqual([]);
+    expect(formatUpDryRun({ ...dry, wouldRestartShared: ["pg"] }, "human").stderr).toMatch(
+      /up would restart dead shared service\(s\): pg/,
+    );
+  });
+
+  it("SHARED_SERVICE_DEAD's description names the reasons up cannot repair (#240)", () => {
+    expect(ERROR_CODE_DESCRIPTIONS.SHARED_SERVICE_DEAD).toMatch(
+      /start_refused.*died_again.*died_while_waiting.*unknown_revision/,
+    );
+  });
 });
 
 /**

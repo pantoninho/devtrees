@@ -1575,6 +1575,34 @@ describe("devtrees CLI — up --dry-run (#124)", () => {
       expect(upDryRun).toHaveBeenCalledWith({ waitTimeoutMs: 2000 });
     });
 
+    it("--json carries would_restart_shared; human mode names it on stderr (#240)", async () => {
+      const upDryRun = vi.fn().mockResolvedValue({ ...withSelection, wouldRestartShared: ["pg"] });
+      const json = await execute(["up", "--dry-run", "--json"], {
+        up: vi.fn(),
+        down: vi.fn(),
+        upDryRun,
+      });
+      expect(JSON.parse(json.stdout).up_dry_run.would_restart_shared).toEqual(["pg"]);
+      const human = await execute(["up", "--dry-run"], { up: vi.fn(), down: vi.fn(), upDryRun });
+      expect(human.stderr).toContain("up would restart dead shared service(s): pg");
+      const help = (await run(["up", "--help"])).stdout.replace(/\s+/g, " ");
+      expect(help).toContain("previews which dead selected shared services `up` would restart");
+    });
+
+    it("up --json passes shared_restarted through; human mode names it (#240)", async () => {
+      const up = vi.fn().mockResolvedValue({
+        worktreeId: "login",
+        socketPath: "/s",
+        env: {},
+        sharedStarted: false,
+        sharedRestarted: ["pg"],
+      });
+      const json = await execute(["up", "--json"], { up, down: vi.fn() });
+      expect(JSON.parse(json.stdout).up.shared_restarted).toEqual(["pg"]);
+      const human = await execute(["up", "--no-attach"], { up, down: vi.fn() });
+      expect(human.stdout).toContain("devtrees up: restarted dead shared service(s): pg.");
+    });
+
     it("`up --help` says --dry-run previews a running instance (#210)", async () => {
       const help = (await run(["up", "--help"])).stdout.replace(/\s+/g, " ");
       expect(help).toContain("If this worktree's instance is running, previews what `up` would do");

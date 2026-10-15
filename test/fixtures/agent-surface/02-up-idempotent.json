@@ -19,6 +19,7 @@
     ],
     "shared_started": false,
     "shared_activated": [],
+    "shared_restarted": [],
     "dropped_namespace_edges": [],
     "braced_env_vars": [],
     "shared_config_changes": [],
