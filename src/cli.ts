@@ -35,6 +35,7 @@ import {
   formatLogLine,
   formatLs,
   formatPrune,
+  formatPruneSharedPorts,
   formatRestart,
   formatUp,
   formatUpDryRun,
@@ -218,6 +219,11 @@ export interface ExecuteDeps {
     sharedPorts?: Readonly<Record<string, SharedPortEntry>>;
   }>;
   attach?: (options: { shared: boolean }) => Promise<void>;
+  /** `prune --shared-ports` (#238): drop shared port map names no instance holds. */
+  pruneSharedPorts?: () => Promise<{
+    dropped: ReadonlyArray<string>;
+    kept: ReadonlyArray<string>;
+  }>;
   prune?: () => Promise<{
     anchor: string;
     pruned: ReadonlyArray<PrunedRow>;
@@ -832,11 +838,27 @@ class PruneCommand extends DevtreesCommand {
   static override usage = Command.Usage({
     description: "Reconcile against `git worktree list` and clean up orphaned instances.",
     // Drops orphan registry entries under the registry lock → LOCK_CONTENTION.
-    details: errorCodeFooter(["LOCK_CONTENTION", "UNKNOWN"]),
+    details:
+      "With `--shared-ports`, prune only the stable shared port map (#238) instead: drop " +
+      "every recorded name that no instance holds (no running shared service binds it and " +
+      "no derived config on disk carries it), freeing shared block numbers after " +
+      "an `up` failed because the shared block is full (`block_full`). Refused while any " +
+      "worktree's `up` or `down` is in flight.\n\n" +
+      errorCodeFooter(["LOCK_CONTENTION", "UNKNOWN"]),
+  });
+
+  sharedPorts = Option.Boolean("--shared-ports", false, {
+    description: "Drop shared port map names no instance holds, instead of pruning orphans.",
   });
 
   override async execute(): Promise<number> {
     return this.dispatch(async () => {
+      if (this.sharedPorts) {
+        if (!this.context.deps.pruneSharedPorts) return 0;
+        const result = await this.context.deps.pruneSharedPorts();
+        this.emit(formatPruneSharedPorts(result, this.mode));
+        return 0;
+      }
       if (!this.context.deps.prune) return 0;
       const result = await this.context.deps.prune();
       // Issue #148: a failed orphan reap surfaces as a stderr warning (human) /
@@ -1321,6 +1343,7 @@ if (isEntrypoint(import.meta.url, process.argv[1])) {
     runLs,
     runAttach,
     runPrune,
+    runPruneSharedPorts,
     runLogs,
     runInit,
   } = await import("./commands.js");
@@ -1347,6 +1370,7 @@ if (isEntrypoint(import.meta.url, process.argv[1])) {
     ls: () => runLs(),
     attach: ({ shared }) => runAttach({}, { shared }),
     prune: () => runPrune({ stop: stopSeamsFromEnv() }),
+    pruneSharedPorts: () => runPruneSharedPorts(),
     env: () => runEnv(),
     logs: (opts) =>
       runLogs(

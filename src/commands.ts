@@ -42,6 +42,7 @@ import {
   instancePaths,
   logsDir,
   sharedInstancePaths,
+  stateDir,
 } from "./paths.js";
 import {
   formatBracedEnvVarWarning,
@@ -74,7 +75,13 @@ import {
   type ServiceStatus,
   type StreamLogsOptions,
 } from "./driver.js";
-import { readRegistry, withLifecycleLock, withRegistryLock, withSharedLock } from "./registry.js";
+import {
+  assertNoWorktreeLifecycleLocks,
+  readRegistry,
+  withLifecycleLock,
+  withRegistryLock,
+  withSharedLock,
+} from "./registry.js";
 import {
   defaultIsPortFree,
   defaultPortHolder,
@@ -191,7 +198,7 @@ import {
 } from "./reload-pending.js";
 import { classifyService, dependencyOrder, findDeadServices } from "./service-state.js";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { TARGET_CANDIDATES, fencedBlock, upsertBlock } from "./onboarding.js";
@@ -696,11 +703,12 @@ function readSharedPortPlan(
   stack: ResolvedStack,
   seed: SharedPortSeed,
   running: boolean,
+  warn: (message: string) => void,
 ): SharedPortPlan {
   const processes = readDerivedConfig(sharedInstancePaths(anchor).configPath)?.processes;
   return planSharedPorts({
     names: portNamesOf(sharedServicesOf(stack)),
-    recorded: readSharedPortMap(anchor),
+    recorded: readSharedPortMap(anchor, warn),
     live: liveSharedPortsOf(readSharedState(anchor)?.ports, processes),
     running,
     positional: seed.positional,
@@ -712,7 +720,8 @@ function readSharedPortPlan(
  * Fail `SHARED_PORT_CONFLICT` on a conflict this command must not go past
  * (`blockingPortConflicts`): one involving a shared port the stack declares,
  * or a stale env entry for a port `binding` (the services this `up` starts or
- * adds) would bind. A stale env entry that blocks nothing is warned about.
+ * adds) would bind. A stale env entry that blocks nothing is warned about,
+ * and so is a recorded port outside the current shared block.
  */
 function assertSharedPortsClean(args: {
   readonly command: "up" | "env" | "up --dry-run";
@@ -729,9 +738,11 @@ function assertSharedPortsClean(args: {
   for (const conflict of args.portPlan.conflicts) {
     if (conflict.reason === "stale_env") args.warn(staleEnvWarning(conflict));
   }
+  for (const warning of args.portPlan.warnings) args.warn(warning);
 }
 
-const SHARED_PORT_CONFLICT_REMEDY = `${SHARED_DRIFT_REMEDY} (for every worktree)`;
+/** `SHARED_PORT_CONFLICT`'s remedy when the shared block is full: drop unused names. */
+const PRUNE_SHARED_PORTS_REMEDY = "devtrees prune --shared-ports";
 
 function sharedPortConflictError(
   command: string,
@@ -739,21 +750,26 @@ function sharedPortConflictError(
   conflicts: ReadonlyArray<PortMapConflict>,
 ): SharedPortConflictError {
   const mapPath = sharedPortMapFile(anchor);
+  const onlyFull = conflicts.every((c) => c.reason === "block_full");
+  const remedy = onlyFull ? PRUNE_SHARED_PORTS_REMEDY : SHARED_DRIFT_REMEDY;
+  const next = onlyFull
+    ? `Next: \`${remedy}\` drops the recorded names no instance holds; if it frees nothing, ` +
+      `raise \`block_size\` in devtrees.yaml.`
+    : `Next: \`${remedy}\`, for every worktree (it stops the shared instance for all of them). ` +
+      `If two entries of ${mapPath} name one port, that survives a restart: surface it to a ` +
+      `human, who removes one of them.`;
   return new SharedPortConflictError(
-    `devtrees ${command}: refusing to hand one shared port to two names or move a recorded ` +
-      `one:\n${conflicts.map(describePortConflict).join("\n")}\n` +
-      `Nothing was started, added or recorded. Next: \`${SHARED_PORT_CONFLICT_REMEDY}\` ` +
-      `(this stops the shared instance for every worktree); if the conflict is between two ` +
-      `entries of ${mapPath}, remove one of them first.`,
-    {
-      conflicts: conflicts.map(portConflictJson),
-      map_path: mapPath,
-      remedy: SHARED_PORT_CONFLICT_REMEDY,
-    },
+    `devtrees ${command}: refusing to hand one shared port to two names, move a recorded one, ` +
+      `or start a service without its port:\n${conflicts.map(describePortConflict).join("\n")}\n` +
+      `Nothing was started, added or recorded. ${next}`,
+    { conflicts: conflicts.map(portConflictJson), map_path: mapPath, remedy },
   );
 }
 
 function describePortConflict(c: PortMapConflict): string {
+  if (c.reason === "block_full") {
+    return `  ${c.portName}: no free number left in the shared block (every one is recorded)`;
+  }
   const recorded = c.recordedPort === undefined ? "unrecorded" : `recorded ${c.recordedPort}`;
   if (c.reason === "port_taken") return `  ${c.portName} ${c.port}: held by ${c.holder ?? "?"}`;
   if (c.reason === "bound_mismatch") {
@@ -766,7 +782,7 @@ function portConflictJson(c: PortMapConflict): Record<string, string | number> {
   return {
     reason: c.reason,
     port_name: c.portName,
-    port: c.port,
+    ...(c.port !== undefined ? { port: c.port } : {}),
     ...(c.recordedPort !== undefined ? { recorded_port: c.recordedPort } : {}),
     ...(c.holder !== undefined ? { holder: c.holder } : {}),
     ...(c.process !== undefined ? { process: c.process } : {}),
@@ -2209,6 +2225,7 @@ export async function runUpDryRun(deps: CommandDeps = {}): Promise<DryRunResult>
           block: sharedBlockOf(allocated.sharedBase, options),
         },
         running: await sharedSocketLive(anchor.anchor, deps),
+        warn: deps.warn ?? defaultWarn,
       }).ports
     : undefined;
   const sharedPortFor =
@@ -2808,7 +2825,7 @@ async function ensureSharedStarted(
     });
     // The stable shared port map (#238): read and reconciled under the shared
     // lock, so two `up`s from different branches cannot both assign a name.
-    const portPlan = readSharedPortPlan(anchor, stack, seed, live);
+    const portPlan = readSharedPortPlan(anchor, stack, seed, live, deps.warn);
     const step = { anchor, stack, selected, portPlan, deps };
     if (live) return await reconcileLiveShared({ ...step, worktreeId });
     // A fresh start binds every selected service's ports.
@@ -4312,6 +4329,62 @@ export interface UnreclaimedOrphan {
  * dir, not at any single worktree, and its lifecycle is decoupled from any
  * worktree's `down` (ADR-0001). Tear it down explicitly with `down --shared`.
  */
+/** What `prune --shared-ports` did to the shared port map (#238). */
+export interface PruneSharedPortsResult {
+  /** Names removed from the map, sorted. */
+  readonly dropped: ReadonlyArray<string>;
+  /** Names kept because some instance still holds them, sorted. */
+  readonly kept: ReadonlyArray<string>;
+}
+
+/**
+ * Drop from the shared port map every name no instance holds (#238,
+ * ADR-0011), so a block filled by names branches no longer use
+ * (`SHARED_PORT_CONFLICT`, `block_full`) has room again. A name is held when
+ * the shared state records a running service binding it, or any derived
+ * config on disk — the shared instance's or any worktree's, running or not —
+ * carries it in a process's env. Those are every number a process may still
+ * use; anything else can get a new number at its next `up` without
+ * miswiring a process.
+ *
+ * Under the shared lifecycle lock, and refused with `LOCK_CONTENTION` while
+ * any worktree's `up` or `down` is in flight: an `up` writes its worktree
+ * config after it releases the shared lock, so a name it just recorded is
+ * not provably held before then.
+ */
+export async function runPruneSharedPorts(deps: CommandDeps = {}): Promise<PruneSharedPortsResult> {
+  const { anchor } = resolve(deps);
+  const sharedLock = deps.withSharedLock ?? defaultWithSharedLock;
+  return await sharedLock(anchor.anchor, async () => {
+    assertNoWorktreeLifecycleLocks(anchor.anchor);
+    const recorded = readSharedPortMap(anchor.anchor, deps.warn ?? defaultWarn);
+    // An unreadable map is never rewritten here: that would drop the names
+    // other branches recorded.
+    if (recorded === undefined) return { dropped: [], kept: [] };
+    const held = heldSharedPortNames(anchor.anchor);
+    const names = Object.keys(recorded).sort();
+    const kept = names.filter((name) => held.has(name));
+    const dropped = names.filter((name) => !held.has(name));
+    if (dropped.length > 0) writeSharedPortMap(anchor.anchor, pick(recorded, kept));
+    return { dropped, kept };
+  });
+}
+
+/** Every env name a derived config on disk, or the shared state's bound ports, holds. */
+function heldSharedPortNames(anchor: string): Set<string> {
+  const held = new Set(Object.keys(readSharedState(anchor)?.ports ?? {}));
+  const dir = stateDir(anchor);
+  if (!existsSync(dir)) return held;
+  for (const entry of readdirSync(dir)) {
+    if (!entry.endsWith(".yaml")) continue;
+    const processes = readDerivedConfig(join(dir, entry))?.processes;
+    for (const env of Object.values(liveSharedPortsOf(undefined, processes).processEnv)) {
+      for (const name of Object.keys(env)) held.add(name);
+    }
+  }
+  return held;
+}
+
 export async function runPrune(deps: PruneDeps = {}): Promise<PruneResult> {
   const cwd = deps.cwd ?? process.cwd();
   const git = deps.git ?? defaultGit(cwd);
@@ -4636,7 +4709,8 @@ export async function runEnv(deps: CommandDeps = {}): Promise<EnvResult> {
   // shared service diverges, exactly as `up` would, instead of reporting
   // connection info that is wrong. `env` takes no `-n`, so only the always-on
   // shared services (no `namespace:`) are checked (#236).
-  const running = sharedNeeded && existsSync(sharedInstancePaths(anchor.anchor).socketPath);
+  // A probe, not the socket file: a leftover socket is not a running instance.
+  const running = sharedNeeded && (await sharedSocketLive(anchor.anchor, deps));
   if (running) {
     const state = readRecordedSharedState(anchor.anchor, stack);
     if (state !== undefined) {
@@ -4651,6 +4725,7 @@ export async function runEnv(deps: CommandDeps = {}): Promise<EnvResult> {
         stack,
         seed: { positional: sharedPortFor, block: sharedBlockOf(sharedBlock?.base, options) },
         running,
+        warn: deps.warn ?? defaultWarn,
       })
     : undefined;
 
@@ -4681,13 +4756,14 @@ function previewSharedPorts(args: {
   readonly stack: ResolvedStack;
   readonly seed: SharedPortSeed;
   readonly running: boolean;
+  readonly warn: (message: string) => void;
 }): { ports: Readonly<Record<string, number>>; origins: Record<string, SharedPortEntry> } {
-  const plan = readSharedPortPlan(args.anchor, args.stack, args.seed, args.running);
-  assertSharedPortsClean({ ...args, portPlan: plan, binding: [], warn: () => {} });
+  const plan = readSharedPortPlan(args.anchor, args.stack, args.seed, args.running, args.warn);
+  assertSharedPortsClean({ ...args, portPlan: plan, binding: [] });
   const active = args.running ? (readSharedState(args.anchor)?.ports ?? {}) : {};
   return {
     ports: plan.ports,
-    origins: sharedPortOrigins(plan.ports, readSharedPortMap(args.anchor), active),
+    origins: sharedPortOrigins(plan.ports, plan.recorded, active),
   };
 }
 

@@ -598,6 +598,16 @@ describe("built CLI e2e — argv→commands wiring over the stub process-compose
     expect(err.code).toBe("SHARED_PORT_CONFLICT");
     expect(err.details?.remedy).toContain("devtrees down --shared && devtrees up");
     expect(JSON.parse(readFileSync(mapPath, "utf8"))).toEqual(map);
+
+    // prune --shared-ports drops only names nothing holds: an unused one goes,
+    // every name a running instance's derived config carries stays.
+    writeFileSync(mapPath, JSON.stringify({ ...map, ports: { ...map.ports, GONE_PORT: 1 } }));
+    const pruned = devtrees(login.wt, ["prune", "--shared-ports", "--json"]);
+    expect(pruned.code, `prune --shared-ports: ${pruned.stderr}`).toBe(0);
+    const prunedDoc = (pruned.doc as { prune_shared_ports: { dropped: string[]; kept: string[] } })
+      .prune_shared_ports;
+    expect(prunedDoc.dropped).toEqual(["GONE_PORT"]);
+    expect(prunedDoc.kept).toEqual(Object.keys(map.ports).sort());
   }, 90_000);
 
   it("up refuses a process-compose older than v1.122.0 before starting anything (#173)", () => {

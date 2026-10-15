@@ -18,6 +18,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   renameSync,
   unlinkSync,
   writeFileSync,
@@ -337,4 +338,33 @@ export async function withSharedLock<T>(
   options: LockOptions = {},
 ): Promise<T> {
   return withLifecycleLock(anchor, SHARED_INSTANCE_ID, fn, options);
+}
+
+/**
+ * Fail `LOCK_CONTENTION` when any worktree instance's lifecycle lock is held
+ * by a live process: an `up` or `down` is in flight there (#238). Called by
+ * `prune --shared-ports` while it holds the shared lock: an `up` records its
+ * shared ports under the shared lock but writes its worktree config after
+ * releasing it, under its own lifecycle lock, so a name it just recorded is
+ * only provably in use once that lock is gone. A lock left by a dead process
+ * does not count. The shared and registry locks are not lifecycle locks of a
+ * worktree and are skipped.
+ */
+export function assertNoWorktreeLifecycleLocks(anchor: string): void {
+  const dir = devtreesDir(anchor);
+  if (!existsSync(dir)) return;
+  for (const entry of readdirSync(dir)) {
+    if (!entry.endsWith(".lock")) continue;
+    if (entry === `${SHARED_INSTANCE_ID}.lock` || entry === "registry.lock") continue;
+    const path = join(dir, entry);
+    let pid: number;
+    try {
+      pid = Number.parseInt(readFileSync(path, "utf8").trim(), 10);
+    } catch {
+      continue; // released between the listing and the read
+    }
+    if (!Number.isInteger(pid) || pid <= 0 || isPidAlive(pid)) {
+      throw new LockContentionError(path);
+    }
+  }
 }

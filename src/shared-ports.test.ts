@@ -4,7 +4,7 @@
  * assignment of numbers to names it does not hold yet.
  */
 
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vite-plus/test";
@@ -22,7 +22,7 @@ import {
 
 const block = { base: 20_000, size: 10 };
 const noLive = { bound: {}, processEnv: {} };
-const any = (): boolean => true;
+const any = (): "seed" => "seed";
 
 describe("assignSharedPorts", () => {
   const positional = (name: string) =>
@@ -33,13 +33,18 @@ describe("assignSharedPorts", () => {
     expect(assignSharedPorts({ names, map: {}, positional, block })).toEqual({
       ports: { PG_PORT: 20_000, SB_PORT: 20_001, CACHE_PORT: 20_002 },
       assigned: names,
+      unassigned: [],
     });
   });
 
   it("keeps every recorded number, even off its positional slot", () => {
     const map = { PG_PORT: 20_005, SB_PORT: 20_001 };
     const result = assignSharedPorts({ names: ["PG_PORT", "SB_PORT"], map, positional, block });
-    expect(result).toEqual({ ports: { PG_PORT: 20_005, SB_PORT: 20_001 }, assigned: [] });
+    expect(result).toEqual({
+      ports: { PG_PORT: 20_005, SB_PORT: 20_001 },
+      assigned: [],
+      unassigned: [],
+    });
   });
 
   it("moves a new name off a number another branch's recorded name holds", () => {
@@ -51,6 +56,7 @@ describe("assignSharedPorts", () => {
     expect(assignSharedPorts({ names, map, positional, block })).toEqual({
       ports: { PG_PORT: 20_000, SB_PORT: 20_002, CACHE_PORT: 20_003 },
       assigned: ["SB_PORT", "CACHE_PORT"],
+      unassigned: [],
     });
   });
 
@@ -62,7 +68,7 @@ describe("assignSharedPorts", () => {
       positional: () => 20_000,
       block: tiny,
     });
-    expect(result).toEqual({ ports: { PG_PORT: 20_000 }, assigned: [] });
+    expect(result).toEqual({ ports: { PG_PORT: 20_000 }, assigned: [], unassigned: ["SB_PORT"] });
   });
 });
 
@@ -125,6 +131,7 @@ describe("reconcileSharedPortMap — migration from a 0.4.0 shared instance", ()
       map: { PG_PORT: 20_000, SB_PORT: 20_001 },
       seeded: ["PG_PORT", "SB_PORT"],
       conflicts: [],
+      reserved: new Set(),
     });
   });
 
@@ -167,7 +174,7 @@ describe("reconcileSharedPortMap — migration from a 0.4.0 shared instance", ()
 
   it("ignores env entries that are not shared ports", () => {
     const live = liveSharedPortsOf({}, { pg: { environment: ["PGPORT=5432"] } });
-    const isShared = (name: string) => name.endsWith("_PORT");
+    const isShared = (name: string) => (name.endsWith("_PORT") ? "seed" : "ignore");
     expect(reconcileSharedPortMap(undefined, live, isShared).map).toEqual({});
   });
 });
@@ -188,20 +195,50 @@ describe("planSharedPorts — conflicts", () => {
     ]);
   });
 
-  it("seeds an unknown name from the env only when its number is in the shared block", () => {
-    const live = liveSharedPortsOf(
-      {},
-      { pg: { environment: ["OTHER_PORT=20004", "FOREIGN=31337"] } },
-    );
+  it("never seeds an author env entry; an unknown in-block number is only avoided", () => {
+    // `FOO=20004` is the author's own environment (or another branch's
+    // pre-#238 prediction devtrees cannot name): it is never recorded, but a
+    // new name does not take its number while the instance runs.
+    const live = liveSharedPortsOf({}, { pg: { environment: ["FOO=20004", "FOREIGN=31337"] } });
     const plan = planSharedPorts({
-      names: ["PG_PORT"],
+      names: ["PG_PORT", "NEW_PORT"],
       recorded: undefined,
       live,
       running: true,
+      positional: (name) => ({ PG_PORT: 20_000, NEW_PORT: 20_004 })[name],
+      block,
+    });
+    expect(plan.map).toEqual({ PG_PORT: 20_000, NEW_PORT: 20_001 });
+    expect(plan.conflicts).toEqual([]);
+  });
+
+  it("reports block_full for a new name when recorded names hold every number", () => {
+    // The reviewer's repro: block of 4, A..D recorded, a new name E.
+    const tiny = { base: 100, size: 4 };
+    const plan = planSharedPorts({
+      names: ["E_PORT"],
+      recorded: { A: 100, B: 101, C: 102, D: 103 },
+      live: noLive,
+      running: false,
+      positional: () => 100,
+      block: tiny,
+    });
+    expect(plan.ports).toEqual({});
+    expect(plan.conflicts).toEqual([{ reason: "block_full", portName: "E_PORT" }]);
+    expect(blockingPortConflicts(plan.conflicts, new Set(["E_PORT"]), new Set())).toHaveLength(1);
+  });
+
+  it("warns about a recorded port outside the current shared block", () => {
+    const plan = planSharedPorts({
+      names: ["PG_PORT"],
+      recorded: { PG_PORT: 30_000 },
+      live: noLive,
+      running: false,
       positional: () => 20_000,
       block,
     });
-    expect(plan.map).toEqual({ OTHER_PORT: 20_004, PG_PORT: 20_000 });
+    expect(plan.ports.PG_PORT).toBe(30_000);
+    expect(plan.warnings).toEqual([expect.stringContaining("PG_PORT=30000")]);
   });
 });
 
@@ -250,12 +287,31 @@ describe("shared port map file", () => {
     expect(readSharedPortMap(dir)).toEqual({ PG_PORT: 20_000 });
   });
 
-  it("reads a corrupt or malformed file as absent", () => {
+  it("writes atomically: no temp file is left beside the map", () => {
+    const dir = anchor();
+    writeSharedPortMap(dir, { PG_PORT: 20_000 });
+    writeSharedPortMap(dir, { PG_PORT: 20_000, SB_PORT: 20_001 });
+    expect(readdirSync(join(dir, "devtrees"))).toEqual(["shared-ports.json"]);
+  });
+
+  it("warns, and reads as absent, a file that cannot be parsed", () => {
     const dir = anchor();
     writeSharedPortMap(dir, {});
     writeFileSync(sharedPortMapFile(dir), "{not json");
-    expect(readSharedPortMap(dir)).toBeUndefined();
-    writeFileSync(sharedPortMapFile(dir), JSON.stringify({ ports: { PG_PORT: "x" } }));
-    expect(readSharedPortMap(dir)).toBeUndefined();
+    const warnings: string[] = [];
+    expect(readSharedPortMap(dir, (m) => warnings.push(m))).toBeUndefined();
+    expect(warnings).toEqual([expect.stringContaining("cannot read the shared port map")]);
+  });
+
+  it("drops only an invalid entry, with a warning, and keeps the rest", () => {
+    const dir = anchor();
+    writeSharedPortMap(dir, {});
+    writeFileSync(
+      sharedPortMapFile(dir),
+      JSON.stringify({ version: 1, ports: { PG_PORT: 20_000, SB_PORT: "x", Z: -1 } }),
+    );
+    const warnings: string[] = [];
+    expect(readSharedPortMap(dir, (m) => warnings.push(m))).toEqual({ PG_PORT: 20_000 });
+    expect(warnings).toHaveLength(2);
   });
 });

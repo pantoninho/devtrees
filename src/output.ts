@@ -111,7 +111,7 @@ export const ERROR_CODE_DESCRIPTIONS: Readonly<Record<ErrorCode, string>> = {
   SHARED_ACTIVATION_FAILED:
     "Adding a selected namespaced shared service to the running shared instance failed (process-compose refused or timed out on the config reload); the shared services it already ran are untouched. `details` has `{services, reason, config_path, remedy}`.",
   SHARED_PORT_CONFLICT:
-    "A shared named port cannot be resolved without handing one port to two names or moving a recorded one (the stable shared port map, #238): `details.conflicts` lists each `{reason, port_name, port, recorded_port?, holder?, process?}` (`reason`: `port_taken`, `bound_mismatch` or `stale_env`); nothing was started, added or recorded. `details.remedy` is the `down --shared` + `up` that clears it; `details.map_path` is the map.",
+    "A shared named port cannot be resolved without handing one port to two names or moving a recorded one (the stable shared port map, #238): `details.conflicts` lists each `{reason, port_name, port, recorded_port?, holder?, process?}` (`reason`: `port_taken`, `bound_mismatch`, `stale_env`, or `block_full` when the shared block has no free number left); nothing was started, added or recorded. `details.remedy` is one command: `devtrees down --shared && devtrees up` (run for every worktree), or `devtrees prune --shared-ports` for `block_full`; `details.map_path` is the map.",
   WORKTREE_START_FAILED:
     "This worktree's instance died before binding its control socket; `details.config_path` is the config to run by hand.",
   NO_SERVICES_SELECTED:
@@ -548,6 +548,30 @@ function formatPruneHuman(pruned: ReadonlyArray<PrunedRow>): string {
  * list itself stays because `prune` is the only command that reconciles
  * devtrees-state vs `git worktree list`. Human output is unchanged.
  */
+/**
+ * Render `devtrees prune --shared-ports` (#238): the shared port map names it
+ * dropped and kept. `json`: `{schema_version, prune_shared_ports: {dropped,
+ * kept}}`.
+ */
+export function formatPruneSharedPorts(
+  result: { readonly dropped: ReadonlyArray<string>; readonly kept: ReadonlyArray<string> },
+  mode: FormatMode,
+): OutputResult {
+  if (mode === "json") {
+    const doc = {
+      schema_version: SCHEMA_VERSION,
+      prune_shared_ports: { dropped: result.dropped, kept: result.kept },
+    };
+    return { stdout: `${JSON.stringify(doc)}\n`, stderr: "" };
+  }
+  const kept = result.kept.length === 0 ? "none" : result.kept.join(", ");
+  const head =
+    result.dropped.length === 0
+      ? "devtrees prune --shared-ports: no unused shared port to drop"
+      : `devtrees prune --shared-ports: dropped ${result.dropped.join(", ")}`;
+  return { stdout: `${head} (kept: ${kept}).\n`, stderr: "" };
+}
+
 export function formatPrune(
   pruned: ReadonlyArray<PrunedRow>,
   mode: FormatMode,

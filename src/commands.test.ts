@@ -32,6 +32,7 @@ import {
   runDown,
   runEnv,
   runLogs,
+  runPruneSharedPorts,
   runUp,
   runUpDryRun,
   type CommandDeps,
@@ -8192,9 +8193,7 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
         port: Number(first.env.SB_PORT),
         holder: "DB_PORT",
       });
-      expect(err?.details?.remedy).toBe(
-        "devtrees down --shared && devtrees up (for every worktree)",
-      );
+      expect(err?.details?.remedy).toBe("devtrees down --shared && devtrees up");
       expect(blocked.reloads).toEqual([]);
       expect(readFileSync(sharedPortMapFile(fixture.sharedAnchor), "utf8")).toBe(mapBefore);
       // `env` reports the same conflict instead of a wrong number.
@@ -8221,6 +8220,79 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
       ]);
       expect(adding.reloads).toEqual([]);
       expect(Object.keys(sharedConfigOf(fixture))).toEqual(["postgres"]);
+    });
+
+    it("a full shared block fails SHARED_PORT_CONFLICT block_full; prune --shared-ports frees it", async () => {
+      // Names no branch uses any more hold every number of the shared block.
+      const fixture = multiWorktreeFixture("dt-238-full-");
+      const first = await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+      const used = { DB_PORT: Number(first.env.DB_PORT), SB_PORT: Number(first.env.SB_PORT) };
+      const sharedBase = fixture.registryRef.snapshot.__shared__ ?? 0;
+      const stale: Record<string, number> = {};
+      for (let port = sharedBase; port < sharedBase + 32; port++) {
+        if (!Object.values(used).includes(port)) stale[`OLD_${port}`] = port;
+      }
+      writeSharedPortMap(fixture.sharedAnchor, { ...used, ...stale });
+
+      const grown: ResolvedStack = {
+        services: [...base.services, shared("cache", "redis-server", ["CACHE_PORT"])],
+      };
+      const blocked = wt(fixture, grown, "billing", { namespaces: ["app", "db"] });
+      const err = await failure(runUp(blocked.deps));
+      expect(err?.code).toBe("SHARED_PORT_CONFLICT");
+      expect(err?.details?.conflicts).toEqual([{ reason: "block_full", port_name: "CACHE_PORT" }]);
+      expect(err?.details?.remedy).toBe("devtrees prune --shared-ports");
+      expect((await failure(runEnv(blocked.deps)))?.code).toBe("SHARED_PORT_CONFLICT");
+
+      const pruned = await runPruneSharedPorts(blocked.deps);
+      expect(pruned.kept).toEqual(["DB_PORT", "SB_PORT"]);
+      expect(pruned.dropped).toHaveLength(Object.keys(stale).length);
+      const result = await runUp(blocked.deps);
+      expect(result.env.DB_PORT).toBe(first.env.DB_PORT);
+      expect(Number(result.env.CACHE_PORT)).toBeGreaterThanOrEqual(sharedBase);
+    });
+
+    it("prune --shared-ports keeps a name only a worktree's derived config holds", async () => {
+      const fixture = multiWorktreeFixture("dt-238-prune-wt-");
+      await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+      const map = readSharedPortMap(fixture.sharedAnchor) ?? {};
+      writeSharedPortMap(fixture.sharedAnchor, { ...map, GONE_PORT: 1 });
+      // SB_PORT is no running service's, but the worktree's env carries it.
+      const result = await runPruneSharedPorts(wt(fixture, base, "login").deps);
+      expect(result).toEqual({ dropped: ["GONE_PORT"], kept: ["DB_PORT", "SB_PORT"] });
+      expect(readSharedPortMap(fixture.sharedAnchor)).toEqual(map);
+    });
+
+    it("prune --shared-ports refuses while a worktree's up holds its lifecycle lock", async () => {
+      const fixture = multiWorktreeFixture("dt-238-prune-lock-");
+      await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+      const before = readFileSync(sharedPortMapFile(fixture.sharedAnchor), "utf8");
+      writeFileSync(join(fixture.sharedAnchor, "devtrees", "billing.lock"), String(process.pid));
+      const err = await failure(runPruneSharedPorts(wt(fixture, base, "login").deps));
+      expect(err?.code).toBe("LOCK_CONTENTION");
+      expect(readFileSync(sharedPortMapFile(fixture.sharedAnchor), "utf8")).toBe(before);
+    });
+
+    it("SHARED_PORT_CONFLICT's remedy is one runnable command; 'every worktree' is in the message", async () => {
+      const fixture = multiWorktreeFixture("dt-238-remedy-");
+      const first = await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+      writeSharedPortMap(fixture.sharedAnchor, {
+        DB_PORT: Number(first.env.DB_PORT),
+        SB_PORT: Number(first.env.DB_PORT),
+      });
+      const err = await failure(runUp(wt(fixture, base, "billing", { namespaces: ["app"] }).deps));
+      expect(err?.details?.remedy).toBe("devtrees down --shared && devtrees up");
+      expect(err?.message).toContain("for every worktree");
+      expect(err?.message).toContain("surface it to a human");
+    });
+
+    it("env reports no port active for a leftover socket nothing listens on", async () => {
+      const fixture = multiWorktreeFixture("dt-238-stale-sock-");
+      const deps = wt(fixture, branchA, "login", { namespaces: ["app"] }).deps;
+      await runUp(deps);
+      expect(existsSync(sharedInstancePaths(fixture.sharedAnchor).socketPath)).toBe(true);
+      const env = await runEnv({ ...deps, probeSocket: async () => "stale" as const });
+      expect(env.sharedPorts?.DB_PORT?.origin).toBe("recorded");
     });
 
     /** Rewrite one shared process's injected value for `name`, as a 0.4.0 prediction would. */

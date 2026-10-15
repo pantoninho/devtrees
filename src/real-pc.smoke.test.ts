@@ -3659,6 +3659,64 @@ describe.skipIf(!ENABLED)("real-pc smoke — stable shared ports (#238)", () => 
     expect(recorded.ports.X_PORT).toBe(Number(envOf(first).X_PORT));
   }, 120_000);
 
+  it("scenario 133: a shared instance the real devtrees@0.4.0 started is seeded by this build, with no restart", async () => {
+    // The published 0.4.0, installed from npm into a throwaway dir: the real
+    // pre-#238 writer of the shared state, not a simulation of it.
+    const legacyDir = mkdtempSync(join(TMP_BASE, "dt-rpc133-legacy-"));
+    cleanupStack.push(() => rmSync(legacyDir, { recursive: true, force: true }));
+    execFileSync(
+      "npm",
+      ["install", "--silent", "--no-save", "--prefix", legacyDir, "devtrees@0.4.0"],
+      {
+        stdio: "pipe",
+        timeout: 120_000,
+      },
+    );
+    const legacyCli = join(legacyDir, "node_modules", "devtrees", "dist", "cli.mjs");
+    const legacy = (cwd: string, args: ReadonlyArray<string>): CliResult => {
+      const out = spawnSync(process.execPath, [legacyCli, ...args], {
+        cwd,
+        encoding: "utf8",
+        timeout: 60_000,
+      });
+      let doc: unknown;
+      try {
+        doc = JSON.parse(out.stdout);
+      } catch {
+        doc = undefined;
+      }
+      return { code: out.status ?? -1, stdout: out.stdout, stderr: out.stderr, doc };
+    };
+    const { repo, login, billing, holdPg, upWith } = crossBranchRepo("dt-rpc133-");
+
+    // 0.4.0 boots login: pg only, with its positional X_PORT prediction in pg's env.
+    const old = legacy(login, ["up", "--json", "--wait-timeout", "30", "-n", "app"]);
+    expect(old.code, `0.4.0 up: ${old.stderr}`).toBe(0);
+    expect(await waitForPid(holdPg, 10_000), "pg should be running").toBe(true);
+    const pgPids = pidsMatching(`tail -f ${holdPg}`);
+    const mapPath = join(repo.root, "main", ".git", "devtrees", "shared-ports.json");
+    expect(existsSync(mapPath), "0.4.0 writes no map").toBe(false);
+    const oldEnv = envOf(old);
+
+    // This build, from billing (whose layout puts Y_PORT on that same slot):
+    // it seeds the map from 0.4.0's live numbers and restarts nothing.
+    const next = upWith(billing, "app", "ys");
+    expect(next.code, `PR build up: ${next.stderr}`).toBe(0);
+    expect((next.doc as PortsUp).up.shared_started).toBe(false);
+    expect(pidsMatching(`tail -f ${holdPg}`)).toEqual(pgPids);
+    const nextEnv = envOf(next);
+    expect(nextEnv.PG_PORT).toBe(oldEnv.PG_PORT);
+    expect(nextEnv.X_PORT).toBe(oldEnv.X_PORT);
+    expect(nextEnv.Y_PORT).not.toBe(oldEnv.X_PORT);
+    expect(await waitForListener(Number(nextEnv.Y_PORT), 10_000), "y listens").toBe(true);
+
+    // Activating x from login binds the number 0.4.0 injected.
+    const activated = upWith(login, "app", "xs");
+    expect(activated.code, `activate x: ${activated.stderr}`).toBe(0);
+    expect(envOf(activated).X_PORT).toBe(oldEnv.X_PORT);
+    expect(await waitForListener(Number(oldEnv.X_PORT), 10_000), "x listens").toBe(true);
+  }, 240_000);
+
   it("scenario 132: a recorded port another name holds fails SHARED_PORT_CONFLICT and starts nothing", async () => {
     const { repo, login, billing, upWith } = crossBranchRepo("dt-rpc132-");
     const first = upWith(billing, "app", "ys");

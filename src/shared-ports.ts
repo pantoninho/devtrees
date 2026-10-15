@@ -25,8 +25,9 @@
  * back as a conflict instead of being resolved silently.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { writeAtomic } from "./registry.js";
 
 /** The repo-wide shared port block: its base and size. */
 export interface SharedBlock {
@@ -51,32 +52,66 @@ export function sharedPortMapFile(anchor: string): string {
   return join(anchor, "devtrees", "shared-ports.json");
 }
 
+/** Sink for the map's read warnings; stderr by default. */
+export type PortMapWarn = (message: string) => void;
+
+const stderrWarn: PortMapWarn = (message) => {
+  process.stderr.write(`${message}\n`);
+};
+
+const isPort = (v: unknown): v is number =>
+  typeof v === "number" && Number.isInteger(v) && v > 0 && v <= 65_535;
+
 /**
- * Read the persisted map, or `undefined` when it is absent or unreadable. A
- * corrupt file degrades to "no map": the next `up` seeds it again from the
- * running instance, so nothing it handed out moves.
+ * Read the persisted map, or `undefined` when it is absent or cannot be
+ * parsed. The file is written atomically (`writeSharedPortMap`), so a torn
+ * write is not expected; a file that still cannot be parsed (a hand edit, a
+ * disk fault) is warned about, because the next `up` re-seeds the map from
+ * the running instance and so loses the names only other branches recorded.
+ * One invalid entry is dropped with a warning; the rest are kept.
  */
-export function readSharedPortMap(anchor: string): SharedPortMap | undefined {
+export function readSharedPortMap(
+  anchor: string,
+  warn: PortMapWarn = stderrWarn,
+): SharedPortMap | undefined {
   const file = sharedPortMapFile(anchor);
   if (!existsSync(file)) return undefined;
+  let ports: unknown;
   try {
-    const parsed = JSON.parse(readFileSync(file, "utf8")) as { ports?: unknown };
-    const ports = parsed?.ports;
-    if (ports === null || typeof ports !== "object" || Array.isArray(ports)) return undefined;
-    const entries = Object.entries(ports as Record<string, unknown>);
-    return entries.every(([, v]) => Number.isInteger(v))
-      ? (Object.fromEntries(entries) as Record<string, number>)
-      : undefined;
-  } catch {
+    ports = (JSON.parse(readFileSync(file, "utf8")) as { ports?: unknown } | null)?.ports;
+  } catch (err) {
+    warn(unreadableMapWarning(file, (err as Error).message));
     return undefined;
   }
+  if (ports === null || typeof ports !== "object" || Array.isArray(ports)) {
+    warn(unreadableMapWarning(file, "it has no `ports` object"));
+    return undefined;
+  }
+  const out: Record<string, number> = {};
+  for (const [name, port] of Object.entries(ports as Record<string, unknown>)) {
+    if (isPort(port)) out[name] = port;
+    else warn(`devtrees: ignoring invalid entry ${name}=${JSON.stringify(port)} in ${file}.`);
+  }
+  return out;
 }
 
-/** Persist the map. Called only by `up`, under the shared lifecycle lock. */
+function unreadableMapWarning(file: string, reason: string): string {
+  return (
+    `devtrees: cannot read the shared port map ${file} (${reason}). The next \`up\` rebuilds ` +
+    `it from the running shared instance, so a shared port only another branch recorded may ` +
+    `get a new number.`
+  );
+}
+
+/**
+ * Persist the map atomically: a same-directory temp file renamed over the
+ * old one, so a reader sees the old complete file or the new one. Called only
+ * by `up` and `prune --shared-ports`, under the shared lifecycle lock.
+ */
 export function writeSharedPortMap(anchor: string, ports: SharedPortMap): void {
   mkdirSync(join(anchor, "devtrees"), { recursive: true });
   const doc = { version: 1, ports };
-  writeFileSync(sharedPortMapFile(anchor), `${JSON.stringify(doc, null, 2)}\n`, "utf8");
+  writeAtomic(sharedPortMapFile(anchor), `${JSON.stringify(doc, null, 2)}\n`);
 }
 
 /**
@@ -99,15 +134,18 @@ export interface LiveSharedPorts {
  *    the recorded one.
  *  - `stale_env`: a running shared process was given a number for a name that
  *    is not the recorded one (or that belongs to another name).
+ *  - `block_full`: a name seen for the first time finds no free number in the
+ *    shared block, because recorded names (some possibly from other branches
+ *    and no longer used) hold every one. It gets no `port`.
  */
-export type PortMapConflictReason = "port_taken" | "bound_mismatch" | "stale_env";
+export type PortMapConflictReason = "port_taken" | "bound_mismatch" | "stale_env" | "block_full";
 
 /** One shared port that cannot be resolved cleanly. */
 export interface PortMapConflict {
   readonly reason: PortMapConflictReason;
   readonly portName: string;
-  /** The contested number: the one claimed for `portName`. */
-  readonly port: number;
+  /** The contested number: the one claimed for `portName` (absent for `block_full`). */
+  readonly port?: number;
   /** The number the map holds for `portName`, when it holds one. */
   readonly recordedPort?: number;
   /** The other name that holds `port`, for `port_taken`. */
@@ -123,7 +161,16 @@ export interface ReconciledPortMap {
   /** Names this reconciliation added from live numbers (not yet persisted). */
   readonly seeded: ReadonlyArray<string>;
   readonly conflicts: ReadonlyArray<PortMapConflict>;
+  /**
+   * Numbers a running shared process's env holds under a name devtrees does
+   * not know (not declared, recorded or bound): possibly another branch's
+   * pre-#238 prediction. New names avoid them; they are never recorded.
+   */
+  readonly reserved: ReadonlySet<number>;
 }
+
+/** How `reconcileSharedPortMap` treats one `KEY=NUMBER` env entry of a shared process. */
+export type EnvEntryKind = "seed" | "reserve" | "ignore";
 
 /** One claim of `port` for `name`, and what to report if it is refused. */
 interface Claim {
@@ -140,14 +187,16 @@ interface Claim {
  * A claim that agrees with the map is a no-op; a claim for an unrecorded name
  * on a free number seeds it; anything else is a conflict and changes nothing.
  *
- * `isSharedEnvEntry` says which `KEY=NUMBER` env entries are shared ports
- * (the shared processes' env also carries the author's own `environment:`).
+ * `envEntry` classifies each `KEY=NUMBER` env entry (the shared processes'
+ * env also carries the author's own `environment:`): only a known shared port
+ * name is `seed`ed into the map; an unknown one can only `reserve` its number.
  */
 export function reconcileSharedPortMap(
   recorded: SharedPortMap | undefined,
   live: LiveSharedPorts | undefined,
-  isSharedEnvEntry: (name: string, port: number) => boolean,
+  envEntry: (name: string, port: number) => EnvEntryKind,
 ): ReconciledPortMap {
+  const reserved = new Set<number>();
   const map: Record<string, number> = {};
   const owner = new Map<number, string>();
   const seeded: string[] = [];
@@ -171,10 +220,13 @@ export function reconcileSharedPortMap(
   }
   for (const [process, env] of Object.entries(live?.processEnv ?? {})) {
     for (const [name, port] of Object.entries(env)) {
-      if (isSharedEnvEntry(name, port)) claim({ name, port, source: "env", process });
+      const kind = envEntry(name, port);
+      if (kind === "seed") claim({ name, port, source: "env", process });
+      else if (kind === "reserve") reserved.add(port);
     }
   }
-  return { map, seeded, conflicts };
+  for (const port of owner.keys()) reserved.delete(port);
+  return { map, seeded, conflicts, reserved };
 }
 
 /** The conflict a claim raises against the map so far, or `undefined` if it is fine. */
@@ -200,6 +252,8 @@ export interface AssignedSharedPorts {
   readonly ports: Record<string, number>;
   /** Names newly given a number (to be recorded), in declaration order. */
   readonly assigned: ReadonlyArray<string>;
+  /** Names that found no free number in the block (`block_full`). */
+  readonly unassigned: ReadonlyArray<string>;
 }
 
 /**
@@ -209,17 +263,20 @@ export interface AssignedSharedPorts {
  * fresh shared start always used, so a stack seen for the first time gets the
  * same ports as before #238 — and otherwise the lowest number in the block no
  * recorded or newly assigned name holds. Recorded names this stack does not
- * declare (another branch's) still reserve their numbers.
+ * declare (another branch's) still reserve their numbers, and so does every
+ * number in `reserved`. A name that finds no free number is `unassigned`.
  */
 export function assignSharedPorts(args: {
   readonly names: ReadonlyArray<string>;
   readonly map: SharedPortMap;
   readonly positional: (name: string) => number | undefined;
   readonly block: SharedBlock | undefined;
+  readonly reserved?: ReadonlySet<number>;
 }): AssignedSharedPorts {
   const ports: Record<string, number> = {};
   const assigned: string[] = [];
-  const taken = new Set(Object.values(args.map));
+  const unassigned: string[] = [];
+  const taken = new Set([...Object.values(args.map), ...(args.reserved ?? [])]);
   for (const name of args.names) {
     const recorded = args.map[name];
     if (recorded !== undefined) {
@@ -232,12 +289,15 @@ export function assignSharedPorts(args: {
       positional !== undefined && !taken.has(positional)
         ? positional
         : lowestFree(args.block, taken);
-    if (port === undefined) continue;
+    if (port === undefined) {
+      if (!unassigned.includes(name)) unassigned.push(name);
+      continue;
+    }
     ports[name] = port;
     taken.add(port);
     assigned.push(name);
   }
-  return { ports, assigned };
+  return { ports, assigned, unassigned };
 }
 
 function lowestFree(block: SharedBlock | undefined, used: ReadonlySet<number>): number | undefined {
@@ -306,8 +366,13 @@ export interface SharedPortPlan {
    * Conflicts that matter: every one when the shared instance is running;
    * only those between recorded entries otherwise (a fresh start re-derives
    * every process from the map, so a dead instance's numbers cannot be stale).
+   * A `block_full` name is always reported.
    */
   readonly conflicts: ReadonlyArray<PortMapConflict>;
+  /** The persisted map this plan was made from (`undefined`: none yet). */
+  readonly recorded: SharedPortMap | undefined;
+  /** One warning per name this stack declares whose number lies outside the current shared block. */
+  readonly warnings: ReadonlyArray<string>;
 }
 
 /**
@@ -334,19 +399,40 @@ export function planSharedPorts(input: {
     input.block !== undefined &&
     port >= input.block.base &&
     port < input.block.base + input.block.size;
-  const reconciled = reconcileSharedPortMap(
-    input.recorded,
-    input.live,
-    (name, port) => known.has(name) || inBlock(port),
-  );
-  const { ports, assigned } = assignSharedPorts({ ...input, map: reconciled.map });
+  const reconciled = reconcileSharedPortMap(input.recorded, input.live, (name, port) => {
+    if (known.has(name)) return "seed";
+    return input.running && inBlock(port) ? "reserve" : "ignore";
+  });
+  const { ports, assigned, unassigned } = assignSharedPorts({
+    ...input,
+    map: reconciled.map,
+    reserved: reconciled.reserved,
+  });
   const map = { ...reconciled.map, ...pickPorts(ports, assigned) };
   const changed =
     input.recorded === undefined || reconciled.seeded.length > 0 || assigned.length > 0;
-  const conflicts = input.running
+  const live = input.running
     ? reconciled.conflicts
     : reconciled.conflicts.filter((c) => betweenRecorded(c, input.recorded));
-  return { ports, map, changed, conflicts };
+  const full = unassigned.map((portName): PortMapConflict => ({ reason: "block_full", portName }));
+  const block = input.block;
+  const warnings =
+    block === undefined
+      ? []
+      : input.names.flatMap((portName) => {
+          const port = reconciled.map[portName];
+          return port === undefined || inBlock(port)
+            ? []
+            : [outOfBlockWarning({ portName, port }, block)];
+        });
+  return {
+    ports,
+    map,
+    changed,
+    conflicts: [...live, ...full],
+    recorded: input.recorded,
+    warnings,
+  };
 }
 
 /** A conflict between two recorded entries, which no restart can clear. */
@@ -354,6 +440,7 @@ function betweenRecorded(c: PortMapConflict, recorded: SharedPortMap | undefined
   return (
     c.reason === "port_taken" &&
     c.holder !== undefined &&
+    c.port !== undefined &&
     recorded?.[c.portName] === c.port &&
     recorded[c.holder] === c.port
   );
@@ -373,7 +460,7 @@ function pickPorts(ports: SharedPortMap, names: ReadonlyArray<string>): Record<s
  * ports its stack declares — every one is injected into its worktree — and
  * the ones it is about to bind by starting or adding their services:
  *
- *  - `port_taken` / `bound_mismatch` fail any `up` that declares one of the
+ *  - `port_taken` / `bound_mismatch` / `block_full` fail any `up` that declares one of the
  *    names involved: resolving it would inject one number under two names,
  *    or move a number someone was already given.
  *  - `stale_env` fails an `up` that would start the service owning the name:
@@ -394,11 +481,23 @@ export function blockingPortConflicts(
   );
 }
 
+/** The warning for a recorded port outside the current shared block (#238). */
+function outOfBlockWarning(
+  entry: { readonly portName: string; readonly port: number },
+  block: SharedBlock,
+): string {
+  return (
+    `devtrees: shared port ${entry.portName}=${entry.port} is recorded outside the shared ` +
+    `block [${block.base}, ${block.base + block.size}) (its size or base changed since it was ` +
+    `recorded); it keeps that number, which the allocator does not reserve for shared services.`
+  );
+}
+
 /** One line per stale env entry a running shared process holds (#238). */
 export function staleEnvWarning(c: PortMapConflict): string {
   const recorded = c.recordedPort === undefined ? "" : ` (recorded: ${c.recordedPort})`;
   return (
-    `devtrees up: running shared service '${c.process ?? "?"}' was started with ` +
+    `devtrees: running shared service '${c.process ?? "?"}' was started with ` +
     `${c.portName}=${c.port}${recorded}, which is not ${c.portName}'s recorded port; it keeps ` +
     `that env until \`devtrees down --shared\` (a running shared service is never restarted).`
   );
