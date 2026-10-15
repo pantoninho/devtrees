@@ -1021,8 +1021,8 @@ services:
  * selection — the singleton runs it regardless — so it's rejected at
  * resolution time to surface the footgun loudly instead of silently.
  */
-describe("stack model — shared-tier namespace rejection (issue #130)", () => {
-  it("rejects a shared service that declares a namespace", () => {
+describe("stack model — namespaced shared services (#236; #130 rejected them)", () => {
+  it("accepts a shared service that declares a namespace", () => {
     const yaml = `
 services:
   postgres:
@@ -1030,10 +1030,12 @@ services:
     command: "postgres"
     namespace: local-backend
 `;
-    expect(() => parseStack(yaml)).toThrow(/namespace.*isolated/i);
+    const postgres = parseStack(yaml).services[0];
+    expect(postgres?.tier).toBe("shared");
+    expect(postgres?.namespace).toBe("local-backend");
   });
 
-  it("rejects a shared service with a list-valued namespace (#179)", () => {
+  it("accepts a shared service with a list-valued namespace (#179)", () => {
     const yaml = `
 services:
   postgres:
@@ -1041,38 +1043,24 @@ services:
     command: "postgres"
     namespace: [one, two]
 `;
-    expect(() => parseStack(yaml)).toThrow(/namespace.*isolated/i);
+    expect(parseStack(yaml).services[0]?.namespace).toEqual(["one", "two"]);
   });
 
-  it("rejects a shared service with an explicit namespace: default", () => {
-    // No inert-but-allowed form: the rule is "no namespace key on a shared
-    // service", with no special-casing for the implicit default namespace.
+  it("still rejects a shared service that depends_on an isolated one (ADR-0003)", () => {
     const yaml = `
 services:
+  api:
+    tier: isolated
+    command: "node api.js"
   postgres:
     tier: shared
     command: "postgres"
-    namespace: default
+    namespace: db-shared
+    depends_on:
+      api:
+        condition: process_started
 `;
-    expect(() => parseStack(yaml)).toThrow(/namespace.*isolated/i);
-  });
-
-  it("names the offending service and points at the fix in the error", () => {
-    const yaml = `
-services:
-  cache:
-    tier: shared
-    command: "redis"
-    namespace: local-backend
-`;
-    try {
-      parseStack(yaml);
-      throw new Error("expected parseStack to throw");
-    } catch (err) {
-      const msg = (err as Error).message;
-      expect(msg).toContain("cache");
-      expect(msg).toMatch(/isolated/i);
-    }
+    expect(() => parseStack(yaml)).toThrow(/cannot depends_on isolated service/);
   });
 
   it("allows an isolated service with a namespace (no #128 regression)", () => {
@@ -1127,17 +1115,6 @@ services:
   web:
     tier: isolated
     command: "node server.js"
-`;
-    expect(codeOf(() => parseStack(yaml))).toBe("CONFIG_INVALID");
-  });
-
-  it("tags the shared-namespace rejection (issue #130) with code CONFIG_INVALID", () => {
-    const yaml = `
-services:
-  postgres:
-    tier: shared
-    command: "postgres"
-    namespace: local-backend
 `;
     expect(codeOf(() => parseStack(yaml))).toBe("CONFIG_INVALID");
   });

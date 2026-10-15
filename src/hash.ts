@@ -164,6 +164,20 @@ export function sharedStackHash(stack: ResolvedStack): string {
 }
 
 /**
+ * SHA-256 hex digest of ONE shared service's definition: its revision, the
+ * unit `SHARED_DRIFT` is scoped by (#236). The same canonical fields
+ * `sharedStackHash` covers for the whole subset, so a service drifts exactly
+ * when it would have tripped the subset hash. `namespace` is left out like
+ * there: it decides which `up`s select the service, not what the running
+ * process is, so moving a shared service between namespaces is not drift.
+ */
+export function sharedServiceHash(service: ResolvedService): string {
+  return createHash("sha256")
+    .update(JSON.stringify(canonicalBase(service)))
+    .digest("hex");
+}
+
+/**
  * The five process-compose fields `sharedStackHash` deliberately leaves out
  * (#183), per shared service, keyed by service name with `devtrees.yaml`
  * field names. Absent fields are null, blocks key-sorted, so two equal

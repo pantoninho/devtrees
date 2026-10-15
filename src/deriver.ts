@@ -276,6 +276,15 @@ export interface SharedDeriveContext {
   readonly anchor?: string;
   /** Resolve a declared shared named port to its repo-wide allocated number. */
   readonly portFor: PortResolver;
+  /**
+   * The shared services to emit processes for (#236), by name. Absent: every
+   * shared service. A namespaced shared service runs only once an `up`
+   * selects it, so a fresh shared start emits the selected ones and adding
+   * one to a running instance emits just that one. The env injection still
+   * covers every shared service's named ports either way, so a process's
+   * environment does not depend on which services were selected with it.
+   */
+  readonly services?: ReadonlyArray<string>;
 }
 
 export interface DerivedShared {
@@ -298,6 +307,8 @@ export interface DerivedShared {
  */
 export function deriveSharedConfig(stack: ResolvedStack, ctx: SharedDeriveContext): DerivedShared {
   const shared = stack.services.filter((s) => s.tier === "shared");
+  const only = ctx.services === undefined ? undefined : new Set(ctx.services);
+  const emitted = only === undefined ? shared : shared.filter((s) => only.has(s.name));
 
   const env: Record<string, string> = {};
   collectPortEnv(shared, ctx.portFor, env);
@@ -305,7 +316,7 @@ export function deriveSharedConfig(stack: ResolvedStack, ctx: SharedDeriveContex
   const { processes, droppedEdges } = buildTierProcesses({
     stack,
     tier: "shared",
-    services: shared,
+    services: emitted,
     workingDir: ctx.workingDir,
     // Shared-tier logs live under the fixed `shared` instance id so they never
     // collide with any worktree's logs (issue #136).
@@ -316,7 +327,7 @@ export function deriveSharedConfig(stack: ResolvedStack, ctx: SharedDeriveContex
   return {
     config: {
       processes,
-      [DEVTREES_METADATA_KEY]: { ports_by_service: collectPortsByService(shared, ctx.portFor) },
+      [DEVTREES_METADATA_KEY]: { ports_by_service: collectPortsByService(emitted, ctx.portFor) },
     },
     env,
     droppedEdges,

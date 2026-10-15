@@ -446,11 +446,10 @@ describe("built CLI e2e — argv→commands wiring over the stub process-compose
     expect(existsSync(sock)).toBe(false);
   }, 60_000);
 
-  it("rejects a namespaced shared service as CONFIG_INVALID with no side effects (#130)", () => {
-    // A shared service can't be namespace-selected (ADR-0001 singleton), so a
-    // `namespace` on it is rejected at resolution time. Exercised through
-    // `up --dry-run --json` — a resolve-only path — so the envelope must carry
-    // CONFIG_INVALID (not UNKNOWN) and produce no config/socket side effects.
+  it("previews a namespaced shared service only for an up that selects its namespace (#236)", () => {
+    // #130 used to reject `namespace` on a shared service; since #236 it
+    // decides which `up`s use the service (ADR-0010). Exercised through
+    // `up --dry-run --json`, a resolve-only path with no side effects.
     const {
       wt,
       id,
@@ -467,13 +466,23 @@ describe("built CLI e2e — argv→commands wiring over the stub process-compose
         "",
       ].join("\n"),
     );
-    const dry = devtrees(wt, ["up", "--dry-run", "--json"]);
-    expect(dry.code, `expected a non-zero exit; stdout=${dry.stdout}`).not.toBe(0);
-    const err = (dry.doc as ErrorDoc).error;
-    expect(err?.code).toBe("CONFIG_INVALID");
-    // Message names the offending service and points at the isolated-only rule.
-    expect(err?.message).toContain("db");
-    expect(err?.message).toMatch(/isolated/i);
+    type SharedDry = {
+      up_dry_run: {
+        selected_shared_services: string[];
+        shared_config: { processes: Record<string, unknown> };
+      };
+    };
+    const bare = devtrees(wt, ["up", "--dry-run", "--json"]);
+    expect(bare.code, `dry-run failed: ${bare.stderr}`).toBe(0);
+    expect((bare.doc as SharedDry).up_dry_run.selected_shared_services).toEqual([]);
+    expect(Object.keys((bare.doc as SharedDry).up_dry_run.shared_config.processes)).toEqual([]);
+
+    const selected = devtrees(wt, ["up", "--dry-run", "--json", "-n", "local-backend"]);
+    expect(selected.code, `dry-run failed: ${selected.stderr}`).toBe(0);
+    expect((selected.doc as SharedDry).up_dry_run.selected_shared_services).toEqual(["db"]);
+    expect(Object.keys((selected.doc as SharedDry).up_dry_run.shared_config.processes)).toEqual([
+      "db",
+    ]);
 
     // No side effects: no derived config and no control socket were written.
     expect(existsSync(join(devtreesDir, `${id}.yaml`)), "no worktree config").toBe(false);

@@ -49,6 +49,7 @@ export const ERROR_CODES = [
   "CONFIG_DRIFT",
   "SHARED_DRIFT",
   "SHARED_START_FAILED",
+  "SHARED_ACTIVATION_FAILED",
   "WORKTREE_START_FAILED",
   "NO_SERVICES_SELECTED",
   "SOCKET_PATH_TOO_LONG",
@@ -102,9 +103,11 @@ export const ERROR_CODE_DESCRIPTIONS: Readonly<Record<ErrorCode, string>> = {
   CONFIG_DRIFT:
     "Running config differs from devtrees.yaml and hot-reload failed, or an earlier reload is still pending; `details.reason` is `timeout`, `not_supported`, `error`, or `reload_pending` (nothing was reloaded: kill `details.pids`, then retry; empty `pids` means the old process is gone and process-compose is still starting the new one, so retry shortly).",
   SHARED_DRIFT:
-    "This worktree's shared services diverge from the running shared instance; bring shared down and up again.",
+    "A shared service this `up` selects diverges from the revision the running shared instance runs (an `up` that does not select it is unaffected); `details.services` lists each `{service, running_hash, local_hash}`, `details.port_conflicts` each named port a running shared service already owns, `details.remedy` is `devtrees down --shared && devtrees up` (for every worktree).",
   SHARED_START_FAILED:
     "The lazy-started shared instance died before binding its control socket; `details.config_path` is the config to run by hand.",
+  SHARED_ACTIVATION_FAILED:
+    "Adding a selected namespaced shared service to the running shared instance failed (process-compose refused or timed out on the config reload); the shared services it already ran are untouched. `details` has `{services, reason, config_path, remedy}`.",
   WORKTREE_START_FAILED:
     "This worktree's instance died before binding its control socket; `details.config_path` is the config to run by hand.",
   NO_SERVICES_SELECTED:
@@ -590,6 +593,11 @@ export interface UpPayload {
   readonly env: Readonly<Record<string, string>>;
   readonly sharedStarted: boolean;
   /**
+   * Namespaced shared services this `up` added to the running shared instance
+   * (#236). JSON mode always emits `shared_activated` (possibly empty).
+   */
+  readonly sharedActivated?: ReadonlyArray<string>;
+  /**
    * Base port of this worktree's allocated block (issue #30). Present on every
    * successful `up`; absent on the older minimal-ack shape some tests still
    * exercise. JSON output omits the field when undefined so the schema stays
@@ -632,7 +640,12 @@ function formatUpHuman(payload: UpPayload): string {
   const ports = Object.entries(payload.env)
     .map(([k, v]) => `  ${k}=${v}`)
     .join("\n");
-  const sharedNote = payload.sharedStarted ? "devtrees up: shared instance started.\n" : "";
+  const activated = payload.sharedActivated ?? [];
+  const sharedNote =
+    (payload.sharedStarted ? "devtrees up: shared instance started.\n" : "") +
+    (activated.length > 0
+      ? `devtrees up: added shared service(s) to the shared instance: ${activated.join(", ")}.\n`
+      : "");
   const restarted = payload.restarted ?? [];
   const restartNote =
     restarted.length > 0
@@ -659,6 +672,8 @@ export function formatUp(payload: UpPayload, mode: FormatMode): OutputResult {
       env: payload.env,
       services: (payload.services ?? []).map(lsServiceJson),
       shared_started: payload.sharedStarted,
+      // Always present, even empty (#236).
+      shared_activated: payload.sharedActivated ?? [],
       // Always present, even empty (#179) — the `up_dry_run.dropped_edges`
       // contract (#169): an empty list is the answer "nothing was dropped".
       dropped_namespace_edges: (payload.droppedNamespaceEdges ?? []).map(droppedNamespaceEdgeJson),
@@ -869,6 +884,11 @@ export interface UpDryRunPayload {
   readonly wouldReload?: boolean;
   /** Running only (#210): dead selected services the real `up` would restart. */
   readonly wouldRestart?: ReadonlyArray<string>;
+  /**
+   * The shared services the selection includes (#236). Optional so a test
+   * stub can omit it; absent reads as none.
+   */
+  readonly selectedSharedServices?: ReadonlyArray<string>;
 }
 
 /**
@@ -892,7 +912,14 @@ function formatPlanNotice(payload: UpDryRunPayload): string {
   if (restart.length > 0) {
     out += `devtrees: up would restart dead service(s): ${restart.join(", ")}\n`;
   }
-  return out;
+  return out + formatSharedSelectionNotice(payload.selectedSharedServices ?? []);
+}
+
+/** The stderr line naming the shared services the previewed `up` would use (#236). */
+function formatSharedSelectionNotice(shared: ReadonlyArray<string>): string {
+  return shared.length > 0
+    ? `devtrees: up would use shared service(s): ${shared.join(", ")}\n`
+    : "";
 }
 
 /**
@@ -982,7 +1009,8 @@ function droppedEdgeJson(edge: DroppedEdge): Record<string, string> {
  *
  *   - `json`: `{schema_version, up_dry_run: {worktree_id, env, config,
  *     dropped_edges, dropped_namespace_edges, braced_env_vars, instance,
- *     namespaces?, selected_services?, would_reload, would_restart,
+ *     namespaces?, selected_services?, selected_shared_services,
+ *     would_reload, would_restart,
  *     shared_env?, shared_config?}}` — one byte-clean document
  *     on stdout, the agent-readable preview of what `up` would run. `shared_*`
  *     keys are omitted when the stack has no shared services; `dropped_edges`
@@ -1032,6 +1060,9 @@ export function formatUpDryRun(payload: UpDryRunPayload, mode: FormatMode): Outp
       dry.namespaces = payload.selection.namespaces;
       dry.selected_services = payload.selection.services;
     }
+    // The shared services that selection includes (#236): always-on ones plus
+    // the namespaced ones it selects. Always present (empty with no shared tier).
+    dry.selected_shared_services = payload.selectedSharedServices ?? [];
     // What the real `up` would do to a running instance (#210); `false` and
     // `[]` on a fresh preview.
     dry.would_reload = payload.wouldReload ?? false;
