@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/pantoninho/devtrees/compare/v0.3.0...v0.4.0) (2026-10-15)
+
+
+### Features
+
+* up restarts dead shared services instead of failing SHARED_SERVICE_DEAD ([#241](https://github.com/pantoninho/devtrees/issues/241)) ([cb1c598](https://github.com/pantoninho/devtrees/commit/cb1c5980d2ca46e495873bef08d14990f2358c6d))
+
 ## [0.3.0](https://github.com/pantoninho/devtrees/compare/v0.2.0...v0.3.0) (2026-10-15)
 
 
