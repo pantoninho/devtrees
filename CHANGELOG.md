@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.0](https://github.com/pantoninho/devtrees/compare/v0.2.0...v0.3.0) (2026-10-15)
+
+
+### ⚠ BREAKING CHANGES
+
+* a branch that adds or removes a shared service no longer fails SHARED_DRIFT (an added one joins the running shared instance); SHARED_DRIFT is raised only for shared services the up selects, and can be raised for a namespaced one while running_hash equals local_hash (the per-service revisions are in details.services[]); up --dry-run's shared_config lists only the selected shared services.
+* `devtrees stop` is removed and is now an unknown command, and the SERVICE_STOP_INCOMPLETE error code is gone. Use `devtrees restart <service...>` (or `restart -n <namespace>`) to cycle a live service in place. To stop a service by hand (e.g. to run it yourself on its port), use `devtrees attach` and stop it in the process-compose TUI; the next `devtrees up` starts it again.
+
+### Features
+
+* namespaced shared services, with SHARED_DRIFT scoped to the selection ([#236](https://github.com/pantoninho/devtrees/issues/236)) ([#237](https://github.com/pantoninho/devtrees/issues/237)) ([c21fac6](https://github.com/pantoninho/devtrees/commit/c21fac65af43e40e9b7451e10c82dabbb745b229))
+* remove devtrees stop ([#234](https://github.com/pantoninho/devtrees/issues/234)) ([c0f6a0e](https://github.com/pantoninho/devtrees/commit/c0f6a0e4144e7c799431d467ab3481c08a282f14))
+
 ## [0.2.0](https://github.com/pantoninho/devtrees/compare/v0.1.0...v0.2.0) (2026-10-13)
 
 
