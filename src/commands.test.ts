@@ -7996,4 +7996,81 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
       "db-shared",
     ]);
   });
+
+  it("a timed-out add is recorded and fails SHARED_ACTIVATION_FAILED; the retried up re-sends the reload", async () => {
+    const fixture = multiWorktreeFixture("dt-nss-timeout-");
+    await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+
+    // process-compose never answers the reload within its budget.
+    const hanging = wt(fixture, base, "billing", { namespaces: ["app", "db-shared"] });
+    const hangingRequest: ControlRequester = (request) =>
+      new Promise((_resolve, reject) => {
+        request.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+      });
+    const onlyPostgres = async (socketPath: string): Promise<ServiceStatus[]> =>
+      socketPath.endsWith("/shared.sock") ? [runningRow("postgres")] : [runningRow("api")];
+    const err = await failure(
+      runUp({
+        ...hanging.deps,
+        driver: { ...hanging.deps.driver, controlRequest: hangingRequest, reloadTimeoutMs: 20 },
+        getServiceStatuses: onlyPostgres,
+      }),
+    );
+    expect(err?.code).toBe("SHARED_ACTIVATION_FAILED");
+    expect(err?.details).toMatchObject({
+      services: ["db-shared"],
+      reason: "timeout",
+      remedy: "retry `devtrees up`",
+    });
+    // Kept and recorded: process-compose may still apply it.
+    expect(Object.keys(sharedConfigOf(fixture))).toEqual(["postgres", "db-shared"]);
+    expect(readSharedState(fixture.sharedAnchor)?.services?.["db-shared"]).toBeDefined();
+
+    // The reload never landed: the instance still runs postgres alone. The
+    // retry must not trust the record — it re-sends the reload.
+    const retry = wt(fixture, base, "billing", { namespaces: ["app", "db-shared"] });
+    const result = await runUp({ ...retry.deps, getServiceStatuses: onlyPostgres });
+    expect(result.sharedActivated).toEqual(["db-shared"]);
+    expect(retry.reloads).toHaveLength(1);
+    expect(Object.keys(sharedConfigOf(fixture))).toEqual(["postgres", "db-shared"]);
+  });
+
+  it("a recorded service the instance runs is not re-added", async () => {
+    const fixture = multiWorktreeFixture("dt-nss-present-");
+    await runUp(wt(fixture, base, "login", { namespaces: ["app", "db-shared"] }).deps);
+    const again = wt(fixture, base, "billing", { namespaces: ["app", "db-shared"] });
+    const result = await runUp(again.deps);
+    expect(result.sharedActivated).toEqual([]);
+    expect(again.reloads).toEqual([]);
+  });
+
+  it("a shared instance with no shared state (pre-#83) cannot have a namespaced service added: SHARED_ACTIVATION_FAILED", async () => {
+    const fixture = multiWorktreeFixture("dt-nss-pre83-");
+    const dir = runDir(fixture.sharedAnchor);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "shared.sock"), "");
+
+    // Always-on only: the old positional fallback still applies.
+    const ok = await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+    expect(ok.sharedStarted).toBe(false);
+
+    const err = await failure(
+      runUp(wt(fixture, base, "billing", { namespaces: ["app", "db-shared"] }).deps),
+    );
+    expect(err?.code).toBe("SHARED_ACTIVATION_FAILED");
+    expect(err?.details).toMatchObject({ services: ["db-shared"], reason: "not_supported" });
+  });
+
+  it("SHARED_DRIFT keeps running_hash/local_hash as the always-on whole-subset hashes", async () => {
+    const fixture = multiWorktreeFixture("dt-nss-hashes-");
+    await runUp(wt(fixture, base, "login", { namespaces: ["app", "db-shared"] }).deps);
+    const err = await failure(
+      runUp(wt(fixture, drifted, "billing", { namespaces: ["app", "db-shared"] }).deps),
+    );
+    const alwaysOn = { services: [base.services[0] as ResolvedService] };
+    expect(err?.details).toMatchObject({
+      running_hash: sharedStackHash(alwaysOn),
+      local_hash: sharedStackHash(alwaysOn),
+    });
+  });
 });

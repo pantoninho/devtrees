@@ -75,6 +75,11 @@ are. It never stops anything, and never attaches the TUI.
 - \`-n\` cannot add a namespace the running stack was not booted with: \`up\`
   fails with \`NAMESPACE_NOT_RUNNING\`. Boot with it: \`devtrees down && devtrees
   up -n …\` (the message names the exact command).
+- If the stack has **namespaced shared services** (\`tier: shared\` with a
+  \`namespace:\`), **always pass \`-n\`**, every time, naming the same
+  namespaces you booted with. A bare \`up\` cannot tell that a namespace holding
+  only shared services was booted, so it does not select them: it neither
+  checks them for drift nor adds them back after \`down --shared\`.
 - A dead selected service (crashed, killed, or exited non-zero) is started
   again, and \`up\` names it (\`restarted\` in the \`--json\` envelope). Several
   dead services are started in \`depends_on\` order, without waiting between

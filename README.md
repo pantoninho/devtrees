@@ -260,10 +260,14 @@ services:
 - `env` takes no `-n`, so it checks only the always-on shared services.
 - Every `up` and `env` still injects every shared service's ports, selected or
   not.
-- On a running instance, a bare `up` selects the namespaces the instance
-  booted, read back from process-compose. A namespace that holds only shared
-  services leaves no trace there, so a bare `up` does not select it; pass
-  `-n` for it.
+- **Always pass `-n` when a stack has namespaced shared services.** On a
+  running instance, a bare `up` selects the namespaces the instance booted,
+  read back from process-compose. A namespace that holds only shared
+  services leaves no trace there, so a bare `up` does not select it: it
+  neither checks it for drift nor adds it back after `down --shared`.
+- If adding a service times out (`SHARED_ACTIVATION_FAILED`, `reason:
+  timeout`), retry `up`. A retried `up` that finds a recorded service missing
+  from the shared instance re-sends the reload.
 - `up --dry-run` lists the shared services the selection includes in
   `selected_shared_services` (always present).
 
@@ -439,6 +443,11 @@ are. It never stops anything, and never attaches the TUI.
 - `-n` cannot add a namespace the running stack was not booted with: `up`
   fails with `NAMESPACE_NOT_RUNNING`. Boot with it: `devtrees down && devtrees
   up -n …` (the message names the exact command).
+- If the stack has **namespaced shared services** (`tier: shared` with a
+  `namespace:`), **always pass `-n`**, every time, naming the same
+  namespaces you booted with. A bare `up` cannot tell that a namespace holding
+  only shared services was booted, so it does not select them: it neither
+  checks them for drift nor adds them back after `down --shared`.
 - A dead selected service (crashed, killed, or exited non-zero) is started
   again, and `up` names it (`restarted` in the `--json` envelope). Several
   dead services are started in `depends_on` order, without waiting between

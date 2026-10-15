@@ -241,8 +241,10 @@ class ConfigDriftError extends Error {
  * `details.services` names each drifted service with both revisions;
  * `details.port_conflicts` each named port a not-yet-running selected service
  * declares that a running shared service already owns. `running_hash` /
- * `local_hash` are the first drifted service's revisions (before #236 they
- * were whole-subset hashes; both only ever meant "these differ").
+ * `local_hash` keep their pre-#236 meaning, the whole-subset hash
+ * (`sharedStackHash`) of the shared instance's always-on services and of this
+ * worktree's: for a stack with no namespaced shared service, exactly what
+ * they always were. Per-service revisions are only in `services[]`.
  */
 class SharedDriftError extends Error {
   readonly code = "SHARED_DRIFT" as const;
@@ -572,7 +574,14 @@ function shortRevision(hash: string): string {
  * trips it, and neither does any edit to a shared service this `up` does not
  * select.
  */
-function assertSharedPlanClean(plan: SharedPlan, worktreeId: string): void {
+function assertSharedPlanClean(
+  plan: SharedPlan,
+  ctx: {
+    readonly worktreeId: string;
+    readonly state: SharedState;
+    readonly stack: ResolvedStack;
+  },
+): void {
   if (plan.drifted.length === 0 && plan.portConflicts.length === 0) return;
   const drifted = plan.drifted.map(
     (d) =>
@@ -582,7 +591,6 @@ function assertSharedPlanClean(plan: SharedPlan, worktreeId: string): void {
   const conflicts = plan.portConflicts.map(
     (c) => `'${c.service}' declares ${c.port}, which running shared service '${c.owner}' owns`,
   );
-  const first = plan.drifted[0];
   throw new SharedDriftError(
     `the shared instance runs a different definition of shared services this up selects: ` +
       `${[...drifted, ...conflicts].join("; ")} ` +
@@ -592,9 +600,12 @@ function assertSharedPlanClean(plan: SharedPlan, worktreeId: string): void {
       `Run \`${SHARED_DRIFT_REMEDY}\` to restart shared from this worktree's config ` +
       `(this stops the shared instance for every worktree).`,
     {
-      worktree_id: worktreeId,
-      running_hash: first?.runningHash ?? "",
-      local_hash: first?.localHash ?? "",
+      worktree_id: ctx.worktreeId,
+      running_hash: ctx.state.hash,
+      local_hash: sharedStackHash({
+        ...ctx.stack,
+        services: sharedServicesOf(ctx.stack).filter(isAlwaysOnShared),
+      }),
       services: plan.drifted.map((d) => ({
         service: d.service,
         running_hash: d.runningHash,
@@ -2271,13 +2282,6 @@ export async function runAttach(
   await driver.attach({ configPath: paths.configPath, socketPath: paths.socketPath });
 }
 
-/**
- * Outcome of `ensureSharedStarted`: whether THIS call lazy-started the shared
- * instance, and the authoritative name→port map worktrees must inject for
- * shared services (issue #83). `ports` is `undefined` only on the legacy
- * fallback — a shared instance started by a pre-#83 devtrees whose anchor
- * state has no persisted map; the caller falls back to positional offsets.
- */
 /** The shared-tier outcome of one `up` (#236): what it started, added and injects. */
 interface SharedOutcome {
   /** This `up` lazy-started the shared instance. */
@@ -2330,7 +2334,17 @@ async function prepareShared(args: {
     selected,
     seed,
     args.sharedLock,
-    { driver, probe: args.probe, socketTimeoutMs: deps.sharedSocketTimeoutMs, warn: args.warn },
+    {
+      driver,
+      probe: args.probe,
+      socketTimeoutMs: deps.sharedSocketTimeoutMs,
+      warn: args.warn,
+      readSharedRows: () =>
+        statusReader(
+          deps,
+          driver,
+        )(sharedInstancePaths(anchor.anchor).socketPath).catch(() => undefined),
+    },
   );
   if (!ensured.started) {
     const added = new Set(ensured.activated);
@@ -2400,12 +2414,22 @@ async function runningSharedNamespaces(args: {
     .namespaces;
 }
 
+/**
+ * Outcome of `ensureSharedStarted`: whether THIS call lazy-started the shared
+ * instance, which selected shared services it added to the running one
+ * (#236), and the authoritative name→port map worktrees must inject for
+ * shared services (issue #83). `ports` is `undefined` only on the legacy
+ * fallback — a shared instance started by a pre-#83 devtrees whose anchor
+ * state has no persisted map; the caller falls back to positional offsets.
+ */
 interface EnsuredShared {
   readonly started: boolean;
   /**
-   * Namespaced shared services this call added to an already-running shared
-   * instance (#236), in declaration order. Empty when it started the instance
-   * (`started`), or when everything selected was already running.
+   * Shared services this call added to an already-running shared
+   * instance (#236), in declaration order: selected services it did not run,
+   * including ones recorded by an earlier add whose reload timed out and never
+   * landed. Empty when it started the instance (`started`), or when everything
+   * selected was already running.
    */
   readonly activated: ReadonlyArray<string>;
   /** Extended shared fields edited since the running instance started (#185). */
@@ -2429,6 +2453,12 @@ interface EnsureSharedDeps {
   readonly socketTimeoutMs?: number;
   /** Sink for the shared-field-change warnings (#185). */
   readonly warn: (message: string) => void;
+  /**
+   * One `process list` read of the running shared instance; `undefined` when
+   * it cannot be read. Lets a retried `up` see a service a timed-out add
+   * recorded but process-compose never started (#236).
+   */
+  readonly readSharedRows: () => Promise<ServiceStatus[] | undefined>;
 }
 
 /**
@@ -2502,10 +2532,11 @@ async function reconcileLiveShared(
   const { anchor, stack, selected, seed, deps } = step;
   const state = readRecordedSharedState(anchor, stack);
   // Legacy fallback: a pre-#83 shared instance left no persisted map.
-  // Positional computation is all we have — same behaviour as before.
-  if (state === undefined) return { started: false, activated: [], fieldChanges: [] };
+  // Positional computation is all we have — same behaviour as before, as long
+  // as nothing has to be added: what that instance runs cannot be known.
+  if (state === undefined) return legacySharedInstance(selected, anchor);
   const plan = planSharedSelection(selected, state.services);
-  assertSharedPlanClean(plan, step.worktreeId);
+  assertSharedPlanClean(plan, { worktreeId: step.worktreeId, state, stack });
   const selectedNames = selected.map((s) => s.name);
   const fieldChanges = sharedFieldChanges(state, pick(sharedExtendedFields(stack), selectedNames));
   for (const change of fieldChanges) deps.warn(formatSharedFieldChangeWarning(change));
@@ -2514,15 +2545,70 @@ async function reconcileLiveShared(
     bound: state.ports,
     ...seed,
   });
-  if (plan.missing.length > 0) {
-    await activateShared({ ...step, state, missing: plan.missing, ports });
+  const toAdd = await servicesToAdd(selected, plan, state, deps);
+  if (toAdd.length > 0) {
+    await activateShared({ ...step, state, missing: toAdd, ports });
   }
   return {
     started: false,
-    activated: plan.missing.map((s) => s.name),
+    activated: toAdd.map((s) => s.name),
     ports,
     fieldChanges,
   };
+}
+
+/**
+ * The selected shared services to add to the running instance: the ones it
+ * has no record of, plus — when its `process list` can be read — recorded
+ * ones it does not actually run. The second kind is a service an earlier add
+ * recorded after its reload timed out, which process-compose never applied:
+ * a retried `up` re-sends the reload rather than trusting the record. A
+ * missing row is otherwise invisible: the dead-service check counts "no row"
+ * as not dead.
+ */
+async function servicesToAdd(
+  selected: ReadonlyArray<ResolvedService>,
+  plan: SharedPlan,
+  state: RecordedSharedState,
+  deps: EnsureSharedDeps,
+): Promise<ResolvedService[]> {
+  const missing = new Set(plan.missing.map((s) => s.name));
+  const recorded = selected.filter((s) => !missing.has(s.name) && state.services[s.name]);
+  const rows = recorded.length > 0 ? await deps.readSharedRows() : undefined;
+  const present = new Set((rows ?? []).map((r) => r.name));
+  const absent = new Set(
+    rows === undefined ? [] : recorded.filter((s) => !present.has(s.name)).map((s) => s.name),
+  );
+  return selected.filter((s) => missing.has(s.name) || absent.has(s.name));
+}
+
+/**
+ * A running shared instance started by a devtrees older than #83 left no
+ * state, so what it runs is unknown. Always-on shared services keep the old
+ * positional fallback; a selected namespaced one cannot be added safely and
+ * fails `SHARED_ACTIVATION_FAILED` instead of an `up` that silently runs
+ * without it.
+ */
+function legacySharedInstance(
+  selected: ReadonlyArray<ResolvedService>,
+  anchor: string,
+): EnsuredShared {
+  const namespaced = selected.filter((s) => !isAlwaysOnShared(s)).map((s) => s.name);
+  if (namespaced.length > 0) {
+    throw new SharedActivationFailedError(
+      `devtrees up: cannot add shared service(s) ${namespaced.map((s) => `'${s}'`).join(", ")} ` +
+        `to the running shared instance: it was started by a devtrees that records no shared ` +
+        `state, so what it runs is unknown. Nothing was changed. Next: ` +
+        `${SHARED_DRIFT_REMEDY} (for every worktree).`,
+      {
+        services: namespaced,
+        reason: "not_supported",
+        config_path: sharedInstancePaths(anchor).configPath,
+        remedy: `${SHARED_DRIFT_REMEDY} (for every worktree)`,
+      },
+    );
+  }
+  return { started: false, activated: [], fieldChanges: [] };
 }
 
 /** Lazy-start the shared instance with exactly the selected shared services. */
@@ -2591,7 +2677,9 @@ async function startShared(step: SharedStep): Promise<EnsuredShared> {
  * On a refused reload the previous config is restored and nothing is
  * recorded. On a timed-out one the new config stays and the services are
  * recorded: process-compose may still be applying it, and a later reload
- * from a config without them would stop them again.
+ * from a config without them would stop them again. A retried `up` that
+ * finds a recorded service absent from the instance re-sends the reload
+ * (`servicesToAdd`); it is idempotent, the config already holds the process.
  */
 async function activateShared(
   step: SharedStep & {
@@ -2617,12 +2705,15 @@ async function activateShared(
     services: names,
   }).config;
   ensureLogsDir(stack, logsDir(anchor, SHARED_INSTANCE_ID), "shared");
-  writeFileSync(paths.configPath, stringifyYaml(mergeDerived(previous, added)), "utf8");
+  const merged = mergeDerived(previous, added);
+  writeFileSync(paths.configPath, stringifyYaml(merged), "utf8");
 
-  const reload = await deps.driver.reloadConfig({
-    configPath: paths.configPath,
-    socketPath: paths.socketPath,
-  });
+  // Same budget as a worktree hot-reload (#188): the base plus the merged
+  // config's shutdown timeouts. An add stops nothing, so it rarely matters.
+  const reload = await deps.driver.reloadConfig(
+    { configPath: paths.configPath, socketPath: paths.socketPath },
+    { timeoutMs: reloadTimeoutMs(merged) },
+  );
   if (!reload.ok && reload.reason !== "timeout") {
     writeFileSync(paths.configPath, previousYaml, "utf8");
     throw activationFailed(names, reload.reason, paths.configPath, reload.message);
@@ -4121,7 +4212,7 @@ export async function runEnv(deps: CommandDeps = {}): Promise<EnvResult> {
     const state = readRecordedSharedState(anchor.anchor, stack);
     if (state !== undefined) {
       const plan = planSharedSelection(selectSharedServices(stack, []), state.services);
-      assertSharedPlanClean(plan, anchor.worktreeId);
+      assertSharedPlanClean(plan, { worktreeId: anchor.worktreeId, state, stack });
       const ports = resolveSharedPorts({
         services: sharedServicesOf(stack),
         bound: state.ports,
