@@ -87,11 +87,11 @@ export const ERROR_CODE_DESCRIPTIONS: Readonly<Record<ErrorCode, string>> = {
   SERVICE_NOT_FOUND:
     "The named service does not exist in the target instance; `details.valid_services` lists the known ones.",
   HEALTH_TIMEOUT:
-    'Stack started but services did not report healthy before the wait window expired, or a selected service is dead, including one `up` or `restart` restarted (`details.dead_services`); after `restart`, `devtrees restart <service>` retries it. A dead shared service `up` restarted that never became healthy is this code too, with `details.instance: "shared"` and the shared `details.remedy`.',
+    "Stack started but services did not report healthy before the wait window expired, or a selected service is dead, including one `up` or `restart` restarted (`details.dead_services`); after `restart`, `devtrees restart <service>` retries it.",
   NAMESPACE_NOT_RUNNING:
     "`up -n` named a namespace the running instance was not booted with, or `restart` named a service in one, or such a namespace with `-n`; `details` has `{worktree_id, namespaces, services, remedy}`, the remedy being the `down` + `up` that boots it.",
   SHARED_SERVICE_DEAD:
-    "A dead shared service `up` could not repair (`details.reason`): process-compose refused to restart it (`start_refused`, `details.start_failures`), it died again after `up` restarted it (`died_again`), it died during the shared-health wait (`died_while_waiting`), or the shared instance records no state to check it against (`unknown_revision`). Other dead shared services `up` restarts itself. Run `details.remedy` (`devtrees down --shared && devtrees up`).",
+    "A shared service `up` could not bring back (`details.reason`): process-compose refused to restart it (`start_refused`, `details.start_failures`), it died again after `up` restarted it (`died_again`), it died while `up` waited on it (`died_while_waiting`), it did not become healthy within `--wait-timeout` (`not_healthy`, `details.unhealthy_services`), or the shared instance records no state to check it against (`unknown_revision`). Other dead shared services `up` restarts itself. Run `details.remedy` (`devtrees down --shared && devtrees up`).",
   SERVICE_START_FAILED:
     "`up` tried to restart a dead service on the running instance, or `restart` a named one, and process-compose refused; `details.services` names each one, `details.remedy` says what to run next. The instance is still running.",
   SHARED_SERVICE_REFUSED:

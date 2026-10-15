@@ -421,6 +421,8 @@ class UpCommand extends DevtreesCommand {
   waitTimeout = Option.String("--wait-timeout", {
     description:
       "Health-wait timeout in seconds for the headless (`--no-attach` / `--json`) path. Default 120. " +
+      "When the shared instance is already running, `up` first waits up to this long for the shared services it selects, " +
+      "then for this worktree's, so the worst case is about double. " +
       "Ignored when the TUI is attached — the live view, not a silent wait, signals readiness. " +
       "With `--dry-run` on a running instance, bounds its one read of the instance's state instead (default 5).",
   });

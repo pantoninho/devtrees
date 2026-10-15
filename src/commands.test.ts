@@ -291,6 +291,9 @@ function stubDeps(opts: {
     // stub — the default polls a real `process-compose` over the UDS, which
     // would hang the unit test. Tests that *do* care override this field.
     waitForHealth: () => Promise.resolve(),
+    // Same for the wait on an already-running shared instance's services
+    // (#240); the tests that care use the real one.
+    waitForSharedReady: () => Promise.resolve(),
     // Default verdict "running" preserves the pre-#80 semantics existing
     // tests fake liveness with (touching a plain file at the socket path).
     probeSocket: opts.probeSocket ?? (async () => "running" as const),
@@ -8103,6 +8106,8 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
       };
       const withDead: CommandDeps = {
         ...deps,
+        // The real wait on the shared services (#240), not the suite's no-op.
+        waitForSharedReady: undefined,
         getServiceStatuses: async (socketPath, readOpts) =>
           socketPath === sharedSock ? sharedRows() : worktreeRows(socketPath, readOpts),
         driver: {
@@ -8199,9 +8204,71 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
           { name: "db-shared", status: "Restarting", health: "unknown", exitCode: -1 },
         ],
       });
-      const result = await runUp(billing.deps);
+      // Nothing is started; up still waits for the Restarting service, and
+      // fails not_healthy when it never comes back.
+      const err = await failure(runUp({ ...billing.deps, waitTimeoutMs: 300 }));
+      expect(billing.starts).toEqual([]);
+      expect(err?.code).toBe("SHARED_SERVICE_DEAD");
+      expect(err?.details).toMatchObject({
+        reason: "not_healthy",
+        unhealthy_services: ["db-shared"],
+      });
+    });
+
+    it("an up that restarts nothing still waits for a running shared service that is not ready yet", async () => {
+      // Another worktree's up restarted db-shared: Running, its probe not passed yet.
+      const probed: ResolvedStack = {
+        services: base.services.map((s) =>
+          s.name === "db-shared" ? { ...s, readinessProbe: { exec: { command: "x" } } } : s,
+        ),
+      };
+      const fixture = await sharedRunning("dt-rds-notready-", probed);
+      const billing = againstDead(fixture, probed, "billing", {
+        namespaces: ["app", "db-shared"],
+        dead: [],
+      });
+      const rows = billing.deps.getServiceStatuses;
+      if (rows === undefined) throw new Error("expected stub");
+      let sharedReads = 0;
+      const result = await runUp({
+        ...billing.deps,
+        getServiceStatuses: async (socketPath, o) => {
+          if (socketPath !== billing.sharedSock) return rows(socketPath, o);
+          sharedReads += 1;
+          const ready = sharedReads >= 4;
+          return [
+            runningRow("postgres"),
+            { name: "db-shared", status: "Running", health: ready ? "ready" : "not_ready" },
+          ];
+        },
+      });
       expect(billing.starts).toEqual([]);
       expect(result.sharedRestarted).toEqual([]);
+      // It returned only once the probe passed.
+      expect(sharedReads).toBeGreaterThanOrEqual(4);
+    });
+
+    it("on the running path the shared wait runs outside the worktree lifecycle lock; on the fresh path inside it", async () => {
+      const fixture = await sharedRunning("dt-rds-lock-");
+      // A `down` of the same worktree must get the lock while up waits on shared.
+      const lockFreeDuringWait = async (deps: CommandDeps, id: string): Promise<boolean> => {
+        let free: boolean | undefined;
+        await runUp({
+          ...deps,
+          waitForSharedReady: async () => {
+            free = await withLifecycleLock(fixture.sharedAnchor, id, async () => true, {
+              retries: 0,
+            }).catch(() => false);
+          },
+        });
+        if (free === undefined) throw new Error("the shared wait did not run");
+        return free;
+      };
+      const fresh = wt(fixture, base, "billing", { namespaces: ["app", "db-shared"] });
+      const id = idFor(fixture.wtRoot, "billing");
+      expect(await lockFreeDuringWait(fresh.deps, id)).toBe(false);
+      const running = wt(fixture, base, "billing", { namespaces: ["app", "db-shared"] });
+      expect(await lockFreeDuringWait(running.deps, id)).toBe(true);
     });
 
     it("dead shared services are started in depends_on order", async () => {

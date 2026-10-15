@@ -475,8 +475,12 @@ interface WaitFailures {
   readonly dying: (dead: ReadonlyArray<DeadService>) => Error;
   /** The instance's control socket is definitively gone (#205). */
   readonly gone: () => Error;
-  /** The window ran out; `last` is the final poll's verdict, if any ran. */
-  readonly deadline: (last: PollVerdict | undefined) => Error;
+  /**
+   * The window ran out; `last` is the final poll's verdict, if any ran, and
+   * `counted` the dead services in it that count (a restarted service's
+   * stale pre-restart row excluded, `createRestartTracker`).
+   */
+  readonly deadline: (last: PollVerdict | undefined, counted: ReadonlyArray<DeadService>) => Error;
 }
 
 /**
@@ -514,7 +518,7 @@ async function waitWithRestarts(
     lastDead = dead;
     await sleep(pollMs);
   }
-  throw fail.deadline(last);
+  throw fail.deadline(last, lastDead);
 }
 
 /**
@@ -537,60 +541,57 @@ function readErrorHandler(
 }
 
 /**
- * Wait until every shared service `up` just restarted (#240, ADR-0008) is
- * healthy, the way the worktree wait treats restarted isolated services: the
- * same `--wait-timeout`, the same stale-row rule (`createRestartTracker`).
- * Only the restarted services are waited on, never the shared services that
- * were already running.
+ * Wait until the selected shared services are healthy (#240, ADR-0008),
+ * before `up` reports success. Run when `up` found the shared instance
+ * already running, whether or not it restarted anything there: a service
+ * another worktree's `up` just restarted reads `Running` while its readiness
+ * probe has not passed yet, and an `up` that neither restarted nor waited on
+ * it would return before it serves. A healthy instance passes on the first
+ * poll. Same `--wait-timeout` and stale-row rule (`createRestartTracker`) as
+ * the worktree wait; probed services gate on `ready`, the others on running.
  *
- *  - A restarted service that dies again fails fast with
- *    `SHARED_SERVICE_DEAD` (`reason: "died_again"`): waiting will not bring
- *    it back, and its remedy tears down the shared instance.
- *  - One that is still not healthy when the window ends is `HEALTH_TIMEOUT`,
- *    naming it and the `down --shared` remedy. The shared instance is left
- *    running, so its logs stay readable (ADR-0005).
- *  - A shared instance whose socket disappears meanwhile is
- *    `INSTANCE_NOT_FOUND` (#205).
+ * Every failure names the `down --shared` remedy, so every one is
+ * `SHARED_SERVICE_DEAD` (ADR-0005: a code per remedy):
+ *
+ *  - a service this `up` restarted that dies again: `reason: "died_again"`;
+ *  - any other selected service that dies meanwhile: `"died_while_waiting"`;
+ *  - one still not healthy when the window ends, including a restarted one
+ *    whose only dead rows are its stale pre-restart ones: `"not_healthy"`.
+ *
+ * The shared instance is left running, so its logs stay readable (ADR-0005).
+ * A shared instance whose socket disappears meanwhile is `INSTANCE_NOT_FOUND`
+ * (#205).
  */
-export function createWaitForRestartedShared(
+export function createWaitForSharedReady(
   source: ServiceStatusSource,
   tuning: PollerTuning = {},
-): WaitForRestartedShared {
+): WaitForSharedReady {
   return async (args) => {
-    const restartedNames = args.restarted.map((r) => r.name);
+    if (args.serviceNames.length === 0) return;
+    const restarted = new Set(args.restarted.map((r) => r.name));
     const dying = (dead: ReadonlyArray<DeadService>) =>
-      sharedServiceDeadError(dead, { reason: "died_again" });
-    await waitWithRestarts(
-      source,
-      tuning,
-      { ...args, serviceNames: restartedNames },
-      {
-        dying,
-        gone: () => instanceStoppedError("shared", args.socketPath),
-        deadline: (last) => {
-          if (last !== undefined && last.dead.length > 0) return dying(last.dead);
-          const pending = last?.pending ?? restartedNames;
-          return new HealthTimeoutError(
-            `devtrees restarted dead shared service(s) [${restartedNames.join(", ")}], but ` +
-              `[${pending.join(", ")}] did not become healthy within ${args.timeoutMs}ms. ` +
-              `The shared instance is still running — read why with ` +
-              `\`devtrees logs --shared <service>\`, then retry \`devtrees up\` or run ` +
-              `\`${SHARED_SERVICE_DEAD_REMEDY}\` (this stops the shared instance for every ` +
-              `worktree).`,
-            { instance: "shared", services: pending, remedy: SHARED_SERVICE_DEAD_REMEDY },
-          );
-        },
-      },
-    );
+      sharedServiceDeadError(dead, {
+        reason: dead.some((d) => restarted.has(d.name)) ? "died_again" : "died_while_waiting",
+      });
+    await waitWithRestarts(source, tuning, args, {
+      dying,
+      gone: () => instanceStoppedError("shared", args.socketPath),
+      deadline: (last, counted) =>
+        counted.length > 0
+          ? dying(counted)
+          : sharedNotHealthyError(last?.pending ?? args.serviceNames, args.timeoutMs),
+    });
   };
 }
 
-/** The wait on shared services `up` restarted (#240); see `createWaitForRestartedShared`. */
-export type WaitForRestartedShared = (args: {
+/** The wait on the selected shared services (#240); see `createWaitForSharedReady`. */
+export type WaitForSharedReady = (args: {
   readonly socketPath: string;
-  /** The services restarted, with the pid of the run that died when known. */
+  /** The selected shared services to wait on. */
+  readonly serviceNames: ReadonlyArray<string>;
+  /** Those this `up` restarted, with the pid of the run that died when known. */
   readonly restarted: ReadonlyArray<RestartedService>;
-  /** The restarted services that declare a readiness probe. */
+  /** The services among `serviceNames` that declare a readiness probe. */
   readonly probedServiceNames: ReadonlyArray<string>;
   readonly timeoutMs: number;
 }) => Promise<void>;
@@ -637,6 +638,9 @@ const SHARED_SERVICE_DEAD_REMEDY = "devtrees down --shared && devtrees up";
  *  - `start_refused`: process-compose refused or errored on the `process
  *    start` request (`details.start_failures` carries its complaint).
  *  - `died_again`: `up` restarted it and the restarted run died too.
+ *  - `not_healthy`: it is running (or was restarted) but did not become
+ *    healthy within `--wait-timeout` (`details.unhealthy_services`;
+ *    `dead_services` is empty).
  *  - `died_while_waiting`: it died during the shared-health wait a fresh
  *    worktree start runs for its cross-tier edges (ADR-0003), typically right
  *    after this `up` started it.
@@ -644,10 +648,11 @@ const SHARED_SERVICE_DEAD_REMEDY = "devtrees down --shared && devtrees up";
  *    records no shared state (pre-#83), so the definition a restart would run
  *    cannot be checked against this worktree's; it is not restarted.
  */
-export type SharedServiceDeadReason =
+type SharedServiceDeadReason =
   | "start_refused"
   | "died_again"
   | "died_while_waiting"
+  | "not_healthy"
   | "unknown_revision";
 
 /**
@@ -667,6 +672,7 @@ class SharedServiceDeadError extends Error {
       readonly dead_services: ReadonlyArray<{ name: string; status: string; exit_code?: number }>;
       readonly reason: SharedServiceDeadReason;
       readonly start_failures?: ReadonlyArray<{ readonly name: string; readonly message: string }>;
+      readonly unhealthy_services?: ReadonlyArray<string>;
       readonly remedy: string;
     },
   ) {
@@ -676,7 +682,9 @@ class SharedServiceDeadError extends Error {
 }
 
 /** What each `SharedServiceDeadReason` tells the reader, after the dead list. */
-const SHARED_DEAD_EXPLANATION: Record<SharedServiceDeadReason, (names: string) => string> = {
+type DeadReason = Exclude<SharedServiceDeadReason, "not_healthy">;
+
+const SHARED_DEAD_EXPLANATION: Record<DeadReason, (names: string) => string> = {
   start_refused: () => "process-compose refused to start it again.",
   died_again: (names) => `devtrees restarted ${names}, and it died again.`,
   died_while_waiting: () => "It died while `up` was waiting for it to become healthy.",
@@ -693,7 +701,7 @@ const SHARED_DEAD_EXPLANATION: Record<SharedServiceDeadReason, (names: string) =
 export function sharedServiceDeadError(
   dead: ReadonlyArray<DeadService>,
   opts: {
-    readonly reason: SharedServiceDeadReason;
+    readonly reason: DeadReason;
     readonly startFailures?: ReadonlyArray<{ readonly name: string; readonly message: string }>;
   },
 ): Error {
@@ -714,6 +722,24 @@ export function sharedServiceDeadError(
       ...(opts.startFailures !== undefined ? { start_failures: opts.startFailures } : {}),
       remedy,
     },
+  );
+}
+
+/**
+ * `SHARED_SERVICE_DEAD` with `reason: "not_healthy"` (#240): selected shared
+ * services that are running (or were restarted) but did not become healthy
+ * within the wait window. A code of its own rather than `HEALTH_TIMEOUT`
+ * because its remedy is the shared teardown (ADR-0005). The shared instance
+ * is left running.
+ */
+function sharedNotHealthyError(pending: ReadonlyArray<string>, timeoutMs: number): Error {
+  const remedy = SHARED_SERVICE_DEAD_REMEDY;
+  return new SharedServiceDeadError(
+    `devtrees up: shared service(s) [${pending.join(", ")}] did not become healthy within ` +
+      `${timeoutMs}ms. The shared instance is still running — read why with ` +
+      `\`devtrees logs --shared <service>\`, then retry \`devtrees up\` or run \`${remedy}\` ` +
+      `to rebuild the shared instance (this stops it for every worktree).`,
+    { dead_services: [], reason: "not_healthy", unhealthy_services: [...pending], remedy },
   );
 }
 

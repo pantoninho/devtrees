@@ -3400,7 +3400,9 @@ describe.skipIf(!ENABLED)("real-pc smoke — restarting dead shared services (#2
       "services:",
       "  pg:",
       "    tier: shared",
-      `    command: "python3 -m http.server $PG_PORT --bind 127.0.0.1 --directory ${pgDir}"`,
+      // Slow to serve (3s), like a database warming up: the window in which
+      // pg runs but its probe has not passed is what scenario 122 races.
+      `    command: "sh -c 'sleep 3; exec python3 -m http.server $PG_PORT --bind 127.0.0.1 --directory ${pgDir}'"`,
       "    ports: [PG_PORT]",
       "    readiness_probe:",
       "      exec:",
@@ -3486,14 +3488,19 @@ describe.skipIf(!ENABLED)("real-pc smoke — restarting dead shared services (#2
     const cachePids = pidsMatching(s.needles.cache);
     await kill(s.needles.pg);
 
-    const results = await Promise.all([
-      devtreesAsync(s.login, ["up", "--json", "--wait-timeout", "60"]),
-      devtreesAsync(s.billing, ["up", "--json", "--wait-timeout", "60"]),
-    ]);
-    for (const r of results) expect(r.code, `concurrent up: ${r.stderr} ${r.stdout}`).toBe(0);
-    const restarted = results.map((r) => (r.doc as SharedRestartUp).up.shared_restarted);
+    // Each up, as soon as it exits 0, must find pg serving: the one that did
+    // not restart it waits for its probe too, not just for it to run.
+    const upThenProbe = async (wt: string) => {
+      const r = await devtreesAsync(wt, ["up", "--json", "--wait-timeout", "60"]);
+      return { r, status: await httpStatus(port) };
+    };
+    const results = await Promise.all([upThenProbe(s.login), upThenProbe(s.billing)]);
+    for (const { r, status } of results) {
+      expect(r.code, `concurrent up: ${r.stderr} ${r.stdout}`).toBe(0);
+      expect(status, "pg must answer when up returns").toBe(200);
+    }
+    const restarted = results.map(({ r }) => (r.doc as SharedRestartUp).up.shared_restarted);
     expect(restarted.flat()).toEqual(["pg"]);
-    expect(await httpStatusWithin(port, 10_000)).toBe(200);
     expect(pidsMatching(s.needles.pg)).toHaveLength(1);
     expect(pidsMatching(s.needles.cache)).toEqual(cachePids);
   }, 180_000);

@@ -142,7 +142,7 @@ import {
 } from "./shared-selection.js";
 import {
   createWaitForHealth,
-  createWaitForRestartedShared,
+  createWaitForSharedReady,
   createWaitForSharedHealth,
   isGone,
   readStatusesWithin,
@@ -150,7 +150,7 @@ import {
   type RestartedService,
   type WaitForHealth,
   type WaitingCommand,
-  type WaitForRestartedShared,
+  type WaitForSharedReady,
   type WaitForSharedHealth,
 } from "./health.js";
 import {
@@ -918,11 +918,11 @@ export interface CommandDeps {
    */
   readonly waitForSharedHealth?: WaitForSharedHealth;
   /**
-   * Wait for the dead shared services `up` restarted to be healthy (#240).
-   * Default: `createWaitForRestartedShared` over the shared UDS, with
-   * `--wait-timeout`. Injected so tests can stub it.
+   * Wait for the selected shared services of an already-running shared
+   * instance to be healthy (#240). Default: `createWaitForSharedReady` over
+   * the shared UDS, with `--wait-timeout`. Injected so tests can stub it.
    */
-  readonly waitForRestartedShared?: WaitForRestartedShared;
+  readonly waitForSharedReady?: WaitForSharedReady;
   /**
    * Wait for the worktree instance's services to be healthy after `driver.up`
    * — the gate that turns "up returned" into "the stack is serving traffic"
@@ -1554,9 +1554,10 @@ function unresponsiveRemedy(socketPath: string, context: LivenessContext): strin
  * Dead shared services (ADR-0008, #240), on both paths: in a shared instance
  * found already running, the dead selected ones are restarted under the
  * shared lock by `ensureSharedStarted`, after its drift check, and waited
- * on; one that is refused or dies again fails with `SHARED_SERVICE_DEAD`, one
- * that never becomes healthy with `HEALTH_TIMEOUT`. A running shared service
- * is never touched. One this call lazy-started is covered by the
+ * on with every other selected shared service (after the lifecycle lock on
+ * the running path); one that is refused, dies again or never becomes
+ * healthy fails with `SHARED_SERVICE_DEAD`. A running shared service is
+ * never touched. One this call lazy-started is covered by the
  * shared-health wait, which fails fast with `SHARED_SERVICE_DEAD`.
  *
  * Pre-flight stale-port-block check (issue #58): when the worktree's
@@ -1717,6 +1718,10 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
       deps,
       probe: seams.probe,
       warn,
+      // The fresh path waits for the shared services here, inside the lock and
+      // before the worktree spawns (ADR-0003); the running path waits after the
+      // lock is released, with the rest of its verification (#240).
+      waitNow: freshSelection !== undefined,
     });
     const { started: sharedStarted, fieldChanges: sharedChanges } = shared;
 
@@ -1764,6 +1769,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
         sharedStarted,
         sharedActivated: shared.activated,
         sharedRestarted: shared.restarted,
+        sharedReady: shared.ready,
         sharedChanges,
       } as const;
     }
@@ -1870,6 +1876,9 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     // it exists. Runs AFTER the lifecycle lock is released, like the fresh
     // path's health wait, so a slow wait never shows up as LOCK_CONTENTION to
     // a concurrent `up`. Headless always — this path never attaches a TTY.
+    // The shared services first (#240): a `down` of this worktree must not
+    // wait out a shared service's readiness for the lifecycle lock.
+    await outcome.sharedReady();
     const verified = await verifyRunning({
       stack,
       anchor,
@@ -2366,8 +2375,16 @@ interface SharedOutcome {
   readonly started: boolean;
   /** Namespaced shared services this `up` added to the running shared instance. */
   readonly activated: ReadonlyArray<string>;
-  /** Dead selected shared services this `up` restarted and waited on (#240). */
+  /** Dead selected shared services this `up` restarted (#240). */
   readonly restarted: ReadonlyArray<string>;
+  /**
+   * Wait for the selected shared services to be healthy (#240): a no-op
+   * unless this `up` found the shared instance already running. The caller
+   * decides when to run it: on the fresh path inside the worktree lifecycle
+   * lock, before the worktree spawns; on the running path after the lock is
+   * released, like the rest of verification (ADR-0008).
+   */
+  readonly ready: () => Promise<void>;
   readonly fieldChanges: ReadonlyArray<SharedFieldChange>;
   /** Shared named port → the number to inject. */
   readonly portFor: (name: string) => number | undefined;
@@ -2379,19 +2396,17 @@ interface SharedOutcome {
  * Bring the shared tier to what this `up` selects (#236, ADR-0010): lazy-start
  * the shared instance or add the selected namespaced shared services it lacks,
  * and restart the selected ones it runs that are dead (#240, ADR-0008), all
- * under the shared lifecycle lock (`ensureSharedStarted`). Then wait for the
- * restarted ones to become healthy, outside the shared lock, before this
- * worktree derives or spawns anything against them — on the fresh path as
- * much as the running one. A restarted service that dies again fails fast
- * with `SHARED_SERVICE_DEAD`; one that never becomes healthy is
- * `HEALTH_TIMEOUT`. Services this call just started or added are covered by
- * the cross-tier shared-health wait instead.
+ * under the shared lifecycle lock (`ensureSharedStarted`).
  *
- * The wait runs inside this worktree's lifecycle lock (the caller's), like
- * the fresh path's shared-health wait: on the fresh path the worktree must
- * not start until its shared dependencies are back (ADR-0003). A concurrent
- * `up` or `down` of the same worktree can see `LOCK_CONTENTION` meanwhile;
- * other worktrees only take the shared lock, which is released by then.
+ * When the shared instance was already running, a wait (run here with
+ * `waitNow`, else returned as the outcome's `ready`) waits
+ * for every selected shared service to be healthy (`createWaitForSharedReady`):
+ * the ones this `up` restarted or added, and any another worktree's `up`
+ * restarted that has not passed its readiness probe yet. Without that wait an
+ * `up` racing the restart would read the service `Running`, restart nothing,
+ * and report success before it serves. A shared instance this call
+ * lazy-started is covered by the cross-tier shared-health wait instead, as
+ * before.
  */
 async function prepareShared(args: {
   readonly stack: ResolvedStack;
@@ -2403,13 +2418,17 @@ async function prepareShared(args: {
   readonly deps: CommandDeps;
   readonly probe: LivenessProbe;
   readonly warn: (message: string) => void;
+  /** Run the shared wait before returning (the fresh path), not as `ready`. */
+  readonly waitNow: boolean;
 }): Promise<SharedOutcome> {
   const { stack, anchor, seed, driver, deps } = args;
+  const ready = async (): Promise<void> => {};
   if (!hasTier(stack, "shared")) {
     return {
       started: false,
       activated: [],
       restarted: [],
+      ready,
       fieldChanges: [],
       portFor: seed.positional,
       selected: [],
@@ -2435,34 +2454,55 @@ async function prepareShared(args: {
         )(sharedInstancePaths(anchor.anchor).socketPath).catch(() => undefined),
     },
   );
-  if (ensured.restarted.length > 0) {
-    const names = new Set(ensured.restarted.map((r) => r.name));
-    args.warn(
-      `devtrees up: restarted dead shared service(s): ${[...names].join(", ")}; ` +
-        `waiting for them to be healthy...`,
-    );
-    const wait =
-      deps.waitForRestartedShared ??
-      createWaitForRestartedShared(
-        { getServiceStatuses: statusReader(deps, driver) },
-        { notify: args.warn, probe: probeOf(deps) },
-      );
-    await wait({
-      socketPath: sharedInstancePaths(anchor.anchor).socketPath,
-      restarted: ensured.restarted,
-      probedServiceNames: probedNames(selected.filter((s) => names.has(s.name))),
-      timeoutMs: deps.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS,
-    });
-  }
+  const wait = ensured.started ? ready : () => waitSharedReady(args, selected, ensured.restarted);
+  if (args.waitNow) await wait();
   const ports = ensured.ports;
   return {
     started: ensured.started,
     activated: ensured.activated,
     restarted: ensured.restarted.map((r) => r.name),
+    ready: args.waitNow ? ready : wait,
     fieldChanges: ensured.fieldChanges,
     portFor: ports === undefined ? seed.positional : (name) => ports[name],
     selected,
   };
+}
+
+/**
+ * Wait, with `--wait-timeout`, for the selected shared services of an
+ * already-running shared instance to be healthy (#240). A healthy instance
+ * costs one `process list` read.
+ */
+async function waitSharedReady(
+  args: {
+    readonly anchor: { readonly anchor: string };
+    readonly driver: ReturnType<typeof createDriver>;
+    readonly deps: CommandDeps;
+    readonly warn: (message: string) => void;
+  },
+  selected: ReadonlyArray<ResolvedService>,
+  restarted: ReadonlyArray<RestartedService>,
+): Promise<void> {
+  const { deps, driver } = args;
+  if (restarted.length > 0) {
+    args.warn(
+      `devtrees up: restarted dead shared service(s): ${restarted.map((r) => r.name).join(", ")}; ` +
+        `waiting for them to be healthy...`,
+    );
+  }
+  const wait =
+    deps.waitForSharedReady ??
+    createWaitForSharedReady(
+      { getServiceStatuses: statusReader(deps, driver) },
+      { notify: args.warn, probe: probeOf(deps) },
+    );
+  await wait({
+    socketPath: sharedInstancePaths(args.anchor.anchor).socketPath,
+    serviceNames: selected.map((s) => s.name),
+    restarted,
+    probedServiceNames: probedNames(selected),
+    timeoutMs: deps.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS,
+  });
 }
 
 /** The repo-wide shared block for the allocator's block size, if one was allocated. */
@@ -2739,7 +2779,7 @@ function servicesToAdd(
  * `reason: "start_refused"` (the services it did start keep running); one it
  * answers with "already running" was started by someone else and is not
  * reported. Returns the services started, each with the pid of the run that
- * died, for the health wait (`createWaitForRestartedShared`).
+ * died, for the health wait (`createWaitForSharedReady`).
  */
 async function restartDeadShared(args: {
   readonly stack: ResolvedStack;

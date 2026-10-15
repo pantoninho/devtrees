@@ -4,7 +4,7 @@ import { EventEmitter } from "node:events";
 import { Readable } from "node:stream";
 import {
   createWaitForHealth,
-  createWaitForRestartedShared,
+  createWaitForSharedReady,
   createWaitForSharedHealth,
   readStatusesWithin,
   type ServiceStatusSource,
@@ -740,12 +740,11 @@ describe("health — the instance vanishing mid-wait (#205)", () => {
 });
 
 /**
- * The wait on dead shared services `up` restarted (#240): the worktree
- * wait's stale-row rule, but a restarted service that dies again is
- * SHARED_SERVICE_DEAD (its remedy tears down the shared instance), and one
- * that never becomes healthy is HEALTH_TIMEOUT naming the shared remedy.
+ * The wait on the selected shared services of a running shared instance
+ * (#240): the worktree wait's stale-row rule, and every failure is
+ * SHARED_SERVICE_DEAD (its remedy tears down the shared instance).
  */
-describe("health — createWaitForRestartedShared (#240)", () => {
+describe("health — createWaitForSharedReady (#240)", () => {
   const SHARED_REMEDY = "devtrees down --shared && devtrees up";
   const dead = (name: string, pid: number, exitCode = -1): ServiceStatus => ({
     name,
@@ -760,6 +759,7 @@ describe("health — createWaitForRestartedShared (#240)", () => {
       () => undefined,
       (e: unknown) => e as Failure,
     );
+  const base = { socketPath: "/run/shared.sock", probedServiceNames: [] as string[] };
 
   it("resolves once the restarted service runs, ignoring its stale pre-restart row", async () => {
     // Same pid as the run that died: still the old row, not a new death.
@@ -769,40 +769,48 @@ describe("health — createWaitForRestartedShared (#240)", () => {
       [dead("db", 41), row("cache", "Running")],
       [row("db", "Running"), row("cache", "Running")],
     ]);
-    const wait = createWaitForRestartedShared(source, { probe: unknownProbe, pollMs: 1 });
+    const wait = createWaitForSharedReady(source, { probe: unknownProbe, pollMs: 1 });
     await expect(
       wait({
-        socketPath: "/run/shared.sock",
+        ...base,
+        serviceNames: ["db", "cache"],
         restarted: [{ name: "db", stalePid: 41 }],
-        probedServiceNames: [],
         timeoutMs: 10_000,
       }),
     ).resolves.toBeUndefined();
   });
 
-  it("waits only on the restarted services, not on the shared services already running", async () => {
-    // `cache` is never healthy, but it was not restarted: not this wait's business.
-    const source = sourceFromQueue([[row("db", "Running"), row("cache", "Pending")]]);
-    const wait = createWaitForRestartedShared(source, { probe: unknownProbe, pollMs: 1 });
-    await expect(
-      wait({
-        socketPath: "/run/shared.sock",
-        restarted: [{ name: "db" }],
-        probedServiceNames: [],
-        timeoutMs: 1_000,
-      }),
-    ).resolves.toBeUndefined();
+  it("waits for a probed service that runs but is not ready yet, though nothing was restarted", async () => {
+    // Another worktree's `up` restarted db: it reads Running, its probe has not passed.
+    const calls = { count: 0 };
+    const source = sourceFromQueue(
+      [
+        [row("db", "Running", "not_ready")],
+        [row("db", "Running", "not_ready")],
+        [row("db", "Running", "ready")],
+      ],
+      calls,
+    );
+    const wait = createWaitForSharedReady(source, { probe: unknownProbe, pollMs: 1 });
+    await wait({
+      ...base,
+      serviceNames: ["db"],
+      restarted: [],
+      probedServiceNames: ["db"],
+      timeoutMs: 10_000,
+    });
+    expect(calls.count).toBe(3);
   });
 
   it("a restarted run that dies again (new pid) fails fast with SHARED_SERVICE_DEAD died_again", async () => {
     const source = sourceFromQueue([[dead("db", 77, 1)]]);
-    const wait = createWaitForRestartedShared(source, { probe: unknownProbe, pollMs: 1 });
+    const wait = createWaitForSharedReady(source, { probe: unknownProbe, pollMs: 1 });
     const started = Date.now();
     const err = await failure(
       wait({
-        socketPath: "/run/shared.sock",
+        ...base,
+        serviceNames: ["db"],
         restarted: [{ name: "db", stalePid: 41 }],
-        probedServiceNames: [],
         timeoutMs: 60_000,
       }),
     );
@@ -818,33 +826,59 @@ describe("health — createWaitForRestartedShared (#240)", () => {
     });
   });
 
-  it("a restarted probed service that never becomes ready is HEALTH_TIMEOUT with the shared remedy", async () => {
+  it("a service it did not restart that dies meanwhile is died_while_waiting", async () => {
+    const source = sourceFromQueue([[dead("db", 77, 1)]]);
+    const wait = createWaitForSharedReady(source, { probe: unknownProbe, pollMs: 1 });
+    const err = await failure(
+      wait({ ...base, serviceNames: ["db"], restarted: [], timeoutMs: 60_000 }),
+    );
+    expect(err?.details).toMatchObject({ reason: "died_while_waiting" });
+  });
+
+  it("a probed service that never becomes ready is SHARED_SERVICE_DEAD not_healthy with the shared remedy", async () => {
     const source = sourceFromQueue([[row("db", "Running", "not_ready")]]);
-    const wait = createWaitForRestartedShared(source, { probe: unknownProbe, pollMs: 1 });
+    const wait = createWaitForSharedReady(source, { probe: unknownProbe, pollMs: 1 });
     const err = await failure(
       wait({
-        socketPath: "/run/shared.sock",
+        ...base,
+        serviceNames: ["db"],
         restarted: [{ name: "db", stalePid: 41 }],
         probedServiceNames: ["db"],
         timeoutMs: 200,
       }),
     );
-    expect(err?.code).toBe("HEALTH_TIMEOUT");
+    expect(err?.code).toBe("SHARED_SERVICE_DEAD");
     expect(err?.message).toContain("[db] did not become healthy within 200ms");
-    expect(err?.details).toEqual({ instance: "shared", services: ["db"], remedy: SHARED_REMEDY });
+    expect(err?.details).toEqual({
+      dead_services: [],
+      reason: "not_healthy",
+      unhealthy_services: ["db"],
+      remedy: SHARED_REMEDY,
+    });
+  });
+
+  it("at the deadline a restarted service's stale pre-restart row is not_healthy, not died_again", async () => {
+    // Only the old corpse is ever read: the restart never showed up.
+    const source = sourceFromQueue([[dead("db", 41)]]);
+    const wait = createWaitForSharedReady(source, { probe: unknownProbe, pollMs: 1 });
+    const err = await failure(
+      wait({
+        ...base,
+        serviceNames: ["db"],
+        restarted: [{ name: "db", stalePid: 41 }],
+        timeoutMs: 200,
+      }),
+    );
+    expect(err?.code).toBe("SHARED_SERVICE_DEAD");
+    expect(err?.details).toMatchObject({ reason: "not_healthy", unhealthy_services: ["db"] });
   });
 
   it("a shared instance whose socket goes away meanwhile is INSTANCE_NOT_FOUND", async () => {
     const source = sourceFromQueue([new Error("connect ENOENT")]);
     const { probe } = probeReturning("stale");
-    const wait = createWaitForRestartedShared(source, { probe, pollMs: 1 });
+    const wait = createWaitForSharedReady(source, { probe, pollMs: 1 });
     const err = await failure(
-      wait({
-        socketPath: "/run/shared.sock",
-        restarted: [{ name: "db" }],
-        probedServiceNames: [],
-        timeoutMs: 10_000,
-      }),
+      wait({ ...base, serviceNames: ["db"], restarted: [{ name: "db" }], timeoutMs: 10_000 }),
     );
     expect(err?.code).toBe("INSTANCE_NOT_FOUND");
     expect(err?.details).toMatchObject({ instance: "shared" });

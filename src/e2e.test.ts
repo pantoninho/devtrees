@@ -83,6 +83,7 @@ function stubDriverDeps(worktree: string): {
   driver: { binary: string; prefixArgs: string[] };
   attach: false;
   waitForHealth: () => Promise<void>;
+  waitForSharedReady: () => Promise<void>;
   getServiceStatuses: () => Promise<never[]>;
 } {
   return {
@@ -94,6 +95,9 @@ function stubDriverDeps(worktree: string): {
     // default driver-backed wait is exercised against the stub in the #87
     // e2e below.
     waitForHealth: () => Promise.resolve(),
+    // Same for the wait on an already-running shared instance (#240): this
+    // stub reports no rows, which that wait would read as never healthy.
+    waitForSharedReady: () => Promise.resolve(),
     // The issue-#30 `up --json` envelope publishes per-service rows via the
     // driver's `getServiceStatuses` (same hook `ls --json` uses, issue #29).
     // Default it to an empty snapshot for up/down-focused e2e tests so this
