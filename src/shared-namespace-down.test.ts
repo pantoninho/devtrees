@@ -192,6 +192,7 @@ function sharedInstance(opts: Opts = {}) {
         servicesRead: "ok",
       },
     ],
+    lifecycleWaitMs: 50,
     withSharedLock: async (_anchor, fn) => {
       log.push("lock");
       try {
@@ -346,7 +347,7 @@ describe("runSharedNamespaceDown (#239)", () => {
     ]);
   });
 
-  it("a worktree whose lifecycle lock a live process holds blocks it, though it has no socket yet", async () => {
+  it("a lifecycle command still in flight after the wait refuses with a plain retry, never --force", async () => {
     const s = sharedInstance();
     const id = deriveWorktreeId("/x/billing");
     writeFileSync(join(s.anchor, "devtrees", `${id}.lock`), `${process.pid}\n`);
@@ -356,14 +357,55 @@ describe("runSharedNamespaceDown (#239)", () => {
       dependants: [
         { instance: id, service: null, depends_on: [], source: "lifecycle_in_progress" },
       ],
-      forceable: true,
+      forceable: false,
+      remedy: "devtrees down --shared -n a",
     });
     expect(err.message).toContain("in progress there");
+    expect(err.message).toContain(`${id}.lock`);
+    expect(s.log.filter((l) => l.startsWith("process"))).toEqual([]);
+    // --force does not override an in-flight command, and its retry drops --force.
+    const forced = await failure(
+      runSharedNamespaceDown(s.deps, { namespaces: ["a"], force: true }),
+    );
+    expect(forced.code).toBe("SHARED_IN_USE");
+    expect(forced.details?.remedy).toBe("devtrees down --shared -n a");
+  });
+
+  it("waits for an in-flight command OUTSIDE the shared lock, then goes ahead once it is gone", async () => {
+    const s = sharedInstance();
+    const lock = join(s.anchor, "devtrees", `${deriveWorktreeId("/x/billing")}.lock`);
+    writeFileSync(lock, `${process.pid}\n`);
+    setTimeout(() => rmSync(lock, { force: true }), 150);
+    const result = await runSharedNamespaceDown(
+      { ...s.deps, lifecycleWaitMs: 5000 },
+      { namespaces: ["a"] },
+    );
+    expect(result).toMatchObject({ stopped: true, services: ["sa"], dependants: [] });
+    // The first attempt released the shared lock before waiting; the second did the work.
+    expect(s.log.slice(0, 3)).toEqual(["lock", "unlock", "lock"]);
+    expect(s.log).toContain("process stop sa");
+  });
+
+  it("a shared dependant fails at once, without waiting for an in-flight command", async () => {
+    const s = sharedInstance({
+      processes: {
+        pg: proc(),
+        sa: proc({ namespace: "a" }),
+        sb: proc({ namespace: "b", depends_on: { sa: { condition: "process_started" } } }),
+      },
+    });
+    writeFileSync(
+      join(s.anchor, "devtrees", `${deriveWorktreeId("/x/billing")}.lock`),
+      `${process.pid}\n`,
+    );
+    const started = Date.now();
+    const err = await failure(
+      runSharedNamespaceDown({ ...s.deps, lifecycleWaitMs: 5000 }, { namespaces: ["a"] }),
+    );
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(err.code).toBe("SHARED_IN_USE");
+    expect(err.details?.remedy).toBe("devtrees down --shared -n a -n b");
     expect(s.log).toEqual(["lock", "unlock"]);
-    const forced = await runSharedNamespaceDown(s.deps, { namespaces: ["a"], force: true });
-    expect(forced.dependants).toEqual([
-      { instance: id, service: null, depends_on: [], source: "lifecycle_in_progress" },
-    ]);
   });
 
   it("ignores a lifecycle lock whose holder is dead, and the registry, shared and hashes locks", async () => {
@@ -377,7 +419,7 @@ describe("runSharedNamespaceDown (#239)", () => {
     expect(result).toMatchObject({ stopped: true, services: ["sa"], dependants: [] });
   });
 
-  it("lists a worktree with a live instance once, by its edges, even while its lock is held", async () => {
+  it("lists both a worktree's edges and its in-flight command, and remedies with a retry, not --force", async () => {
     const s = sharedInstance({
       worktrees: [{ id: "login-1aaaaaaa", sharedDependsOn: { worker: ["sa"] } }],
     });
@@ -390,7 +432,23 @@ describe("runSharedNamespaceDown (#239)", () => {
         depends_on: ["sa"],
         source: "derived_config",
       },
+      {
+        instance: "login-1aaaaaaa",
+        service: null,
+        depends_on: [],
+        source: "lifecycle_in_progress",
+      },
     ]);
+    expect(err.details?.remedy).toBe("devtrees down --shared -n a");
+  });
+
+  it("remedies a real worktree dependant alone with --force", async () => {
+    const s = sharedInstance({ worktrees: [{ id: "w", sharedDependsOn: { worker: ["sa"] } }] });
+    const err = await failure(runSharedNamespaceDown(s.deps, { namespaces: ["a"] }));
+    expect(err.details).toMatchObject({
+      forceable: true,
+      remedy: "devtrees down --shared -n a --force",
+    });
   });
 
   it("removing only already-stopped services reports stopped: false, and lists them as removed", async () => {

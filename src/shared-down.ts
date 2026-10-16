@@ -12,10 +12,16 @@
 
 import { DEVTREES_METADATA_KEY, type DerivedConfig } from "./deriver.js";
 import type { ServiceStatus } from "./driver.js";
-import { namespaceSelected, serviceNamespaces } from "./selection.js";
+import {
+  DEFAULT_NAMESPACE,
+  formatUpCommand,
+  namespaceSelected,
+  serviceNamespaces,
+} from "./selection.js";
 import { keepsInstanceAlive } from "./service-state.js";
 import type { SharedState } from "./shared-state.js";
-import type { ResolvedStack } from "./stack.js";
+import { isAlwaysOnShared, sharedServicesOf } from "./shared-selection.js";
+import type { ResolvedService, ResolvedStack } from "./stack.js";
 
 /**
  * Something that still depends on a shared service the teardown would
@@ -143,21 +149,17 @@ export function worktreeDependants(
 
 /**
  * The worktrees with a lifecycle command in flight (`held`, their lock
- * holders alive), as dependants: each one not already listed in `found`.
+ * holders alive), as dependants. Listed even when the worktree's instance
+ * was already found by its edges: the command in flight may be changing
+ * them, and it is what the teardown waits for.
  */
-export function inProgressDependants(
-  held: ReadonlyArray<string>,
-  found: ReadonlyArray<SharedDependant>,
-): SharedDependant[] {
-  const listed = new Set(found.map((d) => d.instance));
-  return [...new Set(held)]
-    .filter((id) => !listed.has(id))
-    .map((id) => ({
-      instance: id,
-      service: null,
-      depends_on: [],
-      source: "lifecycle_in_progress",
-    }));
+export function inProgressDependants(held: ReadonlyArray<string>): SharedDependant[] {
+  return [...new Set(held)].map((id) => ({
+    instance: id,
+    service: null,
+    depends_on: [],
+    source: "lifecycle_in_progress" as const,
+  }));
 }
 
 /** A worktree's isolated → shared edges from its `devtrees.yaml` (instances started before #239). */
@@ -234,4 +236,69 @@ export function withoutServiceRecords(
     ...(extended !== undefined ? { extended } : {}),
     ...(services !== undefined ? { services } : {}),
   };
+}
+
+/**
+ * The namespaced recovery for drifted or dead shared services `names` (#239):
+ * a forced `down --shared -n` for their namespaces, then the same `up`
+ * (`upNamespaces`), which leaves the other shared services running.
+ * `undefined` when only the full teardown can work: a named service is
+ * always-on, or an always-on one depends on them. A service's namespace is
+ * the one the `up` selects it by, or its own first one when it came in as a
+ * dependency.
+ *
+ * `--force` is part of it on purpose. The service is already drifted or dead
+ * for every worktree that uses it, and those worktrees, the caller's
+ * included, are exactly the dependants that would otherwise refuse the
+ * teardown (`SHARED_IN_USE`), so without it the remedy would fail on its
+ * first run. Forcing interrupts them as the full `down --shared` would, but
+ * stops only these namespaces' shared services, never more than it. A shared
+ * service outside them that depends on one would still refuse (a shared
+ * dependant is never forceable), so its namespaces are added.
+ */
+export function namespacedRecoveryRemedy(
+  stack: ResolvedStack,
+  upNamespaces: ReadonlyArray<string>,
+  names: ReadonlyArray<string>,
+): string | undefined {
+  const shared = sharedServicesOf(stack);
+  const byName = new Map(shared.map((s) => [s.name, s]));
+  const services = names.map((n) => byName.get(n));
+  if (services.length === 0 || services.some((s) => s === undefined || isAlwaysOnShared(s))) {
+    return undefined;
+  }
+  const ns = new Set(
+    (services as ResolvedService[]).map((s) => {
+      const own = serviceNamespaces(s);
+      return own.find((n) => upNamespaces.includes(n)) ?? own[0] ?? DEFAULT_NAMESPACE;
+    }),
+  );
+  const closed = closeOverSharedDependants(shared, ns);
+  if (closed === undefined) return undefined;
+  const down = ["devtrees down --shared", ...[...closed].map((n) => `-n ${n}`), "--force"];
+  return `${down.join(" ")} && ${formatUpCommand(stack.services, upNamespaces)}`;
+}
+
+/**
+ * Grow `namespaces` until no shared service outside them depends on one in
+ * them (a teardown of them would refuse it, unforceably); `undefined` when
+ * an always-on shared service does, which no namespaced teardown can take.
+ */
+function closeOverSharedDependants(
+  shared: ReadonlyArray<ResolvedService>,
+  namespaces: ReadonlySet<string>,
+): Set<string> | undefined {
+  const ns = new Set(namespaces);
+  const inside = (s: ResolvedService) => !isAlwaysOnShared(s) && namespaceSelected(s, [...ns]);
+  for (let grew = true; grew; ) {
+    grew = false;
+    const targets = new Set(shared.filter(inside).map((s) => s.name));
+    for (const s of shared) {
+      if (inside(s) || !s.dependsOn.some((d) => targets.has(d.name))) continue;
+      if (isAlwaysOnShared(s)) return undefined;
+      for (const n of serviceNamespaces(s)) ns.add(n);
+      grew = true;
+    }
+  }
+  return ns;
 }

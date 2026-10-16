@@ -3858,12 +3858,12 @@ describe.skipIf(!ENABLED)("real-pc smoke — namespaced shared teardown (#239)",
     expect(devtrees(s.login, ["down", "--json"]).code).toBe(0);
 
     // A worktree with a lifecycle command in flight (its lock held by a live
-    // process, no socket yet) blocks the teardown.
+    // process, no socket yet) shows as blocking in the dry run, which does not wait.
     const inFlight = join(anchorOf(s.login), "devtrees", `${deriveWorktreeId("/x/racer")}.lock`);
     writeFileSync(inFlight, `${process.pid}\n`);
-    const racing = nsDown(s.login, "-n", "a");
-    expect((racing.doc as ErrDoc).error.code).toBe("SHARED_IN_USE");
-    expect((racing.doc as ErrDoc).error.details).toMatchObject({
+    const racing = nsDown(s.login, "-n", "a", "--dry-run");
+    expect((racing.doc as { down_dry_run: unknown }).down_dry_run).toMatchObject({
+      blocked: true,
       dependants: [{ source: "lifecycle_in_progress", service: null }],
     });
     rmSync(inFlight, { force: true });
@@ -4024,6 +4024,49 @@ describe.skipIf(!ENABLED)("real-pc smoke — namespaced shared teardown (#239)",
     expect(await waitForPid(s.holds.sa, 10_000), "sa should run again").toBe(true);
     expect(pidsMatching(s.holds.pg)).toEqual(pg);
     expect(pidsMatching(s.holds.sb)).toEqual(sb);
+  }, 180_000);
+
+  it("scenario 128: the teardown waits for a worktree's in-flight lifecycle command, then goes ahead", async () => {
+    const s = nsStack("dt-rpc128-");
+    expect(upWith(s.billing, "app", "b").code).toBe(0);
+    expect(upWith(s.login, "app", "a").code).toBe(0);
+    expect(devtrees(s.login, ["down"]).code).toBe(0);
+    const lock = join(anchorOf(s.login), "devtrees", `${deriveWorktreeId("/x/racer")}.lock`);
+    writeFileSync(lock, `${process.pid}\n`);
+    const started = Date.now();
+    const pending = devtreesAsync(s.login, ["down", "--shared", "--json", "-n", "a"]);
+    setTimeout(() => rmSync(lock, { force: true }), 2000);
+    const down = await pending;
+    expect(down.code, `down: ${down.stdout} ${down.stderr}`).toBe(0);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(1500);
+    expect((down.doc as NsDownDoc).down).toMatchObject({ stopped: true, services: ["sa"] });
+    expect(await waitForNoPids(s.holds.sa)).toEqual([]);
+  }, 180_000);
+
+  it("scenario 129: the namespaced SHARED_DRIFT remedy succeeds when followed literally, though every worktree depends on the service", async () => {
+    const s = nsStack("dt-rpc129-");
+    expect(upWith(s.billing, "app", "a").code).toBe(0);
+    expect(upWith(s.login, "app", "a").code).toBe(0);
+    const pg = pidsMatching(s.holds.pg);
+    // login edits sa: its up fails SHARED_DRIFT with a namespaced remedy.
+    s.write(s.login, s.holds.sa2);
+    const drifted = upWith(s.login, "app", "a");
+    expect(drifted.code).not.toBe(0);
+    const err = (drifted.doc as ErrDoc).error;
+    expect(err.code).toBe("SHARED_DRIFT");
+    const remedy = String(err.details.remedy);
+    expect(remedy).toBe("devtrees down --shared -n a --force && devtrees up -n app -n a");
+    // Run it exactly as printed (with the built CLI standing in for `devtrees`).
+    const cli = `'${process.execPath}' '${CLI}'`;
+    const run = spawnSync("sh", ["-c", remedy.replaceAll("devtrees ", `${cli} `)], {
+      cwd: s.login,
+      encoding: "utf8",
+      timeout: 120_000,
+    });
+    expect(run.status, `remedy: ${run.stdout} ${run.stderr}`).toBe(0);
+    expect(await waitForPid(s.holds.sa2, 10_000), "the new sa should run").toBe(true);
+    expect(pidsMatching(s.holds.sa)).toEqual([]);
+    expect(pidsMatching(s.holds.pg)).toEqual(pg);
   }, 180_000);
 
   it("scenario 126: removing the last running shared services stops the shared instance, as down --shared does", async () => {

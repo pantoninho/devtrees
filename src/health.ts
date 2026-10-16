@@ -658,9 +658,9 @@ function rebuildAdvice(remedy: string): string {
     return `Run \`${remedy}\` to rebuild the shared instance (this stops it for every worktree).`;
   }
   return (
-    `Run \`${remedy}\` to restart only those shared services (the others keep running), ` +
-    `or \`${SHARED_SERVICE_DEAD_REMEDY}\` to rebuild the whole shared instance (this stops ` +
-    "it for every worktree)."
+    `Run \`${remedy}\` to restart only those shared services: the other shared services ` +
+    "keep running, and `--force` interrupts the worktrees that use these, as the full " +
+    `\`${SHARED_SERVICE_DEAD_REMEDY}\` would.`
   );
 }
 

@@ -283,14 +283,20 @@ services:
     `devtrees.yaml`, and an instance it cannot read counts as a dependant.
     A worktree with an `up`, `down` or `restart` in flight (its lifecycle
     lock held) counts too (`source: lifecycle_in_progress`): an `up` there
-    may be waiting for shared health, with no socket yet.
+    may be waiting for shared health, with no socket yet. The teardown waits
+    for such a command (up to 15s, outside the shared lock) and starts over.
+    If it is still running after that, the refusal's `details.remedy` is the
+    plain retry: `--force` never overrides an in-flight command.
   - An `up` that adds a removed service back while process-compose still
     lists it stopped (a removal whose reload timed out) starts it again, and
     lists it in `shared_restarted`.
   - When every drifted or dead shared service an `up` reports is
     namespaced, `SHARED_DRIFT` and `SHARED_SERVICE_DEAD` name this command
-    as `details.remedy` (`devtrees down --shared -n <namespace> && devtrees
-    up -n …`), which leaves the other shared services running.
+    as `details.remedy`: `devtrees down --shared -n <namespace> --force &&
+    devtrees up -n …`. It leaves the other shared services running. The
+    `--force` is there because the worktrees using a broken service would
+    otherwise refuse its teardown. It interrupts them, as the full
+    `down --shared` would.
   - A namespace with no running shared service is a no-op (exit 0), listed in
     `inactive_namespaces`. An always-on shared service has no namespace, so
     `-n` never stops it, not even `-n default`.
@@ -466,7 +472,7 @@ footer lists the subset that command can actually emit.
 | `SHARED_START_FAILED`       | The lazy-started shared instance died before binding its control socket; `details.config_path` is the config to run by hand. |
 | `SHARED_ACTIVATION_FAILED`  | Adding a selected namespaced shared service to the running shared instance failed (process-compose refused or timed out on the config reload); the shared services it already ran are untouched. `details` has `{services, reason, config_path, remedy}`. |
 | `SHARED_PORT_CONFLICT`      | A shared named port cannot be resolved without handing one port to two names or moving a recorded one (the stable shared port map, #238): `details.conflicts` lists each `{reason, port_name, port, recorded_port?, holder?, process?}` (`reason`: `port_taken`, `bound_mismatch`, `stale_env`, or `block_full` when the shared block has no free number left); nothing was started, added or recorded. `details.remedy` is one command: `devtrees down --shared && devtrees up` (run for every worktree), or `devtrees prune --shared-ports` for `block_full`; `details.map_path` is the map. |
-| `SHARED_IN_USE`             | `down --shared -n` refused: something still depends on a shared service it would remove. `details.dependants` lists each `{instance, service, depends_on, source}` (a live worktree's booted isolated service, a worktree with an `up`, `down` or `restart` in flight, `source: lifecycle_in_progress`, or a shared service it would keep, `instance: shared`). Nothing was stopped. `details.forceable` says whether `--force` overrides it (a shared dependant never is); `details.remedy` says what to do. |
+| `SHARED_IN_USE`             | `down --shared -n` refused: something still depends on a shared service it would remove. `details.dependants` lists each `{instance, service, depends_on, source}` (a live worktree's booted isolated service, a worktree with an `up`, `down` or `restart` in flight, `source: lifecycle_in_progress`, or a shared service it would keep, `instance: shared`). Nothing was stopped. `details.forceable` says whether `--force` overrides it (a shared dependant and a command still in flight after the wait never are); `details.remedy` is the one command to run: the plain retry while a command is in flight. |
 | `SHARED_REMOVAL_FAILED`     | `down --shared -n` could not finish removing the shared services (`details.reason`): process-compose refused to stop them or they did not stop (`stop_refused`, `stop_incomplete`: nothing was removed), or it refused or timed out on the config reload that removes them (`not_supported`, `error`, `timeout`). The other shared services are untouched. `details` has `{services, reason, config_path, remedy}`; run `details.remedy`. |
 | `WORKTREE_START_FAILED`     | This worktree's instance died before binding its control socket; `details.config_path` is the config to run by hand. |
 | `NO_SERVICES_SELECTED`      | The selection has no services: a bare `up` starts only the `default` namespace and it has none, or `-n` names only namespaces with none, or a `restart -n` namespace has no isolated service (`details.selected_namespaces` names it; nothing was touched). `details.namespaces` lists the namespaces to pass with `-n`. |
@@ -560,8 +566,10 @@ are. It never stops anything, and never attaches the TUI.
   (`details.dependants`). The next `up -n <namespace>` adds them back with
   the current definition, on the same ports. Preview it with
   `--dry-run --json`. A namespace with no running shared service is a no-op.
-  `SHARED_DRIFT` and `SHARED_SERVICE_DEAD` name it as `details.remedy` when
-  the services involved are namespaced.
+  `SHARED_DRIFT` and `SHARED_SERVICE_DEAD` name it, with `--force`, as
+  `details.remedy` when the services involved are namespaced: run that
+  remedy as printed. When it refuses because a command is still in flight
+  elsewhere, its remedy is a plain retry; never add `--force` to that.
 - A dead selected service (crashed, killed, or exited non-zero) is started
   again, and `up` names it (`restarted` in the `--json` envelope). Several
   dead services are started in `depends_on` order, without waiting between
@@ -651,7 +659,7 @@ Branch on `error.code`:
 | `SHARED_DRIFT`              | A shared service this `up` selects (`details.services`) runs at another revision than this worktree defines. An `up` that does not select it is unaffected. Follow the message: `devtrees down --shared && devtrees up` (it stops the shared instance for every worktree). |
 | `SHARED_ACTIVATION_FAILED`  | `up` could not add a namespaced shared service to the running shared instance; nothing that was running changed. `reason: timeout` → retry `devtrees up`. Otherwise **surface it to the human** with `details.remedy`. |
 | `SHARED_PORT_CONFLICT`      | A shared port is claimed by two names, a running shared service holds a different number than the one recorded for it, or the shared block has no free number left (`details.conflicts[].reason`). Nothing was started or recorded. `block_full` → run `details.remedy` (`devtrees prune --shared-ports`) and retry. Otherwise **surface it to the human** with `details.remedy` (`devtrees down --shared && devtrees up`, which stops the shared instance for every worktree). If the message says two map entries share a port, that is for the human to fix; never edit `shared-ports.json` or ports by hand yourself. |
-| `SHARED_IN_USE`             | `down --shared -n` refused: a running worktree's service, or a shared service it would keep, still depends on one it would remove (`details.dependants`). Nothing was stopped. Stop those worktrees first (`devtrees down` in each), or, when `details.forceable` is true and they can run without it, rerun with `--force`. Otherwise follow `details.remedy`. |
+| `SHARED_IN_USE`             | `down --shared -n` refused: a running worktree's service, or a shared service it would keep, still depends on one it would remove, or a command is still running in a worktree (`details.dependants`). Nothing was stopped. Run `details.remedy`. While a command is in flight it is a plain retry: retry it in a moment, and never add `--force`. When `details.forceable` is true it is the `--force` rerun; stop those worktrees first (`devtrees down` in each) if they must not lose the service. |
 | `SHARED_REMOVAL_FAILED`     | `down --shared -n` could not finish removing the services (`details.reason`); the other shared services are untouched. **Retry** `details.remedy` once; if it fails again, **surface it to the human**. |
 | `CONFIG_DRIFT`              | The running config differs from `devtrees.yaml` and hot-reload failed, or an earlier reload is still pending. Branch on `details.reason`: `not_supported`/`error` → `devtrees down && devtrees up`. `timeout` → a changed service's old process won't stop: kill that process, then run `devtrees up` again to resync. Or run `devtrees down && devtrees up`: `down` force-kills that old process first and lists it in `force_killed`. `reload_pending` → that earlier reload is still waiting, so `up` reloaded nothing (another reload would start an untracked second copy): kill the old process (`details.pids`, for `details.services`), then run `devtrees up` again. Empty `details.pids` → the old process is gone and process-compose is still starting the new one: retry shortly; if it persists, follow the message's `devtrees down && devtrees up …`. |
 | `SERVICE_NOT_FOUND`         | You named a service that isn't in the instance. `details.valid_services` lists the real names; pick one. |

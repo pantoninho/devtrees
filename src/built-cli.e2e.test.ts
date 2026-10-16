@@ -1647,7 +1647,7 @@ describe("built CLI e2e — namespaced shared teardown (#239)", () => {
     expect(err?.code).toBe("SHARED_SERVICE_DEAD");
     expect(err?.details).toMatchObject({
       reason: "start_refused",
-      remedy: "devtrees down --shared -n a && devtrees up -n default -n a",
+      remedy: "devtrees down --shared -n a --force && devtrees up -n default -n a",
     });
     // An always-on one still gets the full teardown.
     const db = devtrees(wt, ["up", "--json", "--wait-timeout", "10", "-n", "default", "-n", "a"], {

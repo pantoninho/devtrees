@@ -108,6 +108,7 @@ import { boundedRestart } from "./bounded-restart.js";
 import { boundedStopServices, StopRefusedError } from "./bounded-stop.js";
 import {
   inProgressDependants,
+  namespacedRecoveryRemedy,
   planSharedDown,
   recordedSharedEdges,
   removesLastRunning,
@@ -671,29 +672,14 @@ function assertExplicitSelectionNotEmpty(
 const SHARED_DRIFT_REMEDY = "devtrees down --shared && devtrees up";
 
 /**
- * The remedy for broken or drifted shared services (#239): when every one is
- * namespaced, `down --shared -n` for their namespaces then the same `up`,
- * which leaves the other shared services running; otherwise the full
- * teardown. A service's namespace is the one this `up` selects it by, or its
- * own first one when it came in as a dependency.
+ * The remedy for broken or drifted shared services (#239): the forced
+ * namespaced teardown `namespacedRecoveryRemedy` builds, else the full one.
  */
 function sharedRemedyFor(
   stack: ResolvedStack,
   upNamespaces: ReadonlyArray<string>,
 ): (services: ReadonlyArray<string>) => string {
-  return (names) => {
-    const byName = new Map(sharedServicesOf(stack).map((s) => [s.name, s]));
-    const services = names.map((n) => byName.get(n));
-    if (services.length === 0 || services.some((s) => s === undefined || isAlwaysOnShared(s))) {
-      return SHARED_DRIFT_REMEDY;
-    }
-    const ns = (services as ResolvedService[]).map((s) => {
-      const own = serviceNamespaces(s);
-      return own.find((n) => upNamespaces.includes(n)) ?? own[0] ?? DEFAULT_NAMESPACE;
-    });
-    const down = ["devtrees down --shared", ...[...new Set(ns)].map((n) => `-n ${n}`)].join(" ");
-    return `${down} && ${formatUpCommand(stack.services, upNamespaces)}`;
-  };
+  return (names) => namespacedRecoveryRemedy(stack, upNamespaces, names) ?? SHARED_DRIFT_REMEDY;
 }
 
 /** First 12 hex chars of a revision, for prose; the envelope carries it whole. */
@@ -738,8 +724,8 @@ function assertSharedPlanClean(
       ? `Run \`${SHARED_DRIFT_REMEDY}\` to restart shared from this worktree's config ` +
         `(this stops the shared instance for every worktree).`
       : `Run \`${remedy}\` to restart only those shared services from this worktree's ` +
-        `config (the others keep running), or \`${SHARED_DRIFT_REMEDY}\` to restart the ` +
-        `whole shared instance (this stops it for every worktree).`;
+        `config: the other shared services keep running, and \`--force\` interrupts the ` +
+        `worktrees that use these, as the full \`${SHARED_DRIFT_REMEDY}\` would.`;
   throw new SharedDriftError(
     `the shared instance runs a different definition of shared services this up selects: ` +
       `${[...drifted, ...conflicts].join("; ")} ` +
@@ -1325,6 +1311,12 @@ export interface CommandDeps {
    * shared service it would remove. Default: `discoverInstances`.
    */
   readonly discover?: (anchor: string, deps: DiscoverDeps) => Promise<InstanceInfo[]>;
+  /**
+   * How long `down --shared -n` waits, outside the shared lock, for a
+   * worktree's in-flight lifecycle command to finish before it refuses
+   * (#239). Default: 15s.
+   */
+  readonly lifecycleWaitMs?: number;
 }
 
 export interface UpResult {
@@ -3773,8 +3765,52 @@ export async function runSharedNamespaceDown(
   const { anchor } = resolve(deps);
   const sharedLock = deps.withSharedLock ?? defaultWithSharedLock;
   const driver = createDriver(deps.driver);
-  return await sharedLock(anchor.anchor, async () => {
-    const seen = await inspectSharedDown(deps, anchor.anchor, options, { readOnly: false });
+  const deadline = Date.now() + (deps.lifecycleWaitMs ?? LIFECYCLE_WAIT_MS);
+  for (;;) {
+    const attempt = await sharedLock(anchor.anchor, () =>
+      sharedNamespaceDownAttempt(deps, driver, anchor.anchor, options, deadline),
+    );
+    if (attempt.done !== undefined) return attempt.done;
+    // Wait OUTSIDE the shared lock: an `up` queued on it behind this teardown
+    // holds its worktree lock until it is through, so waiting while holding
+    // the shared lock would deadlock until the deadline.
+    await waitForLocksToClear(anchor.anchor, attempt.waitFor, deadline);
+  }
+}
+
+/** How long `down --shared -n` waits for in-flight lifecycle commands (#239). */
+const LIFECYCLE_WAIT_MS = 15_000;
+const LIFECYCLE_POLL_MS = 200;
+
+/** Poll until none of `ids` holds its lifecycle lock, or `deadline`. */
+async function waitForLocksToClear(
+  anchor: string,
+  ids: ReadonlyArray<string>,
+  deadline: number,
+): Promise<void> {
+  while (Date.now() < deadline) {
+    const held = new Set(heldWorktreeLocks(anchor));
+    if (!ids.some((id) => held.has(id))) return;
+    await new Promise((r) => setTimeout(r, Math.min(LIFECYCLE_POLL_MS, deadline - Date.now())));
+  }
+}
+
+/**
+ * One locked attempt of `down --shared -n` (#239). When the only thing in
+ * the way is a lifecycle command in flight, it asks the caller to wait for
+ * those locks outside the shared lock and try again (`waitFor`), until
+ * `deadline`; after it, the attempt fails `SHARED_IN_USE` with a plain retry.
+ * A shared dependant fails at once: waiting cannot clear it.
+ */
+async function sharedNamespaceDownAttempt(
+  deps: CommandDeps,
+  driver: ReturnType<typeof createDriver>,
+  anchor: string,
+  options: SharedNamespaceDownOptions,
+  deadline: number,
+): Promise<{ done?: SharedNamespaceDownResult; waitFor: ReadonlyArray<string> }> {
+  const done = await (async (): Promise<SharedNamespaceDownResult | string[]> => {
+    const seen = await inspectSharedDown(deps, anchor, options, { readOnly: false });
     const result = {
       shared: true as const,
       namespaces: [...options.namespaces],
@@ -3788,21 +3824,27 @@ export async function runSharedNamespaceDown(
       return { ...result, stopped: false, instanceStopped: false };
     }
     const removed = [...seen.plan.targets, ...seen.leftovers];
-    assertSharedNotInUse(seen, options);
+    const inFlight = seen.dependants.filter((d) => d.source === "lifecycle_in_progress");
+    const sharedBlock = seen.dependants.some((d) => d.instance === SHARED_INSTANCE_ID);
+    if (inFlight.length > 0 && !sharedBlock && Date.now() < deadline) {
+      return inFlight.map((d) => d.instance);
+    }
+    assertSharedNotInUse(seen, options, anchor);
     const overridden = { dependants: [...seen.dependants], removed };
     if (seen.last) {
-      const forceKilled = await stopWholeShared(driver, anchor.anchor, deps);
+      const forceKilled = await stopWholeShared(driver, anchor, deps);
       return { ...result, ...overridden, stopped: true, instanceStopped: true, forceKilled };
     }
-    const stop = await stopSharedTargets(deps, driver, anchor.anchor, seen);
+    const stop = await stopSharedTargets(deps, driver, anchor, seen);
     const { forceKilled } = stop;
     if (stop.instanceGone) {
-      rmSync(sharedInstancePaths(anchor.anchor).configPath, { force: true });
+      rmSync(sharedInstancePaths(anchor).configPath, { force: true });
       return { ...result, ...overridden, stopped: true, instanceStopped: true, forceKilled };
     }
-    await removeSharedProcesses(driver, anchor.anchor, seen);
+    await removeSharedProcesses(driver, anchor, seen);
     return { ...result, ...overridden, stopped: stop.stopped, instanceStopped: false, forceKilled };
-  });
+  })();
+  return Array.isArray(done) ? { waitFor: done } : { done, waitFor: [] };
 }
 
 /**
@@ -3898,7 +3940,8 @@ async function readSharedRowsOrFail(
  * too (`source: lifecycle_in_progress`): an `up` there may already be past
  * its shared step, waiting for shared health or spawning, with no socket
  * yet. The locks are read after the discovery, so an `up` is seen either by
- * its socket or by its lock. No lock is taken.
+ * its socket or by its lock. No lock is taken. The caller waits for these
+ * outside the shared lock before it refuses (`runSharedNamespaceDown`).
  */
 async function findWorktreeDependants(
   deps: CommandDeps,
@@ -3921,7 +3964,7 @@ async function findWorktreeDependants(
     live.map((i) => worktreeEdgesOf(deps, anchor, i)),
     targets,
   );
-  return [...found, ...inProgressDependants(heldWorktreeLocks(anchor), found)];
+  return [...found, ...inProgressDependants(heldWorktreeLocks(anchor))];
 }
 
 /**
@@ -3951,12 +3994,21 @@ function worktreeEdgesOf(deps: CommandDeps, anchor: string, info: InstanceInfo):
   return { instance: info.id, edges, source: "devtrees_yaml", booted };
 }
 
-/** The dependants that block: shared ones always, worktree ones unless `--force`. */
+/**
+ * The dependants that block: shared ones and in-flight lifecycle commands
+ * always, worktree ones unless `--force`. `--force` overrides a worktree
+ * that uses a service, never one in the middle of an `up`, `down` or
+ * `restart`: forcing under an `up` that is waiting for shared health would
+ * fail it confusingly, and the command clears on its own.
+ */
 function blockingDependants(
   dependants: ReadonlyArray<SharedDependant>,
   force: boolean | undefined,
 ): SharedDependant[] {
-  return dependants.filter((d) => d.instance === SHARED_INSTANCE_ID || force !== true);
+  return dependants.filter(
+    (d) =>
+      d.instance === SHARED_INSTANCE_ID || d.source === "lifecycle_in_progress" || force !== true,
+  );
 }
 
 /** `instance/service (depends on a, b)`, for prose. */
@@ -3978,11 +4030,16 @@ function describeDependant(d: SharedDependant): string {
 function assertSharedNotInUse(
   seen: SharedDownInspection,
   options: SharedNamespaceDownOptions,
+  anchor: string,
 ): void {
   const blocking = blockingDependants(seen.dependants, options.force);
   if (blocking.length === 0) return;
   const shared = blocking.filter((d) => d.instance === SHARED_INSTANCE_ID);
-  const { remedy, advice } = sharedInUseRemedy(shared, seen.config, options);
+  const inFlight = blocking.filter((d) => d.source === "lifecycle_in_progress");
+  const { remedy, advice } =
+    shared.length === 0 && inFlight.length > 0
+      ? inFlightRemedy(inFlight, options, anchor)
+      : sharedInUseRemedy(shared, seen.config, options);
   const targets = seen.plan.targets.map((t) => `'${t}'`).join(", ");
   const plural = options.namespaces.length === 1 ? "" : "s";
   throw new SharedInUseError(
@@ -3994,7 +4051,7 @@ function assertSharedNotInUse(
       namespaces: [...options.namespaces],
       services: [...seen.plan.targets],
       dependants: blocking,
-      forceable: shared.length === 0,
+      forceable: shared.length === 0 && inFlight.length === 0,
       remedy,
     },
   );
@@ -4039,6 +4096,27 @@ function sharedInUseRemedy(
     advice:
       "stop those worktrees first (`devtrees down` in each), or remove the services anyway " +
       `with \`${remedy}\` (those services keep running without them).`,
+  };
+}
+
+/**
+ * The remedy while a lifecycle command is still in flight after the wait
+ * (#239): the plain retry, never `--force`, which would pull the services
+ * from under that command. Names the lock files, in case one is stale.
+ */
+function inFlightRemedy(
+  inFlight: ReadonlyArray<SharedDependant>,
+  options: SharedNamespaceDownOptions,
+  anchor: string,
+): { readonly remedy: string; readonly advice: string } {
+  const remedy = sharedDownCommand(options.namespaces, false);
+  const locks = inFlight.map((d) => join(stateDir(anchor), `${d.instance}.lock`)).join(", ");
+  return {
+    remedy,
+    advice:
+      "an `up`, `down` or `restart` is still running in those worktrees after devtrees " +
+      `waited for it: retry \`${remedy}\` once it has finished. If no devtrees command is ` +
+      `running there, its lock is stale: remove ${locks} and retry.`,
   };
 }
 

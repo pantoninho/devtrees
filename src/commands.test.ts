@@ -7841,9 +7841,9 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
     ]);
     // A namespaced drifted service gets the namespaced teardown (#239).
     expect(err?.details?.remedy).toBe(
-      "devtrees down --shared -n db-shared && devtrees up -n app -n db-shared",
+      "devtrees down --shared -n db-shared --force && devtrees up -n app -n db-shared",
     );
-    expect(err?.message).toContain("the others keep running");
+    expect(err?.message).toContain("interrupts the worktrees that use these");
     expect(err?.message).toContain("devtrees down --shared && devtrees up");
     // Nothing was spawned for the divergent worktree.
     expect(track.invocations).toEqual([]);

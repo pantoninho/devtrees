@@ -2,6 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 import { DEVTREES_METADATA_KEY, type DerivedConfig } from "./deriver.js";
 import type { ServiceStatus } from "./driver.js";
 import {
+  namespacedRecoveryRemedy,
   planSharedDown,
   recordedSharedEdges,
   removesLastRunning,
@@ -235,5 +236,48 @@ describe("withoutServiceRecords (#239)", () => {
       hash: "h",
       ports: { A: 1 },
     });
+  });
+});
+
+describe("namespacedRecoveryRemedy (#239)", () => {
+  const svc = (
+    name: string,
+    namespace: string | undefined,
+    deps: string[] = [],
+    tier: "shared" | "isolated" = "shared",
+  ): ResolvedService => ({
+    name,
+    tier,
+    command: "x",
+    ports: [],
+    environment: [],
+    dependsOn: deps.map((d) => ({ name: d })),
+    ...(namespace !== undefined ? { namespace } : {}),
+  });
+
+  it("forces the namespaced teardown, then the same up, so the caller and other users do not block it", () => {
+    const stack = {
+      services: [svc("pg", undefined), svc("sa", "a"), svc("web", "app", [], "isolated")],
+    };
+    expect(namespacedRecoveryRemedy(stack, ["app", "a"], ["sa"])).toBe(
+      "devtrees down --shared -n a --force && devtrees up -n app -n a",
+    );
+  });
+
+  it("adds the namespaces of shared services that depend on them, transitively", () => {
+    const stack = {
+      services: [svc("sa", "a"), svc("sb", "b", ["sa"]), svc("sc", "c", ["sb"]), svc("sd", "d")],
+    };
+    expect(namespacedRecoveryRemedy(stack, ["a"], ["sa"])).toBe(
+      "devtrees down --shared -n a -n b -n c --force && devtrees up -n a",
+    );
+  });
+
+  it("is undefined (the full teardown) for an always-on service, or when one depends on them", () => {
+    expect(namespacedRecoveryRemedy({ services: [svc("pg", undefined)] }, [], ["pg"])).toBe(
+      undefined,
+    );
+    const stack = { services: [svc("sa", "a"), svc("pg", undefined, ["sa"])] };
+    expect(namespacedRecoveryRemedy(stack, ["a"], ["sa"])).toBe(undefined);
   });
 });
