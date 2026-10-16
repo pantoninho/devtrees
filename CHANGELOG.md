@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.0](https://github.com/pantoninho/devtrees/compare/v0.4.0...v0.5.0) (2026-10-16)
+
+
+### Features
+
+* stable shared ports by name, recorded in a shared port map ([#243](https://github.com/pantoninho/devtrees/issues/243)) ([d826f85](https://github.com/pantoninho/devtrees/commit/d826f8510805931ac04b273adbf41378e1a8fa8c))
+* tear down one namespace's shared services ([#244](https://github.com/pantoninho/devtrees/issues/244)) ([8c10fe3](https://github.com/pantoninho/devtrees/commit/8c10fe345069328870169677abe1f15483c92551))
+
 ## [0.4.0](https://github.com/pantoninho/devtrees/compare/v0.3.0...v0.4.0) (2026-10-15)
 
 
