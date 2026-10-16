@@ -11,9 +11,11 @@ import { afterEach, describe, expect, it } from "vite-plus/test";
 import {
   assignSharedPorts,
   blockingPortConflicts,
+  inSharedBlock,
   liveSharedPortsOf,
   planSharedPorts,
   readSharedPortMap,
+  readSharedPortMapFile,
   reconcileSharedPortMap,
   sharedPortMapFile,
   sharedPortOrigins,
@@ -239,6 +241,34 @@ describe("planSharedPorts — conflicts", () => {
     });
     expect(plan.ports.PG_PORT).toBe(30_000);
     expect(plan.warnings).toEqual([expect.stringContaining("PG_PORT=30000")]);
+    // The warning carries its remedy (#244 follow-up).
+    expect(plan.warnings[0]).toContain("devtrees prune --shared-ports");
+    expect(plan.warnings[0]).toContain("devtrees down --shared");
+  });
+
+  it("a map with an invalid entry is to be rewritten (`changed`) even when nothing else is new", () => {
+    const input = {
+      names: ["PG_PORT"],
+      recorded: { PG_PORT: 20_000 },
+      live: noLive,
+      running: false,
+      positional: () => 20_000,
+      block,
+    };
+    expect(planSharedPorts(input).changed).toBe(false);
+    const repaired = planSharedPorts({ ...input, repair: true });
+    expect(repaired.changed).toBe(true);
+    expect(repaired.map).toEqual({ PG_PORT: 20_000 });
+  });
+});
+
+describe("inSharedBlock", () => {
+  it("is true for [base, base + size) only, and false without a block", () => {
+    expect(inSharedBlock(block, 20_000)).toBe(true);
+    expect(inSharedBlock(block, 20_009)).toBe(true);
+    expect(inSharedBlock(block, 20_010)).toBe(false);
+    expect(inSharedBlock(block, 19_999)).toBe(false);
+    expect(inSharedBlock(undefined, 20_000)).toBe(false);
   });
 });
 
@@ -313,5 +343,9 @@ describe("shared port map file", () => {
     const warnings: string[] = [];
     expect(readSharedPortMap(dir, (m) => warnings.push(m))).toEqual({ PG_PORT: 20_000 });
     expect(warnings).toHaveLength(2);
+    expect(readSharedPortMapFile(dir, () => {})).toEqual({
+      map: { PG_PORT: 20_000 },
+      invalid: ["SB_PORT", "Z"],
+    });
   });
 });
