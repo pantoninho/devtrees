@@ -62,37 +62,63 @@ const stderrWarn: PortMapWarn = (message) => {
 const isPort = (v: unknown): v is number =>
   typeof v === "number" && Number.isInteger(v) && v > 0 && v <= 65_535;
 
+/** The persisted map as read, and the invalid entries the read dropped. */
+export interface SharedPortMapRead {
+  /** `undefined` when the file is absent or cannot be parsed. */
+  readonly map: SharedPortMap | undefined;
+  /** Names whose entry was not a valid port and was dropped. */
+  readonly invalid: ReadonlyArray<string>;
+}
+
 /**
  * Read the persisted map, or `undefined` when it is absent or cannot be
  * parsed. The file is written atomically (`writeSharedPortMap`), so a torn
  * write is not expected; a file that still cannot be parsed (a hand edit, a
  * disk fault) is warned about, because the next `up` re-seeds the map from
  * the running instance and so loses the names only other branches recorded.
- * One invalid entry is dropped with a warning; the rest are kept.
+ * One invalid entry is dropped with a warning; the rest are kept, and the
+ * next `up` (or `prune --shared-ports`) rewrites the map without it, under
+ * the shared lock, so the warning does not repeat (`invalid`).
  */
-export function readSharedPortMap(
+export function readSharedPortMapFile(
   anchor: string,
   warn: PortMapWarn = stderrWarn,
-): SharedPortMap | undefined {
+): SharedPortMapRead {
   const file = sharedPortMapFile(anchor);
-  if (!existsSync(file)) return undefined;
+  if (!existsSync(file)) return { map: undefined, invalid: [] };
   let ports: unknown;
   try {
     ports = (JSON.parse(readFileSync(file, "utf8")) as { ports?: unknown } | null)?.ports;
   } catch (err) {
     warn(unreadableMapWarning(file, (err as Error).message));
-    return undefined;
+    return { map: undefined, invalid: [] };
   }
   if (ports === null || typeof ports !== "object" || Array.isArray(ports)) {
     warn(unreadableMapWarning(file, "it has no `ports` object"));
-    return undefined;
+    return { map: undefined, invalid: [] };
   }
   const out: Record<string, number> = {};
+  const invalid: string[] = [];
   for (const [name, port] of Object.entries(ports as Record<string, unknown>)) {
-    if (isPort(port)) out[name] = port;
-    else warn(`devtrees: ignoring invalid entry ${name}=${JSON.stringify(port)} in ${file}.`);
+    if (isPort(port)) {
+      out[name] = port;
+      continue;
+    }
+    invalid.push(name);
+    warn(
+      `devtrees: ignoring invalid entry ${name}=${JSON.stringify(port)} in ${file}; ` +
+        `the next \`up\` or \`prune --shared-ports\` rewrites the map without it.`,
+    );
   }
-  return out;
+  return { map: out, invalid };
+}
+
+/** `readSharedPortMapFile`'s map alone. */
+export function readSharedPortMap(
+  anchor: string,
+  warn: PortMapWarn = stderrWarn,
+): SharedPortMap | undefined {
+  return readSharedPortMapFile(anchor, warn).map;
 }
 
 function unreadableMapWarning(file: string, reason: string): string {
@@ -300,6 +326,11 @@ export function assignSharedPorts(args: {
   return { ports, assigned, unassigned };
 }
 
+/** Whether `port` lies in `block` (`false` when there is no block). */
+export function inSharedBlock(block: SharedBlock | undefined, port: number): boolean {
+  return block !== undefined && port >= block.base && port < block.base + block.size;
+}
+
 function lowestFree(block: SharedBlock | undefined, used: ReadonlySet<number>): number | undefined {
   if (block === undefined) return undefined;
   for (let port = block.base; port < block.base + block.size; port++) {
@@ -389,16 +420,15 @@ export function planSharedPorts(input: {
   readonly running: boolean;
   readonly positional: (name: string) => number | undefined;
   readonly block: SharedBlock | undefined;
+  /** The persisted map had invalid entries: rewrite it without them even if nothing else changed. */
+  readonly repair?: boolean;
 }): SharedPortPlan {
   const known = new Set([
     ...input.names,
     ...Object.keys(input.recorded ?? {}),
     ...Object.keys(input.live.bound),
   ]);
-  const inBlock = (port: number): boolean =>
-    input.block !== undefined &&
-    port >= input.block.base &&
-    port < input.block.base + input.block.size;
+  const inBlock = (port: number): boolean => inSharedBlock(input.block, port);
   const reconciled = reconcileSharedPortMap(input.recorded, input.live, (name, port) => {
     if (known.has(name)) return "seed";
     return input.running && inBlock(port) ? "reserve" : "ignore";
@@ -410,7 +440,10 @@ export function planSharedPorts(input: {
   });
   const map = { ...reconciled.map, ...pickPorts(ports, assigned) };
   const changed =
-    input.recorded === undefined || reconciled.seeded.length > 0 || assigned.length > 0;
+    input.recorded === undefined ||
+    input.repair === true ||
+    reconciled.seeded.length > 0 ||
+    assigned.length > 0;
   const live = input.running
     ? reconciled.conflicts
     : reconciled.conflicts.filter((c) => betweenRecorded(c, input.recorded));
@@ -481,7 +514,11 @@ export function blockingPortConflicts(
   );
 }
 
-/** The warning for a recorded port outside the current shared block (#238). */
+/**
+ * The warning for a recorded port outside the current shared block (#238),
+ * with its remedy: `prune --shared-ports` drops such a name once nothing
+ * running holds it (ADR-0011).
+ */
 function outOfBlockWarning(
   entry: { readonly portName: string; readonly port: number },
   block: SharedBlock,
@@ -489,7 +526,12 @@ function outOfBlockWarning(
   return (
     `devtrees: shared port ${entry.portName}=${entry.port} is recorded outside the shared ` +
     `block [${block.base}, ${block.base + block.size}) (its size or base changed since it was ` +
-    `recorded); it keeps that number, which the allocator does not reserve for shared services.`
+    `recorded); it keeps that number, which the allocator does not reserve for shared services. ` +
+    `To move it into the block, stop every running instance whose env carries it (\`devtrees ` +
+    `down --shared\`, since every shared process gets every shared port, and \`devtrees down\` ` +
+    `in each running worktree that injects it), then run \`devtrees prune --shared-ports\`: it ` +
+    `drops a name recorded outside the block once nothing running holds it, and the next ` +
+    `\`up\` gives it a number inside the block.`
   );
 }
 

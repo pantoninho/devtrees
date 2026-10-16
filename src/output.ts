@@ -115,7 +115,7 @@ export const ERROR_CODE_DESCRIPTIONS: Readonly<Record<ErrorCode, string>> = {
   SHARED_PORT_CONFLICT:
     "A shared named port cannot be resolved without handing one port to two names or moving a recorded one (the stable shared port map, #238): `details.conflicts` lists each `{reason, port_name, port, recorded_port?, holder?, process?}` (`reason`: `port_taken`, `bound_mismatch`, `stale_env`, or `block_full` when the shared block has no free number left); nothing was started, added or recorded. `details.remedy` is one command: `devtrees down --shared && devtrees up` (run for every worktree), or `devtrees prune --shared-ports` for `block_full`; `details.map_path` is the map.",
   SHARED_IN_USE:
-    "`down --shared -n` refused: something still depends on a shared service it would remove. `details.dependants` lists each `{instance, service, depends_on, source}` (a live worktree's booted isolated service, a worktree with an `up`, `down` or `restart` in flight, `source: lifecycle_in_progress`, or a shared service it would keep, `instance: shared`). Nothing was stopped. `details.forceable` says whether `--force` overrides it (a shared dependant and a command still in flight after the wait never are); `details.remedy` is the one command to run: the plain retry while a command is in flight.",
+    "`down --shared -n` refused: something still depends on a shared service it would remove. `details.dependants` lists each `{instance, service, depends_on, source}` (a live worktree's booted isolated service, a worktree with an `up` or `restart` in flight that may use a target, `source: lifecycle_in_progress`, whose `depends_on` lists the targets an `up` past its shared step selected, or a shared service it would keep, `instance: shared`). Nothing was stopped. `details.forceable` says whether `--force` overrides it (a shared dependant and a command still in flight after the wait never are); `details.remedy` is the one command to run: the plain retry while a command is in flight.",
   SHARED_REMOVAL_FAILED:
     "`down --shared -n` could not finish removing the shared services (`details.reason`): process-compose refused to stop them or they did not stop (`stop_refused`, `stop_incomplete`: nothing was removed), or it refused or timed out on the config reload that removes them (`not_supported`, `error`, `timeout`). The other shared services are untouched. `details` has `{services, reason, config_path, remedy}`; run `details.remedy`.",
   WORKTREE_START_FAILED:
@@ -546,6 +546,59 @@ function formatPruneHuman(pruned: ReadonlyArray<PrunedRow>): string {
 }
 
 /**
+ * Render `devtrees prune --shared-ports` (#238): the shared port map names it
+ * dropped and kept. `json`: `{schema_version, prune_shared_ports: {dropped,
+ * kept, out_of_block, dry_run, blocked_by}}`. With `--dry-run`, `dropped` is
+ * what the real run would drop, and `blocked_by` the worktrees whose
+ * in-flight command would make it refuse now.
+ */
+export function formatPruneSharedPorts(
+  result: {
+    readonly dropped: ReadonlyArray<string>;
+    readonly kept: ReadonlyArray<string>;
+    readonly outOfBlock?: ReadonlyArray<string>;
+    readonly dryRun?: boolean;
+    readonly blockedBy?: ReadonlyArray<string>;
+  },
+  mode: FormatMode,
+): OutputResult {
+  const outOfBlock = result.outOfBlock ?? [];
+  const blockedBy = result.blockedBy ?? [];
+  const dryRun = result.dryRun === true;
+  if (mode === "json") {
+    const doc = {
+      schema_version: SCHEMA_VERSION,
+      prune_shared_ports: {
+        dropped: result.dropped,
+        kept: result.kept,
+        out_of_block: outOfBlock,
+        dry_run: dryRun,
+        blocked_by: blockedBy,
+      },
+    };
+    return { stdout: `${JSON.stringify(doc)}\n`, stderr: "" };
+  }
+  const kept = result.kept.length === 0 ? "none" : result.kept.join(", ");
+  const cmd = `devtrees prune --shared-ports${dryRun ? " --dry-run" : ""}`;
+  const verb = dryRun ? "would drop" : "dropped";
+  const head =
+    result.dropped.length === 0
+      ? `${cmd}: no unused shared port to drop`
+      : `${cmd}: ${verb} ${result.dropped.join(", ")}`;
+  const outside =
+    outOfBlock.length === 0
+      ? ""
+      : `; outside the shared block, held by nothing running: ${outOfBlock.join(", ")}`;
+  const blocked =
+    blockedBy.length === 0
+      ? ""
+      : `\nThe real run would refuse now (LOCK_CONTENTION): a command is in flight in ${blockedBy
+          .map((id) => `'${id}'`)
+          .join(", ")}. Retry once it finishes.`;
+  return { stdout: `${head} (kept: ${kept}${outside}).${blocked}\n`, stderr: "" };
+}
+
+/**
  * `devtrees prune --json` envelope (issue #48). Lists every orphan the sweep
  * reconciled away under `prune.pruned[]`. Each entry is identity-only —
  * `{id, kind, worktreePath}` — because `prune` is a sweep over state that no
@@ -554,30 +607,6 @@ function formatPruneHuman(pruned: ReadonlyArray<PrunedRow>): string {
  * list itself stays because `prune` is the only command that reconciles
  * devtrees-state vs `git worktree list`. Human output is unchanged.
  */
-/**
- * Render `devtrees prune --shared-ports` (#238): the shared port map names it
- * dropped and kept. `json`: `{schema_version, prune_shared_ports: {dropped,
- * kept}}`.
- */
-export function formatPruneSharedPorts(
-  result: { readonly dropped: ReadonlyArray<string>; readonly kept: ReadonlyArray<string> },
-  mode: FormatMode,
-): OutputResult {
-  if (mode === "json") {
-    const doc = {
-      schema_version: SCHEMA_VERSION,
-      prune_shared_ports: { dropped: result.dropped, kept: result.kept },
-    };
-    return { stdout: `${JSON.stringify(doc)}\n`, stderr: "" };
-  }
-  const kept = result.kept.length === 0 ? "none" : result.kept.join(", ");
-  const head =
-    result.dropped.length === 0
-      ? "devtrees prune --shared-ports: no unused shared port to drop"
-      : `devtrees prune --shared-ports: dropped ${result.dropped.join(", ")}`;
-  return { stdout: `${head} (kept: ${kept}).\n`, stderr: "" };
-}
-
 export function formatPrune(
   pruned: ReadonlyArray<PrunedRow>,
   mode: FormatMode,
@@ -851,7 +880,10 @@ function dependantJson(d: SharedDependantRow): Record<string, unknown> {
 }
 
 function describeDependantRow(d: SharedDependantRow): string {
-  if (d.source === "lifecycle_in_progress") return `worktree '${d.instance}' (command in progress)`;
+  if (d.source === "lifecycle_in_progress") {
+    const uses = d.depends_on.length === 0 ? "" : `, uses ${d.depends_on.join(", ")}`;
+    return `worktree '${d.instance}' (command in progress${uses})`;
+  }
   if (d.service === null) return `worktree '${d.instance}' (dependencies unreadable)`;
   const who = d.instance === "shared" ? `shared '${d.service}'` : `${d.instance}/${d.service}`;
   return `${who} (depends on ${d.depends_on.join(", ")})`;

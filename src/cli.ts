@@ -238,9 +238,12 @@ export interface ExecuteDeps {
   }>;
   attach?: (options: { shared: boolean }) => Promise<void>;
   /** `prune --shared-ports` (#238): drop shared port map names no instance holds. */
-  pruneSharedPorts?: () => Promise<{
+  pruneSharedPorts?: (options: { dryRun: boolean }) => Promise<{
     dropped: ReadonlyArray<string>;
     kept: ReadonlyArray<string>;
+    outOfBlock?: ReadonlyArray<string>;
+    dryRun?: boolean;
+    blockedBy?: ReadonlyArray<string>;
   }>;
   prune?: () => Promise<{
     anchor: string;
@@ -944,20 +947,32 @@ class PruneCommand extends DevtreesCommand {
       "With `--shared-ports`, prune only the stable shared port map (#238) instead: drop " +
       "every recorded name that no instance holds (no running shared service binds it and " +
       "no derived config on disk carries it), freeing shared block numbers after " +
-      "an `up` failed because the shared block is full (`block_full`). Refused while any " +
-      "worktree's `up` or `down` is in flight.\n\n" +
-      errorCodeFooter(["LOCK_CONTENTION", "UNKNOWN"]),
+      "an `up` failed because the shared block is full (`block_full`). A name recorded " +
+      "outside the current shared block is dropped once nothing running holds it, so the " +
+      "next `up` gives it a number inside the block. Refused while a worktree's `up` (before " +
+      "its shared step), `down` or `restart` is in flight. `--dry-run` (with `--shared-ports` " +
+      "only) reports what it would drop, and what would refuse it, without a lock or a write.\n\n" +
+      errorCodeFooter(["LOCK_CONTENTION", "INVALID_ARGS", "UNKNOWN"]),
   });
 
   sharedPorts = Option.Boolean("--shared-ports", false, {
     description: "Drop shared port map names no instance holds, instead of pruning orphans.",
   });
 
+  dryRun = Option.Boolean("--dry-run", false, {
+    description: "With `--shared-ports`: report what would be dropped, change nothing.",
+  });
+
   override async execute(): Promise<number> {
     return this.dispatch(async () => {
+      if (this.dryRun && !this.sharedPorts) {
+        throw invalidArgsError(
+          "`devtrees prune --dry-run` applies only to `devtrees prune --shared-ports`.",
+        );
+      }
       if (this.sharedPorts) {
         if (!this.context.deps.pruneSharedPorts) return 0;
-        const result = await this.context.deps.pruneSharedPorts();
+        const result = await this.context.deps.pruneSharedPorts({ dryRun: this.dryRun });
         this.emit(formatPruneSharedPorts(result, this.mode));
         return 0;
       }
@@ -1477,7 +1492,7 @@ if (isEntrypoint(import.meta.url, process.argv[1])) {
     ls: () => runLs(),
     attach: ({ shared }) => runAttach({}, { shared }),
     prune: () => runPrune({ stop: stopSeamsFromEnv() }),
-    pruneSharedPorts: () => runPruneSharedPorts(),
+    pruneSharedPorts: (options) => runPruneSharedPorts({}, options),
     env: () => runEnv(),
     logs: (opts) =>
       runLogs(

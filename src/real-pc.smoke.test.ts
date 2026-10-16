@@ -27,7 +27,15 @@
  */
 import { afterEach, beforeAll, describe, expect, it } from "vite-plus/test";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { createConnection, createServer, type Server } from "node:net";
 import { request } from "node:http";
 import { join } from "node:path";
@@ -48,6 +56,64 @@ const SKIP_REASON = !ENABLED
 function hasProcessCompose(): boolean {
   const out = spawnSync("process-compose", ["version"], { stdio: "ignore" });
   return out.status === 0;
+}
+
+/**
+ * Env var naming a pre-installed `devtrees@0.4.0` `dist/cli.mjs`, for
+ * scenario 133. The smoke workflow installs it in a setup step, with retries
+ * and a cache, so the test itself never depends on the npm registry in CI.
+ */
+const LEGACY_CLI_ENV = "DEVTREES_LEGACY_CLI";
+const LEGACY_INSTALL_DELAYS_MS = [0, 2_000, 8_000];
+
+/**
+ * The published devtrees@0.4.0 CLI for scenario 133. `DEVTREES_LEGACY_CLI`
+ * wins (it must exist). Otherwise it is installed from npm into a throwaway
+ * dir, `--prefer-offline` and retried. When every attempt fails, it throws in
+ * CI (`CI` set): a scenario that cannot run must not pass. Locally it warns
+ * on stderr and returns the note the caller skips with.
+ */
+async function legacyCli040(): Promise<string | { readonly skipped: string }> {
+  const preset = process.env[LEGACY_CLI_ENV] ?? "";
+  if (preset !== "") {
+    if (!existsSync(preset)) throw new Error(`${LEGACY_CLI_ENV}=${preset} does not exist`);
+    return preset;
+  }
+  const installed = await installLegacyCli();
+  if (installed.cli !== undefined) return installed.cli;
+  const why =
+    `could not install devtrees@0.4.0 from npm after ${LEGACY_INSTALL_DELAYS_MS.length} ` +
+    `attempts: ${installed.error.trim()}`;
+  if ((process.env.CI ?? "") !== "") {
+    throw new Error(`[real-pc.smoke] scenario 133 ${why} (set ${LEGACY_CLI_ENV} to skip npm)`);
+  }
+  // Loud: on stderr now, and as the skip's note in the reporter.
+  process.stderr.write(`\n[real-pc.smoke] SKIPPING scenario 133: ${why}\n`);
+  return { skipped: `SKIPPED: ${why}` };
+}
+
+/** `npm install devtrees@0.4.0` into a throwaway dir, retried; the CLI path, or the last error. */
+async function installLegacyCli(): Promise<
+  | { readonly cli: string; readonly error?: never }
+  | { readonly cli?: never; readonly error: string }
+> {
+  const dir = mkdtempSync(join(TMP_BASE, "dt-rpc133-legacy-"));
+  cleanupStack.push(() => rmSync(dir, { recursive: true, force: true }));
+  const args = ["install", "--loglevel=error", "--no-save", "--no-audit", "--no-fund"];
+  let error = "";
+  for (const delay of LEGACY_INSTALL_DELAYS_MS) {
+    await new Promise((r) => setTimeout(r, delay));
+    try {
+      execFileSync("npm", [...args, "--prefer-offline", "--prefix", dir, "devtrees@0.4.0"], {
+        stdio: "pipe",
+        timeout: 120_000,
+      });
+      return { cli: join(dir, "node_modules", "devtrees", "dist", "cli.mjs") };
+    } catch (err) {
+      error = (err as { stderr?: Buffer | string }).stderr?.toString() ?? (err as Error).message;
+    }
+  }
+  return { error };
 }
 
 // `dist/cli.mjs` is a build artifact, not a source module — we spawn it as
@@ -3660,20 +3726,16 @@ describe.skipIf(!ENABLED)("real-pc smoke — stable shared ports (#238)", () => 
     expect(recorded.ports.X_PORT).toBe(Number(envOf(first).X_PORT));
   }, 120_000);
 
-  it("scenario 133: a shared instance the real devtrees@0.4.0 started is seeded by this build, with no restart", async () => {
-    // The published 0.4.0, installed from npm into a throwaway dir: the real
-    // pre-#238 writer of the shared state, not a simulation of it.
-    const legacyDir = mkdtempSync(join(TMP_BASE, "dt-rpc133-legacy-"));
-    cleanupStack.push(() => rmSync(legacyDir, { recursive: true, force: true }));
-    execFileSync(
-      "npm",
-      ["install", "--silent", "--no-save", "--prefix", legacyDir, "devtrees@0.4.0"],
-      {
-        stdio: "pipe",
-        timeout: 120_000,
-      },
-    );
-    const legacyCli = join(legacyDir, "node_modules", "devtrees", "dist", "cli.mjs");
+  it("scenario 133: a shared instance the real devtrees@0.4.0 started is seeded by this build, with no restart", async (ctx) => {
+    // The published 0.4.0: the real pre-#238 writer of the shared state, not
+    // a simulation of it (`legacyCli040`: installed by CI's setup step, or
+    // here with retries; a registry that never answers skips loudly locally
+    // and fails in CI).
+    const legacyCli = await legacyCli040();
+    if (typeof legacyCli !== "string") {
+      ctx.skip(legacyCli.skipped);
+      return;
+    }
     const legacy = (cwd: string, args: ReadonlyArray<string>): CliResult => {
       const out = spawnSync(process.execPath, [legacyCli, ...args], {
         cwd,
@@ -4041,6 +4103,92 @@ describe.skipIf(!ENABLED)("real-pc smoke — namespaced shared teardown (#239)",
     expect(Date.now() - started).toBeGreaterThanOrEqual(1500);
     expect((down.doc as NsDownDoc).down).toMatchObject({ stopped: true, services: ["sa"] });
     expect(await waitForNoPids(s.holds.sa)).toEqual([]);
+  }, 180_000);
+
+  it("scenario 134: the teardown does not wait for an in-flight command whose shared-step marker names none of its targets", async () => {
+    const s = nsStack("dt-rpc134-");
+    expect(upWith(s.billing, "app", "b").code).toBe(0);
+    expect(upWith(s.login, "app", "a").code).toBe(0);
+    expect(devtrees(s.login, ["down"]).code).toBe(0);
+    // A worktree mid-`up`, past its shared step, which selected only pg and sb.
+    const dir = join(anchorOf(s.login), "devtrees");
+    const racer = deriveWorktreeId("/x/racer");
+    const lock = join(dir, `${racer}.lock`);
+    writeFileSync(lock, `${process.pid}\n`);
+    cleanupStack.push(() => rmSync(lock, { force: true }));
+    const marker = join(dir, `${racer}.shared-step.json`);
+    writeFileSync(
+      marker,
+      JSON.stringify({
+        version: 1,
+        pid: process.pid,
+        lock_ino: statSync(lock).ino,
+        services: ["pg", "sb"],
+        ports: ["PG_PORT", "SA_PORT", "SB_PORT"],
+      }),
+    );
+    const down = nsDown(s.login, "-n", "a");
+    expect(down.code, `down: ${down.stdout} ${down.stderr}`).toBe(0);
+    expect((down.doc as NsDownDoc).down).toMatchObject({ stopped: true, services: ["sa"] });
+    // It never waited for the lock, which is still held.
+    expect(existsSync(lock)).toBe(true);
+    expect(await waitForNoPids(s.holds.sa)).toEqual([]);
+    // prune --shared-ports goes ahead beside it too, and keeps what it injects.
+    const prune = devtrees(s.login, ["prune", "--shared-ports", "--json"]);
+    expect(prune.code, `prune: ${prune.stderr}`).toBe(0);
+    expect(
+      (prune.doc as { prune_shared_ports: { kept: string[] } }).prune_shared_ports.kept,
+    ).toEqual(expect.arrayContaining(["PG_PORT", "SA_PORT", "SB_PORT"]));
+  }, 180_000);
+
+  it("scenario 135: up repairs an invalid map entry; prune --shared-ports previews with --dry-run and drops a stopped name recorded outside the block", async () => {
+    const s = nsStack("dt-rpc135-");
+    expect(upWith(s.login, "app", "b").code).toBe(0);
+    const mapPath = join(anchorOf(s.login), "devtrees", "shared-ports.json");
+    const map = JSON.parse(readFileSync(mapPath, "utf8")) as {
+      version: 1;
+      ports: Record<string, number>;
+    };
+
+    // An invalid entry: warned about once, and gone after the next `up`.
+    writeFileSync(mapPath, JSON.stringify({ ...map, ports: { ...map.ports, BAD_PORT: "x" } }));
+    const up = upWith(s.login, "app", "b");
+    expect(up.code, `up: ${up.stderr}`).toBe(0);
+    expect(up.stderr).toContain("ignoring invalid entry BAD_PORT");
+    expect(JSON.parse(readFileSync(mapPath, "utf8"))).toEqual(map);
+    expect(devtrees(s.login, ["env"]).stderr).not.toContain("BAD_PORT");
+
+    // SA_PORT recorded outside the block (a `port_base` change, say), with
+    // nothing running: the warning names its remedy, and the remedy works.
+    expect(devtrees(s.login, ["down"]).code).toBe(0);
+    expect(devtrees(s.login, ["down", "--shared"]).code).toBe(0);
+    writeFileSync(mapPath, JSON.stringify({ ...map, ports: { ...map.ports, SA_PORT: 7 } }));
+    const warned = devtrees(s.login, ["env"]);
+    expect(warned.stderr).toContain("SA_PORT=7 is recorded outside the shared block");
+    expect(warned.stderr).toContain("devtrees prune --shared-ports");
+
+    const preview = devtrees(s.login, ["prune", "--shared-ports", "--dry-run", "--json"]);
+    expect(preview.code, `dry run: ${preview.stderr}`).toBe(0);
+    const previewed = (
+      preview.doc as {
+        prune_shared_ports: { dropped: string[]; out_of_block: string[]; dry_run: boolean };
+      }
+    ).prune_shared_ports;
+    expect(previewed.dry_run).toBe(true);
+    expect(previewed.out_of_block).toEqual(["SA_PORT"]);
+    expect(previewed.dropped).toContain("SA_PORT");
+    expect(JSON.parse(readFileSync(mapPath, "utf8")).ports.SA_PORT).toBe(7);
+
+    const pruned = devtrees(s.login, ["prune", "--shared-ports", "--json"]);
+    expect(pruned.code, `prune: ${pruned.stderr}`).toBe(0);
+    expect(JSON.parse(readFileSync(mapPath, "utf8")).ports.SA_PORT).toBeUndefined();
+    expect(devtrees(s.login, ["env"]).stderr).not.toContain("outside the shared block");
+    const again = upWith(s.login, "app", "a");
+    expect(again.code, `up: ${again.stderr}`).toBe(0);
+    expect(again.stderr).not.toContain("outside the shared block");
+    const sa = JSON.parse(readFileSync(mapPath, "utf8")).ports.SA_PORT as number;
+    expect(sa).not.toBe(7);
+    expect(await waitForPid(s.holds.sa, 10_000), "sa runs").toBe(true);
   }, 180_000);
 
   it("scenario 129: the namespaced SHARED_DRIFT remedy succeeds when followed literally, though every worktree depends on the service", async () => {

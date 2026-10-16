@@ -20,6 +20,7 @@ import {
   readFileSync,
   readdirSync,
   renameSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -118,6 +119,143 @@ export function heldWorktreeLocks(anchor: string): string[] {
     const held = !Number.isInteger(pid) || pid <= 0 || isPidAlive(pid);
     return held ? [entry.slice(0, -".lock".length)] : [];
   });
+}
+
+/**
+ * What a worktree's in-flight lifecycle command declared about the shared
+ * services it uses (#244 follow-up): the **shared-step marker**,
+ * `<anchor>/devtrees/<worktree id>.shared-step.json`.
+ *
+ * An `up` writes it under the shared lifecycle lock, in its shared step,
+ * naming the shared services it selected and the shared named ports it
+ * injects. A worktree `down`, which never uses a shared service, writes one
+ * that names none (and no ports). A `down --shared -n` then waits only for
+ * an in-flight worktree whose marker names one of its targets, or that has
+ * no valid marker yet (an `up` not past its shared step); `prune
+ * --shared-ports` treats the marker's ports as held instead of refusing.
+ *
+ * The marker belongs to ONE hold of the worktree's lifecycle lock: it records
+ * the holder's pid and the lock file's inode, and is valid only while that
+ * same lock file is held by that same live pid. It is removed before the lock
+ * is released, and a leftover one (a crash) is ignored and removed by the
+ * next holder of that lock, or by a teardown or prune that finds it stale.
+ */
+export interface SharedStepMarker {
+  readonly version: 1;
+  readonly pid: number;
+  /** Inode of the lifecycle lock file this marker belongs to. */
+  readonly lock_ino: number;
+  /** The shared services the command uses (selected, for an `up`). */
+  readonly services: ReadonlyArray<string>;
+  /** The shared named ports it injects; absent when it does not say (prune keeps refusing). */
+  readonly ports?: ReadonlyArray<string>;
+}
+
+/** Path of a worktree's shared-step marker. */
+export function sharedStepMarkerFile(anchor: string, worktreeId: string): string {
+  return join(devtreesDir(anchor), `${worktreeId}.shared-step.json`);
+}
+
+/** The pid recorded in a lock file and its inode, or `undefined` when it is gone or not a pid. */
+function lockHolder(path: string): { readonly pid: number; readonly ino: number } | undefined {
+  try {
+    const ino = statSync(path).ino;
+    const pid = Number.parseInt(readFileSync(path, "utf8").trim(), 10);
+    return Number.isInteger(pid) && pid > 0 ? { pid, ino } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Write this process's shared-step marker for `worktreeId`. A no-op unless
+ * this process holds that worktree's lifecycle lock (a lock file carrying
+ * its pid): a marker is only ever about the current hold.
+ */
+export function writeSharedStepMarker(
+  anchor: string,
+  worktreeId: string,
+  claim: { readonly services: ReadonlyArray<string>; readonly ports?: ReadonlyArray<string> },
+): void {
+  if (worktreeId === SHARED_INSTANCE_ID) return;
+  const holder = lockHolder(lifecycleLockFile(anchor, worktreeId));
+  if (holder === undefined || holder.pid !== process.pid) return;
+  const marker: SharedStepMarker = {
+    version: 1,
+    pid: holder.pid,
+    lock_ino: holder.ino,
+    services: [...claim.services],
+    ...(claim.ports !== undefined ? { ports: [...claim.ports] } : {}),
+  };
+  writeAtomic(sharedStepMarkerFile(anchor, worktreeId), `${JSON.stringify(marker)}\n`);
+}
+
+function clearSharedStepMarker(anchor: string, worktreeId: string): void {
+  releaseLockAt(sharedStepMarkerFile(anchor, worktreeId));
+}
+
+function readMarkerFile(path: string): SharedStepMarker | undefined {
+  try {
+    const doc = JSON.parse(readFileSync(path, "utf8")) as Partial<SharedStepMarker> | null;
+    const strings = (v: unknown): v is string[] =>
+      Array.isArray(v) && v.every((x) => typeof x === "string");
+    if (
+      doc?.version !== 1 ||
+      typeof doc.pid !== "number" ||
+      typeof doc.lock_ino !== "number" ||
+      !strings(doc.services) ||
+      (doc.ports !== undefined && !strings(doc.ports))
+    ) {
+      return undefined;
+    }
+    return doc as SharedStepMarker;
+  } catch {
+    return undefined;
+  }
+}
+
+/** One worktree with a lifecycle command in flight, and its valid marker if it wrote one. */
+export interface InFlightWorktree {
+  readonly id: string;
+  readonly marker: SharedStepMarker | undefined;
+}
+
+/**
+ * The worktrees with a lifecycle command in flight (`heldWorktreeLocks`),
+ * each with its shared-step marker when that marker belongs to the current
+ * hold of its lock (same pid, same lock file). A marker that does not is
+ * stale; with `clearStale`, it is removed, and so is every marker of a
+ * worktree whose lock is not held at all. Only callers holding the shared
+ * lock pass `clearStale`: a marker is written under that lock, so none can
+ * appear while they decide.
+ */
+export function inFlightWorktrees(
+  anchor: string,
+  opts: { readonly clearStale?: boolean } = {},
+): InFlightWorktree[] {
+  const held = heldWorktreeLocks(anchor);
+  const out = held.map((id): InFlightWorktree => {
+    const path = sharedStepMarkerFile(anchor, id);
+    const marker = existsSync(path) ? readMarkerFile(path) : undefined;
+    const holder = lockHolder(lifecycleLockFile(anchor, id));
+    const valid =
+      marker !== undefined &&
+      holder !== undefined &&
+      holder.pid === marker.pid &&
+      holder.ino === marker.lock_ino;
+    return { id, marker: valid ? marker : undefined };
+  });
+  if (opts.clearStale === true) {
+    const live = new Set(out.filter((w) => w.marker !== undefined).map((w) => w.id));
+    const dir = devtreesDir(anchor);
+    const suffix = ".shared-step.json";
+    for (const entry of existsSync(dir) ? readdirSync(dir) : []) {
+      if (entry.endsWith(suffix) && !live.has(entry.slice(0, -suffix.length))) {
+        releaseLockAt(join(dir, entry));
+      }
+    }
+  }
+  return out;
 }
 
 /**
@@ -348,10 +486,21 @@ export async function withLifecycleLock<T>(
   mkdirSync(devtreesDir(anchor), { recursive: true });
   const path = lifecycleLockFile(anchor, instanceId);
   await acquireLockAtAsync(path, options);
+  const worktree = instanceId !== SHARED_INSTANCE_ID;
   try {
+    // A shared-step marker left by a crashed earlier holder describes a hold
+    // that is over; this one starts with none.
+    if (worktree) clearSharedStepMarker(anchor, instanceId);
     return await fn();
   } finally {
-    releaseLockAt(path);
+    // Marker first, then the lock: a reader that still sees the lock held
+    // sees at worst no marker (the conservative case), never a marker that
+    // outlived its hold.
+    try {
+      if (worktree) clearSharedStepMarker(anchor, instanceId);
+    } finally {
+      releaseLockAt(path);
+    }
   }
 }
 
@@ -377,9 +526,13 @@ export async function withSharedLock<T>(
  * releasing it, under its own lifecycle lock, so a name it just recorded is
  * only provably in use once that lock is gone. A lock left by a dead process
  * does not count. The shared, registry and hashes locks are skipped
- * (`heldWorktreeLocks`).
+ * (`heldWorktreeLocks`). A worktree in `except` does not count either: the
+ * caller already knows what its command holds (its shared-step marker).
  */
-export function assertNoWorktreeLifecycleLocks(anchor: string): void {
-  const [held] = heldWorktreeLocks(anchor);
+export function assertNoWorktreeLifecycleLocks(
+  anchor: string,
+  except: ReadonlySet<string> = new Set(),
+): void {
+  const held = heldWorktreeLocks(anchor).find((id) => !except.has(id));
   if (held !== undefined) throw new LockContentionError(lifecycleLockFile(anchor, held));
 }

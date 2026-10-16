@@ -24,6 +24,7 @@ import type { ServiceStatus, SpawnedProcess } from "./driver.js";
 import type { InstanceInfo } from "./instances.js";
 import { classifyError } from "./output.js";
 import { instancePaths, runDir, sharedInstancePaths } from "./paths.js";
+import { sharedStepMarkerFile, withLifecycleLock, writeSharedStepMarker } from "./registry.js";
 import { writePendingReload } from "./reload-pending.js";
 import { readSharedState, writeSharedState } from "./shared-state.js";
 import type { ResolvedService, ResolvedStack } from "./stack.js";
@@ -384,6 +385,99 @@ describe("runSharedNamespaceDown (#239)", () => {
     // The first attempt released the shared lock before waiting; the second did the work.
     expect(s.log.slice(0, 3)).toEqual(["lock", "unlock", "lock"]);
     expect(s.log).toContain("process stop sa");
+  });
+
+  describe("scoped to the targets by the shared-step marker (#244 follow-up)", () => {
+    const id = "billing-0a1b2c3d";
+
+    it("does not wait for an in-flight `up` whose marker names no target", async () => {
+      const s = sharedInstance();
+      const result = await withLifecycleLock(s.anchor, id, async () => {
+        writeSharedStepMarker(s.anchor, id, { services: ["pg", "sb"], ports: [] });
+        return await runSharedNamespaceDown(
+          { ...s.deps, lifecycleWaitMs: 5000 },
+          { namespaces: ["a"] },
+        );
+      });
+      expect(result).toMatchObject({ stopped: true, services: ["sa"], dependants: [] });
+      // One attempt: no release-and-wait.
+      expect(s.log).toEqual(["lock", "process stop sa", "reload /project/configuration", "unlock"]);
+    });
+
+    it("does not wait for a worktree `down` (its marker names no shared service)", async () => {
+      const s = sharedInstance();
+      const result = await withLifecycleLock(s.anchor, id, async () => {
+        writeSharedStepMarker(s.anchor, id, { services: [] });
+        return await runSharedNamespaceDown(s.deps, { namespaces: ["a"] });
+      });
+      expect(result).toMatchObject({ stopped: true, services: ["sa"] });
+    });
+
+    it("waits for an in-flight `up` whose marker names a target, and lists the targets it uses", async () => {
+      const s = sharedInstance();
+      const err = await withLifecycleLock(s.anchor, id, async () => {
+        writeSharedStepMarker(s.anchor, id, { services: ["pg", "sa"], ports: [] });
+        return await failure(runSharedNamespaceDown(s.deps, { namespaces: ["a"] }));
+      });
+      expect(err.code).toBe("SHARED_IN_USE");
+      expect(err.details).toMatchObject({
+        dependants: [
+          { instance: id, service: null, depends_on: ["sa"], source: "lifecycle_in_progress" },
+        ],
+        forceable: false,
+        remedy: "devtrees down --shared -n a",
+      });
+      expect(err.message).toContain("it selected 'sa'");
+      expect(s.log.filter((l) => l.startsWith("process"))).toEqual([]);
+    });
+
+    it("goes ahead once an `up` without a marker gets past its shared step, without waiting for its lock", async () => {
+      const s = sharedInstance();
+      const lock = join(s.anchor, "devtrees", `${id}.lock`);
+      writeFileSync(lock, `${process.pid}\n`);
+      cleanups.push(() => rmSync(lock, { force: true }));
+      // The `up` reaches its shared step (no target selected) while the
+      // teardown waits outside the shared lock; its lock stays held.
+      setTimeout(() => writeSharedStepMarker(s.anchor, id, { services: ["sb"], ports: [] }), 150);
+      const result = await runSharedNamespaceDown(
+        { ...s.deps, lifecycleWaitMs: 20_000 },
+        { namespaces: ["a"] },
+      );
+      expect(result).toMatchObject({ stopped: true, services: ["sa"], dependants: [] });
+      expect(s.log.slice(0, 3)).toEqual(["lock", "unlock", "lock"]);
+      expect(existsSync(lock)).toBe(true);
+    });
+
+    it("treats a marker that is not the current hold's as none (conservative), and removes it", async () => {
+      const s = sharedInstance();
+      writeFileSync(join(s.anchor, "devtrees", `${id}.lock`), `${process.pid}\n`);
+      const marker = sharedStepMarkerFile(s.anchor, id);
+      // Left by a crashed holder whose lock this live process has since taken.
+      writeFileSync(
+        marker,
+        JSON.stringify({ version: 1, pid: process.pid + 1, lock_ino: 1, services: [], ports: [] }),
+      );
+      const orphan = sharedStepMarkerFile(s.anchor, "gone-0a1b2c3d");
+      writeFileSync(orphan, JSON.stringify({ version: 1, pid: 1, lock_ino: 1, services: [] }));
+      const err = await failure(runSharedNamespaceDown(s.deps, { namespaces: ["a"] }));
+      expect(err.details?.dependants).toEqual([
+        { instance: id, service: null, depends_on: [], source: "lifecycle_in_progress" },
+      ]);
+      expect(existsSync(marker)).toBe(false);
+      expect(existsSync(orphan)).toBe(false);
+    });
+
+    it("the dry run applies the same scoping, and removes nothing", async () => {
+      const s = sharedInstance();
+      const orphan = sharedStepMarkerFile(s.anchor, "gone-0a1b2c3d");
+      writeFileSync(orphan, JSON.stringify({ version: 1, pid: 1, lock_ino: 1, services: [] }));
+      const preview = await withLifecycleLock(s.anchor, id, async () => {
+        writeSharedStepMarker(s.anchor, id, { services: ["sb"], ports: [] });
+        return await runSharedNamespaceDownDryRun(s.deps, { namespaces: ["a"] });
+      });
+      expect(preview).toMatchObject({ blocked: false, dependants: [] });
+      expect(existsSync(orphan)).toBe(true);
+    });
   });
 
   it("a shared dependant fails at once, without waiting for an in-flight command", async () => {

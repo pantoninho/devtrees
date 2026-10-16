@@ -2,6 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 import { DEVTREES_METADATA_KEY, type DerivedConfig } from "./deriver.js";
 import type { ServiceStatus } from "./driver.js";
 import {
+  inProgressDependants,
   namespacedRecoveryRemedy,
   planSharedDown,
   recordedSharedEdges,
@@ -279,5 +280,74 @@ describe("namespacedRecoveryRemedy (#239)", () => {
     );
     const stack = { services: [svc("sa", "a"), svc("pg", undefined, ["sa"])] };
     expect(namespacedRecoveryRemedy(stack, ["a"], ["sa"])).toBe(undefined);
+  });
+
+  describe("reads the namespaces from the running shared derived config (#244 follow-up)", () => {
+    const running = (processes: Record<string, Record<string, unknown>>) => ({
+      processes: Object.fromEntries(
+        Object.entries(processes).map(([name, extra]) => [name, proc(extra)]),
+      ) as DerivedConfig["processes"],
+    });
+
+    it("names the namespace the running definition sits in, which the teardown selects by", () => {
+      // This branch moved `sa` to namespace `a2`; the running instance still runs it in `a`.
+      const stack = { services: [svc("sa", "a2"), svc("web", "app", [], "isolated")] };
+      const config = running({ sa: { namespace: "a" } });
+      expect(namespacedRecoveryRemedy(stack, ["app", "a2"], ["sa"], config)).toBe(
+        "devtrees down --shared -n a --force && devtrees up -n app -n a2",
+      );
+    });
+
+    it("closes over the running config's shared dependants, not this branch's", () => {
+      // Running: `sb` depends on `sa`. This branch dropped that edge.
+      const stack = { services: [svc("sa", "a"), svc("sb", "b")] };
+      const config = running({
+        sa: { namespace: "a" },
+        sb: { namespace: "b", depends_on: { sa: { condition: "process_started" } } },
+      });
+      expect(namespacedRecoveryRemedy(stack, ["a"], ["sa"])).toBe(
+        "devtrees down --shared -n a --force && devtrees up -n a",
+      );
+      expect(namespacedRecoveryRemedy(stack, ["a"], ["sa"], config)).toBe(
+        "devtrees down --shared -n a -n b --force && devtrees up -n a",
+      );
+    });
+
+    it("is the full teardown when a running always-on service depends on them", () => {
+      const stack = { services: [svc("sa", "a"), svc("pg", undefined)] };
+      const config = running({
+        sa: { namespace: "a" },
+        pg: { depends_on: { sa: { condition: "process_started" } } },
+      });
+      expect(namespacedRecoveryRemedy(stack, ["a"], ["sa"], config)).toBe(undefined);
+    });
+
+    it("falls back to the stack when the running config does not run a named service", () => {
+      const stack = { services: [svc("sa", "a"), svc("sx", "x")] };
+      const config = running({ sa: { namespace: "other" } });
+      expect(namespacedRecoveryRemedy(stack, ["a"], ["sa", "sx"], config)).toBe(
+        "devtrees down --shared -n a -n x --force && devtrees up -n a",
+      );
+    });
+  });
+});
+
+describe("inProgressDependants (#244 follow-up)", () => {
+  it("blocks on a worktree with no marker, or whose marker names a target; never on the rest", () => {
+    expect(
+      inProgressDependants(
+        [
+          { id: "nomarker", marker: undefined },
+          { id: "uses", marker: { services: ["pg", "sa", "sb"] } },
+          { id: "other", marker: { services: ["pg"] } },
+          { id: "down", marker: { services: [] } },
+          { id: "uses", marker: { services: ["sa"] } },
+        ],
+        ["sa", "both"],
+      ),
+    ).toEqual([
+      { instance: "nomarker", service: null, depends_on: [], source: "lifecycle_in_progress" },
+      { instance: "uses", service: null, depends_on: ["sa"], source: "lifecycle_in_progress" },
+    ]);
   });
 });

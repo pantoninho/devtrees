@@ -148,18 +148,45 @@ export function worktreeDependants(
 }
 
 /**
- * The worktrees with a lifecycle command in flight (`held`, their lock
- * holders alive), as dependants. Listed even when the worktree's instance
- * was already found by its edges: the command in flight may be changing
- * them, and it is what the teardown waits for.
+ * One worktree with a lifecycle command in flight, and the shared services
+ * its shared-step marker names (`marker` absent: it wrote no valid one yet).
  */
-export function inProgressDependants(held: ReadonlyArray<string>): SharedDependant[] {
-  return [...new Set(held)].map((id) => ({
-    instance: id,
-    service: null,
-    depends_on: [],
-    source: "lifecycle_in_progress" as const,
-  }));
+export interface InFlightCommand {
+  readonly id: string;
+  readonly marker?: { readonly services: ReadonlyArray<string> } | undefined;
+}
+
+/**
+ * The worktrees with a lifecycle command in flight (their lock holders
+ * alive) that block a teardown of `targets`, as dependants: one whose
+ * shared-step marker names a target (`depends_on` lists them), or that has
+ * no marker yet, so what it is about to use cannot be known (an `up` not
+ * past its shared step, conservatively). One whose marker names no target
+ * (an `up` of other namespaces past its shared step, a worktree `down`) does
+ * not block. Listed even when the worktree's instance was already found by
+ * its edges: the command in flight may be changing them, and it is what the
+ * teardown waits for.
+ */
+export function inProgressDependants(
+  inFlight: ReadonlyArray<InFlightCommand>,
+  targets: ReadonlyArray<string>,
+): SharedDependant[] {
+  const targeted = new Set(targets);
+  const seen = new Set<string>();
+  return inFlight.flatMap((w): SharedDependant[] => {
+    if (seen.has(w.id)) return [];
+    seen.add(w.id);
+    const hit = w.marker?.services.filter((s) => targeted.has(s));
+    if (hit !== undefined && hit.length === 0) return [];
+    return [
+      {
+        instance: w.id,
+        service: null,
+        depends_on: hit ?? [],
+        source: "lifecycle_in_progress" as const,
+      },
+    ];
+  });
 }
 
 /** A worktree's isolated → shared edges from its `devtrees.yaml` (instances started before #239). */
@@ -239,6 +266,32 @@ export function withoutServiceRecords(
 }
 
 /**
+ * A shared service as the recovery remedy reads it: its `namespace:`
+ * (absent: always-on) and the shared services it `depends_on`.
+ */
+interface SharedNode {
+  readonly name: string;
+  readonly namespace: ResolvedService["namespace"];
+  readonly dependsOn: ReadonlyArray<string>;
+}
+
+function nodesOfStack(stack: ResolvedStack): SharedNode[] {
+  return sharedServicesOf(stack).map((s) => ({
+    name: s.name,
+    namespace: s.namespace,
+    dependsOn: s.dependsOn.map((d) => d.name),
+  }));
+}
+
+function nodesOfConfig(config: Pick<DerivedConfig, "processes">): SharedNode[] {
+  return Object.entries(config.processes).map(([name, proc]) => ({
+    name,
+    namespace: proc.namespace,
+    dependsOn: Object.keys(proc.depends_on ?? {}),
+  }));
+}
+
+/**
  * The namespaced recovery for drifted or dead shared services `names` (#239):
  * a forced `down --shared -n` for their namespaces, then the same `up`
  * (`upNamespaces`), which leaves the other shared services running.
@@ -246,6 +299,15 @@ export function withoutServiceRecords(
  * always-on, or an always-on one depends on them. A service's namespace is
  * the one the `up` selects it by, or its own first one when it came in as a
  * dependency.
+ *
+ * The teardown picks its targets, and refuses on shared dependants, from the
+ * RUNNING shared derived config, not from anyone's `devtrees.yaml`. So when
+ * `running` (that config) holds every named service, the namespaces and
+ * their closure are read from it: in the drift case a service's running
+ * definition may sit in another namespace, or have other dependants, than
+ * this worktree declares. Otherwise (no running config, or a named service
+ * it does not run) they are read from `stack`, as before. The `up` half is
+ * always this worktree's.
  *
  * `--force` is part of it on purpose. The service is already drifted or dead
  * for every worktree that uses it, and those worktrees, the caller's
@@ -260,15 +322,18 @@ export function namespacedRecoveryRemedy(
   stack: ResolvedStack,
   upNamespaces: ReadonlyArray<string>,
   names: ReadonlyArray<string>,
+  running?: Pick<DerivedConfig, "processes">,
 ): string | undefined {
-  const shared = sharedServicesOf(stack);
+  const fromRunning =
+    running !== undefined && names.length > 0 && names.every((n) => n in running.processes);
+  const shared = fromRunning ? nodesOfConfig(running) : nodesOfStack(stack);
   const byName = new Map(shared.map((s) => [s.name, s]));
   const services = names.map((n) => byName.get(n));
   if (services.length === 0 || services.some((s) => s === undefined || isAlwaysOnShared(s))) {
     return undefined;
   }
   const ns = new Set(
-    (services as ResolvedService[]).map((s) => {
+    (services as SharedNode[]).map((s) => {
       const own = serviceNamespaces(s);
       return own.find((n) => upNamespaces.includes(n)) ?? own[0] ?? DEFAULT_NAMESPACE;
     }),
@@ -285,16 +350,16 @@ export function namespacedRecoveryRemedy(
  * an always-on shared service does, which no namespaced teardown can take.
  */
 function closeOverSharedDependants(
-  shared: ReadonlyArray<ResolvedService>,
+  shared: ReadonlyArray<SharedNode>,
   namespaces: ReadonlySet<string>,
 ): Set<string> | undefined {
   const ns = new Set(namespaces);
-  const inside = (s: ResolvedService) => !isAlwaysOnShared(s) && namespaceSelected(s, [...ns]);
+  const inside = (s: SharedNode) => !isAlwaysOnShared(s) && namespaceSelected(s, [...ns]);
   for (let grew = true; grew; ) {
     grew = false;
     const targets = new Set(shared.filter(inside).map((s) => s.name));
     for (const s of shared) {
-      if (inside(s) || !s.dependsOn.some((d) => targets.has(d.name))) continue;
+      if (inside(s) || !s.dependsOn.some((d) => targets.has(d))) continue;
       if (isAlwaysOnShared(s)) return undefined;
       for (const n of serviceNamespaces(s)) ns.add(n);
       grew = true;

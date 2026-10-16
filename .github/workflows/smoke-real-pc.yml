@@ -33,6 +33,11 @@ on:
       # `commands.ts` creates the per-instance logs dir from it (#136) — a
       # regression there only surfaces against the real binary.
       - "src/paths.ts"
+      # The shared port map, the namespaced shared teardown and the lifecycle
+      # locks it reads (#238, #239) are what scenarios 124-134 drive.
+      - "src/registry.ts"
+      - "src/shared-down.ts"
+      - "src/shared-ports.ts"
       - "src/real-pc.smoke.test.ts"
       - "test/fixtures/agent-surface/**"
       - "vite.config.ts"
@@ -98,6 +103,39 @@ jobs:
       # subprocess, so the test depends on `vp run build` having run first.
       - name: Build devtrees CLI
         run: vp run build
+
+      # Scenario 133 boots the published devtrees@0.4.0. It is installed here,
+      # from a cache when possible and with retries otherwise, so an npm
+      # registry hiccup cannot fail the smoke. A registry that stays down
+      # fails this step after the retries, and the test itself fails (never
+      # skips) in CI when the CLI is missing.
+      - name: Cache devtrees@0.4.0 (scenario 133)
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/devtrees-0.4.0
+          key: devtrees-legacy-0.4.0-v1
+
+      - name: Install devtrees@0.4.0 (scenario 133)
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/devtrees-0.4.0"
+          cli="$dir/node_modules/devtrees/dist/cli.mjs"
+          if [ ! -f "$cli" ]; then
+            for attempt in 1 2 3 4 5; do
+              if npm install --loglevel=error --no-save --no-audit --no-fund --prefer-offline \
+                --prefix "$dir" devtrees@0.4.0; then
+                break
+              fi
+              if [ "$attempt" = 5 ]; then
+                echo "::error::could not install devtrees@0.4.0 from npm after 5 attempts"
+                exit 1
+              fi
+              echo "::warning::npm install devtrees@0.4.0 failed (attempt $attempt); retrying"
+              sleep $((attempt * 10))
+            done
+          fi
+          test -f "$cli"
+          echo "DEVTREES_LEGACY_CLI=$cli" >> "$GITHUB_ENV"
 
       - name: Run real-pc smoke
         env:
