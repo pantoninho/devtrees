@@ -57,7 +57,15 @@ export type WaitForSharedHealth = (args: {
    * state (issue #108) — see `poll`.
    */
   readonly probedServiceNames: ReadonlyArray<string>;
+  /** The `SHARED_SERVICE_DEAD` remedy for the dead services (#239); default: the full teardown. */
+  readonly remedyFor?: SharedRemedyFor;
 }) => Promise<void>;
+
+/**
+ * The remedy for broken shared services (#239): a namespaced teardown when
+ * every one of them is namespaced, else the full `down --shared` + `up`.
+ */
+export type SharedRemedyFor = (services: ReadonlyArray<string>) => string;
 
 /**
  * Wait until every named service in an instance is healthy. Called after the
@@ -399,10 +407,15 @@ export function createWaitForSharedHealth(
   const pollMs = tuning.pollMs ?? HEALTH_POLL_MS;
   const timeoutMs = tuning.timeoutMs ?? SHARED_HEALTH_TIMEOUT_MS;
   const probe = tuning.probe ?? probeSocket;
-  return async ({ socketPath, sharedServiceNames, probedServiceNames }) => {
+  return async ({ socketPath, sharedServiceNames, probedServiceNames, remedyFor }) => {
     if (sharedServiceNames.length === 0) return;
     const deadline = Date.now() + timeoutMs;
     const notifyFailure = createFailureNotifier(tuning.notify, timeoutMs);
+    const diedWhileWaiting = (dead: ReadonlyArray<DeadService>): Error =>
+      sharedServiceDeadError(dead, {
+        reason: "died_while_waiting",
+        remedy: remedyFor?.(dead.map((d) => d.name)),
+      });
     let lastDead: ReadonlyArray<DeadService> = [];
     while (Date.now() < deadline) {
       const verdict = await poll(
@@ -422,14 +435,12 @@ export function createWaitForSharedHealth(
       // back by waiting. `up` already restarted the dead services it found
       // before this wait (#240), so one dying here is reported.
       if (verdict.dead.length > 0 && sameDead(verdict.dead, lastDead)) {
-        throw sharedServiceDeadError(verdict.dead, { reason: "died_while_waiting" });
+        throw diedWhileWaiting(verdict.dead);
       }
       lastDead = verdict.dead;
       await sleep(pollMs);
     }
-    if (lastDead.length > 0) {
-      throw sharedServiceDeadError(lastDead, { reason: "died_while_waiting" });
-    }
+    if (lastDead.length > 0) throw diedWhileWaiting(lastDead);
     throw new Error(
       `timed out waiting for shared services to be healthy [${sharedServiceNames.join(", ")}] ` +
         `after ${timeoutMs}ms. Check the shared instance's logs (\`devtrees attach --shared\`).`,
@@ -572,6 +583,7 @@ export function createWaitForSharedReady(
     const dying = (dead: ReadonlyArray<DeadService>) =>
       sharedServiceDeadError(dead, {
         reason: dead.some((d) => restarted.has(d.name)) ? "died_again" : "died_while_waiting",
+        remedy: args.remedyFor?.(dead.map((d) => d.name)),
       });
     await waitWithRestarts(source, tuning, args, {
       dying,
@@ -579,7 +591,11 @@ export function createWaitForSharedReady(
       deadline: (last, counted) =>
         counted.length > 0
           ? dying(counted)
-          : sharedNotHealthyError(last?.pending ?? args.serviceNames, args.timeoutMs),
+          : sharedNotHealthyError(
+              last?.pending ?? args.serviceNames,
+              args.timeoutMs,
+              args.remedyFor?.(last?.pending ?? args.serviceNames),
+            ),
     });
   };
 }
@@ -594,6 +610,8 @@ export type WaitForSharedReady = (args: {
   /** The services among `serviceNames` that declare a readiness probe. */
   readonly probedServiceNames: ReadonlyArray<string>;
   readonly timeoutMs: number;
+  /** The `SHARED_SERVICE_DEAD` remedy for the failing services (#239); default: the full teardown. */
+  readonly remedyFor?: SharedRemedyFor;
 }) => Promise<void>;
 
 /** Build the dead-service `HEALTH_TIMEOUT` for one wait's remedy and restarts. */
@@ -629,6 +647,22 @@ function deadlineError(
 
 /** The command that rebuilds the shared instance from this worktree's config. */
 const SHARED_SERVICE_DEAD_REMEDY = "devtrees down --shared && devtrees up";
+
+/**
+ * How to rebuild broken shared services: the namespaced teardown when the
+ * remedy is one (#239), which leaves the other shared services running,
+ * else the full one, which stops the shared instance for every worktree.
+ */
+function rebuildAdvice(remedy: string): string {
+  if (remedy === SHARED_SERVICE_DEAD_REMEDY) {
+    return `Run \`${remedy}\` to rebuild the shared instance (this stops it for every worktree).`;
+  }
+  return (
+    `Run \`${remedy}\` to restart only those shared services: the other shared services ` +
+    "keep running, and `--force` interrupts the worktrees that use these, as the full " +
+    `\`${SHARED_SERVICE_DEAD_REMEDY}\` would.`
+  );
+}
 
 /**
  * Why a dead shared service could not be repaired (#240). Since #240 `up`
@@ -703,9 +737,11 @@ export function sharedServiceDeadError(
   opts: {
     readonly reason: DeadReason;
     readonly startFailures?: ReadonlyArray<{ readonly name: string; readonly message: string }>;
+    /** A namespaced teardown for these services (#239); default: the full one. */
+    readonly remedy?: string | undefined;
   },
 ): Error {
-  const remedy = SHARED_SERVICE_DEAD_REMEDY;
+  const remedy = opts.remedy ?? SHARED_SERVICE_DEAD_REMEDY;
   const names = dead.map((d) => d.name).join(", ");
   const refusals =
     opts.startFailures === undefined || opts.startFailures.length === 0
@@ -714,8 +750,7 @@ export function sharedServiceDeadError(
   return new SharedServiceDeadError(
     `devtrees up: shared service(s) not running: ${describeDeadServices(dead)}. ` +
       `${SHARED_DEAD_EXPLANATION[opts.reason](names)}${refusals} Read why with ` +
-      `\`devtrees logs --shared <service>\`. Run \`${remedy}\` to rebuild the shared instance ` +
-      `(this stops it for every worktree).`,
+      `\`devtrees logs --shared <service>\`. ${rebuildAdvice(remedy)}`,
     {
       dead_services: deadServicesDetails(dead),
       reason: opts.reason,
@@ -732,13 +767,16 @@ export function sharedServiceDeadError(
  * because its remedy is the shared teardown (ADR-0005). The shared instance
  * is left running.
  */
-function sharedNotHealthyError(pending: ReadonlyArray<string>, timeoutMs: number): Error {
-  const remedy = SHARED_SERVICE_DEAD_REMEDY;
+function sharedNotHealthyError(
+  pending: ReadonlyArray<string>,
+  timeoutMs: number,
+  namespacedRemedy?: string,
+): Error {
+  const remedy = namespacedRemedy ?? SHARED_SERVICE_DEAD_REMEDY;
   return new SharedServiceDeadError(
     `devtrees up: shared service(s) [${pending.join(", ")}] did not become healthy within ` +
       `${timeoutMs}ms. The shared instance is still running — read why with ` +
-      `\`devtrees logs --shared <service>\`, then retry \`devtrees up\` or run \`${remedy}\` ` +
-      `to rebuild the shared instance (this stops it for every worktree).`,
+      `\`devtrees logs --shared <service>\`, then retry \`devtrees up\`. ${rebuildAdvice(remedy)}`,
     { dead_services: [], reason: "not_healthy", unhealthy_services: [...pending], remedy },
   );
 }

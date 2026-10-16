@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vite-plus/test";
 import { stringify as stringifyYaml } from "yaml";
-import { bracedEnvVars, deriveSharedConfig, deriveWorktreeConfig } from "./deriver.js";
+import {
+  DEVTREES_METADATA_KEY,
+  bracedEnvVars,
+  deriveSharedConfig,
+  deriveWorktreeConfig,
+} from "./deriver.js";
 import { parseStack, type ResolvedStack } from "./stack.js";
 
 const stack: ResolvedStack = {
@@ -892,6 +897,32 @@ describe("config deriver — cross-tier depends_on handling (ADR-0003)", () => {
       ]),
     );
     expect(derived.droppedEdges).toHaveLength(2);
+  });
+
+  it("records the dropped isolated→shared edges in x-devtrees.shared_depends_on (#239)", () => {
+    const derived = deriveWorktreeConfig(mixedDepsStack(), {
+      worktreeId: "login",
+      worktreeRoot: "/wt/login",
+      portFor: () => 20512,
+      sharedPortFor: () => 19000,
+    });
+    expect(derived.config[DEVTREES_METADATA_KEY].shared_depends_on).toEqual({
+      web: ["postgres", "cache"],
+    });
+    // Never in the shared config: a shared service cannot depend on an isolated one.
+    const sharedDerived = deriveSharedConfig(mixedDepsStack(), {
+      workingDir: "/anchor",
+      portFor: () => 19000,
+    });
+    expect(sharedDerived.config[DEVTREES_METADATA_KEY]).not.toHaveProperty("shared_depends_on");
+  });
+
+  it("writes an empty x-devtrees.shared_depends_on when no edge crosses tiers (#239)", () => {
+    const derived = deriveWorktreeConfig(
+      { services: [{ ...mixedDepsStack().services[0]!, dependsOn: [] }] },
+      { worktreeId: "login", worktreeRoot: "/wt/login", portFor: () => 20512 },
+    );
+    expect(derived.config[DEVTREES_METADATA_KEY].shared_depends_on).toEqual({});
   });
 
   it("emits same-tier (shared→shared) depends_on into derived shared processes", () => {

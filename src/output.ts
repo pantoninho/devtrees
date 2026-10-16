@@ -52,6 +52,8 @@ export const ERROR_CODES = [
   "SHARED_START_FAILED",
   "SHARED_ACTIVATION_FAILED",
   "SHARED_PORT_CONFLICT",
+  "SHARED_IN_USE",
+  "SHARED_REMOVAL_FAILED",
   "WORKTREE_START_FAILED",
   "NO_SERVICES_SELECTED",
   "SOCKET_PATH_TOO_LONG",
@@ -112,6 +114,10 @@ export const ERROR_CODE_DESCRIPTIONS: Readonly<Record<ErrorCode, string>> = {
     "Adding a selected namespaced shared service to the running shared instance failed (process-compose refused or timed out on the config reload); the shared services it already ran are untouched. `details` has `{services, reason, config_path, remedy}`.",
   SHARED_PORT_CONFLICT:
     "A shared named port cannot be resolved without handing one port to two names or moving a recorded one (the stable shared port map, #238): `details.conflicts` lists each `{reason, port_name, port, recorded_port?, holder?, process?}` (`reason`: `port_taken`, `bound_mismatch`, `stale_env`, or `block_full` when the shared block has no free number left); nothing was started, added or recorded. `details.remedy` is one command: `devtrees down --shared && devtrees up` (run for every worktree), or `devtrees prune --shared-ports` for `block_full`; `details.map_path` is the map.",
+  SHARED_IN_USE:
+    "`down --shared -n` refused: something still depends on a shared service it would remove. `details.dependants` lists each `{instance, service, depends_on, source}` (a live worktree's booted isolated service, a worktree with an `up`, `down` or `restart` in flight, `source: lifecycle_in_progress`, or a shared service it would keep, `instance: shared`). Nothing was stopped. `details.forceable` says whether `--force` overrides it (a shared dependant and a command still in flight after the wait never are); `details.remedy` is the one command to run: the plain retry while a command is in flight.",
+  SHARED_REMOVAL_FAILED:
+    "`down --shared -n` could not finish removing the shared services (`details.reason`): process-compose refused to stop them or they did not stop (`stop_refused`, `stop_incomplete`: nothing was removed), or it refused or timed out on the config reload that removes them (`not_supported`, `error`, `timeout`). The other shared services are untouched. `details` has `{services, reason, config_path, remedy}`; run `details.remedy`.",
   WORKTREE_START_FAILED:
     "This worktree's instance died before binding its control socket; `details.config_path` is the config to run by hand.",
   NO_SERVICES_SELECTED:
@@ -805,6 +811,165 @@ export function formatDown(payload: DownPayload, mode: FormatMode): OutputResult
     formatForceKilledStderr("down", what, payload.forceKilled ?? []) +
     (warning !== undefined ? formatReapWarningStderr(warning) : "");
   return { stdout: text, stderr };
+}
+
+// --- down --shared -n (#239) -------------------------------------------------
+
+/** Something that still depends on a shared service `down --shared -n` removes (#239). */
+export interface SharedDependantRow {
+  /** A worktree id, or `shared` for a kept shared service. */
+  readonly instance: string;
+  readonly service: string | null;
+  readonly depends_on: ReadonlyArray<string>;
+  readonly source: string;
+}
+
+/** `devtrees down --shared -n <namespace>...` payload (#239). */
+export interface SharedNamespaceDownPayload {
+  readonly namespaces: ReadonlyArray<string>;
+  /** devtrees stopped a running shared process; `false` when it only removed stopped ones. */
+  readonly stopped: boolean;
+  /** The shared services of the named namespaces. */
+  readonly services: ReadonlyArray<string>;
+  /** What left the shared instance (`services` plus leftovers of a timed-out removal). */
+  readonly removed?: ReadonlyArray<string>;
+  readonly inactiveNamespaces: ReadonlyArray<string>;
+  /** The removed services were the last running ones: the whole shared instance stopped. */
+  readonly instanceStopped: boolean;
+  /** Worktree dependants `--force` overrode. */
+  readonly dependants: ReadonlyArray<SharedDependantRow>;
+  readonly forceKilled: ReadonlyArray<ForceKilledRow>;
+}
+
+function dependantJson(d: SharedDependantRow): Record<string, unknown> {
+  return {
+    instance: d.instance,
+    service: d.service,
+    depends_on: [...d.depends_on],
+    source: d.source,
+  };
+}
+
+function describeDependantRow(d: SharedDependantRow): string {
+  if (d.source === "lifecycle_in_progress") return `worktree '${d.instance}' (command in progress)`;
+  if (d.service === null) return `worktree '${d.instance}' (dependencies unreadable)`;
+  const who = d.instance === "shared" ? `shared '${d.service}'` : `${d.instance}/${d.service}`;
+  return `${who} (depends on ${d.depends_on.join(", ")})`;
+}
+
+/** `namespace x` / `namespaces x, y`. */
+function namespacesLabel(namespaces: ReadonlyArray<string>): string {
+  return `namespace${namespaces.length === 1 ? "" : "s"} ${namespaces.join(", ")}`;
+}
+
+/** The human stdout line of `down --shared -n` (#239). */
+function sharedNamespaceDownLine(payload: SharedNamespaceDownPayload): string {
+  const removed = (payload.removed ?? payload.services).join(", ");
+  if (payload.instanceStopped) {
+    return `devtrees down: stopped shared ${payload.services.join(", ")}; nothing else was running, so the shared instance stopped.\n`;
+  }
+  if (removed === "") {
+    return `devtrees down: no shared service of ${namespacesLabel(payload.namespaces)} is running; nothing to do.\n`;
+  }
+  if (!payload.stopped) {
+    return `devtrees down: removed shared ${removed}, already stopped; the other shared services keep running.\n`;
+  }
+  return `devtrees down: stopped and removed shared ${removed}; the other shared services keep running.\n`;
+}
+
+/**
+ * Render `devtrees down --shared -n` (#239).
+ *
+ *   - `json`: `{schema_version, down: {shared: true, stopped, force_killed,
+ *     namespaces, services, inactive_namespaces, instance_stopped,
+ *     forced_dependants}}`; every list is always present. The first three
+ *     keys are a plain `down --shared`'s.
+ *   - `human`: one line naming what was stopped; inactive namespaces, a
+ *     forced removal and a force-kill go to stderr.
+ */
+export function formatSharedNamespaceDown(
+  payload: SharedNamespaceDownPayload,
+  mode: FormatMode,
+): OutputResult {
+  if (mode === "json") {
+    const down = {
+      shared: true,
+      stopped: payload.stopped,
+      force_killed: forceKilledJson(payload.forceKilled),
+      namespaces: [...payload.namespaces],
+      services: [...payload.services],
+      removed: [...(payload.removed ?? payload.services)],
+      inactive_namespaces: [...payload.inactiveNamespaces],
+      instance_stopped: payload.instanceStopped,
+      forced_dependants: payload.dependants.map(dependantJson),
+    };
+    return { stdout: `${JSON.stringify({ schema_version: SCHEMA_VERSION, down })}\n`, stderr: "" };
+  }
+  const inactive =
+    (payload.removed ?? payload.services).length > 0 && payload.inactiveNamespaces.length > 0
+      ? `devtrees down: no shared service of ${namespacesLabel(payload.inactiveNamespaces)} was running.\n`
+      : "";
+  const forced =
+    payload.dependants.length > 0
+      ? `devtrees down: WARNING — --force removed shared services still used by ` +
+        `${payload.dependants.map(describeDependantRow).join("; ")}; they keep running without them.\n`
+      : "";
+  const killed = formatForceKilledStderr("down", "the shared services", payload.forceKilled);
+  return { stdout: sharedNamespaceDownLine(payload), stderr: inactive + forced + killed };
+}
+
+/** `devtrees down --shared -n --dry-run` payload (#239). */
+export interface SharedNamespaceDownDryRunPayload {
+  readonly namespaces: ReadonlyArray<string>;
+  readonly running: boolean;
+  readonly services: ReadonlyArray<string>;
+  readonly inactiveNamespaces: ReadonlyArray<string>;
+  readonly wouldStopInstance: boolean;
+  readonly dependants: ReadonlyArray<SharedDependantRow>;
+  readonly blocked: boolean;
+}
+
+/**
+ * Render `devtrees down --shared -n --dry-run` (#239): what the real run
+ * would stop and what blocks it. Exits 0 even when `blocked`.
+ *
+ *   - `json`: `{schema_version, down_dry_run: {shared: true, namespaces,
+ *     running, services, inactive_namespaces, would_stop_instance,
+ *     dependants, blocked}}`.
+ */
+export function formatSharedNamespaceDownDryRun(
+  payload: SharedNamespaceDownDryRunPayload,
+  mode: FormatMode,
+): OutputResult {
+  if (mode === "json") {
+    const dry = {
+      shared: true,
+      namespaces: [...payload.namespaces],
+      running: payload.running,
+      services: [...payload.services],
+      inactive_namespaces: [...payload.inactiveNamespaces],
+      would_stop_instance: payload.wouldStopInstance,
+      dependants: payload.dependants.map(dependantJson),
+      blocked: payload.blocked,
+    };
+    return {
+      stdout: `${JSON.stringify({ schema_version: SCHEMA_VERSION, down_dry_run: dry })}\n`,
+      stderr: "",
+    };
+  }
+  const what =
+    payload.services.length === 0
+      ? `no shared service of ${namespacesLabel(payload.namespaces)} is running; would do nothing.`
+      : `would stop and remove shared ${payload.services.join(", ")}` +
+        (payload.wouldStopInstance
+          ? ", the last running ones: the shared instance would stop."
+          : ".");
+  const lines = [
+    `devtrees down --dry-run: ${what}`,
+    ...payload.dependants.map((d) => `  depended on by ${describeDependantRow(d)}`),
+    ...(payload.blocked ? ["  blocked: the real run would fail SHARED_IN_USE."] : []),
+  ];
+  return { stdout: `${lines.join("\n")}\n`, stderr: "" };
 }
 
 /**

@@ -41,8 +41,9 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { deriveWorktreeId } from "./anchor.js";
-import { instancePaths, runDir } from "./paths.js";
+import { instancePaths, runDir, sharedInstancePaths } from "./paths.js";
 
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
 // Assembled with `join` (not a URL literal) so static analysis doesn't treat
@@ -1505,5 +1506,164 @@ describe("built CLI e2e — hot-reload over the control socket (#194, #191)", ()
     expect(resync.code, `resync failed: ${resync.stderr} ${resync.stdout}`).toBe(0);
     expect(existsSync(marker)).toBe(false);
     expect(readFileSync(join(stateDir, `${id}.yaml`), "utf8")).toContain("sleep 303");
+  }, 60_000);
+});
+
+/**
+ * Namespaced shared teardown (#239) through `dist/cli.mjs`: the flags reach
+ * `runSharedNamespaceDown`, the dependant check reads the worktree's derived
+ * config, and the removal is a reload the stub applies.
+ */
+describe("built CLI e2e — namespaced shared teardown (#239)", () => {
+  /** Always-on shared `db`, shared `sa` in `a`, isolated `web` and `worker` (in `a`, on `sa`). */
+  function setupNsShared(prefix: string): Scenario {
+    const scenario = setupRepoWithStack(
+      prefix,
+      [
+        "services:",
+        "  db:",
+        "    tier: shared",
+        '    command: "sleep 300"',
+        "    ports: [DB_PORT]",
+        "  sa:",
+        "    tier: shared",
+        "    namespace: a",
+        '    command: "sleep 301"',
+        "    ports: [SA_PORT]",
+        "  web:",
+        "    tier: isolated",
+        '    command: "sleep 302"',
+        "  worker:",
+        "    tier: isolated",
+        "    namespace: a",
+        '    command: "sleep 303"',
+        "    depends_on:",
+        "      sa:",
+        "        condition: process_started",
+        "",
+      ].join("\n"),
+    );
+    cleanups.push(() => devtrees(scenario.wt, ["down", "--shared"]));
+    return scenario;
+  }
+
+  type NsDown = {
+    down?: { stopped: boolean; services: string[]; instance_stopped: boolean };
+    down_dry_run?: { services: string[]; blocked: boolean; dependants: unknown[] };
+    error?: { code: string; details: Record<string, unknown> };
+  };
+  const sharedProcs = (anchor: string): string[] =>
+    Object.keys(
+      (
+        parseYaml(readFileSync(join(anchor, "devtrees", "shared.yaml"), "utf8")) as {
+          processes: Record<string, unknown>;
+        }
+      ).processes,
+    );
+  const upNs = (wt: string): CliResult =>
+    devtrees(wt, ["up", "--json", "--wait-timeout", "10", "-n", "default", "-n", "a"]);
+
+  it("refuses SHARED_IN_USE while this worktree's worker depends on sa, then removes sa once it is down", () => {
+    const { wt, id, anchor } = setupNsShared("dt-bcsd1-");
+    const up = upNs(wt);
+    expect(up.code, `up failed: ${up.stdout} ${up.stderr}`).toBe(0);
+    expect(sharedProcs(anchor)).toEqual(["db", "sa"]);
+
+    const dry = devtrees(wt, ["down", "--shared", "-n", "a", "--dry-run", "--json"]);
+    expect(dry.code, dry.stdout).toBe(0);
+    expect((dry.doc as NsDown).down_dry_run).toMatchObject({
+      services: ["sa"],
+      blocked: true,
+      dependants: [{ instance: id, service: "worker", depends_on: ["sa"] }],
+    });
+
+    const refused = devtrees(wt, ["down", "--shared", "-n", "a", "--json"]);
+    expect(refused.code).toBe(1);
+    expect((refused.doc as NsDown).error?.code).toBe("SHARED_IN_USE");
+    expect(sharedProcs(anchor)).toEqual(["db", "sa"]);
+
+    expect(devtrees(wt, ["down"]).code).toBe(0);
+    const down = devtrees(wt, ["down", "--shared", "-n", "a", "--json"]);
+    expect(down.code, `down failed: ${down.stdout} ${down.stderr}`).toBe(0);
+    expect((down.doc as NsDown).down).toMatchObject({
+      stopped: true,
+      services: ["sa"],
+      instance_stopped: false,
+    });
+    expect(sharedProcs(anchor)).toEqual(["db"]);
+
+    // `up -n a` adds it back, as it would any not-yet-running shared service.
+    const back = upNs(wt);
+    expect(back.code, `re-up failed: ${back.stdout} ${back.stderr}`).toBe(0);
+    expect((back.doc as { up: { shared_activated: string[] } }).up.shared_activated).toEqual([
+      "sa",
+    ]);
+    expect(sharedProcs(anchor)).toEqual(["db", "sa"]);
+  }, 90_000);
+
+  it("an up re-adding a service a timed-out removal left listed and stopped starts it again", () => {
+    // What a removing reload that timed out and never landed leaves behind:
+    // the process stopped and still listed, gone from the config and the state.
+    const { wt, anchor } = setupNsShared("dt-bcsd3-");
+    expect(upNs(wt).code).toBe(0);
+    expect(devtrees(wt, ["down"]).code).toBe(0);
+    const shared = sharedInstancePaths(anchor);
+    const stop = spawnSync(
+      join(shimDir, "process-compose"),
+      ["process", "stop", "sa", "-U", "-u", shared.socketPath],
+      { encoding: "utf8" },
+    );
+    expect(stop.status, stop.stderr).toBe(0);
+    const config = parseYaml(readFileSync(shared.configPath, "utf8")) as {
+      processes: Record<string, unknown>;
+    };
+    delete config.processes.sa;
+    writeFileSync(shared.configPath, stringifyYaml(config));
+    const statePath = join(anchor, "devtrees", "shared-state.json");
+    const state = JSON.parse(readFileSync(statePath, "utf8")) as {
+      services: Record<string, unknown>;
+    };
+    delete state.services.sa;
+    writeFileSync(statePath, JSON.stringify(state));
+
+    const back = upNs(wt);
+    expect(back.code, `re-up failed: ${back.stdout} ${back.stderr}`).toBe(0);
+    const doc = back.doc as { up: { shared_activated: string[]; shared_restarted: string[] } };
+    expect(doc.up.shared_activated).toEqual(["sa"]);
+    expect(doc.up.shared_restarted).toEqual(["sa"]);
+    const ls = devtrees(wt, ["ls", "--json", "--services"]);
+    const rows = (ls.doc as LsDoc).ls.instances.find((i) => i.kind === "shared")?.services ?? [];
+    expect(rows.find((r) => r.name === "sa")).toMatchObject({ state: "active" });
+  }, 90_000);
+
+  it("a dead namespaced shared service's SHARED_SERVICE_DEAD names the namespaced teardown", () => {
+    const { wt } = setupNsShared("dt-bcsd4-");
+    expect(upNs(wt).code).toBe(0);
+    const r = devtrees(wt, ["up", "--json", "--wait-timeout", "10", "-n", "default", "-n", "a"], {
+      env: { DEVTREES_STUB_DEAD: "sa", DEVTREES_STUB_START_FAIL: "sa" },
+    });
+    expect(r.code).toBe(1);
+    const err = (r.doc as NsDown).error;
+    expect(err?.code).toBe("SHARED_SERVICE_DEAD");
+    expect(err?.details).toMatchObject({
+      reason: "start_refused",
+      remedy: "devtrees down --shared -n a --force && devtrees up -n default -n a",
+    });
+    // An always-on one still gets the full teardown.
+    const db = devtrees(wt, ["up", "--json", "--wait-timeout", "10", "-n", "default", "-n", "a"], {
+      env: { DEVTREES_STUB_DEAD: "db", DEVTREES_STUB_START_FAIL: "db" },
+    });
+    expect((db.doc as NsDown).error?.details).toMatchObject({
+      remedy: "devtrees down --shared && devtrees up",
+    });
+  }, 60_000);
+
+  it("`down -n a` without --shared fails INVALID_ARGS and touches nothing", () => {
+    const { wt, sock } = setupNsShared("dt-bcsd2-");
+    expect(devtrees(wt, ["up", "--json", "--wait-timeout", "10"]).code).toBe(0);
+    const r = devtrees(wt, ["down", "-n", "a", "--json"]);
+    expect(r.code).toBe(1);
+    expect((r.doc as NsDown).error?.code).toBe("INVALID_ARGS");
+    expect(existsSync(sock)).toBe(true);
   }, 60_000);
 });

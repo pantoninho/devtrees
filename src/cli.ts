@@ -37,6 +37,8 @@ import {
   formatPrune,
   formatPruneSharedPorts,
   formatRestart,
+  formatSharedNamespaceDown,
+  formatSharedNamespaceDownDryRun,
   formatUp,
   formatUpDryRun,
   type ErrorCode,
@@ -47,6 +49,8 @@ import {
   type PrunedRow,
   type ReapWarningRow,
   type RestartPayload,
+  type SharedNamespaceDownDryRunPayload,
+  type SharedNamespaceDownPayload,
   type ForceKilledRow,
   type UnreclaimedRow,
   type UpDryRunPayload,
@@ -74,7 +78,11 @@ export const VERSION = readVersion();
  */
 export const COMMANDS: ReadonlyArray<{ name: string; summary: string }> = [
   { name: "up", summary: "Bring up this worktree's stack" },
-  { name: "down", summary: "Stop this worktree's stack (--shared tears down the shared instance)" },
+  {
+    name: "down",
+    summary:
+      "Stop this worktree's stack (--shared tears down the shared instance, --shared -n one namespace's shared services)",
+  },
   {
     name: "restart",
     summary: "Restart named isolated services in place; the rest of the stack keeps running",
@@ -199,6 +207,16 @@ export interface ExecuteDeps {
     warning?: ReapWarningRow;
     forceKilled?: ReadonlyArray<ForceKilledRow>;
   } | void>;
+  /** `down --shared -n <namespace>...` (#239). Optional, like the other non-core commands. */
+  downSharedNamespaces?: (options: {
+    readonly namespaces: ReadonlyArray<string>;
+    readonly force: boolean;
+  }) => Promise<SharedNamespaceDownPayload>;
+  /** `down --shared -n <namespace>... --dry-run` (#239): read-only preview. */
+  downSharedNamespacesDryRun?: (options: {
+    readonly namespaces: ReadonlyArray<string>;
+    readonly force: boolean;
+  }) => Promise<SharedNamespaceDownDryRunPayload>;
   /** `restart <service...>` (ADR-0009, #222). Optional, like the other non-core commands. */
   restart?: (options: {
     readonly services: ReadonlyArray<string>;
@@ -607,22 +625,65 @@ class DownCommand extends DevtreesCommand {
     // DOWN_TIMEOUT (#190, #206). A stop that finished but left a listener on
     // a booted service's port, or a service descendant SIGKILL could not
     // stop → DOWN_INCOMPLETE (#155).
-    details: errorCodeFooter([
-      "PROCESS_COMPOSE_NOT_FOUND",
-      "LOCK_CONTENTION",
-      "INSTANCE_UNRESPONSIVE",
-      "DOWN_TIMEOUT",
-      "DOWN_INCOMPLETE",
-      "UNKNOWN",
-    ]),
+    // `--shared -n` (#239): a dependant still uses a target → SHARED_IN_USE;
+    // the stop or the removing reload failed → SHARED_REMOVAL_FAILED; `-n`
+    // without `--shared`, or `--force`/`--dry-run` without `--shared -n` →
+    // INVALID_ARGS.
+    details:
+      "`--shared -n <namespace>` (repeatable) stops and removes only the shared services " +
+      "of those namespaces: the other shared services keep running, with the same pids and " +
+      "ports. It refuses `SHARED_IN_USE` while a running worktree has a booted isolated " +
+      "service that `depends_on` one of them (`--force` overrides), or a shared service it " +
+      "keeps does (`--force` does not). A namespace with no running shared service is a " +
+      "no-op, listed in `inactive_namespaces`. When they are the last running shared " +
+      "services, the whole shared instance stops, as with `--shared`. The next `up -n " +
+      "<namespace>` adds them back with the current definition, on the same ports. " +
+      "`--dry-run` (with `--shared -n` only) previews what would stop and what blocks it, " +
+      "with no effect. A plain `down` takes no `-n`.\n\n" +
+      errorCodeFooter([
+        "PROCESS_COMPOSE_NOT_FOUND",
+        "LOCK_CONTENTION",
+        "INSTANCE_UNRESPONSIVE",
+        "DOWN_TIMEOUT",
+        "DOWN_INCOMPLETE",
+        "SHARED_IN_USE",
+        "SHARED_REMOVAL_FAILED",
+        "INVALID_ARGS",
+        "UNKNOWN",
+      ]),
+    examples: [
+      ["Stop this worktree's stack", "devtrees down"],
+      ["Stop the whole shared instance (for every worktree)", "devtrees down --shared"],
+      ["Stop only the shared services of one namespace", "devtrees down --shared -n db-shared"],
+      ["Preview it", "devtrees down --shared -n db-shared --dry-run --json"],
+    ],
   });
 
   shared = Option.Boolean("--shared", false, {
     description: "Tear down the shared instance instead of this worktree's.",
   });
 
+  namespaces = Option.Array("--namespace,-n", {
+    description:
+      "With `--shared`: stop only the shared services of this namespace. Repeatable; the " +
+      "other shared services keep running.",
+  });
+
+  force = Option.Boolean("--force", false, {
+    description:
+      "With `--shared -n`: remove the services even though a running worktree depends on them.",
+  });
+
+  dryRun = Option.Boolean("--dry-run", false, {
+    description:
+      "With `--shared -n`: preview what would stop and what would block it; no side effects.",
+  });
+
   override async execute(): Promise<number> {
     return this.dispatch(async () => {
+      const namespaces = this.namespaces ?? [];
+      assertDownFlags({ shared: this.shared, namespaces, force: this.force, dryRun: this.dryRun });
+      if (namespaces.length > 0) return await this.executeNamespaced(namespaces);
       const result = (await this.context.deps.down({ shared: this.shared })) ?? {};
       // Issue #48: the action envelope carries exactly one of `shared: true`
       // or `worktreeId: "<id>"`. Empty string preserves the discriminated-
@@ -650,6 +711,47 @@ class DownCommand extends DevtreesCommand {
       this.emit(out);
       return 0;
     });
+  }
+
+  /** `down --shared -n` (#239), real or `--dry-run`. */
+  private async executeNamespaced(namespaces: ReadonlyArray<string>): Promise<number> {
+    const options = { namespaces, force: this.force };
+    if (this.dryRun) {
+      if (!this.context.deps.downSharedNamespacesDryRun) return 0;
+      const preview = await this.context.deps.downSharedNamespacesDryRun(options);
+      this.emit(formatSharedNamespaceDownDryRun(preview, this.mode));
+      return 0;
+    }
+    if (!this.context.deps.downSharedNamespaces) return 0;
+    const result = await this.context.deps.downSharedNamespaces(options);
+    this.emit(formatSharedNamespaceDown(result, this.mode));
+    return 0;
+  }
+}
+
+/**
+ * `down`'s flag combinations (#239): `-n` only with `--shared` (a worktree
+ * `down -n` is not supported, #171), and `--force` / `--dry-run` only with
+ * `--shared -n`. Checked before anything runs.
+ */
+function assertDownFlags(flags: {
+  readonly shared: boolean;
+  readonly namespaces: ReadonlyArray<string>;
+  readonly force: boolean;
+  readonly dryRun: boolean;
+}): void {
+  if (flags.namespaces.length > 0 && !flags.shared) {
+    throw invalidArgsError(
+      "`devtrees down -n` needs `--shared`: `devtrees down --shared -n <namespace>` stops the " +
+        "shared services of a namespace. A worktree's `down` always stops its whole instance; " +
+        "to stop one of its namespaces, `devtrees down && devtrees up -n <the others>`.",
+    );
+  }
+  const flag = flags.force ? "--force" : flags.dryRun ? "--dry-run" : undefined;
+  if (flag !== undefined && flags.namespaces.length === 0) {
+    throw invalidArgsError(
+      `\`devtrees down ${flag}\` applies only to \`devtrees down --shared -n <namespace>\`.`,
+    );
   }
 }
 
@@ -1337,6 +1439,8 @@ if (isEntrypoint(import.meta.url, process.argv[1])) {
     runUp,
     runUpDryRun,
     runDown,
+    runSharedNamespaceDown,
+    runSharedNamespaceDownDryRun,
     runRestart,
     bareRestartRemedy,
     runEnv,
@@ -1360,6 +1464,9 @@ if (isEntrypoint(import.meta.url, process.argv[1])) {
         ...(options?.waitTimeoutMs !== undefined ? { waitTimeoutMs: options.waitTimeoutMs } : {}),
       }),
     down: ({ shared }) => runDown({ stop: stopSeamsFromEnv() }, { shared }),
+    downSharedNamespaces: (options) =>
+      runSharedNamespaceDown({ stop: stopSeamsFromEnv() }, options),
+    downSharedNamespacesDryRun: (options) => runSharedNamespaceDownDryRun({}, options),
     restart: ({ services, namespaces, waitTimeoutMs }) =>
       runRestart(
         { stop: stopSeamsFromEnv(), ...(waitTimeoutMs !== undefined ? { waitTimeoutMs } : {}) },

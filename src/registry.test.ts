@@ -3,7 +3,14 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readRegistry, withLifecycleLock, withRegistryLock, withSharedLock } from "./registry.js";
+import {
+  assertNoWorktreeLifecycleLocks,
+  heldWorktreeLocks,
+  readRegistry,
+  withLifecycleLock,
+  withRegistryLock,
+  withSharedLock,
+} from "./registry.js";
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
@@ -289,5 +296,33 @@ describe("withLifecycleLock — per-instance lifecycle lock (issue #91)", () => 
         /holding the lock at/,
       );
     });
+  });
+});
+
+describe("heldWorktreeLocks (#239)", () => {
+  it("lists the worktree ids whose lifecycle lock a live process holds, and nothing else", () => {
+    const anchor = mkdtempSync(join(tmpdir(), "dt-held-"));
+    try {
+      const dir = join(anchor, "devtrees");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "login-0a1b2c3d.lock"), `${process.pid}\n`);
+      writeFileSync(join(dir, "gone-0a1b2c3d.lock"), `${2 ** 22 + 12345}\n`);
+      writeFileSync(join(dir, "odd-0a1b2c3d.lock"), "not a pid\n");
+      for (const name of ["registry.lock", "shared.lock", "hashes.lock", "x.yaml"]) {
+        writeFileSync(join(dir, name), `${process.pid}\n`);
+      }
+      expect(heldWorktreeLocks(anchor).sort()).toEqual(["login-0a1b2c3d", "odd-0a1b2c3d"]);
+      // `prune --shared-ports` (#238) refuses on the same locks.
+      expect(() => assertNoWorktreeLifecycleLocks(anchor)).toThrow();
+      rmSync(join(dir, "login-0a1b2c3d.lock"));
+      rmSync(join(dir, "odd-0a1b2c3d.lock"));
+      expect(() => assertNoWorktreeLifecycleLocks(anchor)).not.toThrow();
+    } finally {
+      rmSync(anchor, { recursive: true, force: true });
+    }
+  });
+
+  it("is empty when the anchor state dir does not exist", () => {
+    expect(heldWorktreeLocks(join(tmpdir(), "dt-held-missing-xyz"))).toEqual([]);
   });
 });
