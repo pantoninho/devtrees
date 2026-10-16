@@ -201,6 +201,28 @@ export function stackSharedEdges(stack: ResolvedStack): Record<string, string[]>
   return edges;
 }
 
+/**
+ * The shared services an in-flight `up`'s shared-step marker names (#244
+ * follow-up): the ones it `selected`, plus the shared targets of the
+ * cross-tier `depends_on` edges of the isolated services it boots. Selection
+ * never pulls in a shared service an isolated one depends on (ADR-0010), yet
+ * that worktree's service starts against it, so a teardown of it must wait
+ * for this `up`. `booted` is the isolated services the `up` boots (a fresh
+ * start's selection); `undefined` counts every isolated service of the stack
+ * (the running path: a hot-reload may start any of them).
+ */
+export function sharedStepServices(
+  stack: ResolvedStack,
+  selected: ReadonlyArray<string>,
+  booted?: ReadonlyArray<string>,
+): string[] {
+  const boots = booted === undefined ? undefined : new Set(booted);
+  const edges = Object.entries(stackSharedEdges(stack))
+    .filter(([service]) => boots === undefined || boots.has(service))
+    .flatMap(([, on]) => on);
+  return [...new Set([...selected, ...edges])];
+}
+
 /** A derived worktree config's recorded isolated → shared edges (#239), when it has them. */
 export function recordedSharedEdges(
   config: DerivedConfig | undefined,

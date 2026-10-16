@@ -427,7 +427,7 @@ describe("runSharedNamespaceDown (#239)", () => {
         forceable: false,
         remedy: "devtrees down --shared -n a",
       });
-      expect(err.message).toContain("it selected 'sa'");
+      expect(err.message).toContain("it uses 'sa'");
       expect(s.log.filter((l) => l.startsWith("process"))).toEqual([]);
     });
 

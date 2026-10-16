@@ -127,7 +127,8 @@ export function heldWorktreeLocks(anchor: string): string[] {
  * `<anchor>/devtrees/<worktree id>.shared-step.json`.
  *
  * An `up` writes it under the shared lifecycle lock, in its shared step,
- * naming the shared services it selected and the shared named ports it
+ * naming the shared services it uses (the ones it selected, plus the ones
+ * its booted isolated services depend on) and the shared named ports it
  * injects. A worktree `down`, which never uses a shared service, writes one
  * that names none (and no ports). A `down --shared -n` then waits only for
  * an in-flight worktree whose marker names one of its targets, or that has
@@ -220,39 +221,50 @@ export interface InFlightWorktree {
   readonly marker: SharedStepMarker | undefined;
 }
 
+/** The worktree's marker, when it belongs to the current hold of its lock (same pid, same lock file). */
+function currentMarker(anchor: string, id: string): SharedStepMarker | undefined {
+  const path = sharedStepMarkerFile(anchor, id);
+  const marker = existsSync(path) ? readMarkerFile(path) : undefined;
+  const holder = lockHolder(lifecycleLockFile(anchor, id));
+  const valid =
+    marker !== undefined &&
+    holder !== undefined &&
+    holder.pid === marker.pid &&
+    holder.ino === marker.lock_ino &&
+    isPidAlive(holder.pid);
+  return valid ? marker : undefined;
+}
+
 /**
  * The worktrees with a lifecycle command in flight (`heldWorktreeLocks`),
  * each with its shared-step marker when that marker belongs to the current
  * hold of its lock (same pid, same lock file). A marker that does not is
- * stale; with `clearStale`, it is removed, and so is every marker of a
- * worktree whose lock is not held at all. Only callers holding the shared
- * lock pass `clearStale`: a marker is written under that lock, so none can
- * appear while they decide.
+ * stale; with `clearStale`, every marker file that is not its worktree's
+ * current hold's (checked again, file by file, just before removing it) is
+ * removed. Only callers holding the shared lock pass `clearStale`.
+ *
+ * Why that is safe: a marker that names shared services (an `up`'s) is
+ * written only under the shared lock, so none appears while such a caller
+ * decides. The others (a worktree `down`, an `up` of a stack with no shared
+ * tier) are written without it and name no shared service; if one is
+ * written in the instant between the re-check and the removal and so lost,
+ * its worktree only counts as having no marker, the conservative case (the
+ * teardown waits for it, prune refuses), never as using fewer services.
  */
 export function inFlightWorktrees(
   anchor: string,
   opts: { readonly clearStale?: boolean } = {},
 ): InFlightWorktree[] {
-  const held = heldWorktreeLocks(anchor);
-  const out = held.map((id): InFlightWorktree => {
-    const path = sharedStepMarkerFile(anchor, id);
-    const marker = existsSync(path) ? readMarkerFile(path) : undefined;
-    const holder = lockHolder(lifecycleLockFile(anchor, id));
-    const valid =
-      marker !== undefined &&
-      holder !== undefined &&
-      holder.pid === marker.pid &&
-      holder.ino === marker.lock_ino;
-    return { id, marker: valid ? marker : undefined };
-  });
+  const out = heldWorktreeLocks(anchor).map(
+    (id): InFlightWorktree => ({ id, marker: currentMarker(anchor, id) }),
+  );
   if (opts.clearStale === true) {
-    const live = new Set(out.filter((w) => w.marker !== undefined).map((w) => w.id));
     const dir = devtreesDir(anchor);
     const suffix = ".shared-step.json";
     for (const entry of existsSync(dir) ? readdirSync(dir) : []) {
-      if (entry.endsWith(suffix) && !live.has(entry.slice(0, -suffix.length))) {
-        releaseLockAt(join(dir, entry));
-      }
+      if (!entry.endsWith(suffix)) continue;
+      if (currentMarker(anchor, entry.slice(0, -suffix.length)) !== undefined) continue;
+      releaseLockAt(join(dir, entry));
     }
   }
   return out;

@@ -7,6 +7,7 @@ import {
   planSharedDown,
   recordedSharedEdges,
   removesLastRunning,
+  sharedStepServices,
   stackSharedEdges,
   withoutProcesses,
   withoutServiceRecords,
@@ -329,6 +330,39 @@ describe("namespacedRecoveryRemedy (#239)", () => {
         "devtrees down --shared -n a -n x --force && devtrees up -n a",
       );
     });
+  });
+});
+
+describe("sharedStepServices (#244 follow-up)", () => {
+  const svc = (
+    name: string,
+    tier: "shared" | "isolated",
+    deps: string[] = [],
+  ): ResolvedService => ({
+    name,
+    tier,
+    command: "x",
+    ports: [],
+    environment: [],
+    dependsOn: deps.map((d) => ({ name: d })),
+  });
+  const stack = {
+    services: [
+      svc("pg", "shared"),
+      svc("sa", "shared"),
+      svc("sw", "shared"),
+      svc("api", "isolated", ["sa", "pg"]),
+      svc("worker", "isolated", ["sw"]),
+      svc("web", "isolated", ["api"]),
+    ],
+  };
+
+  it("adds the shared targets of the booted isolated services' edges to the selection, once each", () => {
+    expect(sharedStepServices(stack, ["pg"], ["api", "web"])).toEqual(["pg", "sa"]);
+  });
+
+  it("counts every isolated service's edges when `booted` is undefined (the running path)", () => {
+    expect(sharedStepServices(stack, ["pg"])).toEqual(["pg", "sa", "sw"]);
   });
 });
 

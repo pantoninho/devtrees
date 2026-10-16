@@ -8127,6 +8127,36 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
       expect(inFlightWorktrees(fixture.sharedAnchor)).toEqual([]);
     });
 
+    it("names a shared service a booted isolated one depends on, though no selected namespace pulls it in", async () => {
+      // `api` (ns app) depends on shared `sa` (ns a); `-n app` does not select
+      // `sa` (ADR-0010), yet `api` starts against it. `worker` (ns w) depends
+      // on `sw` and is not booted by a fresh `-n app`.
+      const sa = inNs(shared("sa", "sa-server", ["SA_PORT"]), "a");
+      const sw = inNs(shared("sw", "sw-server", ["SW_PORT"]), "w");
+      const api = { ...inNs(isolated("api", "node api.js", ["API_PORT"]), "app") };
+      const worker = { ...inNs(isolated("worker", "node w.js", ["W_PORT"]), "w") };
+      const edged: ResolvedStack = {
+        services: [
+          shared("postgres", "postgres -D ./pgdata", ["DB_PORT"]),
+          sa,
+          sw,
+          { ...api, dependsOn: [{ name: "sa" }, { name: "postgres" }] },
+          { ...worker, dependsOn: [{ name: "sw" }] },
+        ],
+      };
+      const fixture = multiWorktreeFixture("dt-marker-edge-");
+      const fresh = observingSharedStep(wt(fixture, edged, "login", { namespaces: ["app"] }).deps);
+      await runUp(fresh.deps);
+      expect(fresh.seen[0]?.[0]?.marker?.services).toEqual(["postgres", "sa"]);
+      // The running path: a hot-reload may start any isolated service, so
+      // every cross-tier edge of the stack counts.
+      const running = observingSharedStep(
+        wt(fixture, edged, "login", { namespaces: ["app"] }).deps,
+      );
+      await runUp(running.deps);
+      expect(running.seen[0]?.[0]?.marker?.services).toEqual(["postgres", "sa", "sw"]);
+    });
+
     it("an up of a stack with no shared tier, and a worktree down, name no shared service", async () => {
       const fixture = multiWorktreeFixture("dt-marker-noshared-");
       const id = idFor(fixture.wtRoot, "login");

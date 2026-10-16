@@ -113,6 +113,7 @@ import {
   planSharedDown,
   recordedSharedEdges,
   removesLastRunning,
+  sharedStepServices,
   stackSharedEdges,
   withoutProcesses,
   withoutServiceRecords,
@@ -1986,6 +1987,10 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
       // before the worktree spawns (ADR-0003); the running path waits after the
       // lock is released, with the rest of its verification (#240).
       waitNow: freshSelection !== undefined,
+      // The isolated services this `up` boots, for its shared-step marker:
+      // a fresh start's selection; on the running path a hot-reload may start
+      // any of them (`undefined`: all).
+      booted: freshSelection?.services.map((s) => s.name),
     });
     const { started: sharedStarted, fieldChanges: sharedChanges } = shared;
 
@@ -2707,6 +2712,8 @@ async function prepareShared(args: {
   readonly warn: (message: string) => void;
   /** Run the shared wait before returning (the fresh path), not as `ready`. */
   readonly waitNow: boolean;
+  /** The isolated services this `up` boots; `undefined`: every one (the running path). */
+  readonly booted?: ReadonlyArray<string> | undefined;
 }): Promise<SharedOutcome> {
   const { stack, anchor, seed, driver, deps } = args;
   const ready = async (): Promise<void> => {};
@@ -2744,6 +2751,11 @@ async function prepareShared(args: {
           driver,
         )(sharedInstancePaths(anchor.anchor).socketPath).catch(() => undefined),
       remedyFor: sharedRemedyFor(stack, args.namespaces, anchor.anchor),
+      stepServices: sharedStepServices(
+        stack,
+        selected.map((s) => s.name),
+        args.booted,
+      ),
     },
   );
   const wait = ensured.started ? ready : () => waitSharedReady(args, selected, ensured.restarted);
@@ -2903,6 +2915,12 @@ interface EnsureSharedDeps {
   readonly readSharedRows: () => Promise<ServiceStatus[] | undefined>;
   /** The remedy for broken or drifted selected shared services (#239). */
   readonly remedyFor?: (services: ReadonlyArray<string>) => string;
+  /**
+   * The shared services the shared-step marker names (#244 follow-up): the
+   * selected ones plus the shared targets of the booted isolated services'
+   * cross-tier edges (`sharedStepServices`). Default: the selected ones.
+   */
+  readonly stepServices?: ReadonlyArray<string>;
 }
 
 /**
@@ -2955,13 +2973,14 @@ async function ensureSharedStarted(
     // lock, so two `up`s from different branches cannot both assign a name.
     const portPlan = readSharedPortPlan(anchor, stack, seed, live, deps.warn);
     // The shared-step marker (#244 follow-up): under the shared lock, before
-    // anything is started, name the shared services this `up` selected and
-    // the shared ports it injects. A `down --shared -n` (also under this
-    // lock) then waits for this worktree only when it targets one of them,
-    // and `prune --shared-ports` keeps those ports. Cleared with the worktree
-    // lifecycle lock.
+    // anything is started, name the shared services this `up` uses (the ones
+    // it selected, and the ones its booted isolated services depend on, which
+    // selection never pulls in) and the shared ports it injects. A `down
+    // --shared -n` (also under this lock) then waits for this worktree only
+    // when it targets one of them, and `prune --shared-ports` keeps those
+    // ports. Cleared with the worktree lifecycle lock.
     writeSharedStepMarker(anchor, worktreeId, {
-      services: selected.map((s) => s.name),
+      services: deps.stepServices ?? selected.map((s) => s.name),
       ports: portNamesOf(sharedServicesOf(stack)),
     });
     const step = { anchor, stack, selected, portPlan, deps };
@@ -3992,7 +4011,8 @@ async function readSharedRowsOrFail(
  * too (`source: lifecycle_in_progress`): an `up` there may already be past
  * its shared step, waiting for shared health or spawning, with no socket
  * yet. Only when it uses a target, though: its shared-step marker names the
- * shared services it selected, and one that names none of the targets does
+ * shared services it uses (selected, or depended on by an isolated service
+ * it boots), and one that names none of the targets does
  * not block. One with no valid marker yet (an `up` not past its shared step,
  * or a `restart`) blocks, conservatively. The locks are read after the
  * discovery, so an `up` is seen either by its socket or by its lock. No lock
@@ -4074,9 +4094,7 @@ function blockingDependants(
 function describeDependant(d: SharedDependant): string {
   if (d.source === "lifecycle_in_progress") {
     const uses =
-      d.depends_on.length === 0
-        ? ""
-        : `; it selected ${d.depends_on.map((s) => `'${s}'`).join(", ")}`;
+      d.depends_on.length === 0 ? "" : `; it uses ${d.depends_on.map((s) => `'${s}'`).join(", ")}`;
     return `worktree '${d.instance}' (an \`up\`, \`down\` or \`restart\` is in progress there${uses})`;
   }
   if (d.service === null) {

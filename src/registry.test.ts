@@ -1,6 +1,14 @@
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+  mkdirSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -423,6 +431,21 @@ describe("shared-step markers (#244 follow-up)", () => {
     inFlightWorktrees(anchor, { clearStale: true });
     expect(existsSync(orphan)).toBe(false);
     expect(existsSync(markerPath(anchor))).toBe(true);
+  });
+
+  it("clearStale removes the marker of a holder that died with its lock and marker in place", () => {
+    const anchor = newAnchor();
+    const dir = join(anchor, "devtrees");
+    mkdirSync(dir, { recursive: true });
+    const lock = join(dir, `${id}.lock`);
+    const dead = deadPid();
+    writeFileSync(lock, `${dead}\n`);
+    writeFileSync(
+      markerPath(anchor),
+      JSON.stringify({ version: 1, pid: dead, lock_ino: statSync(lock).ino, services: ["sa"] }),
+    );
+    expect(inFlightWorktrees(anchor, { clearStale: true })).toEqual([]);
+    expect(existsSync(markerPath(anchor))).toBe(false);
   });
 
   it("assertNoWorktreeLifecycleLocks skips the worktrees it is told to", () => {

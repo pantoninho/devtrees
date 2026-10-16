@@ -4141,6 +4141,48 @@ describe.skipIf(!ENABLED)("real-pc smoke — namespaced shared teardown (#239)",
     ).toEqual(expect.arrayContaining(["PG_PORT", "SA_PORT", "SB_PORT"]));
   }, 180_000);
 
+  it("scenario 136: the teardown waits for an in-flight up whose isolated service depends on a target in a namespace it did not select", async () => {
+    const s = nsStack("dt-rpc136-");
+    // `api` (ns app) depends on `sa` (ns a): `-n app` never selects `sa`
+    // (ADR-0010), but `api` starts against it.
+    writeFileSync(
+      join(s.login, "devtrees.yaml"),
+      `${readFileSync(join(s.login, "devtrees.yaml"), "utf8")}  api:\n    tier: isolated\n` +
+        `    namespace: app\n    command: "tail -f ${s.holds.web}-api"\n    depends_on:\n` +
+        `      sa:\n        condition: process_started\n`,
+    );
+    writeFileSync(`${s.holds.web}-api`, "");
+    expect(upWith(s.billing, "app", "b").code).toBe(0);
+    expect(upWith(s.login, "app", "a").code).toBe(0);
+    expect(devtrees(s.login, ["down"]).code).toBe(0);
+    // A worktree mid-`up -n app` of this layout, holding its lock past its
+    // shared step. Its marker is what that `up` writes: pg (selected) and sa
+    // (api's cross-tier edge); the unit suite pins that content against
+    // runUp. Here the real teardown must wait for it.
+    const dir = join(anchorOf(s.login), "devtrees");
+    const racer = deriveWorktreeId("/x/racer");
+    const lock = join(dir, `${racer}.lock`);
+    writeFileSync(lock, `${process.pid}\n`);
+    cleanupStack.push(() => rmSync(lock, { force: true }));
+    writeFileSync(
+      join(dir, `${racer}.shared-step.json`),
+      JSON.stringify({
+        version: 1,
+        pid: process.pid,
+        lock_ino: statSync(lock).ino,
+        services: ["pg", "sa"],
+        ports: ["PG_PORT", "SA_PORT", "SB_PORT"],
+      }),
+    );
+    const started = Date.now();
+    const pending = devtreesAsync(s.login, ["down", "--shared", "--json", "-n", "a"]);
+    setTimeout(() => rmSync(lock, { force: true }), 2000);
+    const down = await pending;
+    expect(down.code, `down: ${down.stdout} ${down.stderr}`).toBe(0);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(1500);
+    expect((down.doc as NsDownDoc).down).toMatchObject({ stopped: true, services: ["sa"] });
+  }, 180_000);
+
   it("scenario 135: up repairs an invalid map entry; prune --shared-ports previews with --dry-run and drops a stopped name recorded outside the block", async () => {
     const s = nsStack("dt-rpc135-");
     expect(upWith(s.login, "app", "b").code).toBe(0);
