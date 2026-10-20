@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/pantoninho/devtrees/compare/v0.5.0...v0.6.0) (2026-10-20)
+
+
+### Features
+
+* scope in-flight blocking to the targets, and prune --shared-ports --dry-run ([#246](https://github.com/pantoninho/devtrees/issues/246)) ([55e7af0](https://github.com/pantoninho/devtrees/commit/55e7af0804217303e64f15003151a9dafcbe238c))
+
 ## [0.5.0](https://github.com/pantoninho/devtrees/compare/v0.4.0...v0.5.0) (2026-10-16)
 
 
