@@ -282,11 +282,17 @@ services:
     instance started by an older devtrees it reads that worktree's
     `devtrees.yaml`, and an instance it cannot read counts as a dependant.
     A worktree with an `up`, `down` or `restart` in flight (its lifecycle
-    lock held) counts too (`source: lifecycle_in_progress`): an `up` there
-    may be waiting for shared health, with no socket yet. The teardown waits
-    for such a command (up to 15s, outside the shared lock) and starts over.
-    If it is still running after that, the refusal's `details.remedy` is the
-    plain retry: `--force` never overrides an in-flight command.
+    lock held) counts too (`source: lifecycle_in_progress`) when it may use a
+    target: an `up` there may be waiting for shared health, with no socket
+    yet. An `up` past its shared step has recorded which shared services it
+    uses (its shared-step marker: the ones it selected, plus the ones its
+    booted isolated services depend on, which selection never pulls in), so
+    it blocks only when it uses a target (listed in `depends_on`); a
+    worktree `down` never blocks; an `up`
+    not yet past its shared step, and a `restart`, still do. The teardown
+    waits for such a command (up to 15s, outside the shared lock) and starts
+    over. If it is still running after that, the refusal's `details.remedy`
+    is the plain retry: `--force` never overrides an in-flight command.
   - An `up` that adds a removed service back while process-compose still
     lists it stopped (a removal whose reload timed out) starts it again, and
     lists it in `shared_restarted`.
@@ -357,9 +363,18 @@ services:
   instead of starting with its port unset. `devtrees prune --shared-ports`
   drops every recorded name no instance holds (no running shared service
   binds it, no derived config on disk carries it); it refuses with
-  `LOCK_CONTENTION` while an `up` or `down` is in flight. A recorded port
+  `LOCK_CONTENTION` while an `up` (before its shared step), `down` or
+  `restart` is in flight, and counts the ports an `up` past its shared step
+  injects as held. `--dry-run` shows what it would drop, and which in-flight
+  commands would make it refuse, without a lock or a write. A recorded port
   outside the current shared block (after a `block_size` or `port_base`
-  change) keeps its number and is warned about.
+  change) keeps its number and is warned about on every `up` and `env`. To
+  move it into the block, stop what runs with it (`devtrees down --shared`,
+  and `devtrees down` in each running worktree that injects it), then run
+  `devtrees prune --shared-ports`: outside the block, a name is dropped once
+  nothing running holds it, and the next `up` gives it an in-block number.
+- A map entry that is not a valid port is ignored with a warning, and the
+  next `up` (or `prune --shared-ports`) rewrites the map without it.
 - A shared instance started by devtrees 0.4.0 or older has no map: the first
   `up` seeds it from the instance's live numbers (its bound ports and the env
   of its processes), restarting nothing.
@@ -472,7 +487,7 @@ footer lists the subset that command can actually emit.
 | `SHARED_START_FAILED`       | The lazy-started shared instance died before binding its control socket; `details.config_path` is the config to run by hand. |
 | `SHARED_ACTIVATION_FAILED`  | Adding a selected namespaced shared service to the running shared instance failed (process-compose refused or timed out on the config reload); the shared services it already ran are untouched. `details` has `{services, reason, config_path, remedy}`. |
 | `SHARED_PORT_CONFLICT`      | A shared named port cannot be resolved without handing one port to two names or moving a recorded one (the stable shared port map, #238): `details.conflicts` lists each `{reason, port_name, port, recorded_port?, holder?, process?}` (`reason`: `port_taken`, `bound_mismatch`, `stale_env`, or `block_full` when the shared block has no free number left); nothing was started, added or recorded. `details.remedy` is one command: `devtrees down --shared && devtrees up` (run for every worktree), or `devtrees prune --shared-ports` for `block_full`; `details.map_path` is the map. |
-| `SHARED_IN_USE`             | `down --shared -n` refused: something still depends on a shared service it would remove. `details.dependants` lists each `{instance, service, depends_on, source}` (a live worktree's booted isolated service, a worktree with an `up`, `down` or `restart` in flight, `source: lifecycle_in_progress`, or a shared service it would keep, `instance: shared`). Nothing was stopped. `details.forceable` says whether `--force` overrides it (a shared dependant and a command still in flight after the wait never are); `details.remedy` is the one command to run: the plain retry while a command is in flight. |
+| `SHARED_IN_USE`             | `down --shared -n` refused: something still depends on a shared service it would remove. `details.dependants` lists each `{instance, service, depends_on, source}` (a live worktree's booted isolated service, a worktree with an `up` or `restart` in flight that may use a target, `source: lifecycle_in_progress`, whose `depends_on` lists the targets an `up` past its shared step uses, or a shared service it would keep, `instance: shared`). Nothing was stopped. `details.forceable` says whether `--force` overrides it (a shared dependant and a command still in flight after the wait never are); `details.remedy` is the one command to run: the plain retry while a command is in flight. |
 | `SHARED_REMOVAL_FAILED`     | `down --shared -n` could not finish removing the shared services (`details.reason`): process-compose refused to stop them or they did not stop (`stop_refused`, `stop_incomplete`: nothing was removed), or it refused or timed out on the config reload that removes them (`not_supported`, `error`, `timeout`). The other shared services are untouched. `details` has `{services, reason, config_path, remedy}`; run `details.remedy`. |
 | `WORKTREE_START_FAILED`     | This worktree's instance died before binding its control socket; `details.config_path` is the config to run by hand. |
 | `NO_SERVICES_SELECTED`      | The selection has no services: a bare `up` starts only the `default` namespace and it has none, or `-n` names only namespaces with none, or a `restart -n` namespace has no isolated service (`details.selected_namespaces` names it; nothing was touched). `details.namespaces` lists the namespaces to pass with `-n`. |

@@ -603,6 +603,13 @@ describe("built CLI e2e — argv→commands wiring over the stub process-compose
     // prune --shared-ports drops only names nothing holds: an unused one goes,
     // every name a running instance's derived config carries stays.
     writeFileSync(mapPath, JSON.stringify({ ...map, ports: { ...map.ports, GONE_PORT: 1 } }));
+    // The dry run previews it and writes nothing.
+    const preview = devtrees(login.wt, ["prune", "--shared-ports", "--dry-run", "--json"]);
+    expect(preview.code, `prune --shared-ports --dry-run: ${preview.stderr}`).toBe(0);
+    expect(
+      (preview.doc as { prune_shared_ports: Record<string, unknown> }).prune_shared_ports,
+    ).toMatchObject({ dropped: ["GONE_PORT"], dry_run: true, blocked_by: [] });
+    expect(JSON.parse(readFileSync(mapPath, "utf8")).ports.GONE_PORT).toBe(1);
     const pruned = devtrees(login.wt, ["prune", "--shared-ports", "--json"]);
     expect(pruned.code, `prune --shared-ports: ${pruned.stderr}`).toBe(0);
     const prunedDoc = (pruned.doc as { prune_shared_ports: { dropped: string[]; kept: string[] } })

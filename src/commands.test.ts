@@ -39,7 +39,14 @@ import {
   type WithLifecycleLock,
   type WithSharedLock,
 } from "./commands.js";
-import { withLifecycleLock, withSharedLock } from "./registry.js";
+import {
+  inFlightWorktrees,
+  sharedStepMarkerFile,
+  withLifecycleLock,
+  withSharedLock,
+  writeSharedStepMarker,
+  type InFlightWorktree,
+} from "./registry.js";
 import { deriveWorktreeId } from "./anchor.js";
 import { deriveSharedConfig, deriveWorktreeConfig, type DerivedConfig } from "./deriver.js";
 import type { RegistrySnapshot } from "./allocator.js";
@@ -50,7 +57,7 @@ import type {
   ServiceStatus,
   SpawnedProcess,
 } from "./driver.js";
-import type { InstanceStatus } from "./instances.js";
+import type { InstanceInfo, InstanceStatus } from "./instances.js";
 import { classifyError } from "./output.js";
 import {
   SHARED_REGISTRY_KEY,
@@ -8064,6 +8071,115 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
    * recorded under the shared lock the first time an `up` sees a name, and
    * every later `up` and `env`, on any branch, reuses it.
    */
+  it("the namespaced remedy names the namespace the RUNNING definition is in, not this branch's (#244 follow-up)", async () => {
+    const fixture = multiWorktreeFixture("dt-nss-drift-running-ns-");
+    await runUp(wt(fixture, base, "login", { namespaces: ["app", "db-shared"] }).deps);
+    // This branch moved db-shared to namespace `db2` (and changed it): the
+    // running instance still runs it in `db-shared`, which is what the
+    // teardown selects its targets by.
+    const moved: ResolvedStack = {
+      services: drifted.services.map((s) => (s.name === "db-shared" ? inNs(s, "db2") : s)),
+    };
+    const err = await failure(
+      runUp(wt(fixture, moved, "billing", { namespaces: ["app", "db2"] }).deps),
+    );
+    expect(err?.code).toBe("SHARED_DRIFT");
+    expect(err?.details?.remedy).toBe(
+      "devtrees down --shared -n db-shared --force && devtrees up -n app -n db2",
+    );
+  });
+
+  describe("shared-step markers (#244 follow-up)", () => {
+    /** Run `fn` with `deps`, observing the in-flight worktrees right after each shared step. */
+    function observingSharedStep(deps: CommandDeps) {
+      const seen: InFlightWorktree[][] = [];
+      return {
+        seen,
+        deps: {
+          ...deps,
+          withSharedLock: async <T>(anchor: string, fn: () => Promise<T>): Promise<T> => {
+            const result = await fn();
+            seen.push(inFlightWorktrees(anchor));
+            return result;
+          },
+        } as CommandDeps,
+      };
+    }
+
+    it("an up's shared step names the shared services it selected and the shared ports it injects", async () => {
+      const fixture = multiWorktreeFixture("dt-marker-up-");
+      const id = idFor(fixture.wtRoot, "login");
+      const { deps, seen } = observingSharedStep(
+        wt(fixture, base, "login", { namespaces: ["app", "db-shared"] }).deps,
+      );
+      await runUp(deps);
+      expect(seen[0]).toEqual([
+        {
+          id,
+          marker: expect.objectContaining({
+            services: ["postgres", "db-shared"],
+            ports: ["DB_PORT", "SB_PORT"],
+          }),
+        },
+      ]);
+      // Cleared with the worktree lifecycle lock.
+      expect(existsSync(sharedStepMarkerFile(fixture.sharedAnchor, id))).toBe(false);
+      expect(inFlightWorktrees(fixture.sharedAnchor)).toEqual([]);
+    });
+
+    it("names a shared service a booted isolated one depends on, though no selected namespace pulls it in", async () => {
+      // `api` (ns app) depends on shared `sa` (ns a); `-n app` does not select
+      // `sa` (ADR-0010), yet `api` starts against it. `worker` (ns w) depends
+      // on `sw` and is not booted by a fresh `-n app`.
+      const sa = inNs(shared("sa", "sa-server", ["SA_PORT"]), "a");
+      const sw = inNs(shared("sw", "sw-server", ["SW_PORT"]), "w");
+      const api = { ...inNs(isolated("api", "node api.js", ["API_PORT"]), "app") };
+      const worker = { ...inNs(isolated("worker", "node w.js", ["W_PORT"]), "w") };
+      const edged: ResolvedStack = {
+        services: [
+          shared("postgres", "postgres -D ./pgdata", ["DB_PORT"]),
+          sa,
+          sw,
+          { ...api, dependsOn: [{ name: "sa" }, { name: "postgres" }] },
+          { ...worker, dependsOn: [{ name: "sw" }] },
+        ],
+      };
+      const fixture = multiWorktreeFixture("dt-marker-edge-");
+      const fresh = observingSharedStep(wt(fixture, edged, "login", { namespaces: ["app"] }).deps);
+      await runUp(fresh.deps);
+      expect(fresh.seen[0]?.[0]?.marker?.services).toEqual(["postgres", "sa"]);
+      // The running path: a hot-reload may start any isolated service, so
+      // every cross-tier edge of the stack counts.
+      const running = observingSharedStep(
+        wt(fixture, edged, "login", { namespaces: ["app"] }).deps,
+      );
+      await runUp(running.deps);
+      expect(running.seen[0]?.[0]?.marker?.services).toEqual(["postgres", "sa", "sw"]);
+    });
+
+    it("an up of a stack with no shared tier, and a worktree down, name no shared service", async () => {
+      const fixture = multiWorktreeFixture("dt-marker-noshared-");
+      const id = idFor(fixture.wtRoot, "login");
+      const isolatedOnly: ResolvedStack = { services: [isolated("web", "node web.js", ["WEB"])] };
+      const observed: InFlightWorktree[][] = [];
+      const observe: WithLifecycleLock = (anchor, instanceId, fn) =>
+        withLifecycleLock(anchor, instanceId, async () => {
+          const result = await fn();
+          observed.push(inFlightWorktrees(anchor));
+          return result;
+        });
+      const deps = { ...wt(fixture, isolatedOnly, "login").deps, withLifecycleLock: observe };
+      await runUp(deps);
+      await runDown(deps);
+      expect(observed[0]).toEqual([
+        { id, marker: expect.objectContaining({ services: [], ports: [] }) },
+      ]);
+      expect(observed[1]?.[0]?.marker?.services).toEqual([]);
+      expect(observed[1]?.[0]?.marker?.ports).toBeUndefined();
+      expect(existsSync(sharedStepMarkerFile(fixture.sharedAnchor, id))).toBe(false);
+    });
+  });
+
   describe("stable shared ports by name (#238)", () => {
     // Branch A declares postgres + x; branch B declares postgres + y + x. By
     // position, A's X_PORT and B's Y_PORT both take the shared block's second
@@ -8264,7 +8380,14 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
       writeSharedPortMap(fixture.sharedAnchor, { ...map, GONE_PORT: 1 });
       // SB_PORT is no running service's, but the worktree's env carries it.
       const result = await runPruneSharedPorts(wt(fixture, base, "login").deps);
-      expect(result).toEqual({ dropped: ["GONE_PORT"], kept: ["DB_PORT", "SB_PORT"] });
+      // GONE_PORT=1 lies outside the shared block, and nothing running holds it.
+      expect(result).toEqual({
+        dropped: ["GONE_PORT"],
+        kept: ["DB_PORT", "SB_PORT"],
+        outOfBlock: ["GONE_PORT"],
+        dryRun: false,
+        blockedBy: [],
+      });
       expect(readSharedPortMap(fixture.sharedAnchor)).toEqual(map);
     });
 
@@ -8276,6 +8399,152 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
       const err = await failure(runPruneSharedPorts(wt(fixture, base, "login").deps));
       expect(err?.code).toBe("LOCK_CONTENTION");
       expect(readFileSync(sharedPortMapFile(fixture.sharedAnchor), "utf8")).toBe(before);
+    });
+
+    it("prune --shared-ports goes ahead beside an up past its shared step, and keeps the ports it injects", async () => {
+      const fixture = multiWorktreeFixture("dt-238-prune-marked-");
+      await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+      const map = readSharedPortMap(fixture.sharedAnchor) ?? {};
+      writeSharedPortMap(fixture.sharedAnchor, {
+        ...map,
+        NEW_PORT: map.DB_PORT! + 5,
+        GONE_PORT: 1,
+      });
+      const id = idFor(fixture.wtRoot, "billing");
+      const result = await withLifecycleLock(fixture.sharedAnchor, id, async () => {
+        // billing's `up` recorded NEW_PORT and has not written its config yet.
+        writeSharedStepMarker(fixture.sharedAnchor, id, { services: [], ports: ["NEW_PORT"] });
+        return await runPruneSharedPorts(wt(fixture, base, "login").deps);
+      });
+      expect(result.dropped).toEqual(["GONE_PORT"]);
+      expect(result.kept).toEqual(["DB_PORT", "NEW_PORT", "SB_PORT"]);
+    });
+
+    it("prune --shared-ports --dry-run reports what it would drop, writes nothing, and never refuses", async () => {
+      const fixture = multiWorktreeFixture("dt-238-prune-dry-");
+      await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+      const map = readSharedPortMap(fixture.sharedAnchor) ?? {};
+      writeSharedPortMap(fixture.sharedAnchor, { ...map, GONE_PORT: map.DB_PORT! + 7 });
+      const before = readFileSync(sharedPortMapFile(fixture.sharedAnchor), "utf8");
+      const lock = join(
+        fixture.sharedAnchor,
+        "devtrees",
+        `${idFor(fixture.wtRoot, "billing")}.lock`,
+      );
+      writeFileSync(lock, String(process.pid));
+      const deps = wt(fixture, base, "login").deps;
+      const preview = await runPruneSharedPorts(
+        { ...deps, withSharedLock: () => Promise.reject(new Error("no lock in a dry run")) },
+        { dryRun: true },
+      );
+      expect(preview).toEqual({
+        dropped: ["GONE_PORT"],
+        kept: ["DB_PORT", "SB_PORT"],
+        outOfBlock: [],
+        dryRun: true,
+        blockedBy: [idFor(fixture.wtRoot, "billing")],
+      });
+      expect(readFileSync(sharedPortMapFile(fixture.sharedAnchor), "utf8")).toBe(before);
+      rmSync(lock);
+      const real = await runPruneSharedPorts(deps);
+      expect(real).toMatchObject({ dropped: ["GONE_PORT"], dryRun: false, blockedBy: [] });
+    });
+
+    it("prune --shared-ports drops a name recorded outside the block once nothing running holds it", async () => {
+      const fixture = multiWorktreeFixture("dt-238-prune-outside-");
+      await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+      const map = readSharedPortMap(fixture.sharedAnchor) ?? {};
+      writeSharedPortMap(fixture.sharedAnchor, {
+        ...map,
+        OLD_PORT: 7,
+        KEEP_PORT: map.DB_PORT! + 9,
+      });
+      // A stopped worktree's config still carries both names (no socket: not running).
+      const stopped = instancePaths(fixture.sharedAnchor, "old-0a1b2c3d").configPath;
+      writeFileSync(
+        stopped,
+        stringifyYaml({
+          processes: {
+            web: { command: "x", environment: ["OLD_PORT=7", `KEEP_PORT=${map.DB_PORT! + 9}`] },
+          },
+        }),
+      );
+      const deps = wt(fixture, base, "login").deps;
+      const preview = await runPruneSharedPorts(deps, { dryRun: true });
+      // KEEP_PORT is inside the block: a config on disk holds it, as before.
+      expect(preview).toMatchObject({ dropped: ["OLD_PORT"], outOfBlock: ["OLD_PORT"] });
+      expect(preview.kept).toContain("KEEP_PORT");
+
+      // A running instance carrying it holds it.
+      const runningOld: InstanceInfo = {
+        id: "old-0a1b2c3d",
+        kind: "worktree",
+        status: "running",
+        socketPath: instancePaths(fixture.sharedAnchor, "old-0a1b2c3d").socketPath,
+        ports: {},
+        blockBase: undefined,
+        services: [],
+        namespaces: [],
+        servicesRead: "skipped",
+      };
+      const held = await runPruneSharedPorts({ ...deps, discover: async () => [runningOld] });
+      expect(held).toMatchObject({ dropped: [], outOfBlock: [] });
+      expect(readSharedPortMap(fixture.sharedAnchor)?.OLD_PORT).toBe(7);
+
+      const result = await runPruneSharedPorts(deps);
+      expect(result).toMatchObject({ dropped: ["OLD_PORT"], outOfBlock: ["OLD_PORT"] });
+      expect(readSharedPortMap(fixture.sharedAnchor)?.OLD_PORT).toBeUndefined();
+      // The warning `up` printed for it is gone, and the next `up` keeps every other number.
+      const warnings: string[] = [];
+      const again = await runUp({
+        ...wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps,
+        warn: (m) => warnings.push(m),
+      });
+      expect(again.env.DB_PORT).toBe(String(map.DB_PORT));
+      expect(warnings.filter((w) => w.includes("outside the shared block"))).toEqual([]);
+    });
+
+    it("an up rewrites a map with an invalid entry, so its warning is printed once", async () => {
+      const fixture = multiWorktreeFixture("dt-238-repair-");
+      await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+      const map = readSharedPortMap(fixture.sharedAnchor) ?? {};
+      writeFileSync(
+        sharedPortMapFile(fixture.sharedAnchor),
+        JSON.stringify({ version: 1, ports: { ...map, BAD_PORT: "nope" } }),
+      );
+      const warnings: string[] = [];
+      const deps = {
+        ...wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps,
+        warn: (m: string) => warnings.push(m),
+      };
+      // `env` only reads: it warns and leaves the file as it is.
+      await runEnv(deps);
+      expect(warnings.filter((w) => w.includes("BAD_PORT"))).toHaveLength(1);
+      await runUp(deps);
+      expect(warnings.filter((w) => w.includes("BAD_PORT"))).toHaveLength(2);
+      expect(readSharedPortMap(fixture.sharedAnchor)).toEqual(map);
+      await runEnv(deps);
+      await runUp(deps);
+      expect(warnings.filter((w) => w.includes("BAD_PORT"))).toHaveLength(2);
+    });
+
+    it("prune --shared-ports rewrites a map with an invalid entry even when it drops nothing", async () => {
+      const fixture = multiWorktreeFixture("dt-238-prune-repair-");
+      await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+      const map = readSharedPortMap(fixture.sharedAnchor) ?? {};
+      writeFileSync(
+        sharedPortMapFile(fixture.sharedAnchor),
+        JSON.stringify({ version: 1, ports: { ...map, BAD_PORT: -1 } }),
+      );
+      const result = await runPruneSharedPorts({
+        ...wt(fixture, base, "login").deps,
+        warn: () => {},
+      });
+      expect(result.dropped).toEqual([]);
+      expect(JSON.parse(readFileSync(sharedPortMapFile(fixture.sharedAnchor), "utf8"))).toEqual({
+        version: 1,
+        ports: map,
+      });
     });
 
     it("SHARED_PORT_CONFLICT's remedy is one runnable command; 'every worktree' is in the message", async () => {

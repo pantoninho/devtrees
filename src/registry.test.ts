@@ -1,15 +1,26 @@
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+  mkdirSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   assertNoWorktreeLifecycleLocks,
   heldWorktreeLocks,
+  inFlightWorktrees,
   readRegistry,
+  sharedStepMarkerFile,
   withLifecycleLock,
   withRegistryLock,
   withSharedLock,
+  writeSharedStepMarker,
 } from "./registry.js";
 
 const cleanups: Array<() => void> = [];
@@ -324,5 +335,125 @@ describe("heldWorktreeLocks (#239)", () => {
 
   it("is empty when the anchor state dir does not exist", () => {
     expect(heldWorktreeLocks(join(tmpdir(), "dt-held-missing-xyz"))).toEqual([]);
+  });
+});
+
+describe("shared-step markers (#244 follow-up)", () => {
+  const id = "login-0a1b2c3d";
+  const markerPath = (anchor: string) => sharedStepMarkerFile(anchor, id);
+
+  it("an `up` holding the lock writes a marker that is valid until the lock is released", async () => {
+    const anchor = newAnchor();
+    await withLifecycleLock(anchor, id, async () => {
+      writeSharedStepMarker(anchor, id, { services: ["sa"], ports: ["SA_PORT"] });
+      expect(inFlightWorktrees(anchor)).toEqual([
+        {
+          id,
+          marker: expect.objectContaining({
+            pid: process.pid,
+            services: ["sa"],
+            ports: ["SA_PORT"],
+          }),
+        },
+      ]);
+    });
+    expect(existsSync(markerPath(anchor))).toBe(false);
+    expect(inFlightWorktrees(anchor)).toEqual([]);
+  });
+
+  it("omits `ports` when the command does not name them (a worktree `down`)", async () => {
+    const anchor = newAnchor();
+    await withLifecycleLock(anchor, id, async () => {
+      writeSharedStepMarker(anchor, id, { services: [] });
+      expect(inFlightWorktrees(anchor)[0]?.marker).toEqual({
+        version: 1,
+        pid: process.pid,
+        lock_ino: expect.any(Number),
+        services: [],
+      });
+    });
+  });
+
+  it("is a no-op without this process holding the worktree's lock, and for the shared instance", async () => {
+    const anchor = newAnchor();
+    mkdirSync(join(anchor, "devtrees"), { recursive: true });
+    writeSharedStepMarker(anchor, id, { services: ["sa"] });
+    expect(existsSync(markerPath(anchor))).toBe(false);
+    writeFileSync(join(anchor, "devtrees", `${id}.lock`), `${deadPid()}\n`);
+    writeSharedStepMarker(anchor, id, { services: ["sa"] });
+    expect(existsSync(markerPath(anchor))).toBe(false);
+    await withSharedLock(anchor, async () => {
+      writeSharedStepMarker(anchor, "shared", { services: ["sa"] });
+    });
+    expect(existsSync(sharedStepMarkerFile(anchor, "shared"))).toBe(false);
+  });
+
+  it("a marker left by a crashed holder is ignored, and cleared by the next holder of the lock", async () => {
+    const anchor = newAnchor();
+    mkdirSync(join(anchor, "devtrees"), { recursive: true });
+    const stale = { version: 1, pid: deadPid(), lock_ino: 1, services: ["sb"], ports: [] };
+    writeFileSync(markerPath(anchor), JSON.stringify(stale));
+    await withLifecycleLock(anchor, id, async () => {
+      expect(existsSync(markerPath(anchor))).toBe(false);
+      expect(inFlightWorktrees(anchor)).toEqual([{ id, marker: undefined }]);
+    });
+  });
+
+  it("a marker of another pid, or of a lock file since replaced, is not the current hold's", () => {
+    const anchor = newAnchor();
+    const dir = join(anchor, "devtrees");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `${id}.lock`), `${process.pid}\n`);
+    writeSharedStepMarker(anchor, id, { services: ["sb"], ports: [] });
+    expect(inFlightWorktrees(anchor)[0]?.marker?.services).toEqual(["sb"]);
+    const doc = JSON.parse(readFileSync(markerPath(anchor), "utf8")) as Record<string, unknown>;
+    // Another live holder (a stolen lock): same file, another pid.
+    writeFileSync(markerPath(anchor), JSON.stringify({ ...doc, pid: process.pid + 1 }));
+    expect(inFlightWorktrees(anchor)[0]?.marker).toBeUndefined();
+    // The same pid, but a lock file recreated since the marker was written.
+    writeFileSync(markerPath(anchor), JSON.stringify({ ...doc, lock_ino: -1 }));
+    expect(inFlightWorktrees(anchor)[0]?.marker).toBeUndefined();
+    // An unreadable marker counts as none.
+    writeFileSync(markerPath(anchor), "{not json");
+    expect(inFlightWorktrees(anchor)).toEqual([{ id, marker: undefined }]);
+  });
+
+  it("clearStale removes every marker that is not the current hold's, and only those", () => {
+    const anchor = newAnchor();
+    const dir = join(anchor, "devtrees");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `${id}.lock`), `${process.pid}\n`);
+    writeSharedStepMarker(anchor, id, { services: ["sb"], ports: [] });
+    const orphan = sharedStepMarkerFile(anchor, "gone-0a1b2c3d");
+    writeFileSync(orphan, JSON.stringify({ version: 1, pid: 1, lock_ino: 1, services: [] }));
+    inFlightWorktrees(anchor);
+    expect(existsSync(orphan)).toBe(true);
+    inFlightWorktrees(anchor, { clearStale: true });
+    expect(existsSync(orphan)).toBe(false);
+    expect(existsSync(markerPath(anchor))).toBe(true);
+  });
+
+  it("clearStale removes the marker of a holder that died with its lock and marker in place", () => {
+    const anchor = newAnchor();
+    const dir = join(anchor, "devtrees");
+    mkdirSync(dir, { recursive: true });
+    const lock = join(dir, `${id}.lock`);
+    const dead = deadPid();
+    writeFileSync(lock, `${dead}\n`);
+    writeFileSync(
+      markerPath(anchor),
+      JSON.stringify({ version: 1, pid: dead, lock_ino: statSync(lock).ino, services: ["sa"] }),
+    );
+    expect(inFlightWorktrees(anchor, { clearStale: true })).toEqual([]);
+    expect(existsSync(markerPath(anchor))).toBe(false);
+  });
+
+  it("assertNoWorktreeLifecycleLocks skips the worktrees it is told to", () => {
+    const anchor = newAnchor();
+    const dir = join(anchor, "devtrees");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `${id}.lock`), `${process.pid}\n`);
+    expect(() => assertNoWorktreeLifecycleLocks(anchor)).toThrow(/holding the lock/);
+    expect(() => assertNoWorktreeLifecycleLocks(anchor, new Set([id]))).not.toThrow();
   });
 });

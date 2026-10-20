@@ -183,7 +183,8 @@ describe("devtrees CLI", () => {
     ["ls", ["UNKNOWN"]],
     ["attach", ["INSTANCE_NOT_FOUND", "PROCESS_COMPOSE_NOT_FOUND", "UNKNOWN"]],
     // `prune` drops orphan registry entries under the registry lock.
-    ["prune", ["LOCK_CONTENTION", "UNKNOWN"]],
+    // `--dry-run` without `--shared-ports` is INVALID_ARGS.
+    ["prune", ["LOCK_CONTENTION", "INVALID_ARGS", "UNKNOWN"]],
     // `env` loads devtrees.yaml (CONFIG_INVALID) and reports shared-tier
     // divergence (SHARED_DRIFT, #83) but is lock-free (pure registry read).
     ["env", ["SHARED_DRIFT", "SHARED_PORT_CONFLICT", "CONFIG_INVALID", "UNKNOWN"]],
@@ -666,6 +667,60 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
     const result = await execute(["prune"], { up: vi.fn(), down: vi.fn(), prune });
     expect(result.code).toBe(0);
     expect(result.stdout).toMatch(/no orphan|nothing to prune/i);
+  });
+
+  it("routes `prune --shared-ports --dry-run` with dryRun, and renders the preview (#244 follow-up)", async () => {
+    const pruneSharedPorts = vi.fn().mockResolvedValue({
+      dropped: ["OLD_PORT"],
+      kept: ["DB_PORT"],
+      outOfBlock: ["OLD_PORT"],
+      dryRun: true,
+      blockedBy: ["billing-0a1b2c3d"],
+    });
+    const deps = { up: vi.fn(), down: vi.fn(), pruneSharedPorts };
+    const json = await execute(["prune", "--shared-ports", "--dry-run", "--json"], deps);
+    expect(pruneSharedPorts).toHaveBeenCalledWith({ dryRun: true });
+    expect(json.code).toBe(0);
+    expect(JSON.parse(json.stdout).prune_shared_ports).toEqual({
+      dropped: ["OLD_PORT"],
+      kept: ["DB_PORT"],
+      out_of_block: ["OLD_PORT"],
+      dry_run: true,
+      blocked_by: ["billing-0a1b2c3d"],
+    });
+    const human = await execute(["prune", "--shared-ports", "--dry-run"], deps);
+    expect(human.stdout).toContain("would drop OLD_PORT");
+    expect(human.stdout).toContain("outside the shared block");
+    expect(human.stdout).toContain("'billing-0a1b2c3d'");
+  });
+
+  it("`prune --shared-ports` without --dry-run passes dryRun: false", async () => {
+    const pruneSharedPorts = vi.fn().mockResolvedValue({ dropped: [], kept: [] });
+    const result = await execute(["prune", "--shared-ports", "--json"], {
+      up: vi.fn(),
+      down: vi.fn(),
+      pruneSharedPorts,
+    });
+    expect(pruneSharedPorts).toHaveBeenCalledWith({ dryRun: false });
+    expect(JSON.parse(result.stdout).prune_shared_ports).toEqual({
+      dropped: [],
+      kept: [],
+      out_of_block: [],
+      dry_run: false,
+      blocked_by: [],
+    });
+  });
+
+  it("`prune --dry-run` without --shared-ports is INVALID_ARGS, and prunes nothing", async () => {
+    const prune = vi.fn();
+    const result = await execute(["prune", "--dry-run", "--json"], {
+      up: vi.fn(),
+      down: vi.fn(),
+      prune,
+    });
+    expect(result.code).not.toBe(0);
+    expect(JSON.parse(result.stdout || result.stderr).error.code).toBe("INVALID_ARGS");
+    expect(prune).not.toHaveBeenCalled();
   });
 
   it("turns a prune failure into a clear, non-zero error", async () => {
