@@ -20,11 +20,24 @@ import { constants as osConstants } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Writable } from "node:stream";
 import { Cli, Command, Option, Builtins, type BaseContext } from "clipanion";
-import type { LogEvent } from "./driver.js";
-import type { BracedEnvVar, DerivedConfig, DroppedEdge } from "./deriver.js";
-import type { DroppedNamespaceEdge } from "./selection.js";
-import type { SharedFieldChange } from "./shared-state.js";
-import type { SharedPortEntry } from "./shared-ports.js";
+import type {
+  LogsOptions,
+  UpOptions,
+  bareRestartRemedy,
+  runAttach,
+  runDown,
+  runEnv,
+  runInit,
+  runLogs,
+  runLs,
+  runPrune,
+  runPruneSharedPorts,
+  runRestart,
+  runSharedNamespaceDown,
+  runSharedNamespaceDownDryRun,
+  runUp,
+  runUpDryRun,
+} from "./commands.js";
 import { maybeInitHint } from "./init-hint.js";
 import {
   classifyError,
@@ -44,16 +57,7 @@ import {
   formatUpDryRun,
   type ErrorCode,
   type FormatMode,
-  type LsInstanceRow,
-  type LsServiceRow,
   type OutputResult,
-  type PrunedRow,
-  type ReapWarningRow,
-  type RestartPayload,
-  type SharedNamespaceDownDryRunPayload,
-  type SharedNamespaceDownPayload,
-  type ForceKilledRow,
-  type UnreclaimedRow,
   type UpDryRunPayload,
 } from "./output.js";
 
@@ -118,44 +122,20 @@ export interface RunResult {
 }
 
 /**
- * Options the `up` handler threads from CLI flags into the underlying `runUp`.
- * Optional everywhere: when omitted, runUp's own defaults apply (TTY detection
- * for `attach`, 120s for `waitTimeoutMs`).
+ * A command as the CLI calls it: its signature from `commands.ts` minus the
+ * leading `CommandEnv`, which the entrypoint supplies. The options and the
+ * result are the command's own, so the CLI's view cannot drift from them.
  */
-export interface UpOptions {
-  /** Force-attach (`--attach`) or force-skip (`--no-attach`). */
-  readonly attach?: boolean;
-  /** Health-wait window in ms (`--wait-timeout=<seconds>`). */
-  readonly waitTimeoutMs?: number;
-  /**
-   * process-compose namespaces to start (`-n/--namespace`, issue #128),
-   * repeatable and forwarded verbatim. Omitted when no `-n` flag is given, so
-   * `runUp`'s default applies (a fresh start selects only `default`, #176).
-   */
-  readonly namespaces?: ReadonlyArray<string>;
-}
+type Invocation<F> = F extends (env: never, ...options: infer A) => infer R
+  ? (...options: A) => R
+  : never;
+
+/** What a command's invocation resolves to. */
+type ResultOf<F> = Awaited<ReturnType<Invocation<F>>>;
 
 /** The effectful commands, injected so dispatch stays unit-testable. */
 export interface ExecuteDeps {
-  up: (options?: UpOptions) => Promise<{
-    worktreeId: string;
-    socketPath: string;
-    env: Record<string, string>;
-    sharedStarted?: boolean;
-    /** Namespaced shared services this `up` added to the shared instance (#236). */
-    sharedActivated?: ReadonlyArray<string>;
-    /** Dead shared services this `up` restarted (#240). */
-    sharedRestarted?: ReadonlyArray<string>;
-    blockBase?: number;
-    services?: ReadonlyArray<LsServiceRow>;
-    /** `depends_on` edges lost to namespace selection (#179). */
-    droppedNamespaceEdges?: ReadonlyArray<DroppedNamespaceEdge>;
-    /** `${NAME}` references to injected variables in commands (#200). */
-    bracedEnvVars?: ReadonlyArray<BracedEnvVar>;
-    /** Shared fields edited since shared started (#185). */
-    sharedFieldChanges?: ReadonlyArray<SharedFieldChange>;
-    restarted?: ReadonlyArray<string>;
-  }>;
+  up: Invocation<typeof runUp>;
   /**
    * Dry-run derivation (#124): runs the full pipeline `up` would run and
    * returns the derived config(s) + the resolved env, with no side effects.
@@ -164,109 +144,27 @@ export interface ExecuteDeps {
    * carries the allocated worktree ports (and injected shared ports) a sibling
    * reads off the `--json` envelope (#125).
    */
-  upDryRun?: (options?: {
-    readonly namespaces?: ReadonlyArray<string>;
-    /** Caps the running instance's status read (#210); default 5s. */
-    readonly waitTimeoutMs?: number;
-  }) => Promise<{
-    worktreeId: string;
-    env: Record<string, string>;
-    config: DerivedConfig;
-    sharedEnv?: Record<string, string>;
-    sharedConfig?: DerivedConfig;
-    /**
-     * Cross-tier `depends_on` edges the derivation dropped (issue #168).
-     * Optional so a test stub can omit it; absent is read as "none dropped".
-     */
-    droppedEdges?: ReadonlyArray<DroppedEdge>;
-    /** `depends_on` edges a fresh `up` would lose to namespace selection (#179). */
-    droppedNamespaceEdges?: ReadonlyArray<DroppedNamespaceEdge>;
-    /** `${NAME}` references to injected variables in commands (#200). */
-    bracedEnvVars?: ReadonlyArray<BracedEnvVar>;
-    /**
-     * The namespace selection a fresh `up` would apply (issue #176) and the
-     * isolated services it starts. Optional so a test stub can omit them.
-     */
-    namespaces?: ReadonlyArray<string>;
-    selectedServices?: ReadonlyArray<string>;
-    /**
-     * Which path the previewed `up` takes, and on a running instance whether
-     * it would hot-reload and which dead services it would restart (#210).
-     * Optional so a test stub can omit them; absent reads as a fresh start.
-     */
-    instance?: "fresh" | "running";
-    wouldReload?: boolean;
-    wouldRestart?: ReadonlyArray<string>;
-    /** Dead selected shared services the real `up` would restart (#240). */
-    wouldRestartShared?: ReadonlyArray<string>;
-    /** The shared services the selection includes (#236). */
-    selectedSharedServices?: ReadonlyArray<string>;
-  }>;
-  down: (options: { shared: boolean }) => Promise<{
-    worktreeId?: string;
-    stopped?: boolean;
-    warning?: ReapWarningRow;
-    forceKilled?: ReadonlyArray<ForceKilledRow>;
-  } | void>;
+  upDryRun?: Invocation<typeof runUpDryRun>;
+  down: Invocation<typeof runDown>;
   /** `down --shared -n <namespace>...` (#239). Optional, like the other non-core commands. */
-  downSharedNamespaces?: (options: {
-    readonly namespaces: ReadonlyArray<string>;
-    readonly force: boolean;
-  }) => Promise<SharedNamespaceDownPayload>;
+  downSharedNamespaces?: Invocation<typeof runSharedNamespaceDown>;
   /** `down --shared -n <namespace>... --dry-run` (#239): read-only preview. */
-  downSharedNamespacesDryRun?: (options: {
-    readonly namespaces: ReadonlyArray<string>;
-    readonly force: boolean;
-  }) => Promise<SharedNamespaceDownDryRunPayload>;
+  downSharedNamespacesDryRun?: Invocation<typeof runSharedNamespaceDownDryRun>;
   /** `restart <service...>` (ADR-0009, #222). Optional, like the other non-core commands. */
-  restart?: (options: {
-    readonly services: ReadonlyArray<string>;
-    /** `-n` namespaces, expanded to their isolated services (#224). */
-    readonly namespaces?: ReadonlyArray<string>;
-    /** Health-wait window in ms (`--wait-timeout=<seconds>`). */
-    readonly waitTimeoutMs?: number;
-  }) => Promise<RestartPayload>;
+  restart?: Invocation<typeof runRestart>;
   /**
    * The remedy a bare `restart` points to (#225): the `down` + `up` that keeps
    * the booted namespaces. Best-effort; never throws.
    */
-  bareRestartRemedy?: () => Promise<BareRestartRemedyRow>;
-  ls?: () => Promise<{
-    anchor: string;
-    instances: ReadonlyArray<LsInstanceRow>;
-    /** The shared port map with origins (#238). */
-    sharedPorts?: Readonly<Record<string, SharedPortEntry>>;
-  }>;
-  attach?: (options: { shared: boolean }) => Promise<void>;
+  bareRestartRemedy?: Invocation<typeof bareRestartRemedy>;
+  ls?: Invocation<typeof runLs>;
+  attach?: Invocation<typeof runAttach>;
   /** `prune --shared-ports` (#238): drop shared port map names no instance holds. */
-  pruneSharedPorts?: (options: { dryRun: boolean }) => Promise<{
-    dropped: ReadonlyArray<string>;
-    kept: ReadonlyArray<string>;
-    outOfBlock?: ReadonlyArray<string>;
-    dryRun?: boolean;
-    blockedBy?: ReadonlyArray<string>;
-  }>;
-  prune?: () => Promise<{
-    anchor: string;
-    pruned: ReadonlyArray<PrunedRow>;
-    warnings?: ReadonlyArray<ReapWarningRow>;
-    unreclaimed?: ReadonlyArray<UnreclaimedRow>;
-  }>;
-  env?: () => Promise<{
-    worktreeId: string;
-    env: Record<string, string>;
-    /** Each shared port with its origin (#238). */
-    sharedPorts?: Readonly<Record<string, SharedPortEntry>>;
-  }>;
-  logs?: (options: LogsCliOptions) => Promise<{
-    services: ReadonlyArray<string>;
-    events: AsyncIterable<LogEvent>;
-  }>;
-  init?: () => Promise<{
-    target: string;
-    path: string;
-    action: "created" | "updated";
-  }>;
+  pruneSharedPorts?: Invocation<typeof runPruneSharedPorts>;
+  prune?: Invocation<typeof runPrune>;
+  env?: Invocation<typeof runEnv>;
+  logs?: Invocation<typeof runLogs>;
+  init?: Invocation<typeof runInit>;
   /**
    * The agent-onboarding hint `up` surfaces on stderr (issue #119): a one-line,
    * non-fatal pointer at `devtrees init --agents`, returned only when the
@@ -277,17 +175,6 @@ export interface ExecuteDeps {
    * Optional so dispatch paths that don't wire it simply never hint.
    */
   initHint?: () => string | undefined;
-}
-
-/** Parsed `devtrees logs` options threaded into `deps.logs`. */
-export interface LogsCliOptions {
-  readonly service?: string;
-  readonly all: boolean;
-  readonly shared: boolean;
-  readonly follow: boolean;
-  readonly tail?: number;
-  /** `--since` window, already coerced from a duration string (e.g. `5m`) to ms. */
-  readonly sinceMs?: number;
 }
 
 // --- error-code footers for per-command --help -----------------------------
@@ -497,10 +384,7 @@ class UpCommand extends DevtreesCommand {
     return this.dispatch(async () => {
       if (this.dryRun) return this.executeDryRun();
       const result = await this.context.deps.up(this.buildUpOptions());
-      // The optional fields (`blockBase`, `services`, `droppedNamespaceEdges`,
-      // `restarted`) pass through
-      // as-is; `formatUp` defaults whichever a caller left out.
-      const out = formatUp({ ...result, sharedStarted: result.sharedStarted ?? false }, this.mode);
+      const out = formatUp(result, this.mode);
       this.emit(out);
       this.emitInitHint();
       return 0;
@@ -574,7 +458,7 @@ class UpCommand extends DevtreesCommand {
   }
 }
 
-type DryRunResultView = Awaited<ReturnType<NonNullable<ExecuteDeps["upDryRun"]>>>;
+type DryRunResultView = ResultOf<typeof runUpDryRun>;
 
 /** Map the injected `upDryRun` result onto the formatter's payload. */
 function dryRunPayload(result: DryRunResultView): UpDryRunPayload {
@@ -584,35 +468,27 @@ function dryRunPayload(result: DryRunResultView): UpDryRunPayload {
     config: result.config,
     ...(result.sharedEnv !== undefined ? { sharedEnv: result.sharedEnv } : {}),
     ...(result.sharedConfig !== undefined ? { sharedConfig: result.sharedConfig } : {}),
-    droppedEdges: result.droppedEdges ?? [],
-    droppedNamespaceEdges: result.droppedNamespaceEdges ?? [],
-    bracedEnvVars: result.bracedEnvVars ?? [],
-    selectedSharedServices: result.selectedSharedServices ?? [],
-    wouldRestartShared: result.wouldRestartShared ?? [],
+    droppedEdges: result.droppedEdges,
+    droppedNamespaceEdges: result.droppedNamespaceEdges,
+    bracedEnvVars: result.bracedEnvVars,
+    selectedSharedServices: result.selectedSharedServices,
+    wouldRestartShared: result.wouldRestartShared,
     ...dryRunPlanPayload(result),
   };
 }
 
 /**
  * The plan part of the dry-run payload: the selection (#176) and which path
- * `up` would take, with its reload and restarts (#210). Absent fields default
- * to a fresh preview.
+ * `up` would take, with its reload and restarts (#210).
  */
 function dryRunPlanPayload(
   result: DryRunResultView,
 ): Pick<UpDryRunPayload, "selection" | "instance" | "wouldReload" | "wouldRestart"> {
   return {
-    ...(result.namespaces !== undefined
-      ? {
-          selection: {
-            namespaces: result.namespaces,
-            services: result.selectedServices ?? [],
-          },
-        }
-      : {}),
-    instance: result.instance ?? "fresh",
-    wouldReload: result.wouldReload ?? false,
-    wouldRestart: result.wouldRestart ?? [],
+    selection: { namespaces: result.namespaces, services: result.selectedServices },
+    instance: result.instance,
+    wouldReload: result.wouldReload,
+    wouldRestart: result.wouldRestart,
   };
 }
 
@@ -688,22 +564,19 @@ class DownCommand extends DevtreesCommand {
       const namespaces = this.namespaces ?? [];
       assertDownFlags({ shared: this.shared, namespaces, force: this.force, dryRun: this.dryRun });
       if (namespaces.length > 0) return await this.executeNamespaced(namespaces);
-      const result = (await this.context.deps.down({ shared: this.shared })) ?? {};
+      const result = await this.context.deps.down({ shared: this.shared });
       // Issue #48: the action envelope carries exactly one of `shared: true`
-      // or `worktreeId: "<id>"`. Empty string preserves the discriminated-
-      // union shape when the runner couldn't supply an id. `stopped` (#92)
-      // defaults to true so runner stubs that don't thread it keep today's
-      // "instance stopped" output; `runDown` reports `false` on the
-      // idempotent no-op and the formatter renders the notice.
-      const stopped = result.stopped ?? true;
+      // or `worktreeId: "<id>"`. `stopped` (#92) is `false` on the idempotent
+      // no-op, and the formatter renders the notice.
+      const { stopped } = result;
       // Issue #190: service processes devtrees had to SIGKILL to finish the
       // stop — a stderr warning (human) / `down.force_killed` (JSON).
       const forceKilled = result.forceKilled ?? [];
       const out = formatDown(
-        this.shared
+        result.shared
           ? { shared: true, stopped, forceKilled }
           : {
-              worktreeId: result.worktreeId ?? "",
+              worktreeId: result.worktreeId,
               stopped,
               forceKilled,
               // Issue #148: a failed dead-supervisor reap surfaces as a stderr
@@ -988,12 +861,7 @@ class PruneCommand extends DevtreesCommand {
       // while out-of-band resources may have survived.
       // Issue #186: orphans left in place because they could not be stopped
       // surface the same way (stderr / `prune.unreclaimed[]`).
-      const out = formatPrune(
-        result.pruned,
-        this.mode,
-        result.warnings ?? [],
-        result.unreclaimed ?? [],
-      );
+      const out = formatPrune(result.pruned, this.mode, result.warnings, result.unreclaimed);
       this.emit(out);
       return 0;
     });
@@ -1064,7 +932,7 @@ class LogsCommand extends DevtreesCommand {
   override async execute(): Promise<number> {
     return this.dispatch(async () => {
       if (!this.context.deps.logs) return 0;
-      const opts: LogsCliOptions = {
+      const opts: LogsOptions = {
         service: this.service,
         all: this.all,
         shared: this.shared,
@@ -1145,19 +1013,15 @@ function invalidArgsError(message: string, details?: Readonly<Record<string, unk
   return err;
 }
 
-/** What a bare `restart` points to instead (#225): `bareRestartRemedy`'s answer. */
-interface BareRestartRemedyRow {
-  readonly remedy: string;
-  /** False when the running namespaces could not be read: `remedy` boots every declared one. */
-  readonly namespacesRead: boolean;
-}
-
 /**
  * Why a bare `devtrees restart` is refused (ADR-0009, #225), and the ways
  * out: name the services, or run `remedy` (the `down` + `up` with the
  * namespaces booted now, or every declared one when those could not be read).
  */
-function bareRestartMessage({ remedy, namespacesRead }: BareRestartRemedyRow): string {
+function bareRestartMessage({
+  remedy,
+  namespacesRead,
+}: ResultOf<typeof bareRestartRemedy>): string {
   const unread = namespacesRead
     ? ""
     : " devtrees could not read which namespaces the instance runs, so that command boots " +
@@ -1543,47 +1407,23 @@ if (isEntrypoint(import.meta.url, process.argv[1])) {
     runLogs,
     runInit,
   } = await import("./commands.js");
+  // Each command gets its options as the CLI parsed them, and the real seams;
+  // only the stops read their budgets from the environment (#190).
   const deps: ExecuteDeps = {
-    up: (options) =>
-      runUp({
-        ...(options?.attach !== undefined ? { attach: options.attach } : {}),
-        ...(options?.waitTimeoutMs !== undefined ? { waitTimeoutMs: options.waitTimeoutMs } : {}),
-        ...(options?.namespaces !== undefined ? { namespaces: options.namespaces } : {}),
-      }),
-    upDryRun: (options) =>
-      runUpDryRun({
-        ...(options?.namespaces !== undefined ? { namespaces: options.namespaces } : {}),
-        ...(options?.waitTimeoutMs !== undefined ? { waitTimeoutMs: options.waitTimeoutMs } : {}),
-      }),
-    down: ({ shared }) => runDown({ stop: stopSeamsFromEnv() }, { shared }),
+    up: (options) => runUp({}, options),
+    upDryRun: (options) => runUpDryRun({}, options),
+    down: (options) => runDown({ stop: stopSeamsFromEnv() }, options),
     downSharedNamespaces: (options) =>
       runSharedNamespaceDown({ stop: stopSeamsFromEnv() }, options),
     downSharedNamespacesDryRun: (options) => runSharedNamespaceDownDryRun({}, options),
-    restart: ({ services, namespaces, waitTimeoutMs }) =>
-      runRestart(
-        { stop: stopSeamsFromEnv(), ...(waitTimeoutMs !== undefined ? { waitTimeoutMs } : {}) },
-        services,
-        namespaces,
-      ),
+    restart: (options) => runRestart({ stop: stopSeamsFromEnv() }, options),
     bareRestartRemedy: () => bareRestartRemedy(),
     ls: () => runLs(),
-    attach: ({ shared }) => runAttach({}, { shared }),
+    attach: (options) => runAttach({}, options),
     prune: () => runPrune({ stop: stopSeamsFromEnv() }),
     pruneSharedPorts: (options) => runPruneSharedPorts({}, options),
     env: () => runEnv(),
-    logs: (opts) =>
-      runLogs(
-        {},
-        {
-          service: opts.service,
-          all: opts.all,
-          shared: opts.shared,
-          follow: opts.follow,
-          tail: opts.tail,
-          sinceMs: opts.sinceMs,
-          signal: abortOnTerminationSignals(),
-        },
-      ),
+    logs: (options) => runLogs({}, { ...options, signal: abortOnTerminationSignals() }),
     init: () => runInit(),
     // Issue #119: the agent-onboarding hint `up` may surface on stderr. The
     // gate is "agent context" (neither stdout nor stderr a TTY — the same

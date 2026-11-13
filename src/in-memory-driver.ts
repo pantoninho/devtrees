@@ -81,7 +81,7 @@ export interface InMemoryProcessComposeOptions {
 
 /** The in-memory process-compose: its `Driver`, plus the events and reads tests use. */
 export interface InMemoryProcessCompose {
-  /** The `Driver` to inject (`CommandDeps.processCompose`). */
+  /** The `Driver` to inject (`CommandEnv.processCompose`). */
   readonly driver: Driver;
   /** Every request the instances received, oldest first. */
   readonly requests: ReadonlyArray<PcRequest>;
