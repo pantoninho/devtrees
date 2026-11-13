@@ -67,6 +67,7 @@ import {
   reloadTimeoutMs,
   type Driver,
   type DriverDeps,
+  type InstanceRef,
   type LogEvent,
   type ServiceStatus,
   type StreamLogsOptions,
@@ -3444,28 +3445,7 @@ export async function runLogs(
     );
   }
 
-  const { anchor } = resolve(deps);
-  // Either instance is reachable only while its socket file is there.
-  const worktree = instancePaths(anchor.anchor, anchor.worktreeId);
-  const paths = options.shared
-    ? sharedInstanceOf(deps, anchor.anchor).endpoint()
-    : existsSync(worktree.socketPath)
-      ? worktree
-      : undefined;
-
-  if (paths === undefined) {
-    if (options.shared) {
-      throw new Error(
-        "no shared instance is running. Bring it up implicitly via `devtrees up` " +
-          "(when the stack declares shared services) before tailing its logs.",
-      );
-    }
-    throw new Error(
-      `no worktree instance is running for '${anchor.worktreeId}'. ` +
-        "Run `devtrees up` to bring it up first.",
-    );
-  }
-
+  const paths = logsTarget(deps, options.shared === true);
   const known = readDerivedServices(paths.configPath);
   if (!options.all && options.service !== undefined && !known.includes(options.service)) {
     // Fail fast before spawning: `process-compose process logs <unknown>`
@@ -3496,6 +3476,29 @@ export async function runLogs(
       : merged;
 
   return { services, events };
+}
+
+/**
+ * The instance `logs` reads: the shared one (through the shared instance
+ * module) or this worktree's. Either is reachable only while its socket file
+ * is there; without it, fail with the hint `INSTANCE_NOT_FOUND` carries.
+ */
+function logsTarget(deps: CommandDeps, shared: boolean): InstanceRef {
+  const { anchor } = resolve(deps);
+  if (shared) {
+    const target = sharedInstanceOf(deps, anchor.anchor).endpoint();
+    if (target !== undefined) return target;
+    throw new Error(
+      "no shared instance is running. Bring it up implicitly via `devtrees up` " +
+        "(when the stack declares shared services) before tailing its logs.",
+    );
+  }
+  const paths = instancePaths(anchor.anchor, anchor.worktreeId);
+  if (existsSync(paths.socketPath)) return paths;
+  throw new Error(
+    `no worktree instance is running for '${anchor.worktreeId}'. ` +
+      "Run `devtrees up` to bring it up first.",
+  );
 }
 
 /**
