@@ -89,6 +89,20 @@ describe("health — createWaitForHealth (worktree instance gate)", () => {
     ).resolves.toBeUndefined();
   });
 
+  it("treats a launched is_daemon service (Launched) as healthy (#262)", async () => {
+    const source = sourceFromQueue([[row("daemon", "Launched")]]);
+    const wait = createWaitForSharedReady(source, { probe: unknownProbe, pollMs: 1 });
+    await expect(
+      wait({
+        socketPath: "/run/shared.sock",
+        serviceNames: ["daemon"],
+        restarted: [],
+        probedServiceNames: [],
+        timeoutMs: 1000,
+      }),
+    ).resolves.toBeUndefined();
+  });
+
   it("passes a finished exit-0 one-shot parsed from real process-compose output (#174)", async () => {
     // A one-shot has no probe: is_ready "-" -> health unknown, so the wait
     // gates on status `Completed`. The #174 not-running override must not

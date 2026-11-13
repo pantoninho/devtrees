@@ -3637,10 +3637,15 @@ describe.skipIf(!ENABLED)("real-pc smoke — a shared service that exits at once
   it("scenario 137: the only shared service exits at once, so process-compose exits; up fails instead of reporting it started", () => {
     const login = exitingShared("dt-rpc137-", false);
     const r = devtrees(login, ["up", "--json", "--no-attach", "--wait-timeout", "30"]);
-    // The code is pending a decision (#262): none of the existing ones says
-    // "the shared instance exited right after binding its socket".
+    // Whether devtrees saw the socket before process-compose removed it is a
+    // race; either way it is a failed start, with the config to run by hand.
     expect(r.code, `up should fail: ${r.stdout} ${r.stderr}`).toBe(1);
-    expect((r.doc as ErrorDoc).error?.code).toBeDefined();
+    const err = (r.doc as ErrorDoc).error;
+    expect(err?.code).toBe("SHARED_START_FAILED");
+    expect(String(err?.details?.config_path)).toMatch(/shared\.yaml$/);
+    // Nothing is left running: no shared row, no worktree instance.
+    const ls = devtrees(login, ["ls", "--json"]).doc as LsDoc | undefined;
+    expect(ls?.ls.instances ?? []).toEqual([]);
   }, 90_000);
 
   it("scenario 138: one of two shared services exits at once; up fails SHARED_SERVICE_DEAD died_while_waiting", () => {

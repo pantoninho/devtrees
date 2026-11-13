@@ -265,10 +265,11 @@ function createFailureNotifier(
 
 /**
  * "Healthy enough" for a service WITHOUT a readiness probe = the process is
- * up: `Running`, or `Completed` for one-shot jobs (`Ready` is kept for
- * forward-compatibility with status vocabularies that fold readiness into the
- * status string). Anything else (`Pending`, `Restarting`, `Failed`) means we
- * keep waiting.
+ * up: `Running`, `Launched` for an `is_daemon` service whose launch command
+ * returned (#262: the wait after a lazy start reads it), or `Completed` for
+ * one-shot jobs (`Ready` is kept for forward-compatibility with status
+ * vocabularies that fold readiness into the status string). Anything else
+ * (`Pending`, `Restarting`, `Failed`) means we keep waiting.
  *
  * Services WITH a readiness probe never gate on this set. Empirically
  * process-compose keeps their `status` at `Running` while the probe verdict
@@ -277,7 +278,7 @@ function createFailureNotifier(
  * process spawns — before the first probe can fire (issue #108). Probed
  * services are healthy only when `health === "ready"`.
  */
-const HEALTHY_STATES = new Set(["running", "ready", "completed"]);
+const HEALTHY_STATES = new Set(["running", "launched", "ready", "completed"]);
 
 const SHARED_HEALTH_TIMEOUT_MS = 30_000;
 const HEALTH_POLL_MS = 200;

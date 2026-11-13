@@ -109,7 +109,7 @@ export const ERROR_CODE_DESCRIPTIONS: Readonly<Record<ErrorCode, string>> = {
   SHARED_DRIFT:
     "A shared service this `up` selects diverges from the revision the running shared instance runs (an `up` that does not select it is unaffected); `details.services` lists each `{service, running_hash, local_hash}`, `details.port_conflicts` each named port a running shared service already owns, `details.remedy` is `devtrees down --shared && devtrees up` (for every worktree).",
   SHARED_START_FAILED:
-    "The lazy-started shared instance died before binding its control socket; `details.config_path` is the config to run by hand.",
+    "The lazy-started shared instance died before binding its control socket, or exited right after binding it because every shared service it started had exited (process-compose exits once nothing runs); `details.config_path` is the config to run by hand.",
   SHARED_ACTIVATION_FAILED:
     "Adding a selected namespaced shared service to the running shared instance failed (process-compose refused or timed out on the config reload); the shared services it already ran are untouched. `details` has `{services, reason, config_path, remedy}`.",
   SHARED_PORT_CONFLICT:

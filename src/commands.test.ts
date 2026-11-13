@@ -807,13 +807,22 @@ describe("runUp — a lazy-started shared service that exits at once (#262)", ()
       },
     };
 
-    // The error code is pending a decision (see the issue): no existing code
-    // says "the lazy-started shared instance exited after binding its socket".
-    const outcome = await runUp(deps).then(
-      (r) => ({ resolved: r.sharedStarted }),
-      (e: unknown) => ({ rejected: (e as { code?: string }).code }),
+    const err = await runUp(deps).then(
+      () => undefined,
+      (e: unknown) => e as Error & { code?: string; details?: Record<string, unknown> },
     );
-    expect(outcome).toMatchObject({ rejected: expect.any(String) });
+    if (err === undefined) throw new Error("expected runUp to reject, not report shared started");
+    // A failed start, as when the socket never appears (#92): same details.
+    expect(err.code).toBe("SHARED_START_FAILED");
+    const sharedSpawn = findSharedSpawn(track);
+    expect(err.details).toMatchObject({
+      socket_path: sharedSpawn.socketPath,
+      config_path: sharedSpawn.configPath,
+      timeout_ms: expect.any(Number),
+    });
+    expect(err.message).toContain(`process-compose -f ${sharedSpawn.configPath}`);
+    const worktreeSpawn = track.invocations.find((i) => !i.socketPath.endsWith("/shared.sock"));
+    expect(worktreeSpawn).toBeUndefined();
   });
 });
 
