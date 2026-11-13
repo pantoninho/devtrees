@@ -4,10 +4,79 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { Writable } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
-import { COMMANDS, execute, executeStreaming, isEntrypoint, run } from "./cli.js";
+import { COMMANDS, execute, executeStreaming, isEntrypoint, run, type ExecuteDeps } from "./cli.js";
 import type { LogEvent } from "./driver.js";
 import { withRegistryLock } from "./registry.js";
 import { parseStack } from "./stack.js";
+
+/**
+ * The signature of one injected command, so a `vi.fn<Stub<"up">>()` stub's
+ * resolved value is type-checked against what the real command returns.
+ */
+type Stub<K extends keyof ExecuteDeps> = NonNullable<ExecuteDeps[K]>;
+
+/** What the command behind `ExecuteDeps[K]` resolves to. */
+type Result<K extends keyof ExecuteDeps> = Awaited<ReturnType<Stub<K>>>;
+
+/**
+ * A complete `up` result. The list fields default to empty, which renders
+ * exactly as the formatter renders them absent; `blockBase` is the caller's
+ * call, because a present one adds `block_base` to the envelope.
+ */
+function upResult(
+  fields: Pick<Result<"up">, "worktreeId" | "socketPath" | "env" | "blockBase"> &
+    Partial<Result<"up">>,
+): Result<"up"> {
+  return {
+    sharedStarted: false,
+    sharedActivated: [],
+    sharedRestarted: [],
+    services: [],
+    droppedNamespaceEdges: [],
+    bracedEnvVars: [],
+    sharedFieldChanges: [],
+    restarted: [],
+    ...fields,
+  };
+}
+
+/** A complete `up --dry-run` result: a fresh preview selecting `default` unless overridden. */
+function dryRunResult(
+  fields: Pick<Result<"upDryRun">, "worktreeId" | "worktreeRoot" | "anchor" | "env" | "config"> &
+    Partial<Result<"upDryRun">>,
+): Result<"upDryRun"> {
+  return {
+    droppedEdges: [],
+    instance: "fresh",
+    namespaces: ["default"],
+    selectedServices: [],
+    droppedNamespaceEdges: [],
+    wouldReload: false,
+    wouldRestart: [],
+    wouldRestartShared: [],
+    selectedSharedServices: [],
+    bracedEnvVars: [],
+    ...fields,
+  };
+}
+
+/** One `ls` instance with no services read, unless overridden. */
+function lsInstance(
+  fields: Pick<
+    Result<"ls">["instances"][number],
+    "id" | "kind" | "status" | "socketPath" | "ports"
+  > &
+    Partial<Result<"ls">["instances"][number]>,
+): Result<"ls">["instances"][number] {
+  return { blockBase: undefined, services: [], ...fields };
+}
+
+/** A complete `prune` result: nothing warned about or left unreclaimed, unless overridden. */
+function pruneResult(
+  fields: Pick<Result<"prune">, "anchor" | "pruned"> & Partial<Result<"prune">>,
+): Result<"prune"> {
+  return { warnings: [], unreclaimed: [], ...fields };
+}
 
 async function* fromArray<T>(items: ReadonlyArray<T>): AsyncIterable<T> {
   for (const item of items) yield item;
@@ -57,8 +126,10 @@ describe("devtrees CLI", () => {
     // exit-1 run, wiping legitimate envelopes that happened to contain the
     // phrase. Detection now keys off clipanion's parse-time error, so a
     // command failure mentioning "Command not found" passes through.
-    const up = vi.fn().mockRejectedValue(new Error("Command not found in PATH: process-compose"));
-    const result = await execute(["up", "--json"], { up, down: vi.fn() });
+    const up = vi
+      .fn<Stub<"up">>()
+      .mockRejectedValue(new Error("Command not found in PATH: process-compose"));
+    const result = await execute(["up", "--json"], { up, down: vi.fn<Stub<"down">>() });
     expect(result.code).toBe(1);
     const parsed = JSON.parse(result.stdout) as { error: { message: string } };
     expect(parsed.error.message).toContain("Command not found");
@@ -269,12 +340,15 @@ describe("devtrees CLI", () => {
 
 describe("devtrees CLI — execute (effectful dispatch)", () => {
   it("routes `up` to the up command and reports the resolved port", async () => {
-    const up = vi.fn().mockResolvedValue({
-      worktreeId: "login",
-      socketPath: "/x.sock",
-      env: { WEB_PORT: "20512" },
-    });
-    const result = await execute(["up"], { up, down: vi.fn() });
+    const up = vi.fn<Stub<"up">>().mockResolvedValue(
+      upResult({
+        worktreeId: "login",
+        socketPath: "/x.sock",
+        env: { WEB_PORT: "20512" },
+        blockBase: 20512,
+      }),
+    );
+    const result = await execute(["up"], { up, down: vi.fn<Stub<"down">>() });
     expect(up).toHaveBeenCalledOnce();
     expect(result.code).toBe(0);
     expect(result.stdout).toContain("login");
@@ -282,8 +356,10 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
   });
 
   it("routes `down` to the down command with shared=false by default", async () => {
-    const down = vi.fn().mockResolvedValue(undefined);
-    const result = await execute(["down"], { up: vi.fn(), down });
+    const down = vi
+      .fn<Stub<"down">>()
+      .mockResolvedValue({ shared: false, worktreeId: "login", stopped: true });
+    const result = await execute(["down"], { up: vi.fn<Stub<"up">>(), down });
     expect(down).toHaveBeenCalledWith({ shared: false });
     expect(result.code).toBe(0);
     expect(result.stdout).toContain("worktree instance stopped");
@@ -295,13 +371,14 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
       restarted: ["api", "mobile"],
       services: [{ name: "mobile", status: "Running", health: "ready" as const, ports: {} }],
       forceKilled: [{ service: "mobile", pid: 42 }],
+      skippedShared: [],
     };
 
     it("routes the names and --wait-timeout to restart, and prints `up`-style output", async () => {
-      const restart = vi.fn().mockResolvedValue(restarted);
+      const restart = vi.fn<Stub<"restart">>().mockResolvedValue(restarted);
       const result = await execute(["restart", "mobile", "api", "--wait-timeout", "30"], {
-        up: vi.fn(),
-        down: vi.fn(),
+        up: vi.fn<Stub<"up">>(),
+        down: vi.fn<Stub<"down">>(),
         restart,
       });
       expect(restart).toHaveBeenCalledWith({ services: ["mobile", "api"], waitTimeoutMs: 30_000 });
@@ -311,10 +388,10 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
     });
 
     it("--json emits the restart envelope on stdout only", async () => {
-      const restart = vi.fn().mockResolvedValue(restarted);
+      const restart = vi.fn<Stub<"restart">>().mockResolvedValue(restarted);
       const result = await execute(["restart", "mobile", "--json"], {
-        up: vi.fn(),
-        down: vi.fn(),
+        up: vi.fn<Stub<"up">>(),
+        down: vi.fn<Stub<"down">>(),
         restart,
       });
       expect(restart).toHaveBeenCalledWith({ services: ["mobile"] });
@@ -333,11 +410,11 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
 
     it("routes repeatable -n, mixed with names, and reports skipped shared services (#224)", async () => {
       const restart = vi
-        .fn()
+        .fn<Stub<"restart">>()
         .mockResolvedValue({ ...restarted, forceKilled: [], skippedShared: ["db"] });
       const result = await execute(["restart", "-n", "app", "worker", "-n", "ios"], {
-        up: vi.fn(),
-        down: vi.fn(),
+        up: vi.fn<Stub<"up">>(),
+        down: vi.fn<Stub<"down">>(),
         restart,
       });
       expect(restart).toHaveBeenCalledWith({ services: ["worker"], namespaces: ["app", "ios"] });
@@ -350,10 +427,10 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
     });
 
     it("-n alone is enough: no INVALID_ARGS (#224)", async () => {
-      const restart = vi.fn().mockResolvedValue(restarted);
+      const restart = vi.fn<Stub<"restart">>().mockResolvedValue(restarted);
       const result = await execute(["restart", "--namespace", "app", "--json"], {
-        up: vi.fn(),
-        down: vi.fn(),
+        up: vi.fn<Stub<"up">>(),
+        down: vi.fn<Stub<"down">>(),
         restart,
       });
       expect(restart).toHaveBeenCalledWith({ services: [], namespaces: ["app"] });
@@ -361,8 +438,12 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
     });
 
     it("no names fails INVALID_ARGS without calling restart", async () => {
-      const restart = vi.fn();
-      const result = await execute(["restart", "--json"], { up: vi.fn(), down: vi.fn(), restart });
+      const restart = vi.fn<Stub<"restart">>();
+      const result = await execute(["restart", "--json"], {
+        up: vi.fn<Stub<"up">>(),
+        down: vi.fn<Stub<"down">>(),
+        restart,
+      });
       expect(restart).not.toHaveBeenCalled();
       expect(result.code).toBe(1);
       expect(JSON.parse(result.stdout).error).toMatchObject({
@@ -372,13 +453,13 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
     });
 
     it("a bare restart (#225) is refused with the down + up that keeps the booted namespaces", async () => {
-      const restart = vi.fn();
+      const restart = vi.fn<Stub<"restart">>();
       const bareRestartRemedy = vi
-        .fn()
+        .fn<Stub<"bareRestartRemedy">>()
         .mockResolvedValue({ remedy: "devtrees down && devtrees up -n app", namespacesRead: true });
       const result = await execute(["restart", "--json"], {
-        up: vi.fn(),
-        down: vi.fn(),
+        up: vi.fn<Stub<"up">>(),
+        down: vi.fn<Stub<"down">>(),
         restart,
         bareRestartRemedy,
       });
@@ -399,8 +480,8 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
 
     it("a bare restart whose namespaces could not be read says the remedy boots every declared one", async () => {
       const result = await execute(["restart"], {
-        up: vi.fn(),
-        down: vi.fn(),
+        up: vi.fn<Stub<"up">>(),
+        down: vi.fn<Stub<"down">>(),
         bareRestartRemedy: async () => ({
           remedy: "devtrees down && devtrees up -n app -n default",
           namespacesRead: false,
@@ -418,10 +499,10 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
     });
 
     it("other INVALID_ARGS envelopes carry no details", async () => {
-      const restart = vi.fn();
+      const restart = vi.fn<Stub<"restart">>();
       const badTimeout = await execute(["restart", "web", "--wait-timeout", "soon", "--json"], {
-        up: vi.fn(),
-        down: vi.fn(),
+        up: vi.fn<Stub<"up">>(),
+        down: vi.fn<Stub<"down">>(),
         restart,
       });
       expect(JSON.parse(badTimeout.stdout).error.code).toBe("INVALID_ARGS");
@@ -430,22 +511,25 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
     });
 
     it("`restart --help` says a bare restart's INVALID_ARGS carries details.remedy", async () => {
-      const result = await execute(["restart", "--help"], { up: vi.fn(), down: vi.fn() });
+      const result = await execute(["restart", "--help"], {
+        up: vi.fn<Stub<"up">>(),
+        down: vi.fn<Stub<"down">>(),
+      });
       expect(result.stdout.replace(/\s+/g, " ")).toContain(
         "A bare `restart` carries `details.remedy`",
       );
     });
 
     it("a typed failure keeps its code in the envelope", async () => {
-      const restart = vi.fn().mockRejectedValue(
+      const restart = vi.fn<Stub<"restart">>().mockRejectedValue(
         Object.assign(new Error("'db' is a shared service"), {
           code: "SHARED_SERVICE_REFUSED",
           details: { services: ["db"], remedy: "devtrees down --shared && devtrees up" },
         }),
       );
       const result = await execute(["restart", "db", "--json"], {
-        up: vi.fn(),
-        down: vi.fn(),
+        up: vi.fn<Stub<"up">>(),
+        down: vi.fn<Stub<"down">>(),
         restart,
       });
       expect(result.code).toBe(1);
@@ -457,27 +541,32 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
   });
 
   it("passes shared=true through when --shared is given", async () => {
-    const down = vi.fn().mockResolvedValue(undefined);
-    const result = await execute(["down", "--shared"], { up: vi.fn(), down });
+    const down = vi.fn<Stub<"down">>().mockResolvedValue({ shared: true, stopped: true });
+    const result = await execute(["down", "--shared"], { up: vi.fn<Stub<"up">>(), down });
     expect(down).toHaveBeenCalledWith({ shared: true });
     expect(result.code).toBe(0);
     expect(result.stdout).toContain("shared instance stopped");
   });
 
   it("notes when up triggered a shared lazy start", async () => {
-    const up = vi.fn().mockResolvedValue({
-      worktreeId: "login",
-      socketPath: "/x.sock",
-      env: { WEB_PORT: "20512", DB_PORT: "19000" },
-      sharedStarted: true,
-    });
-    const result = await execute(["up"], { up, down: vi.fn() });
+    const up = vi.fn<Stub<"up">>().mockResolvedValue(
+      upResult({
+        worktreeId: "login",
+        socketPath: "/x.sock",
+        env: { WEB_PORT: "20512", DB_PORT: "19000" },
+        blockBase: 20512,
+        sharedStarted: true,
+      }),
+    );
+    const result = await execute(["up"], { up, down: vi.fn<Stub<"down">>() });
     expect(result.stdout).toContain("shared instance started");
   });
 
   it("turns a missing process-compose binary into a clear, non-zero error", async () => {
-    const up = vi.fn().mockRejectedValue(new Error("process-compose not found. ... install"));
-    const result = await execute(["up"], { up, down: vi.fn() });
+    const up = vi
+      .fn<Stub<"up">>()
+      .mockRejectedValue(new Error("process-compose not found. ... install"));
+    const result = await execute(["up"], { up, down: vi.fn<Stub<"down">>() });
     expect(result.code).toBe(1);
     expect(result.stderr).toMatch(/process-compose/);
   });
@@ -488,17 +577,21 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
    * STDERR, never the stdout envelope, and exactly once.
    */
   describe("up init-hint (#119)", () => {
-    const okUp = () => ({
-      worktreeId: "login",
-      socketPath: "/x.sock",
-      env: { WEB_PORT: "20512" },
-    });
+    const okUp = () =>
+      upResult({
+        worktreeId: "login",
+        socketPath: "/x.sock",
+        env: { WEB_PORT: "20512" },
+        blockBase: 20512,
+      });
 
     it("writes the hint to stderr when the thunk returns a line", async () => {
-      const initHint = vi.fn().mockReturnValue("devtrees: run `devtrees init --agents`");
+      const initHint = vi
+        .fn<Stub<"initHint">>()
+        .mockReturnValue("devtrees: run `devtrees init --agents`");
       const result = await execute(["up"], {
-        up: vi.fn().mockResolvedValue(okUp()),
-        down: vi.fn(),
+        up: vi.fn<Stub<"up">>().mockResolvedValue(okUp()),
+        down: vi.fn<Stub<"down">>(),
         initHint,
       });
       expect(result.code).toBe(0);
@@ -508,13 +601,13 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
 
     it("leaves the --json stdout envelope byte-for-byte unaffected by the hint", async () => {
       const hinted = await execute(["up", "--json"], {
-        up: vi.fn().mockResolvedValue(okUp()),
-        down: vi.fn(),
+        up: vi.fn<Stub<"up">>().mockResolvedValue(okUp()),
+        down: vi.fn<Stub<"down">>(),
         initHint: () => "devtrees: run `devtrees init --agents`",
       });
       const silent = await execute(["up", "--json"], {
-        up: vi.fn().mockResolvedValue(okUp()),
-        down: vi.fn(),
+        up: vi.fn<Stub<"up">>().mockResolvedValue(okUp()),
+        down: vi.fn<Stub<"down">>(),
         initHint: () => undefined,
       });
       // Same stdout document whether or not the hint fired — the hint lives on
@@ -527,8 +620,8 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
 
     it("stays silent when the thunk returns undefined (gated off)", async () => {
       const result = await execute(["up"], {
-        up: vi.fn().mockResolvedValue(okUp()),
-        down: vi.fn(),
+        up: vi.fn<Stub<"up">>().mockResolvedValue(okUp()),
+        down: vi.fn<Stub<"down">>(),
         initHint: () => undefined,
       });
       expect(result.code).toBe(0);
@@ -537,18 +630,20 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
 
     it("does not hint when no thunk is wired", async () => {
       const result = await execute(["up"], {
-        up: vi.fn().mockResolvedValue(okUp()),
-        down: vi.fn(),
+        up: vi.fn<Stub<"up">>().mockResolvedValue(okUp()),
+        down: vi.fn<Stub<"down">>(),
       });
       expect(result.code).toBe(0);
       expect(result.stderr).toBe("");
     });
 
     it("does not emit the hint when up fails (only on a successful up)", async () => {
-      const initHint = vi.fn().mockReturnValue("devtrees: run `devtrees init --agents`");
+      const initHint = vi
+        .fn<Stub<"initHint">>()
+        .mockReturnValue("devtrees: run `devtrees init --agents`");
       const result = await execute(["up"], {
-        up: vi.fn().mockRejectedValue(new Error("boom")),
-        down: vi.fn(),
+        up: vi.fn<Stub<"up">>().mockRejectedValue(new Error("boom")),
+        down: vi.fn<Stub<"down">>(),
         initHint,
       });
       expect(result.code).toBe(1);
@@ -558,15 +653,22 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
   });
 
   it("delegates non-effectful commands to the pure run()", async () => {
-    const result = await execute(["--version"], { up: vi.fn(), down: vi.fn() });
+    const result = await execute(["--version"], {
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
+    });
     expect(result.stdout.trim()).toMatch(/^\d+\.\d+\.\d+$/);
   });
 
   it("routes `init --agents` to the init command and names the written file", async () => {
     const init = vi
-      .fn()
+      .fn<Stub<"init">>()
       .mockResolvedValue({ target: "AGENTS.md", path: "/repo/AGENTS.md", action: "created" });
-    const result = await execute(["init", "--agents"], { up: vi.fn(), down: vi.fn(), init });
+    const result = await execute(["init", "--agents"], {
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
+      init,
+    });
     expect(init).toHaveBeenCalledOnce();
     expect(result.code).toBe(0);
     expect(result.stdout).toContain("AGENTS.md");
@@ -575,11 +677,11 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
 
   it("`init --agents --json` emits the created-vs-updated envelope", async () => {
     const init = vi
-      .fn()
+      .fn<Stub<"init">>()
       .mockResolvedValue({ target: "CLAUDE.md", path: "/repo/CLAUDE.md", action: "updated" });
     const result = await execute(["init", "--agents", "--json"], {
-      up: vi.fn(),
-      down: vi.fn(),
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
       init,
     });
     expect(result.code).toBe(0);
@@ -594,8 +696,12 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
   });
 
   it("`init` without `--agents` fails with the INVALID_ARGS envelope", async () => {
-    const init = vi.fn();
-    const result = await execute(["init", "--json"], { up: vi.fn(), down: vi.fn(), init });
+    const init = vi.fn<Stub<"init">>();
+    const result = await execute(["init", "--json"], {
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
+      init,
+    });
     expect(init).not.toHaveBeenCalled();
     expect(result.code).toBe(1);
     const parsed = JSON.parse(result.stdout) as { error: { code: string } };
@@ -603,35 +709,43 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
   });
 
   it("turns an init filesystem failure into a clear, non-zero error", async () => {
-    const init = vi.fn().mockRejectedValue(new Error("EACCES: permission denied"));
-    const result = await execute(["init", "--agents"], { up: vi.fn(), down: vi.fn(), init });
+    const init = vi.fn<Stub<"init">>().mockRejectedValue(new Error("EACCES: permission denied"));
+    const result = await execute(["init", "--agents"], {
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
+      init,
+    });
     expect(result.code).toBe(1);
     expect(result.stderr).toMatch(/EACCES/);
   });
 
   it("routes `ls` to the ls command and formats the table", async () => {
-    const ls = vi.fn().mockResolvedValue({
+    const ls = vi.fn<Stub<"ls">>().mockResolvedValue({
       anchor: "/repo/.git",
       instances: [
-        {
+        lsInstance({
           id: "shared",
           kind: "shared",
           status: "running",
           socketPath: "/repo/.git/devtrees/run/shared.sock",
           ports: { DB_PORT: 30000 },
           blockBase: 30000,
-        },
-        {
+        }),
+        lsInstance({
           id: "login",
           kind: "worktree",
           status: "running",
           socketPath: "/repo/.git/devtrees/run/login.sock",
           ports: { WEB_PORT: 20512 },
           blockBase: 20512,
-        },
+        }),
       ],
     });
-    const result = await execute(["ls"], { up: vi.fn(), down: vi.fn(), ls });
+    const result = await execute(["ls"], {
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
+      ls,
+    });
     expect(ls).toHaveBeenCalledOnce();
     expect(result.code).toBe(0);
     expect(result.stdout).toContain("shared");
@@ -642,46 +756,62 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
   });
 
   it("`ls` says 'no devtrees instances running' when none are discovered", async () => {
-    const ls = vi.fn().mockResolvedValue({ anchor: "/repo/.git", instances: [] });
-    const result = await execute(["ls"], { up: vi.fn(), down: vi.fn(), ls });
+    const ls = vi.fn<Stub<"ls">>().mockResolvedValue({ anchor: "/repo/.git", instances: [] });
+    const result = await execute(["ls"], {
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
+      ls,
+    });
     expect(result.code).toBe(0);
     expect(result.stdout).toMatch(/no devtrees instances/i);
   });
 
   it("routes `prune` to the prune command and lists the cleaned orphans", async () => {
-    const prune = vi.fn().mockResolvedValue({
-      anchor: "/repo/.git",
-      pruned: [
-        {
-          id: "removed",
-          kind: "worktree" as const,
-          status: "running" as const,
-          worktreePath: "/abs/path/.../devtrees-example-removed",
-        },
-      ],
+    const prune = vi.fn<Stub<"prune">>().mockResolvedValue(
+      pruneResult({
+        anchor: "/repo/.git",
+        pruned: [
+          {
+            id: "removed",
+            kind: "worktree" as const,
+            status: "running" as const,
+            worktreePath: "/abs/path/.../devtrees-example-removed",
+          },
+        ],
+      }),
+    );
+    const result = await execute(["prune"], {
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
+      prune,
     });
-    const result = await execute(["prune"], { up: vi.fn(), down: vi.fn(), prune });
     expect(prune).toHaveBeenCalledOnce();
     expect(result.code).toBe(0);
     expect(result.stdout).toContain("removed");
   });
 
   it("`prune` says 'no orphans' when reconciliation finds nothing to clean", async () => {
-    const prune = vi.fn().mockResolvedValue({ anchor: "/repo/.git", pruned: [] });
-    const result = await execute(["prune"], { up: vi.fn(), down: vi.fn(), prune });
+    const prune = vi
+      .fn<Stub<"prune">>()
+      .mockResolvedValue(pruneResult({ anchor: "/repo/.git", pruned: [] }));
+    const result = await execute(["prune"], {
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
+      prune,
+    });
     expect(result.code).toBe(0);
     expect(result.stdout).toMatch(/no orphan|nothing to prune/i);
   });
 
   it("routes `prune --shared-ports --dry-run` with dryRun, and renders the preview (#244 follow-up)", async () => {
-    const pruneSharedPorts = vi.fn().mockResolvedValue({
+    const pruneSharedPorts = vi.fn<Stub<"pruneSharedPorts">>().mockResolvedValue({
       dropped: ["OLD_PORT"],
       kept: ["DB_PORT"],
       outOfBlock: ["OLD_PORT"],
       dryRun: true,
       blockedBy: ["billing-0a1b2c3d"],
     });
-    const deps = { up: vi.fn(), down: vi.fn(), pruneSharedPorts };
+    const deps = { up: vi.fn<Stub<"up">>(), down: vi.fn<Stub<"down">>(), pruneSharedPorts };
     const json = await execute(["prune", "--shared-ports", "--dry-run", "--json"], deps);
     expect(pruneSharedPorts).toHaveBeenCalledWith({ dryRun: true });
     expect(json.code).toBe(0);
@@ -699,10 +829,12 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
   });
 
   it("`prune --shared-ports` without --dry-run passes dryRun: false", async () => {
-    const pruneSharedPorts = vi.fn().mockResolvedValue({ dropped: [], kept: [] });
+    const pruneSharedPorts = vi
+      .fn<Stub<"pruneSharedPorts">>()
+      .mockResolvedValue({ dropped: [], kept: [], outOfBlock: [], dryRun: false, blockedBy: [] });
     const result = await execute(["prune", "--shared-ports", "--json"], {
-      up: vi.fn(),
-      down: vi.fn(),
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
       pruneSharedPorts,
     });
     expect(pruneSharedPorts).toHaveBeenCalledWith({ dryRun: false });
@@ -716,10 +848,10 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
   });
 
   it("`prune --dry-run` without --shared-ports is INVALID_ARGS, and prunes nothing", async () => {
-    const prune = vi.fn();
+    const prune = vi.fn<Stub<"prune">>();
     const result = await execute(["prune", "--dry-run", "--json"], {
-      up: vi.fn(),
-      down: vi.fn(),
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
       prune,
     });
     expect(result.code).not.toBe(0);
@@ -728,59 +860,83 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
   });
 
   it("turns a prune failure into a clear, non-zero error", async () => {
-    const prune = vi.fn().mockRejectedValue(new Error("could not list worktrees"));
-    const result = await execute(["prune"], { up: vi.fn(), down: vi.fn(), prune });
+    const prune = vi.fn<Stub<"prune">>().mockRejectedValue(new Error("could not list worktrees"));
+    const result = await execute(["prune"], {
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
+      prune,
+    });
     expect(result.code).toBe(1);
     expect(result.stderr).toMatch(/could not list worktrees/);
   });
 
   it("`ls` marks stale entries in its output so an operator can spot orphans", async () => {
-    const ls = vi.fn().mockResolvedValue({
+    const ls = vi.fn<Stub<"ls">>().mockResolvedValue({
       anchor: "/repo/.git",
       instances: [
-        {
+        lsInstance({
           id: "login",
           kind: "worktree",
           status: "stale",
           socketPath: "/repo/.git/devtrees/run/login.sock",
           ports: {},
           blockBase: 20512,
-        },
+        }),
       ],
     });
-    const result = await execute(["ls"], { up: vi.fn(), down: vi.fn(), ls });
+    const result = await execute(["ls"], {
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
+      ls,
+    });
     expect(result.stdout).toContain("stale");
   });
 
   it("routes `attach` to the attach command with shared=false by default", async () => {
-    const attach = vi.fn().mockResolvedValue(undefined);
-    const result = await execute(["attach"], { up: vi.fn(), down: vi.fn(), attach });
+    const attach = vi.fn<Stub<"attach">>().mockResolvedValue(undefined);
+    const result = await execute(["attach"], {
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
+      attach,
+    });
     expect(attach).toHaveBeenCalledWith({ shared: false });
     expect(result.code).toBe(0);
   });
 
   it("passes shared=true through to attach when --shared is given", async () => {
-    const attach = vi.fn().mockResolvedValue(undefined);
-    const result = await execute(["attach", "--shared"], { up: vi.fn(), down: vi.fn(), attach });
+    const attach = vi.fn<Stub<"attach">>().mockResolvedValue(undefined);
+    const result = await execute(["attach", "--shared"], {
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
+      attach,
+    });
     expect(attach).toHaveBeenCalledWith({ shared: true });
     expect(result.code).toBe(0);
   });
 
   it("turns an attach failure (no running instance) into a clear, non-zero error", async () => {
     const attach = vi
-      .fn()
+      .fn<Stub<"attach">>()
       .mockRejectedValue(new Error("no worktree instance is running for 'login'"));
-    const result = await execute(["attach"], { up: vi.fn(), down: vi.fn(), attach });
+    const result = await execute(["attach"], {
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
+      attach,
+    });
     expect(result.code).toBe(1);
     expect(result.stderr).toMatch(/no worktree instance is running/);
   });
 
   it("routes `env` to the env command and prints KEY=value lines", async () => {
-    const env = vi.fn().mockResolvedValue({
+    const env = vi.fn<Stub<"env">>().mockResolvedValue({
       worktreeId: "login",
       env: { DEVTREES_WORKTREE_ID: "login", WEB_PORT: "20512", DB_PORT: "30000" },
     });
-    const result = await execute(["env"], { up: vi.fn(), down: vi.fn(), env });
+    const result = await execute(["env"], {
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
+      env,
+    });
     expect(env).toHaveBeenCalledOnce();
     expect(result.code).toBe(0);
     expect(result.stdout).toContain("DEVTREES_WORKTREE_ID=login");
@@ -789,11 +945,15 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
   });
 
   it("`env --json` emits {schema_version, env} on stdout", async () => {
-    const env = vi.fn().mockResolvedValue({
+    const env = vi.fn<Stub<"env">>().mockResolvedValue({
       worktreeId: "login",
       env: { DEVTREES_WORKTREE_ID: "login", WEB_PORT: "20512" },
     });
-    const result = await execute(["env", "--json"], { up: vi.fn(), down: vi.fn(), env });
+    const result = await execute(["env", "--json"], {
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
+      env,
+    });
     expect(result.code).toBe(0);
     expect(result.stderr).toBe("");
     const parsed = JSON.parse(result.stdout) as {
@@ -805,17 +965,23 @@ describe("devtrees CLI — execute (effectful dispatch)", () => {
   });
 
   it("turns an env failure (e.g. missing devtrees.yaml) into a clear, non-zero error", async () => {
-    const env = vi.fn().mockRejectedValue(new Error("devtrees.yaml not found"));
-    const result = await execute(["env"], { up: vi.fn(), down: vi.fn(), env });
+    const env = vi.fn<Stub<"env">>().mockRejectedValue(new Error("devtrees.yaml not found"));
+    const result = await execute(["env"], {
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
+      env,
+    });
     expect(result.code).toBe(1);
     expect(result.stderr).toMatch(/devtrees\.yaml not found/);
   });
 
   it("surfaces an attach-shared failure (no running shared instance) clearly", async () => {
-    const attach = vi.fn().mockRejectedValue(new Error("no shared instance is running"));
+    const attach = vi
+      .fn<Stub<"attach">>()
+      .mockRejectedValue(new Error("no shared instance is running"));
     const result = await execute(["attach", "--shared"], {
-      up: vi.fn(),
-      down: vi.fn(),
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
       attach,
     });
     expect(result.code).toBe(1);
@@ -833,28 +999,32 @@ describe("devtrees CLI — --json (agent-facing surface)", () => {
   const lsRows = {
     anchor: "/repo/.git",
     instances: [
-      {
+      lsInstance({
         id: "shared",
-        kind: "shared" as const,
-        status: "running" as const,
+        kind: "shared",
+        status: "running",
         socketPath: "/repo/.git/devtrees/run/shared.sock",
         ports: { DB_PORT: 30000 },
         blockBase: 30000,
-      },
-      {
+      }),
+      lsInstance({
         id: "login",
-        kind: "worktree" as const,
-        status: "running" as const,
+        kind: "worktree",
+        status: "running",
         socketPath: "/repo/.git/devtrees/run/login.sock",
         ports: { WEB_PORT: 20512 },
         blockBase: 20512,
-      },
+      }),
     ],
   };
 
   it("`ls --json` emits a single JSON document with schema_version on stdout", async () => {
-    const ls = vi.fn().mockResolvedValue(lsRows);
-    const result = await execute(["ls", "--json"], { up: vi.fn(), down: vi.fn(), ls });
+    const ls = vi.fn<Stub<"ls">>().mockResolvedValue(lsRows);
+    const result = await execute(["ls", "--json"], {
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
+      ls,
+    });
     expect(result.code).toBe(0);
     expect(result.stderr).toBe("");
     const parsed = JSON.parse(result.stdout) as {
@@ -867,16 +1037,24 @@ describe("devtrees CLI — --json (agent-facing surface)", () => {
   });
 
   it("`--json` is accepted before the command name too (global flag, any position)", async () => {
-    const ls = vi.fn().mockResolvedValue(lsRows);
-    const result = await execute(["--json", "ls"], { up: vi.fn(), down: vi.fn(), ls });
+    const ls = vi.fn<Stub<"ls">>().mockResolvedValue(lsRows);
+    const result = await execute(["--json", "ls"], {
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
+      ls,
+    });
     expect(result.code).toBe(0);
     // Must still parse as JSON — the flag was honored even though it preceded `ls`.
     expect(() => JSON.parse(result.stdout)).not.toThrow();
   });
 
   it("`ls` without --json prints the instance table, NAMESPACES column included (#226)", async () => {
-    const ls = vi.fn().mockResolvedValue(lsRows);
-    const result = await execute(["ls"], { up: vi.fn(), down: vi.fn(), ls });
+    const ls = vi.fn<Stub<"ls">>().mockResolvedValue(lsRows);
+    const result = await execute(["ls"], {
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
+      ls,
+    });
     expect(result.code).toBe(0);
     expect(result.stderr).toBe("");
     expect(result.stdout).toBe(
@@ -921,8 +1099,8 @@ describe("devtrees CLI — --json (agent-facing surface)", () => {
     async ({ cmd, depKey, message, expectedCode, stderrMatch }) => {
       const failing = vi.fn().mockRejectedValue(new Error(message));
       const deps = {
-        up: vi.fn(),
-        down: vi.fn(),
+        up: vi.fn<Stub<"up">>(),
+        down: vi.fn<Stub<"down">>(),
         [depKey]: failing,
       } as unknown as Parameters<typeof execute>[1];
       const result = await execute([cmd, "--json"], deps);
@@ -935,22 +1113,32 @@ describe("devtrees CLI — --json (agent-facing surface)", () => {
   );
 
   it("`ls --json` success leaves stderr untouched (no diagnostics in success cases)", async () => {
-    const ls = vi.fn().mockResolvedValue(lsRows);
-    const result = await execute(["ls", "--json"], { up: vi.fn(), down: vi.fn(), ls });
+    const ls = vi.fn<Stub<"ls">>().mockResolvedValue(lsRows);
+    const result = await execute(["ls", "--json"], {
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
+      ls,
+    });
     expect(result.stderr).toBe("");
   });
 
   it("error without --json continues today's behaviour — message on stderr, stdout empty", async () => {
-    const up = vi.fn().mockRejectedValue(new Error("process-compose not found on PATH"));
-    const result = await execute(["up"], { up, down: vi.fn() });
+    const up = vi
+      .fn<Stub<"up">>()
+      .mockRejectedValue(new Error("process-compose not found on PATH"));
+    const result = await execute(["up"], { up, down: vi.fn<Stub<"down">>() });
     expect(result.code).not.toBe(0);
     expect(result.stdout).toBe("");
     expect(result.stderr).toMatch(/process-compose/);
   });
 
   it("`ls --json` with no instances emits {ls:{instances:[]}} (not the 'no instances' string)", async () => {
-    const ls = vi.fn().mockResolvedValue({ anchor: "/repo/.git", instances: [] });
-    const result = await execute(["ls", "--json"], { up: vi.fn(), down: vi.fn(), ls });
+    const ls = vi.fn<Stub<"ls">>().mockResolvedValue({ anchor: "/repo/.git", instances: [] });
+    const result = await execute(["ls", "--json"], {
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
+      ls,
+    });
     const parsed = JSON.parse(result.stdout) as { ls: { instances: unknown[] } };
     expect(parsed.ls.instances).toEqual([]);
   });
@@ -960,29 +1148,44 @@ describe("devtrees CLI — --json (agent-facing surface)", () => {
    * 'is `worker` healthy in my worktree instance?' with one call.
    */
   it("`ls --json` nests services[] (name/status/health/ports) on every instance entry", async () => {
-    const ls = vi.fn().mockResolvedValue({
+    const ls = vi.fn<Stub<"ls">>().mockResolvedValue({
       anchor: "/repo/.git",
       instances: [
-        {
+        lsInstance({
           id: "login",
-          kind: "worktree" as const,
-          status: "running" as const,
+          kind: "worktree",
+          status: "running",
           socketPath: "/repo/.git/devtrees/run/login.sock",
           ports: { WEB_PORT: 20000, WORKER_PORT: 20001 },
           blockBase: 20000,
           services: [
-            { name: "web", status: "Running", health: "ready", ports: { WEB_PORT: 20000 } },
+            {
+              name: "web",
+              status: "Running",
+              health: "ready",
+              ports: { WEB_PORT: 20000 },
+              namespaces: ["default"],
+              tier: "isolated",
+              state: "active",
+            },
             {
               name: "worker",
               status: "Running",
               health: "not_ready",
               ports: { WORKER_PORT: 20001 },
+              namespaces: ["default"],
+              tier: "isolated",
+              state: "active",
             },
           ],
-        },
+        }),
       ],
     });
-    const result = await execute(["ls", "--json"], { up: vi.fn(), down: vi.fn(), ls });
+    const result = await execute(["ls", "--json"], {
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
+      ls,
+    });
     const parsed = JSON.parse(result.stdout) as {
       ls: {
         instances: ReadonlyArray<{
@@ -1004,7 +1207,7 @@ describe("devtrees CLI — --json (agent-facing surface)", () => {
   });
 
   it("`ls --services` prints one row per service; `--help` documents the flag (#226)", async () => {
-    const ls = vi.fn().mockResolvedValue({
+    const ls = vi.fn<Stub<"ls">>().mockResolvedValue({
       anchor: "/repo/.git",
       instances: [
         {
@@ -1031,16 +1234,28 @@ describe("devtrees CLI — --json (agent-facing surface)", () => {
         },
       ],
     });
-    const plain = await execute(["ls"], { up: vi.fn(), down: vi.fn(), ls });
+    const plain = await execute(["ls"], {
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
+      ls,
+    });
     expect(plain.stdout).toMatch(/^ID\s+KIND\s+STATUS\s+NAMESPACES\s+PORTS$/m);
     expect(plain.stdout).toMatch(/^login\s+worktree\s+running\s+app\s+\(block 20000\)$/m);
 
-    const services = await execute(["ls", "--services"], { up: vi.fn(), down: vi.fn(), ls });
+    const services = await execute(["ls", "--services"], {
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
+      ls,
+    });
     expect(services.code).toBe(0);
     expect(services.stdout).toMatch(/^INSTANCE\s+SERVICE\s+NAMESPACES\s+TIER\s+STATE\s+PID$/m);
     expect(services.stdout).toMatch(/^login\s+web\s+app\s+isolated\s+active\s+4242$/m);
 
-    const help = await execute(["ls", "--help"], { up: vi.fn(), down: vi.fn(), ls });
+    const help = await execute(["ls", "--help"], {
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
+      ls,
+    });
     expect(help.stdout).toMatch(/--services/);
   });
 });
@@ -1050,8 +1265,10 @@ describe("devtrees CLI — logs (#33)", () => {
   // the standalone `parseLogsArgs` test seam was deleted in #81 after it
   // drifted from the actual parser.
   it("parses positional service name and default flags", async () => {
-    const logs = vi.fn().mockResolvedValue({ services: ["web"], events: fromArray([]) });
-    await execute(["logs", "web"], { up: vi.fn(), down: vi.fn(), logs });
+    const logs = vi
+      .fn<Stub<"logs">>()
+      .mockResolvedValue({ services: ["web"], events: fromArray([]) });
+    await execute(["logs", "web"], { up: vi.fn<Stub<"up">>(), down: vi.fn<Stub<"down">>(), logs });
     expect(logs).toHaveBeenCalledWith({
       service: "web",
       all: false,
@@ -1061,20 +1278,24 @@ describe("devtrees CLI — logs (#33)", () => {
   });
 
   it("parses --follow / -f / --tail=N / --since=DUR / --all / --shared", async () => {
-    const logs = vi.fn().mockResolvedValue({ services: ["web"], events: fromArray([]) });
+    const logs = vi
+      .fn<Stub<"logs">>()
+      .mockResolvedValue({ services: ["web"], events: fromArray([]) });
     await execute(["logs", "web", "--follow", "--tail=25", "--since=5m"], {
-      up: vi.fn(),
-      down: vi.fn(),
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
       logs,
     });
     expect(logs).toHaveBeenCalledWith(
       expect.objectContaining({ service: "web", follow: true, tail: 25, sinceMs: 300_000 }),
     );
 
-    const logsAll = vi.fn().mockResolvedValue({ services: ["web"], events: fromArray([]) });
+    const logsAll = vi
+      .fn<Stub<"logs">>()
+      .mockResolvedValue({ services: ["web"], events: fromArray([]) });
     await execute(["logs", "-f", "--all", "--shared"], {
-      up: vi.fn(),
-      down: vi.fn(),
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
       logs: logsAll,
     });
     expect(logsAll).toHaveBeenCalledWith(
@@ -1091,7 +1312,7 @@ describe("devtrees CLI — logs (#33)", () => {
       yield { ts: "T1", service: "web", stream: "stdout", line: "alpha" };
       await gate; // a follow that has nothing more to say yet
     }
-    const logs = vi.fn().mockResolvedValue({ services: ["web"], events: follow() });
+    const logs = vi.fn<Stub<"logs">>().mockResolvedValue({ services: ["web"], events: follow() });
     let written = "";
     const stdout = new Writable({
       write(chunk: Buffer | string, _enc, cb) {
@@ -1103,7 +1324,7 @@ describe("devtrees CLI — logs (#33)", () => {
     let finished = false;
     const done = executeStreaming(
       ["logs", "web", "-f"],
-      { up: vi.fn(), down: vi.fn(), logs },
+      { up: vi.fn<Stub<"up">>(), down: vi.fn<Stub<"down">>(), logs },
       {
         stdout,
         stderr,
@@ -1129,7 +1350,7 @@ describe("devtrees CLI — logs (#33)", () => {
       });
     const code = await executeStreaming(
       ["nope"],
-      { up: vi.fn(), down: vi.fn() },
+      { up: vi.fn<Stub<"up">>(), down: vi.fn<Stub<"down">>() },
       {
         stdout: sink(() => {}),
         stderr: sink((s) => {
@@ -1142,14 +1363,18 @@ describe("devtrees CLI — logs (#33)", () => {
   });
 
   it("routes `logs <service>` to deps.logs and writes lines verbatim in human mode", async () => {
-    const logs = vi.fn().mockResolvedValue({
+    const logs = vi.fn<Stub<"logs">>().mockResolvedValue({
       services: ["web"],
       events: fromArray([
         { ts: "T1", service: "web", stream: "stdout" as const, line: "alpha" },
         { ts: "T2", service: "web", stream: "stdout" as const, line: "beta" },
       ]),
     });
-    const result = await execute(["logs", "web"], { up: vi.fn(), down: vi.fn(), logs });
+    const result = await execute(["logs", "web"], {
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
+      logs,
+    });
     expect(result.code).toBe(0);
     expect(logs).toHaveBeenCalledWith(
       expect.objectContaining({ service: "web", all: false, shared: false }),
@@ -1159,7 +1384,7 @@ describe("devtrees CLI — logs (#33)", () => {
   });
 
   it("`logs <service> --json` emits NDJSON with one {ts,service,stream,line} per line", async () => {
-    const logs = vi.fn().mockResolvedValue({
+    const logs = vi.fn<Stub<"logs">>().mockResolvedValue({
       services: ["web"],
       events: fromArray([
         { ts: "2026-06-01T22:00:00Z", service: "web", stream: "stdout" as const, line: "hello" },
@@ -1172,8 +1397,8 @@ describe("devtrees CLI — logs (#33)", () => {
       ]),
     });
     const result = await execute(["logs", "web", "--json"], {
-      up: vi.fn(),
-      down: vi.fn(),
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
       logs,
     });
     expect(result.code).toBe(0);
@@ -1197,26 +1422,30 @@ describe("devtrees CLI — logs (#33)", () => {
   });
 
   it("`logs --all` prefixes lines with [service] in human mode for attribution", async () => {
-    const logs = vi.fn().mockResolvedValue({
+    const logs = vi.fn<Stub<"logs">>().mockResolvedValue({
       services: ["web", "worker"],
       events: fromArray([
         { ts: "T1", service: "web", stream: "stdout" as const, line: "w1" },
         { ts: "T2", service: "worker", stream: "stdout" as const, line: "k1" },
       ]),
     });
-    const result = await execute(["logs", "--all"], { up: vi.fn(), down: vi.fn(), logs });
+    const result = await execute(["logs", "--all"], {
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
+      logs,
+    });
     expect(result.code).toBe(0);
     expect(result.stdout).toBe("[web] w1\n[worker] k1\n");
   });
 
   it("`logs --all --json` does NOT add the [service] prefix (the field is the attribution)", async () => {
-    const logs = vi.fn().mockResolvedValue({
+    const logs = vi.fn<Stub<"logs">>().mockResolvedValue({
       services: ["web", "worker"],
       events: fromArray([{ ts: "T1", service: "web", stream: "stdout" as const, line: "raw" }]),
     });
     const result = await execute(["logs", "--all", "--json"], {
-      up: vi.fn(),
-      down: vi.fn(),
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
       logs,
     });
     const line = result.stdout.trimEnd();
@@ -1226,10 +1455,12 @@ describe("devtrees CLI — logs (#33)", () => {
   });
 
   it("passes --shared and --follow through to deps.logs", async () => {
-    const logs = vi.fn().mockResolvedValue({ services: ["postgres"], events: fromArray([]) });
+    const logs = vi
+      .fn<Stub<"logs">>()
+      .mockResolvedValue({ services: ["postgres"], events: fromArray([]) });
     await execute(["logs", "postgres", "--shared", "--follow"], {
-      up: vi.fn(),
-      down: vi.fn(),
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
       logs,
     });
     expect(logs).toHaveBeenCalledWith(
@@ -1238,18 +1469,22 @@ describe("devtrees CLI — logs (#33)", () => {
   });
 
   it("errors with usage hint when no service and no --all is given (exit 1, stderr)", async () => {
-    const logs = vi.fn();
-    const result = await execute(["logs"], { up: vi.fn(), down: vi.fn(), logs });
+    const logs = vi.fn<Stub<"logs">>();
+    const result = await execute(["logs"], {
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
+      logs,
+    });
     expect(result.code).toBe(1);
     expect(result.stderr).toMatch(/specify a service|--all/);
     expect(logs).not.toHaveBeenCalled();
   });
 
   it("rejects `--tail=abc` with a validation error in human mode (exit 1, deps.logs untouched) (#81)", async () => {
-    const logs = vi.fn();
+    const logs = vi.fn<Stub<"logs">>();
     const result = await execute(["logs", "web", "--tail=abc"], {
-      up: vi.fn(),
-      down: vi.fn(),
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
       logs,
     });
     expect(result.code).toBe(1);
@@ -1259,10 +1494,10 @@ describe("devtrees CLI — logs (#33)", () => {
   });
 
   it("rejects `--tail=abc` with an INVALID_ARGS envelope in JSON mode (#81)", async () => {
-    const logs = vi.fn();
+    const logs = vi.fn<Stub<"logs">>();
     const result = await execute(["logs", "web", "--tail=abc", "--json"], {
-      up: vi.fn(),
-      down: vi.fn(),
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
       logs,
     });
     expect(result.code).toBe(1);
@@ -1274,8 +1509,12 @@ describe("devtrees CLI — logs (#33)", () => {
 
   it("rejects negative and non-integer --tail values (#81)", async () => {
     for (const bad of ["--tail=-5", "--tail=2.5", "--tail=NaN"]) {
-      const logs = vi.fn();
-      const result = await execute(["logs", "web", bad], { up: vi.fn(), down: vi.fn(), logs });
+      const logs = vi.fn<Stub<"logs">>();
+      const result = await execute(["logs", "web", bad], {
+        up: vi.fn<Stub<"up">>(),
+        down: vi.fn<Stub<"down">>(),
+        logs,
+      });
       expect(result.code).toBe(1);
       expect(result.stderr).toMatch(/--tail/);
       expect(logs).not.toHaveBeenCalled();
@@ -1292,10 +1531,12 @@ describe("devtrees CLI — logs (#33)", () => {
       ["1.5h", 5_400_000],
     ];
     for (const [raw, ms] of cases) {
-      const logs = vi.fn().mockResolvedValue({ services: ["web"], events: fromArray([]) });
+      const logs = vi
+        .fn<Stub<"logs">>()
+        .mockResolvedValue({ services: ["web"], events: fromArray([]) });
       const result = await execute(["logs", "web", `--since=${raw}`], {
-        up: vi.fn(),
-        down: vi.fn(),
+        up: vi.fn<Stub<"up">>(),
+        down: vi.fn<Stub<"down">>(),
         logs,
       });
       expect(result.code).toBe(0);
@@ -1304,10 +1545,10 @@ describe("devtrees CLI — logs (#33)", () => {
   });
 
   it("rejects `--since=banana` with a validation error in human mode (exit 1, deps.logs untouched) (#88)", async () => {
-    const logs = vi.fn();
+    const logs = vi.fn<Stub<"logs">>();
     const result = await execute(["logs", "web", "--since=banana"], {
-      up: vi.fn(),
-      down: vi.fn(),
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
       logs,
     });
     expect(result.code).toBe(1);
@@ -1317,10 +1558,10 @@ describe("devtrees CLI — logs (#33)", () => {
   });
 
   it("rejects `--since=banana` with an INVALID_ARGS envelope in JSON mode (#88)", async () => {
-    const logs = vi.fn();
+    const logs = vi.fn<Stub<"logs">>();
     const result = await execute(["logs", "web", "--since=banana", "--json"], {
-      up: vi.fn(),
-      down: vi.fn(),
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
       logs,
     });
     expect(result.code).toBe(1);
@@ -1332,8 +1573,12 @@ describe("devtrees CLI — logs (#33)", () => {
 
   it("rejects unitless, unit-only, negative, and spaced --since values (#88)", async () => {
     for (const bad of ["--since=5", "--since=m", "--since=-5m", "--since=5 m", "--since=5x"]) {
-      const logs = vi.fn();
-      const result = await execute(["logs", "web", bad], { up: vi.fn(), down: vi.fn(), logs });
+      const logs = vi.fn<Stub<"logs">>();
+      const result = await execute(["logs", "web", bad], {
+        up: vi.fn<Stub<"up">>(),
+        down: vi.fn<Stub<"down">>(),
+        logs,
+      });
       expect(result.code).toBe(1);
       expect(result.stderr).toMatch(/--since/);
       expect(logs).not.toHaveBeenCalled();
@@ -1341,8 +1586,12 @@ describe("devtrees CLI — logs (#33)", () => {
   });
 
   it("`logs --json` with no service and no --all emits an INVALID_ARGS envelope on stdout (#81)", async () => {
-    const logs = vi.fn();
-    const result = await execute(["logs", "--json"], { up: vi.fn(), down: vi.fn(), logs });
+    const logs = vi.fn<Stub<"logs">>();
+    const result = await execute(["logs", "--json"], {
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
+      logs,
+    });
     expect(result.code).toBe(1);
     const parsed = JSON.parse(result.stdout) as {
       schema_version: string;
@@ -1356,11 +1605,11 @@ describe("devtrees CLI — logs (#33)", () => {
 
   it("`logs --json` failure (missing socket) → INSTANCE_NOT_FOUND envelope on stdout", async () => {
     const logs = vi
-      .fn()
+      .fn<Stub<"logs">>()
       .mockRejectedValue(new Error("no worktree instance is running for 'login'"));
     const result = await execute(["logs", "web", "--json"], {
-      up: vi.fn(),
-      down: vi.fn(),
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
       logs,
     });
     expect(result.code).not.toBe(0);
@@ -1378,10 +1627,10 @@ describe("devtrees CLI — logs (#33)", () => {
     };
     err.code = "SERVICE_NOT_FOUND";
     err.details = { service: "nosuchservice", valid_services: ["web", "worker"] };
-    const logs = vi.fn().mockRejectedValue(err);
+    const logs = vi.fn<Stub<"logs">>().mockRejectedValue(err);
     const result = await execute(["logs", "nosuchservice", "--json"], {
-      up: vi.fn(),
-      down: vi.fn(),
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
       logs,
     });
     expect(result.code).toBe(1);
@@ -1403,8 +1652,12 @@ describe("devtrees CLI — logs (#33)", () => {
       "unknown service 'nosuchservice' in this worktree's instance. Valid services: web.",
     ) as Error & { code?: string };
     err.code = "SERVICE_NOT_FOUND";
-    const logs = vi.fn().mockRejectedValue(err);
-    const result = await execute(["logs", "nosuchservice"], { up: vi.fn(), down: vi.fn(), logs });
+    const logs = vi.fn<Stub<"logs">>().mockRejectedValue(err);
+    const result = await execute(["logs", "nosuchservice"], {
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
+      logs,
+    });
     expect(result.code).toBe(1);
     expect(result.stdout).toBe("");
     expect(result.stderr).toMatch(/devtrees: unknown service 'nosuchservice'/);
@@ -1419,27 +1672,28 @@ describe("devtrees CLI — logs (#33)", () => {
  * `HEALTH_TIMEOUT` error code joins the documented `--json` envelope.
  */
 describe("devtrees CLI — up non-interactive (#28)", () => {
-  const baseUpResult = {
+  const baseUpResult = upResult({
     worktreeId: "login",
     socketPath: "/x.sock",
     env: { WEB_PORT: "20512" },
-  };
+    blockBase: 20512,
+  });
 
   it("passes attach=true to `up` when --attach is given (force-attach)", async () => {
-    const up = vi.fn().mockResolvedValue(baseUpResult);
-    await execute(["up", "--attach"], { up, down: vi.fn() });
+    const up = vi.fn<Stub<"up">>().mockResolvedValue(baseUpResult);
+    await execute(["up", "--attach"], { up, down: vi.fn<Stub<"down">>() });
     expect(up).toHaveBeenCalledWith(expect.objectContaining({ attach: true }));
   });
 
   it("passes attach=false to `up` when --no-attach is given (force-skip)", async () => {
-    const up = vi.fn().mockResolvedValue(baseUpResult);
-    await execute(["up", "--no-attach"], { up, down: vi.fn() });
+    const up = vi.fn<Stub<"up">>().mockResolvedValue(baseUpResult);
+    await execute(["up", "--no-attach"], { up, down: vi.fn<Stub<"down">>() });
     expect(up).toHaveBeenCalledWith(expect.objectContaining({ attach: false }));
   });
 
   it("omits attach from `up` options when neither flag is given (TTY default applies)", async () => {
-    const up = vi.fn().mockResolvedValue(baseUpResult);
-    await execute(["up"], { up, down: vi.fn() });
+    const up = vi.fn<Stub<"up">>().mockResolvedValue(baseUpResult);
+    await execute(["up"], { up, down: vi.fn<Stub<"down">>() });
     const call = up.mock.calls[0]?.[0] ?? {};
     expect(call.attach).toBeUndefined();
   });
@@ -1449,32 +1703,35 @@ describe("devtrees CLI — up non-interactive (#28)", () => {
     // reached the attach decision — a human running `devtrees up --json` in a
     // terminal hit runUp's TTY auto-detect and the TUI took over the very output
     // they asked to be machine-readable. `--json` now defaults attach to false.
-    const up = vi.fn().mockResolvedValue(baseUpResult);
-    await execute(["up", "--json"], { up, down: vi.fn() });
+    const up = vi.fn<Stub<"up">>().mockResolvedValue(baseUpResult);
+    await execute(["up", "--json"], { up, down: vi.fn<Stub<"down">>() });
     expect(up).toHaveBeenCalledWith(expect.objectContaining({ attach: false }));
   });
 
   it("lets an explicit --attach win over the --json no-attach default", async () => {
-    const up = vi.fn().mockResolvedValue(baseUpResult);
-    await execute(["up", "--json", "--attach"], { up, down: vi.fn() });
+    const up = vi.fn<Stub<"up">>().mockResolvedValue(baseUpResult);
+    await execute(["up", "--json", "--attach"], { up, down: vi.fn<Stub<"down">>() });
     expect(up).toHaveBeenCalledWith(expect.objectContaining({ attach: true }));
   });
 
   it("parses --wait-timeout=<seconds> into milliseconds for `up`", async () => {
-    const up = vi.fn().mockResolvedValue(baseUpResult);
-    await execute(["up", "--wait-timeout=30"], { up, down: vi.fn() });
+    const up = vi.fn<Stub<"up">>().mockResolvedValue(baseUpResult);
+    await execute(["up", "--wait-timeout=30"], { up, down: vi.fn<Stub<"down">>() });
     expect(up).toHaveBeenCalledWith(expect.objectContaining({ waitTimeoutMs: 30_000 }));
   });
 
   it("parses --wait-timeout <seconds> (space-separated) for `up`", async () => {
-    const up = vi.fn().mockResolvedValue(baseUpResult);
-    await execute(["up", "--wait-timeout", "45"], { up, down: vi.fn() });
+    const up = vi.fn<Stub<"up">>().mockResolvedValue(baseUpResult);
+    await execute(["up", "--wait-timeout", "45"], { up, down: vi.fn<Stub<"down">>() });
     expect(up).toHaveBeenCalledWith(expect.objectContaining({ waitTimeoutMs: 45_000 }));
   });
 
   it("rejects --wait-timeout values with an INVALID_ARGS envelope under --json (#81)", async () => {
-    const up = vi.fn();
-    const result = await execute(["up", "--wait-timeout=zero", "--json"], { up, down: vi.fn() });
+    const up = vi.fn<Stub<"up">>();
+    const result = await execute(["up", "--wait-timeout=zero", "--json"], {
+      up,
+      down: vi.fn<Stub<"down">>(),
+    });
     expect(result.code).toBe(1);
     const parsed = JSON.parse(result.stdout) as { error: { code: string; message: string } };
     expect(parsed.error.code).toBe("INVALID_ARGS");
@@ -1483,30 +1740,36 @@ describe("devtrees CLI — up non-interactive (#28)", () => {
   });
 
   it("rejects --wait-timeout values that aren't a positive number", async () => {
-    const up = vi.fn().mockResolvedValue(baseUpResult);
-    const result = await execute(["up", "--wait-timeout=zero"], { up, down: vi.fn() });
+    const up = vi.fn<Stub<"up">>().mockResolvedValue(baseUpResult);
+    const result = await execute(["up", "--wait-timeout=zero"], {
+      up,
+      down: vi.fn<Stub<"down">>(),
+    });
     expect(result.code).not.toBe(0);
     expect(result.stderr).toMatch(/--wait-timeout/);
     expect(up).not.toHaveBeenCalled();
   });
 
   it("passes a single -n/--namespace value to `up` (#128)", async () => {
-    const up = vi.fn().mockResolvedValue(baseUpResult);
-    await execute(["up", "-n", "default"], { up, down: vi.fn() });
+    const up = vi.fn<Stub<"up">>().mockResolvedValue(baseUpResult);
+    await execute(["up", "-n", "default"], { up, down: vi.fn<Stub<"down">>() });
     expect(up).toHaveBeenCalledWith(expect.objectContaining({ namespaces: ["default"] }));
   });
 
   it("collects repeated -n/--namespace flags into an array, in order (#128)", async () => {
-    const up = vi.fn().mockResolvedValue(baseUpResult);
-    await execute(["up", "-n", "default", "--namespace", "local-backend"], { up, down: vi.fn() });
+    const up = vi.fn<Stub<"up">>().mockResolvedValue(baseUpResult);
+    await execute(["up", "-n", "default", "--namespace", "local-backend"], {
+      up,
+      down: vi.fn<Stub<"down">>(),
+    });
     expect(up).toHaveBeenCalledWith(
       expect.objectContaining({ namespaces: ["default", "local-backend"] }),
     );
   });
 
   it("omits namespaces from `up` options when no -n flag is given (#128)", async () => {
-    const up = vi.fn().mockResolvedValue(baseUpResult);
-    await execute(["up"], { up, down: vi.fn() });
+    const up = vi.fn<Stub<"up">>().mockResolvedValue(baseUpResult);
+    await execute(["up"], { up, down: vi.fn<Stub<"down">>() });
     const call = up.mock.calls[0]?.[0] ?? {};
     expect(call.namespaces).toBeUndefined();
   });
@@ -1515,8 +1778,8 @@ describe("devtrees CLI — up non-interactive (#28)", () => {
     const err = Object.assign(new Error("timed out waiting for services to be healthy [web]"), {
       code: "HEALTH_TIMEOUT" as const,
     });
-    const up = vi.fn().mockRejectedValue(err);
-    const result = await execute(["up", "--json"], { up, down: vi.fn() });
+    const up = vi.fn<Stub<"up">>().mockRejectedValue(err);
+    const result = await execute(["up", "--json"], { up, down: vi.fn<Stub<"down">>() });
     expect(result.code).not.toBe(0);
     const parsed = JSON.parse(result.stdout) as { error: { code: string; message: string } };
     expect(parsed.error.code).toBe("HEALTH_TIMEOUT");
@@ -1533,7 +1796,7 @@ describe("devtrees CLI — up non-interactive (#28)", () => {
 });
 
 describe("devtrees CLI — up --dry-run (#124)", () => {
-  const dryResult = {
+  const dryResult = dryRunResult({
     worktreeId: "login",
     worktreeRoot: "/wt/login",
     anchor: "/wt/login/.git",
@@ -1547,22 +1810,28 @@ describe("devtrees CLI — up --dry-run (#124)", () => {
       processes: { db: { command: "postgres", working_dir: "/anchor", environment: [] } },
       "x-devtrees": { ports_by_service: { db: { DB_PORT: 30000 } } },
     },
-  };
+    selectedServices: ["web"],
+    selectedSharedServices: ["db"],
+  });
 
   it("dispatches to upDryRun (NOT up) and never spawns the real up path", async () => {
-    const up = vi.fn();
-    const upDryRun = vi.fn().mockResolvedValue(dryResult);
-    const result = await execute(["up", "--dry-run"], { up, down: vi.fn(), upDryRun });
+    const up = vi.fn<Stub<"up">>();
+    const upDryRun = vi.fn<Stub<"upDryRun">>().mockResolvedValue(dryResult);
+    const result = await execute(["up", "--dry-run"], {
+      up,
+      down: vi.fn<Stub<"down">>(),
+      upDryRun,
+    });
     expect(result.code).toBe(0);
     expect(upDryRun).toHaveBeenCalledTimes(1);
     expect(up).not.toHaveBeenCalled();
   });
 
   it("--json emits the up_dry_run envelope on byte-clean stdout — a sibling reads the allocated ports", async () => {
-    const upDryRun = vi.fn().mockResolvedValue(dryResult);
+    const upDryRun = vi.fn<Stub<"upDryRun">>().mockResolvedValue(dryResult);
     const result = await execute(["up", "--dry-run", "--json"], {
-      up: vi.fn(),
-      down: vi.fn(),
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
       upDryRun,
     });
     expect(result.code).toBe(0);
@@ -1579,8 +1848,12 @@ describe("devtrees CLI — up --dry-run (#124)", () => {
   });
 
   it("without --json prints the derived YAML to stdout (human preview)", async () => {
-    const upDryRun = vi.fn().mockResolvedValue(dryResult);
-    const result = await execute(["up", "--dry-run"], { up: vi.fn(), down: vi.fn(), upDryRun });
+    const upDryRun = vi.fn<Stub<"upDryRun">>().mockResolvedValue(dryResult);
+    const result = await execute(["up", "--dry-run"], {
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
+      upDryRun,
+    });
     expect(result.code).toBe(0);
     expect(result.stdout).toContain("node x");
     expect(result.stdout.startsWith("{")).toBe(false);
@@ -1590,10 +1863,10 @@ describe("devtrees CLI — up --dry-run (#124)", () => {
     const err = Object.assign(new Error("devtrees.yaml is malformed"), {
       code: "CONFIG_INVALID" as const,
     });
-    const upDryRun = vi.fn().mockRejectedValue(err);
+    const upDryRun = vi.fn<Stub<"upDryRun">>().mockRejectedValue(err);
     const result = await execute(["up", "--dry-run", "--json"], {
-      up: vi.fn(),
-      down: vi.fn(),
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
       upDryRun,
     });
     expect(result.code).toBe(1);
@@ -1616,23 +1889,27 @@ describe("devtrees CLI — up --dry-run (#124)", () => {
     const withSelection = { ...dryResult, namespaces: ["default"], selectedServices: ["web"] };
 
     it("forwards -n values to upDryRun verbatim; omits them when absent", async () => {
-      const upDryRun = vi.fn().mockResolvedValue(withSelection);
+      const upDryRun = vi.fn<Stub<"upDryRun">>().mockResolvedValue(withSelection);
       await execute(["up", "--dry-run", "-n", "app", "-n", "default"], {
-        up: vi.fn(),
-        down: vi.fn(),
+        up: vi.fn<Stub<"up">>(),
+        down: vi.fn<Stub<"down">>(),
         upDryRun,
       });
       expect(upDryRun).toHaveBeenCalledWith({ namespaces: ["app", "default"] });
       upDryRun.mockClear();
-      await execute(["up", "--dry-run"], { up: vi.fn(), down: vi.fn(), upDryRun });
+      await execute(["up", "--dry-run"], {
+        up: vi.fn<Stub<"up">>(),
+        down: vi.fn<Stub<"down">>(),
+        upDryRun,
+      });
       expect(upDryRun).toHaveBeenCalledWith({});
     });
 
     it("--json carries namespaces + selected_services; stderr stays silent", async () => {
       const result = await execute(["up", "--dry-run", "--json"], {
-        up: vi.fn(),
-        down: vi.fn(),
-        upDryRun: vi.fn().mockResolvedValue(withSelection),
+        up: vi.fn<Stub<"up">>(),
+        down: vi.fn<Stub<"down">>(),
+        upDryRun: vi.fn<Stub<"upDryRun">>().mockResolvedValue(withSelection),
       });
       expect(result.stderr).toBe("");
       const parsed = JSON.parse(result.stdout) as { up_dry_run: Record<string, unknown> };
@@ -1642,9 +1919,9 @@ describe("devtrees CLI — up --dry-run (#124)", () => {
 
     it("human mode names the selection on stderr and leaves stdout the YAML alone", async () => {
       const result = await execute(["up", "--dry-run"], {
-        up: vi.fn(),
-        down: vi.fn(),
-        upDryRun: vi.fn().mockResolvedValue(withSelection),
+        up: vi.fn<Stub<"up">>(),
+        down: vi.fn<Stub<"down">>(),
+        upDryRun: vi.fn<Stub<"upDryRun">>().mockResolvedValue(withSelection),
       });
       expect(result.stderr).toContain("up would start namespace(s) [default]: web");
       expect(result.stdout).not.toContain("would start");
@@ -1662,9 +1939,9 @@ describe("devtrees CLI — up --dry-run (#124)", () => {
 
     it("--json carries instance, would_reload and would_restart (#210)", async () => {
       const fresh = await execute(["up", "--dry-run", "--json"], {
-        up: vi.fn(),
-        down: vi.fn(),
-        upDryRun: vi.fn().mockResolvedValue(withSelection),
+        up: vi.fn<Stub<"up">>(),
+        down: vi.fn<Stub<"down">>(),
+        upDryRun: vi.fn<Stub<"upDryRun">>().mockResolvedValue(withSelection),
       });
       expect(JSON.parse(fresh.stdout).up_dry_run).toMatchObject({
         instance: "fresh",
@@ -1672,9 +1949,9 @@ describe("devtrees CLI — up --dry-run (#124)", () => {
         would_restart: [],
       });
       const running = await execute(["up", "--dry-run", "--json"], {
-        up: vi.fn(),
-        down: vi.fn(),
-        upDryRun: vi.fn().mockResolvedValue(runningPreview),
+        up: vi.fn<Stub<"up">>(),
+        down: vi.fn<Stub<"down">>(),
+        upDryRun: vi.fn<Stub<"upDryRun">>().mockResolvedValue(runningPreview),
       });
       expect(running.stderr).toBe("");
       expect(JSON.parse(running.stdout).up_dry_run).toMatchObject({
@@ -1688,9 +1965,9 @@ describe("devtrees CLI — up --dry-run (#124)", () => {
 
     it("human mode names the running-instance plan on stderr (#210)", async () => {
       const result = await execute(["up", "--dry-run"], {
-        up: vi.fn(),
-        down: vi.fn(),
-        upDryRun: vi.fn().mockResolvedValue(runningPreview),
+        up: vi.fn<Stub<"up">>(),
+        down: vi.fn<Stub<"down">>(),
+        upDryRun: vi.fn<Stub<"upDryRun">>().mockResolvedValue(runningPreview),
       });
       expect(result.stderr).toContain(
         "up would check running namespace(s) [local-backend]: api, db",
@@ -1701,40 +1978,48 @@ describe("devtrees CLI — up --dry-run (#124)", () => {
     });
 
     it("forwards --wait-timeout to upDryRun as its read cap (#210)", async () => {
-      const upDryRun = vi.fn().mockResolvedValue(withSelection);
+      const upDryRun = vi.fn<Stub<"upDryRun">>().mockResolvedValue(withSelection);
       await execute(["up", "--dry-run", "--wait-timeout", "2"], {
-        up: vi.fn(),
-        down: vi.fn(),
+        up: vi.fn<Stub<"up">>(),
+        down: vi.fn<Stub<"down">>(),
         upDryRun,
       });
       expect(upDryRun).toHaveBeenCalledWith({ waitTimeoutMs: 2000 });
     });
 
     it("--json carries would_restart_shared; human mode names it on stderr (#240)", async () => {
-      const upDryRun = vi.fn().mockResolvedValue({ ...withSelection, wouldRestartShared: ["pg"] });
+      const upDryRun = vi
+        .fn<Stub<"upDryRun">>()
+        .mockResolvedValue({ ...withSelection, wouldRestartShared: ["pg"] });
       const json = await execute(["up", "--dry-run", "--json"], {
-        up: vi.fn(),
-        down: vi.fn(),
+        up: vi.fn<Stub<"up">>(),
+        down: vi.fn<Stub<"down">>(),
         upDryRun,
       });
       expect(JSON.parse(json.stdout).up_dry_run.would_restart_shared).toEqual(["pg"]);
-      const human = await execute(["up", "--dry-run"], { up: vi.fn(), down: vi.fn(), upDryRun });
+      const human = await execute(["up", "--dry-run"], {
+        up: vi.fn<Stub<"up">>(),
+        down: vi.fn<Stub<"down">>(),
+        upDryRun,
+      });
       expect(human.stderr).toContain("up would restart dead shared service(s): pg");
       const help = (await run(["up", "--help"])).stdout.replace(/\s+/g, " ");
       expect(help).toContain("previews which dead selected shared services `up` would restart");
     });
 
     it("up --json passes shared_restarted through; human mode names it (#240)", async () => {
-      const up = vi.fn().mockResolvedValue({
-        worktreeId: "login",
-        socketPath: "/s",
-        env: {},
-        sharedStarted: false,
-        sharedRestarted: ["pg"],
-      });
-      const json = await execute(["up", "--json"], { up, down: vi.fn() });
+      const up = vi.fn<Stub<"up">>().mockResolvedValue(
+        upResult({
+          worktreeId: "login",
+          socketPath: "/s",
+          env: {},
+          blockBase: 20000,
+          sharedRestarted: ["pg"],
+        }),
+      );
+      const json = await execute(["up", "--json"], { up, down: vi.fn<Stub<"down">>() });
       expect(JSON.parse(json.stdout).up.shared_restarted).toEqual(["pg"]);
-      const human = await execute(["up", "--no-attach"], { up, down: vi.fn() });
+      const human = await execute(["up", "--no-attach"], { up, down: vi.fn<Stub<"down">>() });
       expect(human.stdout).toContain("devtrees up: restarted dead shared service(s): pg.");
     });
 
@@ -1754,9 +2039,9 @@ describe("devtrees CLI — up --dry-run (#124)", () => {
         ["up", "--dry-run", "--json"],
       ]) {
         const result = await execute(argv, {
-          up: vi.fn().mockRejectedValue(noneSelected),
-          down: vi.fn(),
-          upDryRun: vi.fn().mockRejectedValue(noneSelected),
+          up: vi.fn<Stub<"up">>().mockRejectedValue(noneSelected),
+          down: vi.fn<Stub<"down">>(),
+          upDryRun: vi.fn<Stub<"upDryRun">>().mockRejectedValue(noneSelected),
         });
         expect(result.code).toBe(1);
         const parsed = JSON.parse(result.stdout) as {
@@ -1779,33 +2064,37 @@ describe("devtrees CLI — up --dry-run (#124)", () => {
    * cross-tier edges it drops — the real `up` already does.
    */
   describe("dropped cross-tier depends_on edges (#168)", () => {
-    const withDrops = {
+    const withDrops: Result<"upDryRun"> = {
       ...dryResult,
       droppedEdges: [{ from: "web", to: "db", fromTier: "isolated", toTier: "shared" }],
     };
 
     it("human mode warns on stderr and leaves stdout the previewed YAML alone", async () => {
-      const upDryRun = vi.fn().mockResolvedValue(withDrops);
-      const result = await execute(["up", "--dry-run"], { up: vi.fn(), down: vi.fn(), upDryRun });
+      const upDryRun = vi.fn<Stub<"upDryRun">>().mockResolvedValue(withDrops);
+      const result = await execute(["up", "--dry-run"], {
+        up: vi.fn<Stub<"up">>(),
+        down: vi.fn<Stub<"down">>(),
+        upDryRun,
+      });
       expect(result.code).toBe(0);
       expect(result.stderr).toContain(
         "dropped cross-tier depends_on 'web' (isolated) -> 'db' (shared)",
       );
       // stdout must stay pipe-safe: byte-identical to the drop-free render.
       const clean = await execute(["up", "--dry-run"], {
-        up: vi.fn(),
-        down: vi.fn(),
-        upDryRun: vi.fn().mockResolvedValue(dryResult),
+        up: vi.fn<Stub<"up">>(),
+        down: vi.fn<Stub<"down">>(),
+        upDryRun: vi.fn<Stub<"upDryRun">>().mockResolvedValue(dryResult),
       });
       expect(result.stdout).toBe(clean.stdout);
       expect(result.stdout).not.toContain("dropped cross-tier");
     });
 
     it("--json carries dropped_edges in the envelope and keeps stderr silent", async () => {
-      const upDryRun = vi.fn().mockResolvedValue(withDrops);
+      const upDryRun = vi.fn<Stub<"upDryRun">>().mockResolvedValue(withDrops);
       const result = await execute(["up", "--dry-run", "--json"], {
-        up: vi.fn(),
-        down: vi.fn(),
+        up: vi.fn<Stub<"up">>(),
+        down: vi.fn<Stub<"down">>(),
         upDryRun,
       });
       expect(result.code).toBe(0);
@@ -1818,18 +2107,22 @@ describe("devtrees CLI — up --dry-run (#124)", () => {
       ]);
     });
 
-    it("says nothing on stderr, and emits an empty dropped_edges, when no edge was dropped", async () => {
+    it("warns about no edge on stderr, and emits an empty dropped_edges, when no edge was dropped", async () => {
       const human = await execute(["up", "--dry-run"], {
-        up: vi.fn(),
-        down: vi.fn(),
-        upDryRun: vi.fn().mockResolvedValue({ ...dryResult, droppedEdges: [] }),
+        up: vi.fn<Stub<"up">>(),
+        down: vi.fn<Stub<"down">>(),
+        upDryRun: vi.fn<Stub<"upDryRun">>().mockResolvedValue({ ...dryResult, droppedEdges: [] }),
       });
-      expect(human.stderr).toBe("");
+      // Only the selection notes: a real preview always carries its selection.
+      expect(human.stderr).toBe(
+        "devtrees: up would start namespace(s) [default]: web\n" +
+          "devtrees: up would use shared service(s): db\n",
+      );
 
       const json = await execute(["up", "--dry-run", "--json"], {
-        up: vi.fn(),
-        down: vi.fn(),
-        upDryRun: vi.fn().mockResolvedValue({ ...dryResult, droppedEdges: [] }),
+        up: vi.fn<Stub<"up">>(),
+        down: vi.fn<Stub<"down">>(),
+        upDryRun: vi.fn<Stub<"upDryRun">>().mockResolvedValue({ ...dryResult, droppedEdges: [] }),
       });
       const parsed = JSON.parse(json.stdout) as { up_dry_run: Record<string, unknown> };
       expect(parsed.up_dry_run.dropped_edges).toEqual([]);
@@ -1871,8 +2164,8 @@ describe("devtrees CLI — CONFIG_INVALID / LOCK_CONTENTION envelopes (#84)", ()
   }
 
   it("`up --json` with a malformed devtrees.yaml (parse error) → code:CONFIG_INVALID", async () => {
-    const up = vi.fn().mockRejectedValue(realStackConfigError("services: [unclosed"));
-    const result = await execute(["up", "--json"], { up, down: vi.fn() });
+    const up = vi.fn<Stub<"up">>().mockRejectedValue(realStackConfigError("services: [unclosed"));
+    const result = await execute(["up", "--json"], { up, down: vi.fn<Stub<"down">>() });
     expect(result.code).not.toBe(0);
     const parsed = JSON.parse(result.stdout) as { error: { code: string; message: string } };
     expect(parsed.error.code).toBe("CONFIG_INVALID");
@@ -1891,8 +2184,8 @@ describe("devtrees CLI — CONFIG_INVALID / LOCK_CONTENTION envelopes (#84)", ()
       "    command: node server.js",
       "",
     ].join("\n");
-    const up = vi.fn().mockRejectedValue(realStackConfigError(invalid));
-    const result = await execute(["up", "--json"], { up, down: vi.fn() });
+    const up = vi.fn<Stub<"up">>().mockRejectedValue(realStackConfigError(invalid));
+    const result = await execute(["up", "--json"], { up, down: vi.fn<Stub<"down">>() });
     expect(result.code).not.toBe(0);
     const parsed = JSON.parse(result.stdout) as { error: { code: string; message: string } };
     expect(parsed.error.code).toBe("CONFIG_INVALID");
@@ -1900,8 +2193,8 @@ describe("devtrees CLI — CONFIG_INVALID / LOCK_CONTENTION envelopes (#84)", ()
   });
 
   it("`up --json` with a contended registry lock → code:LOCK_CONTENTION", async () => {
-    const up = vi.fn().mockRejectedValue(await realRegistryLockedError());
-    const result = await execute(["up", "--json"], { up, down: vi.fn() });
+    const up = vi.fn<Stub<"up">>().mockRejectedValue(await realRegistryLockedError());
+    const result = await execute(["up", "--json"], { up, down: vi.fn<Stub<"down">>() });
     expect(result.code).not.toBe(0);
     const parsed = JSON.parse(result.stdout) as { error: { code: string; message: string } };
     expect(parsed.error.code).toBe("LOCK_CONTENTION");
@@ -1919,10 +2212,12 @@ describe("devtrees CLI — CONFIG_INVALID / LOCK_CONTENTION envelopes (#84)", ()
  * under `prune.pruned[]`. Human output for both is unchanged.
  */
 describe("devtrees CLI — down --shared -n (#239)", () => {
-  const result = {
+  const result: Result<"downSharedNamespaces"> = {
+    shared: true,
     namespaces: ["a"],
     stopped: true,
     services: ["sa"],
+    removed: ["sa"],
     inactiveNamespaces: [],
     instanceStopped: false,
     dependants: [],
@@ -1930,10 +2225,10 @@ describe("devtrees CLI — down --shared -n (#239)", () => {
   };
 
   it("routes `down --shared -n a -n b --force` to downSharedNamespaces, not down", async () => {
-    const down = vi.fn();
-    const downSharedNamespaces = vi.fn().mockResolvedValue(result);
+    const down = vi.fn<Stub<"down">>();
+    const downSharedNamespaces = vi.fn<Stub<"downSharedNamespaces">>().mockResolvedValue(result);
     const out = await execute(["down", "--shared", "-n", "a", "-n", "b", "--force", "--json"], {
-      up: vi.fn(),
+      up: vi.fn<Stub<"up">>(),
       down,
       downSharedNamespaces,
     });
@@ -1957,14 +2252,16 @@ describe("devtrees CLI — down --shared -n (#239)", () => {
   });
 
   it("says what it stopped, and warns on stderr about a forced removal and an inactive namespace", async () => {
-    const downSharedNamespaces = vi.fn().mockResolvedValue({
+    const downSharedNamespaces = vi.fn<Stub<"downSharedNamespaces">>().mockResolvedValue({
       ...result,
       inactiveNamespaces: ["nope"],
-      dependants: [{ instance: "login-1", service: "worker", depends_on: ["sa"], source: "x" }],
+      dependants: [
+        { instance: "login-1", service: "worker", depends_on: ["sa"], source: "unknown" },
+      ],
     });
     const out = await execute(["down", "--shared", "-n", "a", "-n", "nope", "--force"], {
-      up: vi.fn(),
-      down: vi.fn(),
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
       downSharedNamespaces,
     });
     expect(out.stdout).toBe(
@@ -1975,11 +2272,13 @@ describe("devtrees CLI — down --shared -n (#239)", () => {
   });
 
   it("says when it only removed services that were already stopped, or only leftovers", async () => {
-    const run = (payload: Record<string, unknown>) =>
+    const run = (payload: Partial<Result<"downSharedNamespaces">>) =>
       execute(["down", "--shared", "-n", "a"], {
-        up: vi.fn(),
-        down: vi.fn(),
-        downSharedNamespaces: vi.fn().mockResolvedValue({ ...result, ...payload }),
+        up: vi.fn<Stub<"up">>(),
+        down: vi.fn<Stub<"down">>(),
+        downSharedNamespaces: vi
+          .fn<Stub<"downSharedNamespaces">>()
+          .mockResolvedValue({ ...result, ...payload }),
       });
     const stale = await run({ stopped: false, removed: ["sa"] });
     expect(stale.stdout).toBe(
@@ -1994,9 +2293,9 @@ describe("devtrees CLI — down --shared -n (#239)", () => {
 
   it("renders the no-op and the last-namespace teardown", async () => {
     const noop = await execute(["down", "--shared", "-n", "a"], {
-      up: vi.fn(),
-      down: vi.fn(),
-      downSharedNamespaces: vi.fn().mockResolvedValue({
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
+      downSharedNamespaces: vi.fn<Stub<"downSharedNamespaces">>().mockResolvedValue({
         ...result,
         stopped: false,
         services: [],
@@ -2009,29 +2308,33 @@ describe("devtrees CLI — down --shared -n (#239)", () => {
       "devtrees down: no shared service of namespace a is running; nothing to do.\n",
     );
     const last = await execute(["down", "--shared", "-n", "a"], {
-      up: vi.fn(),
-      down: vi.fn(),
-      downSharedNamespaces: vi.fn().mockResolvedValue({ ...result, instanceStopped: true }),
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
+      downSharedNamespaces: vi
+        .fn<Stub<"downSharedNamespaces">>()
+        .mockResolvedValue({ ...result, instanceStopped: true }),
     });
     expect(last.stdout).toContain("so the shared instance stopped");
   });
 
   it("`--dry-run --json` previews through downSharedNamespacesDryRun and exits 0 even when blocked", async () => {
-    const downSharedNamespaces = vi.fn();
-    const downSharedNamespacesDryRun = vi.fn().mockResolvedValue({
-      namespaces: ["a"],
-      running: true,
-      services: ["sa"],
-      inactiveNamespaces: [],
-      wouldStopInstance: false,
-      dependants: [
-        { instance: "login-1", service: "worker", depends_on: ["sa"], source: "derived_config" },
-      ],
-      blocked: true,
-    });
+    const downSharedNamespaces = vi.fn<Stub<"downSharedNamespaces">>();
+    const downSharedNamespacesDryRun = vi
+      .fn<Stub<"downSharedNamespacesDryRun">>()
+      .mockResolvedValue({
+        namespaces: ["a"],
+        running: true,
+        services: ["sa"],
+        inactiveNamespaces: [],
+        wouldStopInstance: false,
+        dependants: [
+          { instance: "login-1", service: "worker", depends_on: ["sa"], source: "derived_config" },
+        ],
+        blocked: true,
+      });
     const out = await execute(["down", "--shared", "-n", "a", "--dry-run", "--json"], {
-      up: vi.fn(),
-      down: vi.fn(),
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
       downSharedNamespaces,
       downSharedNamespacesDryRun,
     });
@@ -2062,9 +2365,13 @@ describe("devtrees CLI — down --shared -n (#239)", () => {
     [["down", "--dry-run"], "applies only to"],
     [["down", "--shared", "--dry-run"], "applies only to"],
   ])("`%s` fails INVALID_ARGS before anything runs", async (argv, said) => {
-    const down = vi.fn();
-    const downSharedNamespaces = vi.fn();
-    const out = await execute([...argv, "--json"], { up: vi.fn(), down, downSharedNamespaces });
+    const down = vi.fn<Stub<"down">>();
+    const downSharedNamespaces = vi.fn<Stub<"downSharedNamespaces">>();
+    const out = await execute([...argv, "--json"], {
+      up: vi.fn<Stub<"up">>(),
+      down,
+      downSharedNamespaces,
+    });
     expect(out.code).toBe(1);
     const parsed = JSON.parse(out.stdout) as { error: { code: string; message: string } };
     expect(parsed.error.code).toBe("INVALID_ARGS");
@@ -2074,9 +2381,9 @@ describe("devtrees CLI — down --shared -n (#239)", () => {
   });
 
   it("a plain `down --shared` still goes to down, unchanged", async () => {
-    const down = vi.fn().mockResolvedValue({});
-    const downSharedNamespaces = vi.fn();
-    await execute(["down", "--shared"], { up: vi.fn(), down, downSharedNamespaces });
+    const down = vi.fn<Stub<"down">>().mockResolvedValue({ shared: true, stopped: true });
+    const downSharedNamespaces = vi.fn<Stub<"downSharedNamespaces">>();
+    await execute(["down", "--shared"], { up: vi.fn<Stub<"up">>(), down, downSharedNamespaces });
     expect(down).toHaveBeenCalledWith({ shared: true });
     expect(downSharedNamespaces).not.toHaveBeenCalled();
   });
@@ -2084,8 +2391,10 @@ describe("devtrees CLI — down --shared -n (#239)", () => {
 
 describe("devtrees CLI — down/prune --json envelopes (#48)", () => {
   it("`down --json` emits the worktree-teardown envelope: {down:{worktreeId}} and nothing else", async () => {
-    const down = vi.fn().mockResolvedValue({ worktreeId: "login" });
-    const result = await execute(["down", "--json"], { up: vi.fn(), down });
+    const down = vi
+      .fn<Stub<"down">>()
+      .mockResolvedValue({ shared: false, worktreeId: "login", stopped: true });
+    const result = await execute(["down", "--json"], { up: vi.fn<Stub<"up">>(), down });
     expect(down).toHaveBeenCalledWith({ shared: false });
     expect(result.code).toBe(0);
     expect(result.stderr).toBe("");
@@ -2102,8 +2411,8 @@ describe("devtrees CLI — down/prune --json envelopes (#48)", () => {
   });
 
   it("`down --shared --json` emits the shared-teardown envelope: {down:{shared:true}} and nothing else", async () => {
-    const down = vi.fn().mockResolvedValue({});
-    const result = await execute(["down", "--shared", "--json"], { up: vi.fn(), down });
+    const down = vi.fn<Stub<"down">>().mockResolvedValue({ shared: true, stopped: true });
+    const result = await execute(["down", "--shared", "--json"], { up: vi.fn<Stub<"up">>(), down });
     expect(down).toHaveBeenCalledWith({ shared: true });
     const parsed = JSON.parse(result.stdout) as {
       down: Record<string, unknown>;
@@ -2116,8 +2425,10 @@ describe("devtrees CLI — down/prune --json envelopes (#48)", () => {
   });
 
   it("`down --json` no-op (nothing running) exits 0 with stopped: false (#92)", async () => {
-    const down = vi.fn().mockResolvedValue({ worktreeId: "login", stopped: false });
-    const result = await execute(["down", "--json"], { up: vi.fn(), down });
+    const down = vi
+      .fn<Stub<"down">>()
+      .mockResolvedValue({ shared: false, worktreeId: "login", stopped: false });
+    const result = await execute(["down", "--json"], { up: vi.fn<Stub<"up">>(), down });
     expect(result.code).toBe(0);
     expect(result.stderr).toBe("");
     const parsed = JSON.parse(result.stdout) as { down: Record<string, unknown> };
@@ -2125,23 +2436,27 @@ describe("devtrees CLI — down/prune --json envelopes (#48)", () => {
   });
 
   it("`down` no-op (nothing running) exits 0 with the idempotent human notice (#92)", async () => {
-    const down = vi.fn().mockResolvedValue({ worktreeId: "login", stopped: false });
-    const result = await execute(["down"], { up: vi.fn(), down });
+    const down = vi
+      .fn<Stub<"down">>()
+      .mockResolvedValue({ shared: false, worktreeId: "login", stopped: false });
+    const result = await execute(["down"], { up: vi.fn<Stub<"up">>(), down });
     expect(result.code).toBe(0);
     expect(result.stdout).toBe("devtrees down: no worktree instance running; nothing to do.\n");
   });
 
   it("`down` without --json is byte-for-byte unchanged from today's text", async () => {
-    const down = vi.fn().mockResolvedValue({ worktreeId: "login" });
-    const result = await execute(["down"], { up: vi.fn(), down });
+    const down = vi
+      .fn<Stub<"down">>()
+      .mockResolvedValue({ shared: false, worktreeId: "login", stopped: true });
+    const result = await execute(["down"], { up: vi.fn<Stub<"up">>(), down });
     expect(result.stdout).toBe("devtrees down: worktree instance stopped.\n");
   });
 
   it("`down --json` failure → INSTANCE_NOT_FOUND envelope on stdout, human diagnostic on stderr", async () => {
     const down = vi
-      .fn()
+      .fn<Stub<"down">>()
       .mockRejectedValue(new Error("no worktree instance is running for 'login'"));
-    const result = await execute(["down", "--json"], { up: vi.fn(), down });
+    const result = await execute(["down", "--json"], { up: vi.fn<Stub<"up">>(), down });
     expect(result.code).not.toBe(0);
     const parsed = JSON.parse(result.stdout) as { error: { code: string; message: string } };
     expect(parsed.error.code).toBe("INSTANCE_NOT_FOUND");
@@ -2149,18 +2464,24 @@ describe("devtrees CLI — down/prune --json envelopes (#48)", () => {
   });
 
   it("`prune --json` emits {schema_version, prune:{pruned:[...]}} with identity-only entries", async () => {
-    const prune = vi.fn().mockResolvedValue({
-      anchor: "/repo/.git",
-      pruned: [
-        {
-          id: "removed",
-          kind: "worktree" as const,
-          status: "running" as const,
-          worktreePath: "/abs/path/.../devtrees-example-removed",
-        },
-      ],
+    const prune = vi.fn<Stub<"prune">>().mockResolvedValue(
+      pruneResult({
+        anchor: "/repo/.git",
+        pruned: [
+          {
+            id: "removed",
+            kind: "worktree" as const,
+            status: "running" as const,
+            worktreePath: "/abs/path/.../devtrees-example-removed",
+          },
+        ],
+      }),
+    );
+    const result = await execute(["prune", "--json"], {
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
+      prune,
     });
-    const result = await execute(["prune", "--json"], { up: vi.fn(), down: vi.fn(), prune });
     expect(result.code).toBe(0);
     expect(result.stderr).toBe("");
     const parsed = JSON.parse(result.stdout) as {
@@ -2178,15 +2499,27 @@ describe("devtrees CLI — down/prune --json envelopes (#48)", () => {
   });
 
   it("`prune --json` with no orphans emits {prune:{pruned:[]}} (not the 'no orphans' string)", async () => {
-    const prune = vi.fn().mockResolvedValue({ anchor: "/repo/.git", pruned: [] });
-    const result = await execute(["prune", "--json"], { up: vi.fn(), down: vi.fn(), prune });
+    const prune = vi
+      .fn<Stub<"prune">>()
+      .mockResolvedValue(pruneResult({ anchor: "/repo/.git", pruned: [] }));
+    const result = await execute(["prune", "--json"], {
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
+      prune,
+    });
     const parsed = JSON.parse(result.stdout) as { prune: { pruned: unknown[] } };
     expect(parsed.prune.pruned).toEqual([]);
   });
 
   it("`prune` without --json is byte-for-byte unchanged from today's text (no orphans case)", async () => {
-    const prune = vi.fn().mockResolvedValue({ anchor: "/repo/.git", pruned: [] });
-    const result = await execute(["prune"], { up: vi.fn(), down: vi.fn(), prune });
+    const prune = vi
+      .fn<Stub<"prune">>()
+      .mockResolvedValue(pruneResult({ anchor: "/repo/.git", pruned: [] }));
+    const result = await execute(["prune"], {
+      up: vi.fn<Stub<"up">>(),
+      down: vi.fn<Stub<"down">>(),
+      prune,
+    });
     expect(result.stdout).toBe("devtrees prune: no orphans to clean up.\n");
   });
 });
@@ -2199,15 +2532,17 @@ describe("devtrees CLI — down/prune --json envelopes (#48)", () => {
  */
 describe("devtrees CLI — up --json state envelope (#30)", () => {
   it("emits {schema_version, up:{worktree_id, block_base, env, services, shared_started}} on success", async () => {
-    const up = vi.fn().mockResolvedValue({
-      worktreeId: "login",
-      socketPath: "/x.sock",
-      env: { DEVTREES_WORKTREE_ID: "login", WEB_PORT: "20512", DB_PORT: "30000" },
-      sharedStarted: true,
-      blockBase: 20512,
-      services: [{ name: "web", status: "Running", health: "ready", ports: { WEB_PORT: 20512 } }],
-    });
-    const result = await execute(["up", "--json"], { up, down: vi.fn() });
+    const up = vi.fn<Stub<"up">>().mockResolvedValue(
+      upResult({
+        worktreeId: "login",
+        socketPath: "/x.sock",
+        env: { DEVTREES_WORKTREE_ID: "login", WEB_PORT: "20512", DB_PORT: "30000" },
+        sharedStarted: true,
+        blockBase: 20512,
+        services: [{ name: "web", status: "Running", health: "ready", ports: { WEB_PORT: 20512 } }],
+      }),
+    );
+    const result = await execute(["up", "--json"], { up, down: vi.fn<Stub<"down">>() });
     expect(result.code).toBe(0);
     expect(result.stderr).toBe("");
     const parsed = JSON.parse(result.stdout) as {
@@ -2240,15 +2575,16 @@ describe("devtrees CLI — up --json state envelope (#30)", () => {
   });
 
   it("human `devtrees up` output is unchanged when runUp returns the new state envelope fields", async () => {
-    const up = vi.fn().mockResolvedValue({
-      worktreeId: "login",
-      socketPath: "/x.sock",
-      env: { WEB_PORT: "20512" },
-      sharedStarted: false,
-      blockBase: 20512,
-      services: [{ name: "web", status: "Running", health: "ready", ports: { WEB_PORT: 20512 } }],
-    });
-    const result = await execute(["up"], { up, down: vi.fn() });
+    const up = vi.fn<Stub<"up">>().mockResolvedValue(
+      upResult({
+        worktreeId: "login",
+        socketPath: "/x.sock",
+        env: { WEB_PORT: "20512" },
+        blockBase: 20512,
+        services: [{ name: "web", status: "Running", health: "ready", ports: { WEB_PORT: 20512 } }],
+      }),
+    );
+    const result = await execute(["up"], { up, down: vi.fn<Stub<"down">>() });
     expect(result.code).toBe(0);
     // The human path renders the same "'<id>' is up" line and KEY=value
     // list as before — no JSON shape leaks into the human surface.
@@ -2317,9 +2653,9 @@ describe("devtrees CLI — isEntrypoint", () => {
 
 describe("devtrees CLI — stop removed (ADR-0009 amendment)", () => {
   it("`stop` is an unknown command: it runs nothing and lists no `stop` in COMMANDS", async () => {
-    const up = vi.fn();
-    const down = vi.fn();
-    const restart = vi.fn();
+    const up = vi.fn<Stub<"up">>();
+    const down = vi.fn<Stub<"down">>();
+    const restart = vi.fn<Stub<"restart">>();
     const out = await execute(["stop", "web"], { up, down, restart });
     expect(out.code).toBe(1);
     expect(out.stderr).toContain("stop");
