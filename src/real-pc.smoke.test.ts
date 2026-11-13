@@ -3600,6 +3600,68 @@ describe.skipIf(!ENABLED)("real-pc smoke — restarting dead shared services (#2
 });
 
 /**
+ * A lazy-started shared service whose command exits at once (#262): `node
+ * server.mjs`, with `server.mjs` only in the worktree, while shared services
+ * run from the anchor. No isolated service depends on it, so no cross-tier
+ * wait covers it. `up` used to report `shared_started: true` and exit 0.
+ */
+describe.skipIf(!ENABLED)("real-pc smoke — a shared service that exits at once (#262)", () => {
+  interface ErrorDoc {
+    readonly error?: { code?: string; details?: Record<string, unknown> };
+  }
+
+  function exitingShared(prefix: string, withSleeper: boolean) {
+    const repo = buildSmokeRepo(prefix, ["login"]);
+    currentCtx = { pidNeedle: repo.root, root: repo.root };
+    const login = repo.worktrees.login!;
+    writeFileSync(join(login, "server.mjs"), "setInterval(() => {}, 1000);\n");
+    const yaml = [
+      "services:",
+      "  api:",
+      "    tier: shared",
+      '    command: "node server.mjs"',
+      "    ports: [API_PORT]",
+      ...(withSleeper ? ["  cache:", "    tier: shared", `    command: "sleep 300"`] : []),
+      "  web:",
+      "    tier: isolated",
+      '    command: "sleep 300"',
+      "    ports: [WEB_PORT]",
+      "",
+    ].join("\n");
+    writeFileSync(join(login, "devtrees.yaml"), yaml);
+    cleanupStack.push(() => devtrees(login, ["down", "--shared"]));
+    cleanupStack.push(() => devtrees(login, ["down"]));
+    return login;
+  }
+
+  it("scenario 137: the only shared service exits at once, so process-compose exits; up fails instead of reporting it started", () => {
+    const login = exitingShared("dt-rpc137-", false);
+    const r = devtrees(login, ["up", "--json", "--no-attach", "--wait-timeout", "30"]);
+    // Whether devtrees saw the socket before process-compose removed it is a
+    // race; either way it is a failed start, with the config to run by hand.
+    expect(r.code, `up should fail: ${r.stdout} ${r.stderr}`).toBe(1);
+    const err = (r.doc as ErrorDoc).error;
+    expect(err?.code).toBe("SHARED_START_FAILED");
+    expect(String(err?.details?.config_path)).toMatch(/shared\.yaml$/);
+    // Nothing is left running: no shared row, no worktree instance.
+    const ls = devtrees(login, ["ls", "--json"]).doc as LsDoc | undefined;
+    expect(ls?.ls.instances ?? []).toEqual([]);
+  }, 90_000);
+
+  it("scenario 138: one of two shared services exits at once; up fails SHARED_SERVICE_DEAD died_while_waiting", () => {
+    const login = exitingShared("dt-rpc138-", true);
+    const r = devtrees(login, ["up", "--json", "--no-attach", "--wait-timeout", "30"]);
+    expect(r.code, `up should fail: ${r.stdout} ${r.stderr}`).toBe(1);
+    const err = (r.doc as ErrorDoc).error;
+    expect(err?.code).toBe("SHARED_SERVICE_DEAD");
+    expect(err?.details).toMatchObject({
+      reason: "died_while_waiting",
+      dead_services: [{ name: "api", exit_code: 1 }],
+    });
+  }, 90_000);
+});
+
+/**
  * Stable shared ports (#238, ADR-0011) against the real binary: two branches
  * whose `devtrees.yaml` lay out the shared services differently — `login`
  * declares pg + x, `billing` pg + y + x, so by position login's X_PORT and

@@ -1822,8 +1822,9 @@ function unresponsiveRemedy(socketPath: string, context: LivenessContext): strin
  * on with every other selected shared service (after the lifecycle lock on
  * the running path); one that is refused, dies again or never becomes
  * healthy fails with `SHARED_SERVICE_DEAD`. A running shared service is
- * never touched. One this call lazy-started is covered by the
- * shared-health wait, which fails fast with `SHARED_SERVICE_DEAD`.
+ * never touched. One this call lazy-started is waited on the same way
+ * (#262), and a lazy-started shared instance that exits meanwhile (every
+ * shared service it started died) fails `SHARED_START_FAILED`.
  *
  * Pre-flight stale-port-block check (issue #58): when the worktree's
  * control socket is absent (first up — not the idempotent re-up path),
@@ -2670,8 +2671,8 @@ interface SharedOutcome {
   /** Dead selected shared services this `up` restarted (#240). */
   readonly restarted: ReadonlyArray<string>;
   /**
-   * Wait for the selected shared services to be healthy (#240): a no-op
-   * unless this `up` found the shared instance already running. The caller
+   * Wait for the selected shared services to be healthy (#240), including
+   * in a shared instance this `up` just started (#262). The caller
    * decides when to run it: on the fresh path inside the worktree lifecycle
    * lock, before the worktree spawns; on the running path after the lock is
    * released, like the rest of verification (ADR-0008).
@@ -2690,15 +2691,15 @@ interface SharedOutcome {
  * and restart the selected ones it runs that are dead (#240, ADR-0008), all
  * under the shared lifecycle lock (`ensureSharedStarted`).
  *
- * When the shared instance was already running, a wait (run here with
- * `waitNow`, else returned as the outcome's `ready`) waits
- * for every selected shared service to be healthy (`createWaitForSharedReady`):
- * the ones this `up` restarted or added, and any another worktree's `up`
- * restarted that has not passed its readiness probe yet. Without that wait an
- * `up` racing the restart would read the service `Running`, restart nothing,
- * and report success before it serves. A shared instance this call
- * lazy-started is covered by the cross-tier shared-health wait instead, as
- * before.
+ * A wait (run here with `waitNow`, else returned as the outcome's `ready`)
+ * waits for every selected shared service to be healthy
+ * (`createWaitForSharedReady`): the ones this `up` started, restarted or
+ * added, and any another worktree's `up` restarted that has not passed its
+ * readiness probe yet. Without that wait an `up` racing the restart would
+ * read the service `Running`, restart nothing, and report success before it
+ * serves; and a lazy start whose shared service exited at once would be
+ * reported started (#262). A lazy-started instance that is gone by then
+ * exited on its own: `SHARED_START_FAILED`.
  */
 async function prepareShared(args: {
   readonly stack: ResolvedStack;
@@ -2758,7 +2759,7 @@ async function prepareShared(args: {
       ),
     },
   );
-  const wait = ensured.started ? ready : () => waitSharedReady(args, selected, ensured.restarted);
+  const wait = () => waitSharedReady(args, selected, ensured);
   if (args.waitNow) await wait();
   const ports = ensured.ports;
   return {
@@ -2787,9 +2788,11 @@ async function waitSharedReady(
     readonly namespaces: ReadonlyArray<string>;
   },
   selected: ReadonlyArray<ResolvedService>,
-  restarted: ReadonlyArray<RestartedService>,
+  ensured: Pick<EnsuredShared, "started" | "restarted">,
 ): Promise<void> {
   const { deps, driver } = args;
+  const { restarted } = ensured;
+  const paths = sharedInstancePaths(args.anchor.anchor);
   if (restarted.length > 0) {
     args.warn(
       `devtrees up: restarted dead shared service(s): ${restarted.map((r) => r.name).join(", ")}; ` +
@@ -2803,12 +2806,18 @@ async function waitSharedReady(
       { notify: args.warn, probe: probeOf(deps) },
     );
   await wait({
-    socketPath: sharedInstancePaths(args.anchor.anchor).socketPath,
+    socketPath: paths.socketPath,
     serviceNames: selected.map((s) => s.name),
     restarted,
     probedServiceNames: probedNames(selected),
     timeoutMs: deps.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS,
     remedyFor: sharedRemedyFor(args.stack, args.namespaces, args.anchor.anchor),
+  }).catch((err: unknown) => {
+    // A shared instance this `up` just started that is gone already exited on
+    // its own (#262): process-compose exits once nothing runs, so every shared
+    // service it started died at once. That is a failed start, not a `down`.
+    if (!ensured.started || (err as { code?: unknown }).code !== "INSTANCE_NOT_FOUND") throw err;
+    throw sharedStartFailed(paths, deps.sharedSocketTimeoutMs ?? SOCKET_WAIT_TIMEOUT_MS, true);
   });
 }
 
@@ -3417,12 +3426,30 @@ async function waitForSharedSocket(
   timeoutMs = SOCKET_WAIT_TIMEOUT_MS,
 ): Promise<void> {
   if (await pollForSocket(socketPath, timeoutMs)) return;
-  throw new SharedStartFailedError(
-    `devtrees up: the shared instance was spawned but did not bind its control socket ` +
-      `within ${timeoutMs}ms — it most likely crashed on startup. ` +
+  throw sharedStartFailed({ socketPath, configPath }, timeoutMs, false);
+}
+
+/**
+ * `SHARED_START_FAILED` for a lazy start that never bound its control socket
+ * (`bound: false`, #92), or bound it and then exited because every shared
+ * service it started had exited (`bound: true`, #262). Which one a crashing
+ * command produces is a race (the socket lives for a few ms), so both carry
+ * the same details and the same remedy.
+ */
+function sharedStartFailed(
+  paths: { readonly socketPath: string; readonly configPath: string },
+  timeoutMs: number,
+  bound: boolean,
+): SharedStartFailedError {
+  const what = bound
+    ? "bound its control socket and then exited: process-compose exits once nothing runs, " +
+      "so every shared service it started most likely exited at once"
+    : `did not bind its control socket within ${timeoutMs}ms — it most likely crashed on startup`;
+  return new SharedStartFailedError(
+    `devtrees up: the shared instance was spawned but ${what}. ` +
       `Check the shared services' commands (e.g. run ` +
-      `\`process-compose -f ${configPath}\` by hand) and retry \`devtrees up\`.`,
-    { socket_path: socketPath, config_path: configPath, timeout_ms: timeoutMs },
+      `\`process-compose -f ${paths.configPath}\` by hand) and retry \`devtrees up\`.`,
+    { socket_path: paths.socketPath, config_path: paths.configPath, timeout_ms: timeoutMs },
   );
 }
 
