@@ -6836,14 +6836,14 @@ describe("runDown after process-compose stops (#155)", () => {
 
   /**
    * A live instance of `declared` on the in-memory process-compose, booted
-   * with `namespaces` (default: all), every reap recorded. Tests make things
-   * happen to its processes (`pc.exit`) before the `down`.
+   * with `namespaces` (when omitted, `up` selects only `default`), every reap
+   * recorded. Tests make things happen to its processes (`pc.exit`) before the
+   * `down`.
    */
   async function pcInstance(declared: ResolvedStack = stack, namespaces?: string[]) {
     const onPc = onInMemoryPc(stubDeps({ stack: declared }));
     const { pc } = onPc;
-    const base = namespaces === undefined ? onPc.deps : { ...onPc.deps, namespaces };
-    const up = await runUp(base);
+    const up = await runUp(onPc.deps, namespaces === undefined ? {} : { namespaces });
     const socket = socketsOf(onPc.deps).worktree;
     const reaped: string[][] = [];
     const reap: CommandEnv["reap"] = async (config) => {
@@ -6851,7 +6851,7 @@ describe("runDown after process-compose stops (#155)", () => {
       return { ranCount: Object.keys(config.processes).length, failures: [] };
     };
     const port = (name: string): number => Number(up.env[name]);
-    return { deps: { ...base, reap }, pc, socket, reaped, port };
+    return { deps: { ...onPc.deps, reap }, pc, socket, reaped, port };
   }
 
   it("runs the shutdown hook of a daemon whose launch had failed, and only that one", async () => {
