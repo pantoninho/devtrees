@@ -12,7 +12,9 @@
  *  3. read the on-disk derived config;
  *  4. read the status rows within a time budget (#205, #226);
  *  5. refuse while a hot-reload is still pending (#191, #222);
- *  6. work out which selected services were never booted (ADR-0008, #170).
+ *  6. work out which selected services were never booted (ADR-0008, #170):
+ *     `planUp` for `up`; a per-service verb checks its targets with the pure
+ *     `assertNamedTargetsBooted` (src/selection.ts) against the rows read here.
  *
  * The handle then offers what the commands do to a live instance: start the
  * dead services in `depends_on` order (ADR-0008, #178, #240) and the bounded
@@ -33,7 +35,7 @@ import { boundedRestart, type RestartOutcome } from "./bounded-restart.js";
 import { boundedStopServices } from "./bounded-stop.js";
 import type { DerivedConfig } from "./deriver.js";
 import { unsignalledServices } from "./down-survivors.js";
-import type { Driver, InstanceRef, ServiceStatus } from "./driver.js";
+import type { Driver, ServiceStatus } from "./driver.js";
 import {
   isGone,
   readStatusesWithin,
@@ -52,15 +54,12 @@ import {
 import { SHARED_INSTANCE_ID, instancePaths, sharedInstancePaths } from "./paths.js";
 import { readPendingReload, stuckFromMarker, type StuckReload } from "./reload-pending.js";
 import {
-  assertNamedTargetsBooted,
   formatUpCommand,
   provenNamespaces,
   selectRunningUp,
   serviceNamespaces,
   type DroppedNamespaceEdge,
   type DerivedProcesses,
-  type NamedRequest,
-  type NamedSelection,
   type NamedServiceCommand,
 } from "./selection.js";
 import { dependencyOrder, findDeadServices } from "./service-state.js";
@@ -160,8 +159,6 @@ export interface LiveInstance {
   readonly id: string;
   readonly socketPath: string;
   readonly configPath: string;
-  /** The control socket and derived config, as the Driver takes them. */
-  readonly ref: InstanceRef;
   /** The on-disk derived config's `processes`; `undefined` when unreadable. */
   processes(): DerivedProcesses | undefined;
   /**
@@ -187,12 +184,6 @@ export interface LiveInstance {
     rows: ReadonlyArray<ServiceStatus>,
     requested: ReadonlyArray<string> | undefined,
   ): RunningPlan;
-  /** A per-service verb's targets must be booted (`NAMESPACE_NOT_RUNNING`, #224). */
-  assertNamedBooted(
-    request: Pick<NamedRequest, "worktreeId" | "command" | "declared">,
-    selection: NamedSelection,
-    rows: ReadonlyArray<ServiceStatus>,
-  ): void;
   /**
    * Start the dead services among `names` in `depends_on` order (ADR-0008).
    * Every one is attempted; a refusal fails with the adapter's error. Returns
@@ -286,13 +277,11 @@ async function open(
   const liveness: LivenessContext = { ...context, instance: adapter.id };
   const live = await socketIsLive(socketPath, seams.liveness, liveness, options);
   if (!live) return undefined;
-  const ref = { configPath, socketPath };
   const { driver } = seams;
   return {
     id: adapter.id,
     socketPath,
     configPath,
-    ref,
     processes: () =>
       derivedProcesses(existsSync(configPath) ? readFileSync(configPath, "utf8") : undefined),
     rows: (budgetMs, rowsOptions = {}) =>
@@ -305,8 +294,6 @@ async function open(
     assertNoPendingReload: (check) =>
       adapter.pendingReload ? assertNoPendingReload(adapter.anchor, adapter.id, check) : false,
     planUp: (stack, rows, requested) => planRunningInstance(stack, adapter.id, rows, requested),
-    assertNamedBooted: (request, selection, rows) =>
-      assertNamedTargetsBooted(request, selection, rows),
     restartDead: (request) => restartDead(adapter, driver, request),
     restart: (service, request) =>
       boundedRestart(

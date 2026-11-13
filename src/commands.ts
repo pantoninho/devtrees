@@ -136,6 +136,7 @@ import {
 } from "./health.js";
 import {
   assertExplicitSelectionNotEmpty,
+  assertNamedTargetsBooted,
   bootedNamespaces,
   declaredServices,
   formatUpCommand,
@@ -3476,7 +3477,7 @@ async function resolveNamedServices(
     command,
     retry,
   });
-  own.assertNamedBooted(request, selection, rows);
+  assertNamedTargetsBooted(request, selection, rows);
   return {
     anchor: { anchor: anchor.anchor, worktreeId: anchor.worktreeId },
     instance: own,
