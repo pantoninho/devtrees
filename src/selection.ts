@@ -336,7 +336,7 @@ export type NamedServiceCommand = "restart";
  * lists the namespaces the stack declares so an agent can retry with `-n`
  * without a second round-trip; `selected_namespaces` is what was asked for.
  */
-export class NoServicesSelectedError extends Error {
+class NoServicesSelectedError extends Error {
   readonly code = "NO_SERVICES_SELECTED" as const;
   readonly details: {
     readonly worktree_id: string;
@@ -381,7 +381,7 @@ export class NoServicesSelectedError extends Error {
  * the only honest answer is to fail, name what is missing, and say how to
  * boot with it. Nothing is started or stopped; the instance keeps running.
  */
-export class NamespaceNotRunningError extends Error {
+class NamespaceNotRunningError extends Error {
   readonly code = "NAMESPACE_NOT_RUNNING" as const;
   constructor(
     message: string,
@@ -397,7 +397,7 @@ export class NamespaceNotRunningError extends Error {
   }
 }
 
-export function namespaceNotRunningError(
+function namespaceNotRunningError(
   worktreeId: string,
   notRunning: ReadonlyArray<NamespaceNotRunning>,
   requested: ReadonlyArray<string>,
@@ -431,7 +431,7 @@ export function namespaceNotRunningError(
  * `details.remedy` is the repo-wide way to bounce it, which affects every
  * worktree.
  */
-export class SharedServiceRefusedError extends Error {
+class SharedServiceRefusedError extends Error {
   readonly code = "SHARED_SERVICE_REFUSED" as const;
   constructor(
     message: string,

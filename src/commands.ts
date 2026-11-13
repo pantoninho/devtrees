@@ -1929,7 +1929,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     // survives a later HEALTH_TIMEOUT. The running path warns in
     // `verifyRunning`, against the selection it reads back.
     const nsEdges = freshSelection.droppedNamespaceEdges;
-    for (const edge of nsEdges) warn(formatDroppedNamespaceEdgeWarning(edge));
+    warnDroppedNamespaceEdges(nsEdges, warn);
 
     // The run dir now lives outside the git dir (issue #156), so the anchor
     // state dir the derived config goes in has to be created on its own —
@@ -6356,7 +6356,7 @@ async function verifyRunning(args: {
   );
   const selection = planRunningInstance(stack, anchor.worktreeId, rows, deps.namespaces);
   const nsEdges = selection.droppedNamespaceEdges;
-  for (const edge of nsEdges) args.warn(formatDroppedNamespaceEdgeWarning(edge));
+  warnDroppedNamespaceEdges(nsEdges, args.warn);
 
   const remedy = `devtrees down && ${formatUpCommand(stack.services, selection.namespaces)}`;
   const { restarted, firstRead } = await restartDeadServices({
@@ -6547,6 +6547,14 @@ function serviceStartFailedError(
       `stack. Nothing was stopped; the worktree instance is still running.`,
     { worktree_id: worktreeId, services: failed, remedy },
   );
+}
+
+/** One stderr line per `depends_on` edge the selection drops (ADR-0008, #179). */
+function warnDroppedNamespaceEdges(
+  edges: ReadonlyArray<DroppedNamespaceEdge>,
+  warn: (message: string) => void,
+): void {
+  for (const edge of edges) warn(formatDroppedNamespaceEdgeWarning(edge));
 }
 
 /** One stderr line per braced injected variable (#200). */
