@@ -1,10 +1,10 @@
 /**
  * Single-source-of-truth pins for the coding-agent onboarding block (#118).
  *
- * The README "Using devtrees from a coding agent" section and the
+ * docs/coding-agents.md ("Using devtrees from a coding agent") and the
  * `devtrees init --agents` generator must emit the SAME text — otherwise the
- * pasted-by-hand README block and the generated one drift, which is exactly the
- * failure issue #118 set out to kill. This suite pins the README's fenced block
+ * pasted-by-hand doc block and the generated one drift, which is exactly the
+ * failure issue #118 set out to kill. This suite pins the doc's fenced block
  * to `ONBOARDING_BLOCK` so editing one without the other fails CI, and exercises
  * the pure fence-upsert surface `runInit` builds on.
  */
@@ -19,28 +19,28 @@ import {
   upsertBlock,
 } from "./onboarding.js";
 
-const README = fileURLToPath(new URL("../README.md", import.meta.url));
+const AGENTS_DOC = fileURLToPath(new URL("../docs/coding-agents.md", import.meta.url));
 
 /**
  * Pull the body of the first ````markdown … ```` fenced code block out of the
- * README. The onboarding section quotes the canonical block inside such a fence;
+ * agents doc. It quotes the canonical block inside such a fence;
  * we compare its body, not the surrounding prose, to `ONBOARDING_BLOCK`.
  */
-function readmeOnboardingBlock(): string {
-  const readme = readFileSync(README, "utf8");
+function docOnboardingBlock(): string {
+  const doc = readFileSync(AGENTS_DOC, "utf8");
   const open = "````markdown\n";
-  const startIdx = readme.indexOf(open);
-  if (startIdx === -1) throw new Error("README: no ````markdown fenced block found");
+  const startIdx = doc.indexOf(open);
+  if (startIdx === -1) throw new Error("docs/coding-agents.md: no ````markdown fenced block found");
   const bodyStart = startIdx + open.length;
-  const closeIdx = readme.indexOf("\n````", bodyStart);
-  if (closeIdx === -1) throw new Error("README: unterminated ````markdown fence");
+  const closeIdx = doc.indexOf("\n````", bodyStart);
+  if (closeIdx === -1) throw new Error("docs/coding-agents.md: unterminated ````markdown fence");
   // Body is everything up to and including the newline before the closing fence.
-  return readme.slice(bodyStart, closeIdx + 1);
+  return doc.slice(bodyStart, closeIdx + 1);
 }
 
 describe("onboarding single source of truth", () => {
-  it("README quotes ONBOARDING_BLOCK verbatim (no drift)", () => {
-    expect(readmeOnboardingBlock()).toBe(ONBOARDING_BLOCK);
+  it("docs/coding-agents.md quotes ONBOARDING_BLOCK verbatim (no drift)", () => {
+    expect(docOnboardingBlock()).toBe(ONBOARDING_BLOCK);
   });
 
   it("the canonical block ends with a single trailing newline", () => {

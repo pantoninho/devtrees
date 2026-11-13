@@ -23,7 +23,7 @@
  *     a `normaliseEnvelope` pass that zeroes allocation-dependent fields
  *     (ports, block_base, worktree_id) so the goldens are stable across
  *     runs and OSs. To regenerate after an intentional envelope change,
- *     read README "Smoke testing against real process-compose".
+ *     read docs/development.md "Smoke testing against real process-compose".
  */
 import { afterEach, beforeAll, describe, expect, it } from "vite-plus/test";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
