@@ -1,11 +1,12 @@
 /**
- * `runSharedNamespaceDown` orchestration (#239, ADR-0012): `down --shared
- * -n` stops and removes only the named namespaces' shared services, under
- * the shared lock, refuses while something depends on them, and turns into a
- * full shared teardown when nothing else would be left running.
- * process-compose is the in-memory adapter (src/in-memory-driver.ts); the
- * other collaborators are stubs. The real-binary behaviour is in the smoke
- * suite (scenarios 124-126).
+ * The shared instance module's namespaced teardown (#239, ADR-0012; moved
+ * into the module by #258), at its interface: `downNamespaces` (`down
+ * --shared -n`) stops and removes only the named namespaces' shared
+ * services, under the shared lock, refuses while something depends on them,
+ * and turns into a full shared teardown when nothing else would be left
+ * running; `previewDownNamespaces` is its dry run. process-compose is the
+ * in-memory adapter (src/in-memory-driver.ts); the other collaborators are
+ * stubs. The real-binary behaviour is in the smoke suite (scenarios 124-126).
  */
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -13,11 +14,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { deriveWorktreeId } from "./anchor.js";
-import {
-  runSharedNamespaceDown,
-  runSharedNamespaceDownDryRun,
-  type CommandDeps,
-} from "./commands.js";
 import { DEVTREES_METADATA_KEY } from "./deriver.js";
 import { createInMemoryProcessCompose } from "./in-memory-driver.js";
 import type { InstanceInfo } from "./instances.js";
@@ -25,8 +21,21 @@ import { classifyError } from "./output.js";
 import { instancePaths, runDir, sharedInstancePaths } from "./paths.js";
 import { sharedStepMarkerFile, withLifecycleLock, writeSharedStepMarker } from "./registry.js";
 import { writePendingReload } from "./reload-pending.js";
+import {
+  openSharedInstance,
+  type SharedInstanceDeps,
+  type SharedNamespaceDownOptions,
+} from "./shared-instance.js";
 import { readSharedState, writeSharedState } from "./shared-state.js";
 import type { ResolvedService, ResolvedStack } from "./stack.js";
+
+/** `down --shared -n` through the shared instance the deps open. */
+const downNamespaces = (deps: SharedInstanceDeps, options: SharedNamespaceDownOptions) =>
+  openSharedInstance(deps).downNamespaces(options);
+
+/** `down --shared -n --dry-run` through the shared instance the deps open. */
+const previewDownNamespaces = (deps: SharedInstanceDeps, options: SharedNamespaceDownOptions) =>
+  openSharedInstance(deps).previewDownNamespaces(options);
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
@@ -178,17 +187,14 @@ async function sharedInstance(opts: Opts = {}) {
       servicesRead: "ok",
     };
   });
-  const deps: CommandDeps = {
-    cwd: top,
-    git: (args) => {
-      if (args[1] === "--git-common-dir") return anchor;
-      if (args[1] === "--show-toplevel") return top;
-      return "false";
-    },
+  const deps: SharedInstanceDeps = {
+    anchor,
     readStack: () => opts.stack ?? { services: [] },
-    processCompose: pc.driver,
+    driver: pc.driver,
+    liveness: { probe: (socketPath) => pc.probeSocket(socketPath), retryDelaysMs: [] },
     probeSocket: (socketPath) => pc.probeSocket(socketPath),
-    probeRetryDelaysMs: [],
+    waitTimeoutMs: 2_000,
+    previewReadTimeoutMs: 2_000,
     discover: async () => [
       ...worktrees,
       {
@@ -204,7 +210,7 @@ async function sharedInstance(opts: Opts = {}) {
       },
     ],
     lifecycleWaitMs: 50,
-    withSharedLock: async (_anchor, fn) => {
+    sharedLock: async (_anchor, fn) => {
       log.push("lock");
       try {
         return await fn();
@@ -242,10 +248,10 @@ async function failure(p: Promise<unknown>) {
   throw new Error("expected it to fail");
 }
 
-describe("runSharedNamespaceDown (#239)", () => {
+describe("SharedInstance.downNamespaces: down --shared -n (#239)", () => {
   it("stops and removes only the named namespace's shared services, under the shared lock", async () => {
     const s = await sharedInstance();
-    const result = await runSharedNamespaceDown(s.deps, { namespaces: ["a"] });
+    const result = await downNamespaces(s.deps, { namespaces: ["a"] });
     expect(result).toMatchObject({
       shared: true,
       stopped: true,
@@ -264,7 +270,7 @@ describe("runSharedNamespaceDown (#239)", () => {
 
   it("drops the removed services' revision records and bound ports", async () => {
     const s = await sharedInstance();
-    await runSharedNamespaceDown(s.deps, { namespaces: ["a"] });
+    await downNamespaces(s.deps, { namespaces: ["a"] });
     const after = readSharedState(s.anchor);
     expect(Object.keys(after?.services ?? {})).toEqual(["pg", "sb"]);
     expect(Object.keys(after?.extended ?? {})).toEqual(["pg", "sb"]);
@@ -274,20 +280,20 @@ describe("runSharedNamespaceDown (#239)", () => {
 
   it("is a no-op, listing the namespace as inactive, when no shared service of it runs", async () => {
     const s = await sharedInstance();
-    const result = await runSharedNamespaceDown(s.deps, { namespaces: ["nope"] });
+    const result = await downNamespaces(s.deps, { namespaces: ["nope"] });
     expect(result).toMatchObject({ stopped: false, services: [], inactiveNamespaces: ["nope"] });
     expect(s.log).toEqual(["lock", "unlock"]);
   });
 
   it("names an inactive namespace beside an active one, and stops the active one", async () => {
     const s = await sharedInstance();
-    const result = await runSharedNamespaceDown(s.deps, { namespaces: ["b", "nope"] });
+    const result = await downNamespaces(s.deps, { namespaces: ["b", "nope"] });
     expect(result).toMatchObject({ stopped: true, services: ["sb"], inactiveNamespaces: ["nope"] });
   });
 
   it("is a no-op when the shared instance is not running", async () => {
     const s = await sharedInstance({ live: false });
-    const result = await runSharedNamespaceDown(s.deps, { namespaces: ["a"] });
+    const result = await downNamespaces(s.deps, { namespaces: ["a"] });
     expect(result).toMatchObject({ stopped: false, services: [], inactiveNamespaces: ["a"] });
     expect(s.log).toEqual(["lock", "unlock"]);
   });
@@ -296,7 +302,7 @@ describe("runSharedNamespaceDown (#239)", () => {
     const s = await sharedInstance({
       worktrees: [{ id: "login-1", sharedDependsOn: { worker: ["sa", "pg"] } }],
     });
-    const err = await failure(runSharedNamespaceDown(s.deps, { namespaces: ["a"] }));
+    const err = await failure(downNamespaces(s.deps, { namespaces: ["a"] }));
     expect(err.code).toBe("SHARED_IN_USE");
     expect(err.details).toMatchObject({
       namespaces: ["a"],
@@ -316,7 +322,7 @@ describe("runSharedNamespaceDown (#239)", () => {
     const s = await sharedInstance({
       worktrees: [{ id: "login-1", booted: ["web"], sharedDependsOn: { worker: ["sa"] } }],
     });
-    const result = await runSharedNamespaceDown(s.deps, { namespaces: ["a"] });
+    const result = await downNamespaces(s.deps, { namespaces: ["a"] });
     expect(result.stopped).toBe(true);
   });
 
@@ -328,7 +334,7 @@ describe("runSharedNamespaceDown (#239)", () => {
       services: ["worker"],
       oldRuns: [{ name: "worker", pid: process.pid }],
     });
-    const err = await failure(runSharedNamespaceDown(s.deps, { namespaces: ["a"] }));
+    const err = await failure(downNamespaces(s.deps, { namespaces: ["a"] }));
     expect(err.code).toBe("SHARED_IN_USE");
     expect(err.details?.dependants).toEqual([
       { instance: "login-1", service: "worker", depends_on: ["sa"], source: "derived_config" },
@@ -339,7 +345,7 @@ describe("runSharedNamespaceDown (#239)", () => {
     const s = await sharedInstance();
     const id = deriveWorktreeId("/x/billing");
     writeFileSync(join(s.anchor, "devtrees", `${id}.lock`), `${process.pid}\n`);
-    const err = await failure(runSharedNamespaceDown(s.deps, { namespaces: ["a"] }));
+    const err = await failure(downNamespaces(s.deps, { namespaces: ["a"] }));
     expect(err.code).toBe("SHARED_IN_USE");
     expect(err.details).toMatchObject({
       dependants: [
@@ -352,9 +358,7 @@ describe("runSharedNamespaceDown (#239)", () => {
     expect(err.message).toContain(`${id}.lock`);
     expect(s.log.filter((l) => l.startsWith("process"))).toEqual([]);
     // --force does not override an in-flight command, and its retry drops --force.
-    const forced = await failure(
-      runSharedNamespaceDown(s.deps, { namespaces: ["a"], force: true }),
-    );
+    const forced = await failure(downNamespaces(s.deps, { namespaces: ["a"], force: true }));
     expect(forced.code).toBe("SHARED_IN_USE");
     expect(forced.details?.remedy).toBe("devtrees down --shared -n a");
   });
@@ -364,7 +368,7 @@ describe("runSharedNamespaceDown (#239)", () => {
     const lock = join(s.anchor, "devtrees", `${deriveWorktreeId("/x/billing")}.lock`);
     writeFileSync(lock, `${process.pid}\n`);
     setTimeout(() => rmSync(lock, { force: true }), 150);
-    const result = await runSharedNamespaceDown(
+    const result = await downNamespaces(
       { ...s.deps, lifecycleWaitMs: 5000 },
       { namespaces: ["a"] },
     );
@@ -381,10 +385,7 @@ describe("runSharedNamespaceDown (#239)", () => {
       const s = await sharedInstance();
       const result = await withLifecycleLock(s.anchor, id, async () => {
         writeSharedStepMarker(s.anchor, id, { services: ["pg", "sb"], ports: [] });
-        return await runSharedNamespaceDown(
-          { ...s.deps, lifecycleWaitMs: 5000 },
-          { namespaces: ["a"] },
-        );
+        return await downNamespaces({ ...s.deps, lifecycleWaitMs: 5000 }, { namespaces: ["a"] });
       });
       expect(result).toMatchObject({ stopped: true, services: ["sa"], dependants: [] });
       // One attempt: no release-and-wait.
@@ -395,7 +396,7 @@ describe("runSharedNamespaceDown (#239)", () => {
       const s = await sharedInstance();
       const result = await withLifecycleLock(s.anchor, id, async () => {
         writeSharedStepMarker(s.anchor, id, { services: [] });
-        return await runSharedNamespaceDown(s.deps, { namespaces: ["a"] });
+        return await downNamespaces(s.deps, { namespaces: ["a"] });
       });
       expect(result).toMatchObject({ stopped: true, services: ["sa"] });
     });
@@ -404,7 +405,7 @@ describe("runSharedNamespaceDown (#239)", () => {
       const s = await sharedInstance();
       const err = await withLifecycleLock(s.anchor, id, async () => {
         writeSharedStepMarker(s.anchor, id, { services: ["pg", "sa"], ports: [] });
-        return await failure(runSharedNamespaceDown(s.deps, { namespaces: ["a"] }));
+        return await failure(downNamespaces(s.deps, { namespaces: ["a"] }));
       });
       expect(err.code).toBe("SHARED_IN_USE");
       expect(err.details).toMatchObject({
@@ -426,7 +427,7 @@ describe("runSharedNamespaceDown (#239)", () => {
       // The `up` reaches its shared step (no target selected) while the
       // teardown waits outside the shared lock; its lock stays held.
       setTimeout(() => writeSharedStepMarker(s.anchor, id, { services: ["sb"], ports: [] }), 150);
-      const result = await runSharedNamespaceDown(
+      const result = await downNamespaces(
         { ...s.deps, lifecycleWaitMs: 20_000 },
         { namespaces: ["a"] },
       );
@@ -446,7 +447,7 @@ describe("runSharedNamespaceDown (#239)", () => {
       );
       const orphan = sharedStepMarkerFile(s.anchor, "gone-0a1b2c3d");
       writeFileSync(orphan, JSON.stringify({ version: 1, pid: 1, lock_ino: 1, services: [] }));
-      const err = await failure(runSharedNamespaceDown(s.deps, { namespaces: ["a"] }));
+      const err = await failure(downNamespaces(s.deps, { namespaces: ["a"] }));
       expect(err.details?.dependants).toEqual([
         { instance: id, service: null, depends_on: [], source: "lifecycle_in_progress" },
       ]);
@@ -460,7 +461,7 @@ describe("runSharedNamespaceDown (#239)", () => {
       writeFileSync(orphan, JSON.stringify({ version: 1, pid: 1, lock_ino: 1, services: [] }));
       const preview = await withLifecycleLock(s.anchor, id, async () => {
         writeSharedStepMarker(s.anchor, id, { services: ["sb"], ports: [] });
-        return await runSharedNamespaceDownDryRun(s.deps, { namespaces: ["a"] });
+        return await previewDownNamespaces(s.deps, { namespaces: ["a"] });
       });
       expect(preview).toMatchObject({ blocked: false, dependants: [] });
       expect(existsSync(orphan)).toBe(true);
@@ -481,7 +482,7 @@ describe("runSharedNamespaceDown (#239)", () => {
     );
     const started = Date.now();
     const err = await failure(
-      runSharedNamespaceDown({ ...s.deps, lifecycleWaitMs: 5000 }, { namespaces: ["a"] }),
+      downNamespaces({ ...s.deps, lifecycleWaitMs: 5000 }, { namespaces: ["a"] }),
     );
     expect(Date.now() - started).toBeLessThan(2000);
     expect(err.code).toBe("SHARED_IN_USE");
@@ -496,7 +497,7 @@ describe("runSharedNamespaceDown (#239)", () => {
     for (const name of ["registry.lock", "shared.lock", "hashes.lock"]) {
       writeFileSync(join(dir, name), `${process.pid}\n`);
     }
-    const result = await runSharedNamespaceDown(s.deps, { namespaces: ["a"] });
+    const result = await downNamespaces(s.deps, { namespaces: ["a"] });
     expect(result).toMatchObject({ stopped: true, services: ["sa"], dependants: [] });
   });
 
@@ -505,7 +506,7 @@ describe("runSharedNamespaceDown (#239)", () => {
       worktrees: [{ id: "login-1aaaaaaa", sharedDependsOn: { worker: ["sa"] } }],
     });
     writeFileSync(join(s.anchor, "devtrees", "login-1aaaaaaa.lock"), `${process.pid}\n`);
-    const err = await failure(runSharedNamespaceDown(s.deps, { namespaces: ["a"] }));
+    const err = await failure(downNamespaces(s.deps, { namespaces: ["a"] }));
     expect(err.details?.dependants).toEqual([
       {
         instance: "login-1aaaaaaa",
@@ -527,7 +528,7 @@ describe("runSharedNamespaceDown (#239)", () => {
     const s = await sharedInstance({
       worktrees: [{ id: "w", sharedDependsOn: { worker: ["sa"] } }],
     });
-    const err = await failure(runSharedNamespaceDown(s.deps, { namespaces: ["a"] }));
+    const err = await failure(downNamespaces(s.deps, { namespaces: ["a"] }));
     expect(err.details).toMatchObject({
       forceable: true,
       remedy: "devtrees down --shared -n a --force",
@@ -536,7 +537,7 @@ describe("runSharedNamespaceDown (#239)", () => {
 
   it("removing only already-stopped services reports stopped: false, and lists them as removed", async () => {
     const s = await sharedInstance({ exited: { sa: -1 } });
-    const result = await runSharedNamespaceDown(s.deps, { namespaces: ["a"] });
+    const result = await downNamespaces(s.deps, { namespaces: ["a"] });
     expect(result).toMatchObject({ stopped: false, services: ["sa"], removed: ["sa"] });
     expect(s.rows().map((r) => r.name)).toEqual(["pg", "sb"]);
     expect(s.log).toEqual(["lock", "reload", "unlock"]);
@@ -550,7 +551,7 @@ describe("runSharedNamespaceDown (#239)", () => {
       exited: { sa: -1 },
     });
     expect(s.rows().map((r) => r.name)).toEqual(["pg", "sa", "sb"]);
-    const result = await runSharedNamespaceDown(s.deps, { namespaces: ["a"] });
+    const result = await downNamespaces(s.deps, { namespaces: ["a"] });
     expect(result).toMatchObject({ stopped: false, services: [], removed: ["sa"] });
     expect(s.rows().map((r) => r.name)).toEqual(["pg", "sb"]);
   });
@@ -559,7 +560,7 @@ describe("runSharedNamespaceDown (#239)", () => {
     const s = await sharedInstance({
       worktrees: [{ id: "login-1", sharedDependsOn: { worker: ["sa"] } }],
     });
-    const result = await runSharedNamespaceDown(s.deps, { namespaces: ["a"], force: true });
+    const result = await downNamespaces(s.deps, { namespaces: ["a"], force: true });
     expect(result).toMatchObject({
       stopped: true,
       services: ["sa"],
@@ -573,7 +574,7 @@ describe("runSharedNamespaceDown (#239)", () => {
       worktrees: [{ id: "login-1" }],
       stack: { services: [svc("sa", "shared"), svc("worker", "isolated", ["sa"])] },
     });
-    const err = await failure(runSharedNamespaceDown(s.deps, { namespaces: ["a"] }));
+    const err = await failure(downNamespaces(s.deps, { namespaces: ["a"] }));
     expect(err.code).toBe("SHARED_IN_USE");
     expect(err.details?.dependants).toEqual([
       { instance: "login-1", service: "worker", depends_on: ["sa"], source: "devtrees_yaml" },
@@ -582,13 +583,13 @@ describe("runSharedNamespaceDown (#239)", () => {
 
   it("counts a worktree whose dependencies cannot be read as a dependant", async () => {
     const s = await sharedInstance({ worktrees: [{ id: "login-1" }] });
-    const deps: CommandDeps = {
+    const deps: SharedInstanceDeps = {
       ...s.deps,
       readStack: () => {
         throw new Error("devtrees.yaml is gone");
       },
     };
-    const err = await failure(runSharedNamespaceDown(deps, { namespaces: ["a"] }));
+    const err = await failure(downNamespaces(deps, { namespaces: ["a"] }));
     expect(err.code).toBe("SHARED_IN_USE");
     expect(err.details?.dependants).toEqual([
       { instance: "login-1", service: null, depends_on: [], source: "unknown" },
@@ -603,7 +604,7 @@ describe("runSharedNamespaceDown (#239)", () => {
         sb: proc({ namespace: "b", depends_on: { sa: { condition: "process_started" } } }),
       },
     });
-    const err = await failure(runSharedNamespaceDown(s.deps, { namespaces: ["a"], force: true }));
+    const err = await failure(downNamespaces(s.deps, { namespaces: ["a"], force: true }));
     expect(err.code).toBe("SHARED_IN_USE");
     expect(err.details).toMatchObject({
       dependants: [{ instance: "shared", service: "sb", depends_on: ["sa"] }],
@@ -615,7 +616,7 @@ describe("runSharedNamespaceDown (#239)", () => {
 
   it("stops the whole shared instance when nothing else would be left running", async () => {
     const s = await sharedInstance({ exited: { pg: 0 } });
-    const result = await runSharedNamespaceDown(s.deps, { namespaces: ["a", "b"] });
+    const result = await downNamespaces(s.deps, { namespaces: ["a", "b"] });
     expect(result).toMatchObject({ stopped: true, services: ["sa", "sb"], instanceStopped: true });
     expect(s.log).toContain("down");
     expect(s.pc.isUp(s.paths.socketPath)).toBe(false);
@@ -626,7 +627,7 @@ describe("runSharedNamespaceDown (#239)", () => {
 
   it("a refused reload fails SHARED_REMOVAL_FAILED, restores the config and keeps the records", async () => {
     const s = await sharedInstance({ rejectReload: true });
-    const err = await failure(runSharedNamespaceDown(s.deps, { namespaces: ["a"] }));
+    const err = await failure(downNamespaces(s.deps, { namespaces: ["a"] }));
     expect(err.code).toBe("SHARED_REMOVAL_FAILED");
     expect(err.details).toMatchObject({
       services: ["sa"],
@@ -645,7 +646,7 @@ describe("runSharedNamespaceDown (#239)", () => {
 
   it("a refused stop fails SHARED_REMOVAL_FAILED with nothing removed", async () => {
     const s = await sharedInstance({ refuseStop: "FTL failed to stop process sa" });
-    const err = await failure(runSharedNamespaceDown(s.deps, { namespaces: ["a"] }));
+    const err = await failure(downNamespaces(s.deps, { namespaces: ["a"] }));
     expect(err.code).toBe("SHARED_REMOVAL_FAILED");
     expect(err.details).toMatchObject({ reason: "stop_refused", services: ["sa"] });
     expect(s.log).not.toContain("reload");
@@ -654,12 +655,12 @@ describe("runSharedNamespaceDown (#239)", () => {
   });
 });
 
-describe("runSharedNamespaceDownDryRun (#239)", () => {
+describe("SharedInstance.previewDownNamespaces: down --shared -n --dry-run (#239)", () => {
   it("previews what would stop and what blocks it, with no lock, stop or reload", async () => {
     const s = await sharedInstance({
       worktrees: [{ id: deriveWorktreeId("/x/login"), sharedDependsOn: { worker: ["sa"] } }],
     });
-    const preview = await runSharedNamespaceDownDryRun(s.deps, { namespaces: ["a", "nope"] });
+    const preview = await previewDownNamespaces(s.deps, { namespaces: ["a", "nope"] });
     expect(preview).toMatchObject({
       namespaces: ["a", "nope"],
       running: true,
@@ -677,7 +678,7 @@ describe("runSharedNamespaceDownDryRun (#239)", () => {
     const s = await sharedInstance({
       worktrees: [{ id: "w", sharedDependsOn: { worker: ["sa"] } }],
     });
-    const preview = await runSharedNamespaceDownDryRun(s.deps, { namespaces: ["a"], force: true });
+    const preview = await previewDownNamespaces(s.deps, { namespaces: ["a"], force: true });
     expect(preview.blocked).toBe(false);
     expect(preview.dependants).toHaveLength(1);
   });
@@ -686,7 +687,7 @@ describe("runSharedNamespaceDownDryRun (#239)", () => {
     // A socket file with no server behind it: the probe reads it stale.
     const s = await sharedInstance({ live: false });
     writeFileSync(s.paths.socketPath, "");
-    const preview = await runSharedNamespaceDownDryRun(s.deps, { namespaces: ["a"] });
+    const preview = await previewDownNamespaces(s.deps, { namespaces: ["a"] });
     expect(preview).toMatchObject({ running: false, services: [], wouldStopInstance: false });
     expect(existsSync(s.paths.socketPath)).toBe(true);
   });
