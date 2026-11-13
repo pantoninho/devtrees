@@ -89,7 +89,6 @@ function setup() {
       }
     },
     liveness: { probe: (path) => pc.probeSocket(path), retryDelaysMs: [] },
-    readStatuses: (path, opts) => pc.driver.getServiceStatuses(path, opts),
     probeSocket: (path) => pc.probeSocket(path),
     warn: (message) => warnings.push(message),
     waitTimeoutMs: 2_000,
