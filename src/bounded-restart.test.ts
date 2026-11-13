@@ -247,18 +247,21 @@ describe("boundedRestart (#222)", () => {
   });
 
   // An idle service holds no process: it is simply started, never stopped (#263).
-  it.each(["Skipped", "Disabled"])("a %s service is simply started: no stop (#263)", async (state) => {
-    const w = world();
-    const idle: ServiceStatus = { name: "mobile", status: state, health: "unknown", pid: 201 };
-    const result = await boundedRestart(
-      { ...w.target, statuses: [idle, running("api", 202)] },
-      w.driver,
-      w.seams,
-    );
-    expect(result.ok).toBe(true);
-    expect(w.calls.filter((c) => c.startsWith("stop"))).toEqual([]);
-    expect(w.calls[0]).toMatch(/^start mobile/);
-  });
+  it.each(["Skipped", "Disabled"])(
+    "a %s service is simply started: no stop (#263)",
+    async (state) => {
+      const w = world();
+      const idle: ServiceStatus = { name: "mobile", status: state, health: "unknown", pid: 201 };
+      const result = await boundedRestart(
+        { ...w.target, statuses: [idle, running("api", 202)] },
+        w.driver,
+        w.seams,
+      );
+      expect(result.ok).toBe(true);
+      expect(w.calls.filter((c) => c.startsWith("stop"))).toEqual([]);
+      expect(w.calls[0]).toMatch(/^start mobile/);
+    },
+  );
 
   it("a start whose client timed out counts when the service now reads running", async () => {
     const w = world();

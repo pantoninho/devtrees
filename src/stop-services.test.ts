@@ -153,7 +153,9 @@ describe("assertNotSkipped (#263)", () => {
     }
     // The dependency is restarted earlier in the same request, and waited on.
     const dead = row("api", "Completed", 3, false);
-    expect(() => assertNotSkipped([dead, skipped], ["api", "web"], dependsOn, "login")).not.toThrow();
+    expect(() =>
+      assertNotSkipped([dead, skipped], ["api", "web"], dependsOn, "login"),
+    ).not.toThrow();
     // A Disabled service, and a Skipped one with no dependency row, are never refused.
     const disabled = row("web", "Disabled", 0, false);
     expect(() => assertNotSkipped([dead, disabled], ["web"], dependsOn, "login")).not.toThrow();
