@@ -92,7 +92,7 @@ import {
 } from "./port-probe.js";
 import { acceptsConnections, forwarderLabel, isPortForwarder } from "./port-connect.js";
 import {
-  InstanceUnresponsiveError,
+  instanceUnresponsiveError,
   SOCKET_WAIT_TIMEOUT_MS,
   pollForSocket,
   socketIsLive,
@@ -201,7 +201,12 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync
 import { dirname, join } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { TARGET_CANDIDATES, fencedBlock, upsertBlock } from "./onboarding.js";
-import { openSharedInstance, type SharedInstance, type WithSharedLock } from "./shared-instance.js";
+import {
+  openSharedInstance,
+  pick,
+  type SharedInstance,
+  type WithSharedLock,
+} from "./shared-instance.js";
 
 // The shared instance's contracts live in its module (#257); re-exported here
 // so `CommandDeps` callers keep a single import site.
@@ -376,16 +381,6 @@ class InstanceGoneError extends Error {
     );
     this.name = "InstanceGoneError";
   }
-}
-
-/** The entries of `record` whose key is in `keys`. */
-function pick<V>(record: Readonly<Record<string, V>>, keys: Iterable<string>): Record<string, V> {
-  const out: Record<string, V> = {};
-  for (const key of keys) {
-    const value = record[key];
-    if (value !== undefined) out[key] = value;
-  }
-  return out;
 }
 
 /** Type of the lock-guarded mutator the caller passes for testability. */
@@ -2579,7 +2574,7 @@ async function readSharedRowsOrFail(
     });
   } catch (err) {
     if ((err as { code?: unknown }).code !== "HEALTH_TIMEOUT") throw err;
-    throw new InstanceUnresponsiveError("down", {
+    throw instanceUnresponsiveError("down", {
       instance: SHARED_INSTANCE_ID,
       socket_path: socketPath,
       attempts: 1,
@@ -3252,7 +3247,7 @@ async function resolveRestartStep(
     if (code === "HEALTH_TIMEOUT") {
       const socketPath = instancePaths(anchor.anchor, anchor.worktreeId).socketPath;
       const retry = namedServicesInvocation("restart", names, namespaces);
-      throw new InstanceUnresponsiveError("restart", {
+      throw instanceUnresponsiveError("restart", {
         instance: anchor.worktreeId,
         socket_path: socketPath,
         attempts: 1,

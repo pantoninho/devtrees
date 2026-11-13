@@ -1309,8 +1309,15 @@ function recordSharedPorts(anchor: string, plan: SharedPortPlan): void {
   if (plan.changed) writeSharedPortMap(anchor, plan.map);
 }
 
-/** The entries of `record` whose key is in `keys`. */
-function pick<V>(record: Readonly<Record<string, V>>, keys: Iterable<string>): Record<string, V> {
+/**
+ * The entries of `record` whose key is in `keys`. Exported for the shared
+ * teardown and `prune --shared-ports`, which still live in the commands
+ * module until part 2 (#258).
+ */
+export function pick<V>(
+  record: Readonly<Record<string, V>>,
+  keys: Iterable<string>,
+): Record<string, V> {
   const out: Record<string, V> = {};
   for (const key of keys) {
     const value = record[key];

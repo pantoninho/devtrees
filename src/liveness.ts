@@ -20,7 +20,7 @@ import type { NamedServiceCommand } from "./selection.js";
  * kept and nothing is started or stopped. `details.instance` is the worktree
  * id, or `shared` for the shared instance.
  */
-export class InstanceUnresponsiveError extends Error {
+class InstanceUnresponsiveError extends Error {
   readonly code = "INSTANCE_UNRESPONSIVE" as const;
   constructor(
     command: string,
@@ -40,6 +40,14 @@ export class InstanceUnresponsiveError extends Error {
     );
     this.name = "InstanceUnresponsiveError";
   }
+}
+
+/** `INSTANCE_UNRESPONSIVE` for `command` (#186). */
+export function instanceUnresponsiveError(
+  command: string,
+  details: InstanceUnresponsiveError["details"],
+): InstanceUnresponsiveError {
+  return new InstanceUnresponsiveError(command, details);
 }
 
 /** A socket-liveness probe plus its retry backoff for `unknown` (#80, #186). */
@@ -87,7 +95,7 @@ export async function socketIsLive(
     if (opts.readOnly !== true) rmSync(socketPath, { force: true });
     return false;
   }
-  throw new InstanceUnresponsiveError(context.command, {
+  throw instanceUnresponsiveError(context.command, {
     instance: context.instance,
     socket_path: socketPath,
     attempts: liveness.retryDelaysMs.length + 1,
