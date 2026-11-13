@@ -471,7 +471,7 @@ type ConfigDriftDetails =
       readonly pids: ReadonlyArray<number>;
     };
 
-export class ConfigDriftError extends Error {
+class ConfigDriftError extends Error {
   readonly code = "CONFIG_DRIFT";
   readonly details: ConfigDriftDetails;
   constructor(message: string, details: ConfigDriftDetails) {
@@ -479,6 +479,11 @@ export class ConfigDriftError extends Error {
     this.name = "ConfigDriftError";
     this.details = details;
   }
+}
+
+/** `CONFIG_DRIFT` (see `ConfigDriftError`): a reload refused, timed out, or still pending. */
+export function configDriftError(message: string, details: ConfigDriftDetails): Error {
+  return new ConfigDriftError(message, details);
 }
 
 /**
@@ -581,7 +586,7 @@ function reloadPendingError(
  * stopped; the instance keeps running and `details.remedy` is the `down` +
  * `up` that restarts the whole stack.
  */
-export class ServiceStartFailedError extends Error {
+class ServiceStartFailedError extends Error {
   readonly code = "SERVICE_START_FAILED" as const;
   constructor(
     message: string,
@@ -594,6 +599,14 @@ export class ServiceStartFailedError extends Error {
     super(message);
     this.name = "ServiceStartFailedError";
   }
+}
+
+/** `SERVICE_START_FAILED` (see `ServiceStartFailedError`), with the caller's message. */
+export function serviceStartFailed(
+  message: string,
+  details: ServiceStartFailedError["details"],
+): Error {
+  return new ServiceStartFailedError(message, details);
 }
 
 function serviceStartFailedError(

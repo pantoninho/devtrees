@@ -87,8 +87,8 @@ import {
 import { acceptsConnections, forwarderLabel, isPortForwarder } from "./port-connect.js";
 import { SOCKET_WAIT_TIMEOUT_MS, pollForSocket, type LivenessProbe } from "./liveness.js";
 import {
-  ConfigDriftError,
-  ServiceStartFailedError,
+  configDriftError,
+  serviceStartFailed,
   derivedProcesses,
   openWorktreeInstance,
   type LiveInstance,
@@ -2564,7 +2564,7 @@ function restartFailedError(
   name: string,
   message: string,
   done: ReadonlyArray<string>,
-): ServiceStartFailedError {
+): Error {
   const worktreeId = target.anchor.worktreeId;
   // The refused service and the ones after it: those before it were restarted.
   const rest = target.services.filter((s) => !done.includes(s));
@@ -2573,7 +2573,7 @@ function restartFailedError(
     done.length > 0
       ? `${done.join(", ")} ${done.length === 1 ? "was" : "were"} restarted before it; the`
       : "The";
-  return new ServiceStartFailedError(
+  return serviceStartFailed(
     `devtrees restart: process-compose refused to restart '${name}' in '${worktreeId}': ` +
       `${message}. ${before} services after it were not touched, and the worktree ` +
       `instance is still running. Retry with \`${remedy}\`, or read why with ` +
@@ -3666,7 +3666,7 @@ async function applyReload(args: {
     // the new config, a restart if it was reverted meanwhile.
     args.writeHash(anchor.anchor, anchor.worktreeId, RELOAD_TIMED_OUT_HASH);
   }
-  throw new ConfigDriftError(
+  throw configDriftError(
     `devtrees up: config drift detected for '${anchor.worktreeId}' and the running ` +
       `process-compose could not hot-reload the new config` +
       (reload.message ? ` (${reload.message})` : "") +
