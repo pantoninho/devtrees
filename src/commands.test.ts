@@ -23,6 +23,8 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Readable } from "node:stream";
+import { isDeepStrictEqual } from "node:util";
+import type { SpawnOptions } from "node:child_process";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import {
   filterLogEventsSince,
@@ -53,6 +55,9 @@ import {
   parseServiceStatuses,
   type ControlRequest,
   type ControlRequester,
+  type Driver,
+  type InstanceRef,
+  type ReloadResult,
   type LogEvent,
   type ServiceStatus,
   type SpawnedProcess,
@@ -75,7 +80,12 @@ import {
 import { sharedServiceHash, sharedStackHash, stackHash } from "./hash.js";
 import { readSharedState } from "./shared-state.js";
 import { readSharedPortMap, sharedPortMapFile, writeSharedPortMap } from "./shared-ports.js";
-import { readPendingReload, writePendingReload, type PendingReload } from "./reload-pending.js";
+import {
+  clearPendingReload,
+  readPendingReload,
+  writePendingReload,
+  type PendingReload,
+} from "./reload-pending.js";
 import type { ResolvedService, ResolvedStack, ServiceDependency } from "./stack.js";
 
 const cleanups: Array<() => void> = [];
@@ -329,12 +339,109 @@ function stubDeps(opts: {
   };
 }
 
+/**
+ * `stubDeps` with process-compose as the in-memory adapter
+ * (src/in-memory-driver.ts) instead of an argv-parsing spawner: `up` boots a
+ * process table from the derived config, binds the control socket and
+ * answers `process list` from that table. Tests make things happen to its
+ * processes and assert on its state (`pc.isUp`, `pc.rows`), never on argv.
+ *
+ * Liveness is still read through `probeSocket` (default: the adapter's own,
+ * `running` only while a server holds the socket). Pass `pc` to share one
+ * process-compose between several worktrees of the same anchor.
+ */
+type PcDeps = StubbedDeps & {
+  readonly pc: InMemoryProcessCompose;
+  /** The git common dir the stubbed git resolves to. */
+  readonly anchor: string;
+  /** The worktree instance's config and socket paths. */
+  readonly inst: InstanceRef;
+  /** The shared instance's config and socket paths. */
+  readonly sharedInst: InstanceRef;
+};
+
+function pcDeps(
+  opts: Omit<Parameters<typeof stubDeps>[0], "track"> & {
+    pc?: InMemoryProcessCompose;
+    /**
+     * Runs right after process-compose boots an instance, before `up` sees
+     * it: e.g. a process exits at once (`pc.exit`), so the server exits and
+     * removes its socket when nothing else runs (ADR-0009).
+     */
+    onBoot?: (inst: InstanceRef, pc: InMemoryProcessCompose) => void;
+  },
+): PcDeps {
+  const pc = opts.pc ?? createInMemoryProcessCompose();
+  const { onBoot } = opts;
+  const {
+    driver: _argvDriver,
+    assertProcessComposeVersion: _versionStub,
+    ...base
+  } = stubDeps({ ...opts, probeSocket: opts.probeSocket ?? ((path) => pc.probeSocket(path)) });
+  const anchor = base.git!(["rev-parse", "--git-common-dir"]);
+  return {
+    ...base,
+    processCompose:
+      onBoot === undefined
+        ? pc.driver
+        : {
+            ...pc.driver,
+            async up(inst, namespaces) {
+              await pc.driver.up(inst, namespaces);
+              if (pc.isUp(inst.socketPath)) onBoot(inst, pc);
+            },
+          },
+    pc,
+    anchor,
+    inst: instancePaths(anchor, base.expectedWorktreeId),
+    sharedInst: sharedInstancePaths(anchor),
+  };
+}
+
+/** The `up` requests process-compose received on `socketPath`. */
+function upsOn(pc: InMemoryProcessCompose, socketPath: string): PcRequest[] {
+  return pc.requests.filter((r) => r.op === "up" && r.socketPath === socketPath);
+}
+
+/**
+ * An `onBoot` under which the instance on a socket `doomed` matches dies at
+ * once: every process it booted exits 1, so process-compose exits and
+ * removes its control socket before anyone can connect.
+ */
+function diesAtBoot(doomed: (socketPath: string) => boolean) {
+  return (inst: InstanceRef, pc: InMemoryProcessCompose): void => {
+    if (!doomed(inst.socketPath)) return;
+    for (const { name } of pc.rows(inst.socketPath)) pc.exit(inst.socketPath, name, 1);
+  };
+}
+
+const isSharedSocket = (socketPath: string) => socketPath.endsWith("/shared.sock");
+
+/**
+ * `pc`'s Driver, except that its config reload fails with `failure` and
+ * applies nothing. The in-memory adapter models a reload that lands; one
+ * process-compose refuses (no reload route, an HTTP error) or never finishes
+ * is this answer, the one the real driver maps those to (src/driver.test.ts
+ * pins that mapping).
+ */
+function reloadFailing(
+  pc: InMemoryProcessCompose,
+  failure: Extract<ReloadResult, { ok: false }>,
+): Driver {
+  return { ...pc.driver, reloadConfig: async () => failure };
+}
+
+/** Every `up` request process-compose received, on any socket. */
+function ups(pc: InMemoryProcessCompose): PcRequest[] {
+  return pc.requests.filter((r) => r.op === "up");
+}
+
 describe("runUp — port injection", () => {
   it("maps multiple named ports on one service to consecutive offsets within its block", async () => {
     const stack: ResolvedStack = {
       services: [isolated("web", "node server.js", ["WEB_PORT", "METRICS_PORT", "DEBUG_PORT"])],
     };
-    const result = await runUp(stubDeps({ stack }));
+    const result = await runUp(pcDeps({ stack }));
 
     const web = Number(result.env.WEB_PORT);
     expect(web).toBeGreaterThanOrEqual(20000);
@@ -349,7 +456,7 @@ describe("runUp — port injection", () => {
         isolated("worker", "node worker.js", ["WORKER_PORT"]),
       ],
     };
-    const result = await runUp(stubDeps({ stack }));
+    const result = await runUp(pcDeps({ stack }));
     const web = Number(result.env.WEB_PORT);
     const metrics = Number(result.env.METRICS_PORT);
     const worker = Number(result.env.WORKER_PORT);
@@ -365,25 +472,24 @@ describe("runUp — port injection", () => {
       allocator: { blockSize: 2 },
       services: [isolated("web", "node x.js", ["A_PORT", "B_PORT", "C_PORT"])],
     };
-    await expect(runUp(stubDeps({ stack }))).rejects.toThrow(/block_size is 2/);
+    await expect(runUp(pcDeps({ stack }))).rejects.toThrow(/block_size is 2/);
   });
 });
 
 describe("runUp — minimum process-compose version (#173)", () => {
   it("fails before allocating or spawning when the version probe rejects", async () => {
     const stack: ResolvedStack = { services: [isolated("web", "node server.js", ["WEB_PORT"])] };
-    const track: StubSpawn = { invocations: [], touchSocket: false };
-    let probed = 0;
-    const deps = {
-      ...stubDeps({ stack, track }),
-      assertProcessComposeVersion: async () => {
-        probed += 1;
-        throw Object.assign(new Error("too old"), { code: "PROCESS_COMPOSE_TOO_OLD" });
-      },
-    };
-    await expect(runUp(deps)).rejects.toMatchObject({ code: "PROCESS_COMPOSE_TOO_OLD" });
-    expect(probed).toBe(1);
-    expect(track.invocations).toEqual([]);
+    const registryRef = { snapshot: {} as RegistrySnapshot };
+    const pc = createInMemoryProcessCompose({ version: "v1.100.0" });
+    const deps = pcDeps({ stack, pc, registryRef });
+    await expect(runUp(deps)).rejects.toMatchObject({
+      code: "PROCESS_COMPOSE_TOO_OLD",
+      details: { installed_version: "1.100.0" },
+    });
+    // Nothing allocated, nothing started.
+    expect(registryRef.snapshot).toEqual({});
+    expect(ups(pc)).toEqual([]);
+    expect(pc.isUp(deps.inst.socketPath)).toBe(false);
   });
 });
 
@@ -393,7 +499,7 @@ describe("runUp — per-repo allocator config", () => {
       allocator: { portBase: 40000, blockSize: 8 },
       services: [isolated("web", "node x.js", ["WEB_PORT"])],
     };
-    const result = await runUp(stubDeps({ stack }));
+    const result = await runUp(pcDeps({ stack }));
     expect(Number(result.env.WEB_PORT)).toBeGreaterThanOrEqual(40000);
     // First block starts at port_base; offset 0 maps to the block base.
     expect((Number(result.env.WEB_PORT) - 40000) % 8).toBe(0);
@@ -403,7 +509,7 @@ describe("runUp — per-repo allocator config", () => {
     const stack: ResolvedStack = {
       services: [isolated("web", "node x.js", ["WEB_PORT"])],
     };
-    const result = await runUp(stubDeps({ stack }));
+    const result = await runUp(pcDeps({ stack }));
     const port = Number(result.env.WEB_PORT);
     expect(port).toBeGreaterThanOrEqual(20000);
     expect((port - 20000) % 32).toBe(0);
@@ -416,7 +522,7 @@ describe("runUp — lock-guarded persistence", () => {
   };
 
   it("persists a freshly-allocated block under the lock so subsequent ups reuse it", async () => {
-    const deps = stubDeps({ stack: singleWebStack });
+    const deps = pcDeps({ stack: singleWebStack });
 
     const first = await runUp(deps);
     const second = await runUp(deps);
@@ -428,7 +534,7 @@ describe("runUp — lock-guarded persistence", () => {
     // The registry is keyed by the derived worktree id, so seed it under the
     // same id the stubbed git probe will resolve to.
     const result = await runUp(
-      stubDeps({
+      pcDeps({
         stack: singleWebStack,
         worktreeRootOverride: "/wt",
         initialRegistry: { [idFor("/wt", "login")]: 30000 },
@@ -457,8 +563,8 @@ describe("runUp — double allocation prevention", () => {
       return after;
     };
 
-    const loginDeps = { ...stubDeps({ stack, worktreeId: "login" }), withRegistryLock: lock };
-    const billingDeps = { ...stubDeps({ stack, worktreeId: "billing" }), withRegistryLock: lock };
+    const loginDeps = { ...pcDeps({ stack, worktreeId: "login" }), withRegistryLock: lock };
+    const billingDeps = { ...pcDeps({ stack, worktreeId: "billing" }), withRegistryLock: lock };
 
     const login = await runUp(loginDeps);
     const billing = await runUp(billingDeps);
@@ -477,7 +583,7 @@ describe("runUp — unmanaged port warning", () => {
       services: [isolated("web", "node server.js --port 3000", ["WEB_PORT"])],
     };
     const warnings: string[] = [];
-    await runUp(stubDeps({ stack, warn: (m) => warnings.push(m) }));
+    await runUp(pcDeps({ stack, warn: (m) => warnings.push(m) }));
 
     expect(warnings.some((w) => /3000/.test(w) && /web/.test(w))).toBe(true);
   });
@@ -487,7 +593,7 @@ describe("runUp — unmanaged port warning", () => {
       services: [isolated("web", "node server.js --port $WEB_PORT", ["WEB_PORT"])],
     };
     const warnings: string[] = [];
-    await runUp(stubDeps({ stack, warn: (m) => warnings.push(m) }));
+    await runUp(pcDeps({ stack, warn: (m) => warnings.push(m) }));
 
     expect(warnings).toEqual([]);
   });
@@ -502,31 +608,27 @@ describe("runUp — shared tier lazy start", () => {
   };
 
   it("starts the shared instance exactly once when called for the first time", async () => {
-    const track: StubSpawn = { invocations: [], touchSocket: true };
-    const result = await runUp(stubDeps({ stack: mixedStack, track }));
+    const deps = pcDeps({ stack: mixedStack });
+    const result = await runUp(deps);
 
-    // Two `up` spawns: one for shared, one for the worktree instance.
-    expect(track.invocations).toHaveLength(2);
-    const sharedSpawn = track.invocations.find((i) => i.socketPath.endsWith("/shared.sock"));
-    expect(sharedSpawn).toBeDefined();
+    // Two instances up: the shared one and the worktree instance.
+    expect(ups(deps.pc)).toHaveLength(2);
+    expect(upsOn(deps.pc, deps.sharedInst.socketPath)).toHaveLength(1);
+    expect(deps.pc.isUp(deps.sharedInst.socketPath)).toBe(true);
+    expect(deps.pc.isUp(deps.inst.socketPath)).toBe(true);
+    expect(deps.pc.rows(deps.sharedInst.socketPath).map((r) => r.name)).toEqual(["postgres"]);
+    expect(deps.pc.rows(deps.inst.socketPath).map((r) => r.name)).toEqual(["web"]);
     expect(result.sharedStarted).toBe(true);
   });
 
   it("registers the shared block under SHARED_REGISTRY_KEY", async () => {
     const registryRef = { snapshot: {} as RegistrySnapshot };
-    await runUp(
-      stubDeps({
-        stack: mixedStack,
-        track: { invocations: [], touchSocket: true },
-        registryRef,
-      }),
-    );
+    await runUp(pcDeps({ stack: mixedStack, registryRef }));
     expect(registryRef.snapshot[SHARED_REGISTRY_KEY]).toBeGreaterThanOrEqual(20000);
   });
 
   it("injects the shared service's named port into the worktree env identically", async () => {
-    const track: StubSpawn = { invocations: [], touchSocket: true };
-    const result = await runUp(stubDeps({ stack: mixedStack, track }));
+    const result = await runUp(pcDeps({ stack: mixedStack }));
     expect(result.env.DB_PORT).toBeDefined();
     expect(Number(result.env.DB_PORT)).toBeGreaterThanOrEqual(20000);
   });
@@ -535,38 +637,30 @@ describe("runUp — shared tier lazy start", () => {
     // Two worktrees, same anchor and same registry — the second `up` must see
     // the shared socket from the first and skip lazy-start (acceptance).
     const { sharedAnchor, wtRoot, registryRef } = multiWorktreeFixture("dt-shared-");
+    const pc = createInMemoryProcessCompose();
+    const fixture = {
+      stack: mixedStack,
+      anchorOverride: sharedAnchor,
+      worktreeRootOverride: wtRoot,
+      registryRef,
+      pc,
+    };
 
-    const trackA: StubSpawn = { invocations: [], touchSocket: true };
-    const trackB: StubSpawn = { invocations: [], touchSocket: true };
-
-    const a = await runUp(
-      stubDeps({
-        stack: mixedStack,
-        worktreeId: "login",
-        anchorOverride: sharedAnchor,
-        worktreeRootOverride: wtRoot,
-        registryRef,
-        track: trackA,
-      }),
-    );
-    const b = await runUp(
-      stubDeps({
-        stack: mixedStack,
-        worktreeId: "billing",
-        anchorOverride: sharedAnchor,
-        worktreeRootOverride: wtRoot,
-        registryRef,
-        track: trackB,
-      }),
-    );
+    const login = pcDeps({ ...fixture, worktreeId: "login" });
+    const a = await runUp(login);
+    const sharedPid = pc.pidOf(login.sharedInst.socketPath, "postgres");
+    const billing = pcDeps({ ...fixture, worktreeId: "billing" });
+    const b = await runUp(billing);
 
     // First call started shared; second saw it already running.
     expect(a.sharedStarted).toBe(true);
     expect(b.sharedStarted).toBe(false);
 
-    // And only the worktree instance is spawned the second time, not shared.
-    const bShared = trackB.invocations.find((i) => i.socketPath.endsWith("/shared.sock"));
-    expect(bShared).toBeUndefined();
+    // Only one shared instance was ever started, and its postgres kept running;
+    // the second `up` only started its own worktree instance.
+    expect(upsOn(pc, login.sharedInst.socketPath)).toHaveLength(1);
+    expect(pc.pidOf(login.sharedInst.socketPath, "postgres")).toBe(sharedPid);
+    expect(pc.isUp(billing.inst.socketPath)).toBe(true);
 
     // Same DB_PORT in both worktrees (repo-wide injection).
     expect(a.env.DB_PORT).toBe(b.env.DB_PORT);
@@ -575,33 +669,35 @@ describe("runUp — shared tier lazy start", () => {
   });
 
   it("writes a derived shared config to <anchor>/devtrees/shared.yaml", async () => {
-    const track: StubSpawn = { invocations: [], touchSocket: true };
-    const deps = stubDeps({ stack: mixedStack, track });
+    const deps = pcDeps({ stack: mixedStack });
     await runUp(deps);
-    // The anchor is whatever the stubbed git returned, recoverable from the spawn.
-    const sharedSpawn = findSharedSpawn(track);
-    expect(existsSync(sharedSpawn.configPath)).toBe(true);
-    const config = parseYaml(readFileSync(sharedSpawn.configPath, "utf8")) as {
+    const configPath = deps.sharedInst.configPath;
+    expect(configPath).toMatch(/\/devtrees\/shared\.yaml$/);
+    expect(existsSync(configPath)).toBe(true);
+    const config = parseYaml(readFileSync(configPath, "utf8")) as {
       processes: Record<string, { command: string }>;
     };
     expect(Object.keys(config.processes)).toEqual(["postgres"]);
+    // The shared instance booted from that config.
+    expect(deps.pc.rows(deps.sharedInst.socketPath).map((r) => r.name)).toEqual(["postgres"]);
   });
 
   it("does not start a shared instance when the stack declares no shared services", async () => {
     const onlyIsolated: ResolvedStack = {
       services: [isolated("web", "node server.js", ["WEB_PORT"])],
     };
-    const track: StubSpawn = { invocations: [], touchSocket: true };
-    const result = await runUp(stubDeps({ stack: onlyIsolated, track }));
+    const deps = pcDeps({ stack: onlyIsolated });
+    const result = await runUp(deps);
     expect(result.sharedStarted).toBe(false);
-    const sharedSpawn = track.invocations.find((i) => i.socketPath.endsWith("/shared.sock"));
-    expect(sharedSpawn).toBeUndefined();
+    expect(upsOn(deps.pc, deps.sharedInst.socketPath)).toEqual([]);
+    expect(deps.pc.isUp(deps.sharedInst.socketPath)).toBe(false);
   });
 
   it("two simultaneous ups see the lock-guarded ensureSharedStarted serialize them", async () => {
     // The shared lifecycle lock serialises the check-and-start, so even if both
     // worktrees race their ups, only one ends up spawning the shared instance.
     const { sharedAnchor, wtRoot, registryRef } = multiWorktreeFixture("dt-race-");
+    const pc = createInMemoryProcessCompose();
 
     // Use a real serialising lock so the test exercises the gate, not a mock.
     let held = false;
@@ -615,39 +711,24 @@ describe("runUp — shared tier lazy start", () => {
       }
     };
 
-    const trackA: StubSpawn = { invocations: [], touchSocket: true };
-    const trackB: StubSpawn = { invocations: [], touchSocket: true };
-
-    const depsA: CommandDeps = {
-      ...stubDeps({
-        stack: mixedStack,
-        worktreeId: "login",
-        anchorOverride: sharedAnchor,
-        worktreeRootOverride: wtRoot,
-        registryRef,
-        track: trackA,
-      }),
-      withSharedLock: realSharedLock,
+    const fixture = {
+      stack: mixedStack,
+      anchorOverride: sharedAnchor,
+      worktreeRootOverride: wtRoot,
+      registryRef,
+      pc,
     };
-    const depsB: CommandDeps = {
-      ...stubDeps({
-        stack: mixedStack,
-        worktreeId: "billing",
-        anchorOverride: sharedAnchor,
-        worktreeRootOverride: wtRoot,
-        registryRef,
-        track: trackB,
-      }),
+    const depsA = { ...pcDeps({ ...fixture, worktreeId: "login" }), withSharedLock: realSharedLock };
+    const depsB = {
+      ...pcDeps({ ...fixture, worktreeId: "billing" }),
       withSharedLock: realSharedLock,
     };
 
     const [a, b] = await Promise.all([runUp(depsA), runUp(depsB)]);
     const totalSharedStarts = Number(a.sharedStarted) + Number(b.sharedStarted);
     expect(totalSharedStarts).toBe(1);
-    const sharedSpawnA = trackA.invocations.find((i) => i.socketPath.endsWith("/shared.sock"));
-    const sharedSpawnB = trackB.invocations.find((i) => i.socketPath.endsWith("/shared.sock"));
-    // Exactly one of the two spawned the shared instance.
-    expect(Number(Boolean(sharedSpawnA)) + Number(Boolean(sharedSpawnB))).toBe(1);
+    // Exactly one `up` reached the shared socket.
+    expect(upsOn(pc, depsA.sharedInst.socketPath)).toHaveLength(1);
   });
 });
 
@@ -666,11 +747,10 @@ describe("runUp — shared instance dies before binding its socket (#92)", () =>
   };
 
   it("throws SHARED_START_FAILED when the shared socket never appears", async () => {
-    // touchSocket: false — the spawn returns but no socket is ever bound,
-    // exactly what an instantly-dying shared instance looks like from here.
-    const track: StubSpawn = { invocations: [], touchSocket: false };
-    const deps: CommandDeps = {
-      ...stubDeps({ stack: mixedStack, track }),
+    // The shared instance dies at once and removes its socket: exactly what an
+    // instantly-dying shared instance looks like from here.
+    const deps = {
+      ...pcDeps({ stack: mixedStack, onBoot: diesAtBoot(isSharedSocket) }),
       sharedSocketTimeoutMs: 50,
     };
     const err = await runUp(deps).then(
@@ -680,9 +760,9 @@ describe("runUp — shared instance dies before binding its socket (#92)", () =>
     if (err === undefined) throw new Error("expected runUp to reject");
     expect(err.code).toBe("SHARED_START_FAILED");
     expect(err.message).toMatch(/shared/i);
-    // The worktree instance was never spawned — only the doomed shared up.
-    const worktreeSpawn = track.invocations.find((i) => !i.socketPath.endsWith("/shared.sock"));
-    expect(worktreeSpawn).toBeUndefined();
+    // The worktree instance was never started — only the doomed shared up.
+    expect(upsOn(deps.pc, deps.inst.socketPath)).toEqual([]);
+    expect(deps.pc.isUp(deps.inst.socketPath)).toBe(false);
   });
 
   it("names the shared instance's real config in the remediation, not a placeholder", async () => {
@@ -690,9 +770,8 @@ describe("runUp — shared instance dies before binding its socket (#92)", () =>
     // which is advice nobody can copy-paste. It must be the file the lazy-start
     // just wrote and spawned against — the same one `details.config_path`
     // publishes, mirroring the worktree envelope's shape (#157 follow-up).
-    const track: StubSpawn = { invocations: [], touchSocket: false };
-    const deps: CommandDeps = {
-      ...stubDeps({ stack: mixedStack, track }),
+    const deps = {
+      ...pcDeps({ stack: mixedStack, onBoot: diesAtBoot(isSharedSocket) }),
       sharedSocketTimeoutMs: 50,
     };
     const err = await runUp(deps).then(
@@ -703,9 +782,9 @@ describe("runUp — shared instance dies before binding its socket (#92)", () =>
 
     expect(err.code).toBe("SHARED_START_FAILED");
     const configPath = String((err.details ?? {})["config_path"]);
-    // The path the driver was actually spawned with, not a reconstruction.
-    const sharedSpawn = track.invocations.find((i) => i.socketPath.endsWith("/shared.sock"));
-    expect(configPath).toBe(sharedSpawn?.configPath);
+    // The config the shared instance was booted from, not a reconstruction.
+    expect(configPath).toBe(deps.sharedInst.configPath);
+    expect(upsOn(deps.pc, deps.sharedInst.socketPath)).toHaveLength(1);
     expect(existsSync(configPath)).toBe(true);
     expect(err.message).toContain(`process-compose -f ${configPath}`);
     expect(err.message).not.toContain("<shared config>");
@@ -716,14 +795,13 @@ describe("runUp — shared instance dies before binding its socket (#92)", () =>
     // a failed start must not record one, or the next `up` would inject
     // numbers nothing ever bound.
     const { sharedAnchor, wtRoot, registryRef } = multiWorktreeFixture("dt-sockfail-");
-    const track: StubSpawn = { invocations: [], touchSocket: false };
-    const deps: CommandDeps = {
-      ...stubDeps({
+    const deps = {
+      ...pcDeps({
         stack: mixedStack,
         anchorOverride: sharedAnchor,
         worktreeRootOverride: wtRoot,
         registryRef,
-        track,
+        onBoot: diesAtBoot(isSharedSocket),
       }),
       sharedSocketTimeoutMs: 50,
     };
@@ -742,19 +820,6 @@ describe("runUp — shared instance dies before binding its socket (#92)", () =>
  * dead service. Both stacks below have no cross-tier edge.
  */
 describe("runUp — a lazy-started shared service that exits at once (#262)", () => {
-  const exitedRow = (name: string): ServiceStatus => ({
-    name,
-    status: "Completed",
-    health: "unknown",
-    exitCode: 1,
-    pid: 4242,
-  });
-  const liveRow = (name: string): ServiceStatus => ({
-    name,
-    status: "Running",
-    health: "ready",
-  });
-
   it("one of two shared services dies: fails SHARED_SERVICE_DEAD died_while_waiting", async () => {
     // `cache` keeps process-compose (and its socket) alive; `api` exits 1.
     const stack: ResolvedStack = {
@@ -764,15 +829,17 @@ describe("runUp — a lazy-started shared service that exits at once (#262)", ()
         shared("api", "node server.mjs", ["API_PORT"]),
       ],
     };
-    const track: StubSpawn = { invocations: [], touchSocket: true };
-    const base = stubDeps({ stack, track });
-    const deps: CommandDeps = {
+    const base = pcDeps({
+      stack,
+      onBoot: (inst, pc) => {
+        if (isSharedSocket(inst.socketPath)) pc.exit(inst.socketPath, "api", 1);
+      },
+    });
+    const deps = {
       ...base,
       // The real wait on the shared services, not the suite's no-op.
       waitForSharedReady: undefined,
       waitTimeoutMs: 5_000,
-      getServiceStatuses: async (socketPath) =>
-        socketPath.endsWith("/shared.sock") ? [liveRow("cache"), exitedRow("api")] : [],
     };
 
     const err = await runUp(deps).then(
@@ -786,8 +853,8 @@ describe("runUp — a lazy-started shared service that exits at once (#262)", ()
       dead_services: [{ name: "api", exit_code: 1 }],
     });
     // Waited on before the worktree spawns, like the cross-tier wait.
-    const worktreeSpawn = track.invocations.find((i) => !i.socketPath.endsWith("/shared.sock"));
-    expect(worktreeSpawn).toBeUndefined();
+    expect(upsOn(deps.pc, deps.inst.socketPath)).toEqual([]);
+    expect(deps.pc.isUp(deps.inst.socketPath)).toBe(false);
   });
 
   it("the only shared service dies, so process-compose exits: up fails, not shared_started", async () => {
@@ -799,19 +866,8 @@ describe("runUp — a lazy-started shared service that exits at once (#262)", ()
         shared("api", "node server.mjs", ["API_PORT"]),
       ],
     };
-    const track: StubSpawn = { invocations: [], touchSocket: true };
-    const base = stubDeps({ stack, track });
-    const deps: CommandDeps = {
-      ...base,
-      waitForSharedReady: undefined,
-      waitTimeoutMs: 5_000,
-      probeSocket: async (socketPath) => (existsSync(socketPath) ? "running" : "stale"),
-      getServiceStatuses: async (socketPath) => {
-        if (!socketPath.endsWith("/shared.sock")) return [];
-        rmSync(socketPath, { force: true });
-        throw Object.assign(new Error(`connect ENOENT ${socketPath}`), { code: "ENOENT" });
-      },
-    };
+    const base = pcDeps({ stack, onBoot: diesAtBoot(isSharedSocket) });
+    const deps = { ...base, waitForSharedReady: undefined, waitTimeoutMs: 5_000 };
 
     const err = await runUp(deps).then(
       () => undefined,
@@ -820,15 +876,14 @@ describe("runUp — a lazy-started shared service that exits at once (#262)", ()
     if (err === undefined) throw new Error("expected runUp to reject, not report shared started");
     // A failed start, as when the socket never appears (#92): same details.
     expect(err.code).toBe("SHARED_START_FAILED");
-    const sharedSpawn = findSharedSpawn(track);
     expect(err.details).toMatchObject({
-      socket_path: sharedSpawn.socketPath,
-      config_path: sharedSpawn.configPath,
+      socket_path: deps.sharedInst.socketPath,
+      config_path: deps.sharedInst.configPath,
       timeout_ms: expect.any(Number),
     });
-    expect(err.message).toContain(`process-compose -f ${sharedSpawn.configPath}`);
-    const worktreeSpawn = track.invocations.find((i) => !i.socketPath.endsWith("/shared.sock"));
-    expect(worktreeSpawn).toBeUndefined();
+    expect(err.message).toContain(`process-compose -f ${deps.sharedInst.configPath}`);
+    expect(deps.pc.isUp(deps.sharedInst.socketPath)).toBe(false);
+    expect(upsOn(deps.pc, deps.inst.socketPath)).toEqual([]);
   });
 });
 
@@ -855,18 +910,17 @@ describe("runUp — worktree instance dies before binding its socket (#157)", ()
    * timeout; these tests want the real one, so drop the override and shorten
    * the deadline instead.
    */
-  function withRealSocketWait(base: CommandDeps): CommandDeps {
+  function withRealSocketWait<D extends CommandDeps>(base: D): D {
     const { waitForSocketFile: _stubbed, ...rest } = base;
-    return { ...rest, worktreeSocketTimeoutMs: 50 };
+    return { ...rest, worktreeSocketTimeoutMs: 50 } as D;
   }
 
   it("attributes the failure to the worktree instance on a stack with no shared tier", async () => {
     // Exactly the reproduction from #157: two isolated services, no shared
-    // service anywhere, stub spawner that never binds. Before the fix this
-    // failed with SHARED_START_FAILED and a details.socket_path pointing at
-    // the worktree's own socket.
-    const track: StubSpawn = { invocations: [], touchSocket: false };
-    const base = stubDeps({ stack: allIsolated, track });
+    // service anywhere, a worktree instance that dies at once. Before the fix
+    // this failed with SHARED_START_FAILED and a details.socket_path pointing
+    // at the worktree's own socket.
+    const base = pcDeps({ stack: allIsolated, onBoot: diesAtBoot(() => true) });
     const err = await runUp(withRealSocketWait(base)).then(
       () => undefined,
       (e: unknown) => e as Error & { code?: string; details?: Record<string, unknown> },
@@ -882,29 +936,28 @@ describe("runUp — worktree instance dies before binding its socket (#157)", ()
     // Details point at THIS instance: its own socket, its own derived config.
     const details = err.details ?? {};
     expect(details["worktree_id"]).toBe(base.expectedWorktreeId);
-    expect(String(details["socket_path"])).toContain(`${base.expectedWorktreeId}.sock`);
+    expect(details["socket_path"]).toBe(base.inst.socketPath);
     expect(String(details["socket_path"])).not.toContain("shared.sock");
     // The remediation names the worktree's config, not the shared one — the
     // file an agent (or human) actually runs `process-compose -f` against.
     const configPath = String(details["config_path"]);
-    expect(configPath).toContain(base.expectedWorktreeId);
+    expect(configPath).toBe(base.inst.configPath);
     expect(err.message).toContain(configPath);
     expect(details["timeout_ms"]).toBe(50);
   });
 
   it("still attributes a shared-instance socket failure to the shared instance", async () => {
     // The other half of the contract: nothing about #157 may change the #92
-    // envelope, which something already branches on. Same stub, mixed stack,
-    // shared spawn is the one that never binds.
+    // envelope, which something already branches on. Mixed stack, the shared
+    // instance is the one that dies at once.
     const mixedStack: ResolvedStack = {
       services: [
         isolated("web", "node server.js", ["WEB_PORT"]),
         shared("postgres", "postgres", ["DB_PORT"]),
       ],
     };
-    const track: StubSpawn = { invocations: [], touchSocket: false };
-    const deps: CommandDeps = {
-      ...withRealSocketWait(stubDeps({ stack: mixedStack, track })),
+    const deps = {
+      ...withRealSocketWait(pcDeps({ stack: mixedStack, onBoot: diesAtBoot(isSharedSocket) })),
       sharedSocketTimeoutMs: 50,
     };
     const err = await runUp(deps).then(
@@ -915,16 +968,16 @@ describe("runUp — worktree instance dies before binding its socket (#157)", ()
 
     expect(err.code).toBe("SHARED_START_FAILED");
     expect(err.message).toMatch(/shared instance/i);
-    expect(String((err.details ?? {})["socket_path"])).toContain("shared.sock");
+    expect((err.details ?? {})["socket_path"]).toBe(deps.sharedInst.socketPath);
     // Both envelopes now carry a real `config_path`; the discriminator is
     // which instance's config it is, so pin that rather than its presence.
-    expect(String((err.details ?? {})["config_path"])).toContain("shared");
+    expect((err.details ?? {})["config_path"]).toBe(deps.sharedInst.configPath);
   });
 
   it("blames the worktree when the shared instance came up fine and only the worktree died", async () => {
-    // The discriminating case: both instances are spawned, the shared one
-    // binds, the worktree one doesn't. One code covering both would report
-    // this as a shared failure against a demonstrably healthy shared
+    // The discriminating case: both instances are started, the shared one
+    // stays up, the worktree one dies at once. One code covering both would
+    // report this as a shared failure against a demonstrably healthy shared
     // instance — the exact misdirection #154 chased.
     const mixedStack: ResolvedStack = {
       services: [
@@ -932,27 +985,11 @@ describe("runUp — worktree instance dies before binding its socket (#157)", ()
         shared("postgres", "postgres", ["DB_PORT"]),
       ],
     };
-    const track: StubSpawn = { invocations: [], touchSocket: false };
-    const base = stubDeps({ stack: mixedStack, track });
-    const inner = base.driver?.spawner;
-    if (inner === undefined) throw new Error("expected stub spawner");
-
-    const deps: CommandDeps = {
-      ...withRealSocketWait(base),
-      sharedSocketTimeoutMs: 50,
-      driver: {
-        ...base.driver,
-        spawner: (binary, args, options) => {
-          // Bind only the shared socket, so the shared lazy-start succeeds
-          // and the worktree wait is the one that lapses.
-          const socketPath = args[args.indexOf("-u") + 1] ?? "";
-          if (args[0] === "up" && socketPath.endsWith("shared.sock")) {
-            writeFileSync(socketPath, "");
-          }
-          return inner(binary, args, options);
-        },
-      },
-    };
+    const base = pcDeps({
+      stack: mixedStack,
+      onBoot: diesAtBoot((socketPath) => !isSharedSocket(socketPath)),
+    });
+    const deps = { ...withRealSocketWait(base), sharedSocketTimeoutMs: 50 };
 
     const err = await runUp(deps).then(
       () => undefined,
@@ -961,10 +998,11 @@ describe("runUp — worktree instance dies before binding its socket (#157)", ()
     if (err === undefined) throw new Error("expected runUp to reject");
 
     expect(err.code).toBe("WORKTREE_START_FAILED");
-    expect(String((err.details ?? {})["socket_path"])).not.toContain("shared.sock");
-    // Both spawns happened — the shared one is not the failure.
-    expect(track.invocations.some((i) => i.socketPath.endsWith("shared.sock"))).toBe(true);
-    expect(track.invocations.some((i) => !i.socketPath.endsWith("shared.sock"))).toBe(true);
+    expect((err.details ?? {})["socket_path"]).toBe(deps.inst.socketPath);
+    // Both instances were started — the shared one is up, not the failure.
+    expect(deps.pc.isUp(deps.sharedInst.socketPath)).toBe(true);
+    expect(upsOn(deps.pc, deps.inst.socketPath)).toHaveLength(1);
+    expect(deps.pc.isUp(deps.inst.socketPath)).toBe(false);
   });
 });
 
@@ -995,9 +1033,8 @@ describe("runUp — cross-tier wiring (ADR-0003)", () => {
     // The dropped edges must be visible in output (ADR-0003 "Consequences") —
     // otherwise the behavior is invisible from the source devtrees.yaml.
     const warnings: string[] = [];
-    const track: StubSpawn = { invocations: [], touchSocket: true };
-    const deps: CommandDeps = {
-      ...stubDeps({ stack: crossTierStack, track, warn: (m) => warnings.push(m) }),
+    const deps = {
+      ...pcDeps({ stack: crossTierStack, warn: (m) => warnings.push(m) }),
       waitForSharedHealth: () => Promise.resolve(),
     };
     await runUp(deps);
@@ -1009,12 +1046,11 @@ describe("runUp — cross-tier wiring (ADR-0003)", () => {
   });
 
   it("waits for shared services to be healthy before starting the worktree instance", async () => {
-    // The shared-health wait happens between the shared up-spawn and the worktree
-    // up-spawn — that's the orchestration layer's stand-in for the dropped
-    // cross-tier depends_on edge (ADR-0003).
+    // The shared-health wait happens between the shared instance's start and
+    // the worktree instance's — that's the orchestration layer's stand-in for
+    // the dropped cross-tier depends_on edge (ADR-0003).
     const order: string[] = [];
     let waitResolved = false;
-    const track: StubSpawn = { invocations: [], touchSocket: true };
 
     const waitForSharedHealth = (): Promise<void> =>
       new Promise<void>((resolve) => {
@@ -1026,31 +1062,20 @@ describe("runUp — cross-tier wiring (ADR-0003)", () => {
         }, 5);
       });
 
-    const baseDeps = stubDeps({ stack: crossTierStack, track });
-    // Wrap the stub spawner so we can record the order of up-spawns relative
-    // to the wait.
-    const inner = baseDeps.driver?.spawner;
-    if (inner === undefined) throw new Error("expected stub spawner");
-    const deps: CommandDeps = {
-      ...baseDeps,
-      driver: {
-        ...baseDeps.driver,
-        spawner: (binary, args, options) => {
-          if (args[0] === "up") {
-            const si = args.indexOf("-u");
-            const sock = args[si + 1] ?? "";
-            order.push(sock.endsWith("/shared.sock") ? "up:shared" : "up:worktree");
-          }
-          return inner(binary, args, options);
-        },
+    // Record each instance's start relative to the wait.
+    const pc = createInMemoryProcessCompose({
+      onRequest: (r) => {
+        if (r.op === "up") order.push(isSharedSocket(r.socketPath) ? "up:shared" : "up:worktree");
       },
-      waitForSharedHealth,
-    };
+    });
+    const deps = { ...pcDeps({ stack: crossTierStack, pc }), waitForSharedHealth };
 
     await runUp(deps);
-    // The wait must have run, and the worktree up must not have spawned before it resolved.
+    // The wait must have run, and the worktree up must not have started before it resolved.
     expect(waitResolved).toBe(true);
     expect(order).toEqual(["up:shared", "wait:start", "wait:resolve", "up:worktree"]);
+    expect(pc.isUp(deps.sharedInst.socketPath)).toBe(true);
+    expect(pc.isUp(deps.inst.socketPath)).toBe(true);
   });
 
   it("skips the shared-health wait when no isolated service depends on a shared one", async () => {
@@ -1066,20 +1091,15 @@ describe("runUp — cross-tier wiring (ADR-0003)", () => {
       called = true;
       return Promise.resolve();
     };
-    const track: StubSpawn = { invocations: [], touchSocket: true };
-    const deps: CommandDeps = {
-      ...stubDeps({ stack: independent, track }),
-      waitForSharedHealth,
-    };
+    const deps = { ...pcDeps({ stack: independent }), waitForSharedHealth };
     await runUp(deps);
     expect(called).toBe(false);
   });
 
   it("logs a 'waiting for shared' message when the wait runs", async () => {
     const warnings: string[] = [];
-    const track: StubSpawn = { invocations: [], touchSocket: true };
-    const deps: CommandDeps = {
-      ...stubDeps({ stack: crossTierStack, track, warn: (m) => warnings.push(m) }),
+    const deps = {
+      ...pcDeps({ stack: crossTierStack, warn: (m) => warnings.push(m) }),
       waitForSharedHealth: () => Promise.resolve(),
     };
     await runUp(deps);
@@ -1109,12 +1129,11 @@ describe("runUp — cross-tier wiring (ADR-0003)", () => {
         },
       ],
     };
-    const track: StubSpawn = { invocations: [], touchSocket: true };
-    const deps = stubDeps({ stack: sameTier, track });
+    const deps = pcDeps({ stack: sameTier });
     await runUp(deps);
-    const worktreeSpawn = track.invocations.find((i) => !i.socketPath.endsWith("/shared.sock"));
-    if (worktreeSpawn === undefined) throw new Error("expected a worktree spawn");
-    const config = parseYaml(readFileSync(worktreeSpawn.configPath, "utf8")) as {
+    // The worktree instance booted from this config.
+    expect(deps.pc.rows(deps.inst.socketPath).map((r) => r.name)).toEqual(["api", "web"]);
+    const config = parseYaml(readFileSync(deps.inst.configPath, "utf8")) as {
       processes: Record<string, { depends_on?: Record<string, { condition: string }> }>;
     };
     expect(config.processes.web?.depends_on).toEqual({ api: { condition: "process_started" } });
@@ -1123,15 +1142,13 @@ describe("runUp — cross-tier wiring (ADR-0003)", () => {
   it("does not emit cross-tier depends_on edges in the derived worktree config", async () => {
     // The whole point of the deriver's edge-dropping: process-compose would
     // raise an "unknown process 'postgres'" error otherwise.
-    const track: StubSpawn = { invocations: [], touchSocket: true };
-    const deps: CommandDeps = {
-      ...stubDeps({ stack: crossTierStack, track }),
+    const deps = {
+      ...pcDeps({ stack: crossTierStack }),
       waitForSharedHealth: () => Promise.resolve(),
     };
     await runUp(deps);
-    const worktreeSpawn = track.invocations.find((i) => !i.socketPath.endsWith("/shared.sock"));
-    if (worktreeSpawn === undefined) throw new Error("expected a worktree spawn");
-    const config = parseYaml(readFileSync(worktreeSpawn.configPath, "utf8")) as {
+    expect(deps.pc.rows(deps.inst.socketPath).map((r) => r.name)).toEqual(["web"]);
+    const config = parseYaml(readFileSync(deps.inst.configPath, "utf8")) as {
       processes: Record<string, { depends_on?: Record<string, { condition: string }> }>;
     };
     // No depends_on at all on `web` — `postgres` is the only declared dep and
@@ -1149,42 +1166,38 @@ describe("runUp — wait-for-healthy (worktree instance, #28)", () => {
     ],
   };
 
+  /** The TUI attaches process-compose received. */
+  const attaches = (pc: InMemoryProcessCompose) => pc.requests.filter((r) => r.op === "attach");
+
   it("waits for the worktree instance's services to be healthy after starting it", async () => {
     // The wait must happen between `driver.up` of the worktree and any subsequent
     // attach — that is the gate that turns "up returned" into "the stack is
     // serving traffic" (PRD #26, ADR-0005).
     const order: string[] = [];
-    const track: StubSpawn = { invocations: [], touchSocket: false };
-    const baseDeps = stubDeps({ stack: twoIsolated, track });
-    const inner = baseDeps.driver?.spawner;
-    if (inner === undefined) throw new Error("expected stub spawner");
-
-    const deps: CommandDeps = {
-      ...baseDeps,
-      driver: {
-        ...baseDeps.driver,
-        spawner: (binary, args, options) => {
-          if (args[0] === "up") order.push("up:worktree");
-          if (args[0] === "attach") order.push("attach");
-          return inner(binary, args, options);
-        },
+    const pc = createInMemoryProcessCompose({
+      onRequest: (r) => {
+        if (r.op === "up") order.push("up:worktree");
+        if (r.op === "attach") order.push("attach");
       },
-      waitForHealth: async ({ serviceNames }) => {
-        order.push(`wait:${[...serviceNames].sort().join(",")}`);
+    });
+    const deps = {
+      ...pcDeps({ stack: twoIsolated, pc }),
+      waitForHealth: async ({ serviceNames }: { serviceNames: ReadonlyArray<string> }) => {
+        // The instance is up by the time the wait runs.
+        order.push(`wait:${[...serviceNames].sort().join(",")}:${pc.isUp(deps.inst.socketPath)}`);
       },
     };
 
     await runUp(deps);
-    expect(order).toContain("wait:web,worker");
-    // The wait must run after the worktree up-spawn (otherwise it polls a
-    // socket that doesn't exist yet).
-    expect(order.indexOf("up:worktree")).toBeLessThan(order.indexOf("wait:web,worker"));
+    expect(order).toContain("wait:web,worker:true");
+    // The wait must run after the worktree up (otherwise it polls a socket
+    // that doesn't exist yet).
+    expect(order.indexOf("up:worktree")).toBeLessThan(order.indexOf("wait:web,worker:true"));
   });
 
   it("passes the worktree's own socket path to the wait — not the shared one", async () => {
     const seen: string[] = [];
-    const track: StubSpawn = { invocations: [], touchSocket: false };
-    const base = stubDeps({ stack: twoIsolated, track });
+    const base = pcDeps({ stack: twoIsolated });
     const deps: CommandDeps = {
       ...base,
       waitForHealth: async ({ socketPath }) => {
@@ -1192,7 +1205,7 @@ describe("runUp — wait-for-healthy (worktree instance, #28)", () => {
       },
     };
     await runUp(deps);
-    expect(seen).toHaveLength(1);
+    expect(seen).toEqual([base.inst.socketPath]);
     expect(seen[0]?.endsWith(`/${base.expectedWorktreeId}.sock`)).toBe(true);
   });
 
@@ -1206,9 +1219,8 @@ describe("runUp — wait-for-healthy (worktree instance, #28)", () => {
       ],
     };
     let observed: { serviceNames: string[]; probedServiceNames: string[] } | undefined;
-    const track: StubSpawn = { invocations: [], touchSocket: false };
     const deps: CommandDeps = {
-      ...stubDeps({ stack: probedStack, track }),
+      ...pcDeps({ stack: probedStack }),
       waitForHealth: async ({ serviceNames, probedServiceNames }) => {
         observed = {
           serviceNames: [...serviceNames].sort(),
@@ -1239,9 +1251,8 @@ describe("runUp — wait-for-healthy (worktree instance, #28)", () => {
       ],
     };
     let observed: { sharedServiceNames: string[]; probedServiceNames: string[] } | undefined;
-    const track: StubSpawn = { invocations: [], touchSocket: true };
     const deps: CommandDeps = {
-      ...stubDeps({ stack: probedCrossTier, track }),
+      ...pcDeps({ stack: probedCrossTier }),
       waitForSharedHealth: async ({ sharedServiceNames, probedServiceNames }) => {
         observed = {
           sharedServiceNames: [...sharedServiceNames].sort(),
@@ -1258,9 +1269,8 @@ describe("runUp — wait-for-healthy (worktree instance, #28)", () => {
 
   it("threads the timeout from deps to the wait", async () => {
     let observed: number | undefined;
-    const track: StubSpawn = { invocations: [], touchSocket: false };
     const deps: CommandDeps = {
-      ...stubDeps({ stack: twoIsolated, track }),
+      ...pcDeps({ stack: twoIsolated }),
       waitTimeoutMs: 7777,
       waitForHealth: async ({ timeoutMs }) => {
         observed = timeoutMs;
@@ -1272,9 +1282,8 @@ describe("runUp — wait-for-healthy (worktree instance, #28)", () => {
 
   it("defaults the wait timeout to 120s when deps don't override it", async () => {
     let observed: number | undefined;
-    const track: StubSpawn = { invocations: [], touchSocket: false };
     const deps: CommandDeps = {
-      ...stubDeps({ stack: twoIsolated, track }),
+      ...pcDeps({ stack: twoIsolated }),
       waitForHealth: async ({ timeoutMs }) => {
         observed = timeoutMs;
       },
@@ -1289,15 +1298,9 @@ describe("runUp — wait-for-healthy (worktree instance, #28)", () => {
     // TUI instead of waiting (#132). ADR-0005: timeout exits non-zero, leaves the
     // stack running, agent can then call `devtrees logs <service>` to inspect, so
     // the worktree's `process-compose down` must NOT be invoked from this path.
-    const track: StubSpawn = { invocations: [], touchSocket: false };
-    const baseDeps = stubDeps({ stack: twoIsolated, track });
-    const inner = baseDeps.driver?.spawner;
-    if (inner === undefined) throw new Error("expected stub spawner");
-
-    const sawAttach = { called: false };
-    const sawDown = { called: false };
+    const base = pcDeps({ stack: twoIsolated });
     const deps: CommandDeps = {
-      ...baseDeps,
+      ...base,
       attach: false, // headless: the path the silent health-wait gates
       waitForHealth: async () => {
         const err = new Error(
@@ -1305,14 +1308,6 @@ describe("runUp — wait-for-healthy (worktree instance, #28)", () => {
         ) as Error & { code: string };
         err.code = "HEALTH_TIMEOUT";
         throw err;
-      },
-      driver: {
-        ...baseDeps.driver,
-        spawner: (binary, args, options) => {
-          if (args[0] === "attach") sawAttach.called = true;
-          if (args[0] === "down") sawDown.called = true;
-          return inner(binary, args, options);
-        },
       },
     };
 
@@ -1322,126 +1317,52 @@ describe("runUp — wait-for-healthy (worktree instance, #28)", () => {
     );
     if (err === undefined) throw new Error("expected runUp to reject");
     expect(err.code).toBe("HEALTH_TIMEOUT");
-    expect(sawAttach.called).toBe(false);
-    expect(sawDown.called).toBe(false);
+    expect(attaches(base.pc)).toEqual([]);
+    // The stack is left running.
+    expect(base.pc.requests.filter((r) => r.op === "down")).toEqual([]);
+    expect(base.pc.isUp(base.inst.socketPath)).toBe(true);
+    expect(base.pc.rows(base.inst.socketPath).map((r) => [r.name, r.status])).toEqual([
+      ["web", "Running"],
+      ["worker", "Running"],
+    ]);
   });
 
   it("does not attach when deps.attach is false even if the wait succeeds", async () => {
-    const track: StubSpawn = { invocations: [], touchSocket: false };
-    const baseDeps = stubDeps({ stack: twoIsolated, track });
-    const inner = baseDeps.driver?.spawner;
-    if (inner === undefined) throw new Error("expected stub spawner");
-
-    let attachCalled = false;
-    const deps: CommandDeps = {
-      ...baseDeps,
-      attach: false,
-      waitForHealth: async () => {},
-      driver: {
-        ...baseDeps.driver,
-        spawner: (binary, args, options) => {
-          if (args[0] === "attach") attachCalled = true;
-          return inner(binary, args, options);
-        },
-      },
-    };
+    const base = pcDeps({ stack: twoIsolated });
+    const deps: CommandDeps = { ...base, attach: false, waitForHealth: async () => {} };
     await runUp(deps);
-    expect(attachCalled).toBe(false);
+    expect(attaches(base.pc)).toEqual([]);
   });
 
   it("auto-detect: attaches when isTTY()===true and deps.attach is unset", async () => {
-    const track: StubSpawn = { invocations: [], touchSocket: false };
-    const baseDeps = stubDeps({ stack: twoIsolated, track });
-    const inner = baseDeps.driver?.spawner;
-    if (inner === undefined) throw new Error("expected stub spawner");
-
-    let attached = false;
-    const deps: CommandDeps = {
-      ...baseDeps,
-      attach: undefined,
-      isTTY: () => true,
-      driver: {
-        ...baseDeps.driver,
-        spawner: (binary, args, options) => {
-          if (args[0] === "attach") attached = true;
-          return inner(binary, args, options);
-        },
-      },
-    };
+    const base = pcDeps({ stack: twoIsolated });
+    const deps: CommandDeps = { ...base, attach: undefined, isTTY: () => true };
     await runUp(deps);
-    expect(attached).toBe(true);
+    expect(attaches(base.pc)).toEqual([{ op: "attach", socketPath: base.inst.socketPath }]);
   });
 
   it("auto-detect: skips attach when isTTY()===false (non-interactive caller)", async () => {
     // The whole point of #28: an agent / CI step calling `devtrees up` must
     // not be hijacked into a TUI. With no explicit override and a non-TTY
     // environment, the TUI stays off and `up` returns after the health-wait.
-    const track: StubSpawn = { invocations: [], touchSocket: false };
-    const baseDeps = stubDeps({ stack: twoIsolated, track });
-    const inner = baseDeps.driver?.spawner;
-    if (inner === undefined) throw new Error("expected stub spawner");
-
-    let attached = false;
-    const deps: CommandDeps = {
-      ...baseDeps,
-      attach: undefined,
-      isTTY: () => false,
-      driver: {
-        ...baseDeps.driver,
-        spawner: (binary, args, options) => {
-          if (args[0] === "attach") attached = true;
-          return inner(binary, args, options);
-        },
-      },
-    };
+    const base = pcDeps({ stack: twoIsolated });
+    const deps: CommandDeps = { ...base, attach: undefined, isTTY: () => false };
     await runUp(deps);
-    expect(attached).toBe(false);
+    expect(attaches(base.pc)).toEqual([]);
   });
 
   it("explicit deps.attach=true overrides isTTY()===false", async () => {
-    const track: StubSpawn = { invocations: [], touchSocket: false };
-    const baseDeps = stubDeps({ stack: twoIsolated, track });
-    const inner = baseDeps.driver?.spawner;
-    if (inner === undefined) throw new Error("expected stub spawner");
-
-    let attached = false;
-    const deps: CommandDeps = {
-      ...baseDeps,
-      attach: true,
-      isTTY: () => false,
-      driver: {
-        ...baseDeps.driver,
-        spawner: (binary, args, options) => {
-          if (args[0] === "attach") attached = true;
-          return inner(binary, args, options);
-        },
-      },
-    };
+    const base = pcDeps({ stack: twoIsolated });
+    const deps: CommandDeps = { ...base, attach: true, isTTY: () => false };
     await runUp(deps);
-    expect(attached).toBe(true);
+    expect(attaches(base.pc)).toEqual([{ op: "attach", socketPath: base.inst.socketPath }]);
   });
 
   it("explicit deps.attach=false overrides isTTY()===true", async () => {
-    const track: StubSpawn = { invocations: [], touchSocket: false };
-    const baseDeps = stubDeps({ stack: twoIsolated, track });
-    const inner = baseDeps.driver?.spawner;
-    if (inner === undefined) throw new Error("expected stub spawner");
-
-    let attached = false;
-    const deps: CommandDeps = {
-      ...baseDeps,
-      attach: false,
-      isTTY: () => true,
-      driver: {
-        ...baseDeps.driver,
-        spawner: (binary, args, options) => {
-          if (args[0] === "attach") attached = true;
-          return inner(binary, args, options);
-        },
-      },
-    };
+    const base = pcDeps({ stack: twoIsolated });
+    const deps: CommandDeps = { ...base, attach: false, isTTY: () => true };
     await runUp(deps);
-    expect(attached).toBe(false);
+    expect(attaches(base.pc)).toEqual([]);
   });
 
   it("attach mode (#132): attaches the live TUI and skips the silent health-wait", async () => {
@@ -1450,29 +1371,17 @@ describe("runUp — wait-for-healthy (worktree instance, #28)", () => {
     // attach the TUI immediately — the human watching it is the progress AND the
     // health signal. The silent `waitForHealth` gate (and HEALTH_TIMEOUT) is for
     // the headless paths only, so it must NOT run here.
-    const track: StubSpawn = { invocations: [], touchSocket: false };
-    const baseDeps = stubDeps({ stack: twoIsolated, track });
-    const inner = baseDeps.driver?.spawner;
-    if (inner === undefined) throw new Error("expected stub spawner");
-
+    const base = pcDeps({ stack: twoIsolated });
     let waited = false;
-    let attached = false;
     const deps: CommandDeps = {
-      ...baseDeps,
+      ...base,
       attach: true,
       waitForHealth: async () => {
         waited = true;
       },
-      driver: {
-        ...baseDeps.driver,
-        spawner: (binary, args, options) => {
-          if (args[0] === "attach") attached = true;
-          return inner(binary, args, options);
-        },
-      },
     };
     await runUp(deps);
-    expect(attached).toBe(true);
+    expect(attaches(base.pc)).toEqual([{ op: "attach", socketPath: base.inst.socketPath }]);
     expect(waited).toBe(false);
   });
 });
@@ -1515,7 +1424,7 @@ describe("runUp — namespace selection (#128)", () => {
       services: [isolated("web", "serve ${WEB_PORT} $WEB_PORT", ["WEB_PORT"])],
     };
     const deps: CommandDeps = {
-      ...stubDeps({ stack, track: { invocations: [], touchSocket: false } }),
+      ...pcDeps({ stack }),
       warn: (m) => warnings.push(m),
       waitForHealth: async () => {},
     };
@@ -1527,8 +1436,9 @@ describe("runUp — namespace selection (#128)", () => {
   it("#179: -n two selects the list-valued db and api, and health-waits on exactly them", async () => {
     let waited: string[] | undefined;
     const warnings: string[] = [];
+    const base = pcDeps({ stack: listNamespaces });
     const deps: CommandDeps = {
-      ...stubDeps({ stack: listNamespaces, track: { invocations: [], touchSocket: false } }),
+      ...base,
       namespaces: ["two"],
       warn: (m) => warnings.push(m),
       waitForHealth: async ({ serviceNames }) => {
@@ -1537,6 +1447,8 @@ describe("runUp — namespace selection (#128)", () => {
     };
     const result = await runUp(deps);
     expect(waited).toEqual(["db", "api"]);
+    // process-compose booted exactly them.
+    expect(base.pc.rows(base.inst.socketPath).map((r) => r.name)).toEqual(["db", "api"]);
     expect(result.droppedNamespaceEdges).toEqual([]);
     expect(warnings.filter((w) => /cross-namespace/.test(w))).toEqual([]);
   });
@@ -1544,7 +1456,7 @@ describe("runUp — namespace selection (#128)", () => {
   it("#179: warns once per depends_on edge whose target no selected namespace covers", async () => {
     const warnings: string[] = [];
     const deps: CommandDeps = {
-      ...stubDeps({ stack: listNamespaces, track: { invocations: [], touchSocket: false } }),
+      ...pcDeps({ stack: listNamespaces }),
       namespaces: ["one"],
       warn: (m) => warnings.push(m),
       waitForHealth: async () => {},
@@ -1559,27 +1471,14 @@ describe("runUp — namespace selection (#128)", () => {
     expect(lines[0]).toContain("[two]");
   });
 
-  it("forwards each requested namespace verbatim to the worktree up-spawn", async () => {
-    const track: StubSpawn = { invocations: [], touchSocket: false };
-    const baseDeps = stubDeps({ stack: mixedNamespaces, track });
-    const inner = baseDeps.driver?.spawner;
-    if (inner === undefined) throw new Error("expected stub spawner");
-    let upArgs: ReadonlyArray<string> | undefined;
-    const deps: CommandDeps = {
-      ...baseDeps,
-      namespaces: ["default"],
-      driver: {
-        ...baseDeps.driver,
-        spawner: (binary, args, options) => {
-          if (args[0] === "up") upArgs = args;
-          return inner(binary, args, options);
-        },
-      },
-    };
-    await runUp(deps);
-    if (upArgs === undefined) throw new Error("expected an up-spawn");
-    expect(upArgs.join(" ")).toContain("-n default");
-    expect(upArgs.filter((a) => a === "-n")).toHaveLength(1);
+  it("starts the worktree instance with exactly the requested namespace", async () => {
+    const base = pcDeps({ stack: mixedNamespaces });
+    await runUp({ ...base, namespaces: ["default"] });
+    expect(upsOn(base.pc, base.inst.socketPath)).toEqual([
+      { op: "up", socketPath: base.inst.socketPath, namespaces: ["default"] },
+    ]);
+    // Only the default-namespace web runs; the local-backend api was not started.
+    expect(base.pc.rows(base.inst.socketPath).map((r) => r.name)).toEqual(["web"]);
   });
 
   it("narrows the health-wait's expected set to the selected namespaces", async () => {
@@ -1587,9 +1486,8 @@ describe("runUp — namespace selection (#128)", () => {
     // local-backend api (a probed service) — otherwise it HEALTH_TIMEOUTs on a
     // service it never asked process-compose to start.
     let observed: { serviceNames: string[]; probedServiceNames: string[] } | undefined;
-    const track: StubSpawn = { invocations: [], touchSocket: false };
     const deps: CommandDeps = {
-      ...stubDeps({ stack: mixedNamespaces, track }),
+      ...pcDeps({ stack: mixedNamespaces }),
       namespaces: ["default"],
       waitForHealth: async ({ serviceNames, probedServiceNames }) => {
         observed = {
@@ -1605,9 +1503,8 @@ describe("runUp — namespace selection (#128)", () => {
   it("still waits on probed services WITHIN the selected namespace (no #108 regression)", async () => {
     // Selecting local-backend keeps the probed api in the expected set.
     let observed: { serviceNames: string[]; probedServiceNames: string[] } | undefined;
-    const track: StubSpawn = { invocations: [], touchSocket: false };
     const deps: CommandDeps = {
-      ...stubDeps({ stack: mixedNamespaces, track }),
+      ...pcDeps({ stack: mixedNamespaces }),
       namespaces: ["local-backend"],
       waitForHealth: async ({ serviceNames, probedServiceNames }) => {
         observed = {
@@ -1620,29 +1517,11 @@ describe("runUp — namespace selection (#128)", () => {
     expect(observed).toEqual({ serviceNames: ["api"], probedServiceNames: ["api"] });
   });
 
-  /** Capture the worktree up-spawn's argv alongside the stub spawner. */
-  function capturingUpArgs(base: ReturnType<typeof stubDeps>) {
-    const inner = base.driver?.spawner;
-    if (inner === undefined) throw new Error("expected stub spawner");
-    const captured: { args?: ReadonlyArray<string> } = {};
-    const driver = {
-      ...base.driver,
-      spawner: ((binary, args, options) => {
-        if (args[0] === "up") captured.args = args;
-        return inner(binary, args, options);
-      }) as typeof inner,
-    };
-    return { captured, driver };
-  }
-
-  it("a bare fresh up selects only `default`: spawns with `-n default` and waits only on default services (#176)", async () => {
+  it("a bare fresh up selects only `default`: starts and waits only on default services (#176)", async () => {
     let observed: string[] | undefined;
-    const track: StubSpawn = { invocations: [], touchSocket: false };
-    const baseDeps = stubDeps({ stack: mixedNamespaces, track });
-    const { captured, driver } = capturingUpArgs(baseDeps);
+    const base = pcDeps({ stack: mixedNamespaces });
     const deps: CommandDeps = {
-      ...baseDeps,
-      driver,
+      ...base,
       waitForHealth: async ({ serviceNames }) => {
         observed = [...serviceNames].sort();
       },
@@ -1651,25 +1530,18 @@ describe("runUp — namespace selection (#128)", () => {
     // Namespaces are opt-in (ADR-0008): the excluded local-backend api is
     // neither started nor waited on.
     expect(observed).toEqual(["web"]);
-    const args = captured.args ?? [];
-    expect(args.filter((a) => a === "-n")).toHaveLength(1);
-    expect(args.join(" ")).toContain("-n default");
+    expect(upsOn(base.pc, base.inst.socketPath).map((r) => r.namespaces)).toEqual([["default"]]);
+    expect(base.pc.rows(base.inst.socketPath).map((r) => r.name)).toEqual(["web"]);
   });
 
   it("`-n <ns>` stays exact: it never adds `default` on top (#176)", async () => {
-    const track: StubSpawn = { invocations: [], touchSocket: false };
-    const baseDeps = stubDeps({ stack: mixedNamespaces, track });
-    const { captured, driver } = capturingUpArgs(baseDeps);
-    await runUp({
-      ...baseDeps,
-      driver,
-      namespaces: ["local-backend"],
-      waitForHealth: async () => {},
-    });
-    const args = captured.args ?? [];
-    expect(args.filter((a) => a === "-n")).toHaveLength(1);
-    expect(args.join(" ")).toContain("-n local-backend");
-    expect(args).not.toContain("default");
+    const base = pcDeps({ stack: mixedNamespaces });
+    await runUp({ ...base, namespaces: ["local-backend"], waitForHealth: async () => {} });
+    expect(upsOn(base.pc, base.inst.socketPath).map((r) => r.namespaces)).toEqual([
+      ["local-backend"],
+    ]);
+    // The default-namespace web was not started.
+    expect(base.pc.rows(base.inst.socketPath).map((r) => r.name)).toEqual(["api"]);
   });
 
   /** Every isolated service in a named namespace — nothing in `default`. */
@@ -1682,8 +1554,7 @@ describe("runUp — namespace selection (#128)", () => {
   };
 
   it("a bare fresh up with no `default` services fails NO_SERVICES_SELECTED before any spawn (#176)", async () => {
-    const track: StubSpawn = { invocations: [], touchSocket: false };
-    const deps = stubDeps({ stack: allNamespaced, track });
+    const deps = pcDeps({ stack: allNamespaced });
     const err = await runUp(deps).then(
       () => undefined,
       (e: unknown) => e as Error & { code?: string; details?: Record<string, unknown> },
@@ -1696,13 +1567,12 @@ describe("runUp — namespace selection (#128)", () => {
     });
     expect(err?.message).toContain("Available namespaces: app, local-backend");
     expect(err?.message).toContain("devtrees up -n app");
-    expect(track.invocations).toEqual([]);
+    expect(ups(deps.pc)).toEqual([]);
   });
 
   it("`-n` naming only a namespace with NO services fails NO_SERVICES_SELECTED before any state is written (#203)", async () => {
     const registryRef = { snapshot: {} as RegistrySnapshot };
-    const track: StubSpawn = { invocations: [], touchSocket: false };
-    const deps = stubDeps({ stack: allNamespaced, track, registryRef });
+    const deps = pcDeps({ stack: allNamespaced, registryRef });
     const err = await runUp({ ...deps, namespaces: ["nope"] }).then(
       () => undefined,
       (e: unknown) => e as Error & { code?: string; details?: Record<string, unknown> },
@@ -1716,32 +1586,34 @@ describe("runUp — namespace selection (#128)", () => {
     expect(err?.message).toContain("-n nope");
     expect(err?.message).toContain("Available namespaces: app, local-backend");
     expect(err?.message).toContain("devtrees up -n app");
-    expect(track.invocations).toEqual([]);
+    expect(ups(deps.pc)).toEqual([]);
     expect(registryRef.snapshot).toEqual({});
   });
 
   it("`-n app -n nope` still starts: only an overall empty selection is an error (#203)", async () => {
     let observed: string[] | undefined;
-    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const base = pcDeps({ stack: allNamespaced });
     await runUp({
-      ...stubDeps({ stack: allNamespaced, track }),
+      ...base,
       namespaces: ["app", "nope"],
       waitForHealth: async ({ serviceNames }) => {
         observed = [...serviceNames].sort();
       },
     });
     expect(observed).toEqual(["web", "worker"]);
+    expect(base.pc.rows(base.inst.socketPath).map((r) => r.name)).toEqual(["web", "worker"]);
   });
 
   it("a bare up on a RUNNING instance is not a fresh start: no NO_SERVICES_SELECTED, no spawn (#177's scope)", async () => {
-    const track: StubSpawn = { invocations: [], touchSocket: true };
-    const baseDeps = stubDeps({ stack: allNamespaced, track });
+    const baseDeps = pcDeps({ stack: allNamespaced });
     await runUp({ ...baseDeps, namespaces: ["app"], waitForHealth: async () => {} });
-    const spawnsAfterBoot = track.invocations.length;
+    const upsAfterBoot = ups(baseDeps.pc).length;
+    const webPid = baseDeps.pc.pidOf(baseDeps.inst.socketPath, "web");
     // Bare re-up against the live instance takes the reconcile path unchanged.
-    const result = await runUp({ ...baseDeps, probeSocket: async () => "running" as const });
+    const result = await runUp(baseDeps);
     expect(result.worktreeId).toBe(baseDeps.expectedWorktreeId);
-    expect(track.invocations).toHaveLength(spawnsAfterBoot);
+    expect(ups(baseDeps.pc)).toHaveLength(upsAfterBoot);
+    expect(baseDeps.pc.pidOf(baseDeps.inst.socketPath, "web")).toBe(webPid);
   });
 });
 
@@ -1761,9 +1633,12 @@ describe("runUp — state envelope on success (#30)", () => {
     ],
   };
 
+  /** The `process list` reads process-compose answered on `socketPath`. */
+  const listsOn = (pc: InMemoryProcessCompose, socketPath: string) =>
+    pc.requests.filter((r) => r.op === "list" && r.socketPath === socketPath);
+
   it("returns the allocated block_base on the up result", async () => {
-    const track: StubSpawn = { invocations: [], touchSocket: false };
-    const result = await runUp(stubDeps({ stack: twoIsolated, track }));
+    const result = await runUp(pcDeps({ stack: twoIsolated }));
     // block_base is the bottom of this worktree's allocated block: the
     // first named port (offset 0 within the block) lines up with it, and
     // every other port falls inside [blockBase, blockBase + blockSize).
@@ -1774,24 +1649,19 @@ describe("runUp — state envelope on success (#30)", () => {
     expect(Number(result.env.WORKER_PORT)).toBeLessThan(result.blockBase + 32);
   });
 
-  it("populates services[] from the injected getServiceStatuses, zipped with named-port allocations", async () => {
-    const track: StubSpawn = { invocations: [], touchSocket: false };
-    const baseDeps = stubDeps({ stack: twoIsolated, track });
-    const seen: string[] = [];
-    const deps: CommandDeps = {
-      ...baseDeps,
-      getServiceStatuses: async (socketPath) => {
-        seen.push(socketPath);
-        return [
-          { name: "web", status: "Running", health: "ready" },
-          { name: "worker", status: "Running", health: "not_ready" },
-        ];
-      },
+  it("populates services[] from process-compose's rows, zipped with named-port allocations", async () => {
+    // Both probed: web passes its readiness probe, worker does not (yet).
+    const probed: ResolvedStack = {
+      services: twoIsolated.services.map((s) => ({ ...s, readinessProbe: { exec: {} } })),
     };
+    const deps = pcDeps({
+      stack: probed,
+      onBoot: (inst, pc) => pc.setReady(inst.socketPath, "worker", false),
+    });
     const result = await runUp(deps);
-    // Called once, against the worktree's own socket.
-    expect(seen).toHaveLength(1);
-    expect(seen[0]?.endsWith(`/${baseDeps.expectedWorktreeId}.sock`)).toBe(true);
+    // Read once, from the worktree's own socket.
+    expect(listsOn(deps.pc, deps.inst.socketPath)).toHaveLength(1);
+    expect(deps.pc.requests.filter((r) => r.op === "list")).toHaveLength(1);
     expect(result.services).toEqual([
       {
         name: "web",
@@ -1808,74 +1678,71 @@ describe("runUp — state envelope on success (#30)", () => {
     ]);
   });
 
-  it("services[] is the empty array (not undefined) when getServiceStatuses returns nothing", async () => {
-    const track: StubSpawn = { invocations: [], touchSocket: false };
+  it("services[] is the empty array (not undefined) when process-compose lists no processes", async () => {
+    const base = pcDeps({ stack: twoIsolated });
     const deps: CommandDeps = {
-      ...stubDeps({ stack: twoIsolated, track }),
-      getServiceStatuses: async () => [],
+      ...base,
+      // A process-compose whose `process list` answers with no rows.
+      processCompose: { ...base.pc.driver, getServiceStatuses: async () => [] },
     };
     const result = await runUp(deps);
     expect(result.services).toEqual([]);
   });
 
-  it("a getServiceStatuses failure does not abort `up` — services[] degrades to []", async () => {
+  it("a failed status read does not abort `up` — services[] degrades to []", async () => {
     // Same containment rule `ls --json` uses (issue #29): a flaky driver call
     // must not turn an otherwise-healthy worktree into a failed `up`. The
-    // stack is running; the envelope just gets the partial answer.
-    const track: StubSpawn = { invocations: [], touchSocket: false };
+    // stack is running; the envelope just gets the partial answer. Here
+    // process-compose stops answering once the health-wait is done.
+    const base = pcDeps({ stack: twoIsolated });
     const deps: CommandDeps = {
-      ...stubDeps({ stack: twoIsolated, track }),
-      getServiceStatuses: async () => {
-        throw new Error("simulated process-compose hiccup");
-      },
+      ...base,
+      waitForHealth: async ({ socketPath }) => base.pc.freeze(socketPath),
     };
     const result = await runUp(deps);
+    expect(listsOn(base.pc, base.inst.socketPath).length).toBeGreaterThan(0);
     expect(result.services).toEqual([]);
     // The rest of the envelope is still well-formed.
     expect(result.blockBase).toBe(Number(result.env.WEB_PORT));
     expect(result.env.WEB_PORT).toBeDefined();
   });
 
-  it("calls getServiceStatuses after the health-wait, never before", async () => {
-    // Order matters: `getServiceStatuses` polls the running stack — calling
-    // it before the wait would return process-compose's transient "starting"
+  it("reads the service rows after the health-wait, never before", async () => {
+    // Order matters: the status read polls the running stack — reading it
+    // before the wait would return process-compose's transient "starting"
     // state instead of the healthy snapshot the agent is contracting for.
     const order: string[] = [];
-    const track: StubSpawn = { invocations: [], touchSocket: false };
+    const pc = createInMemoryProcessCompose({
+      onRequest: (r) => {
+        if (r.op === "list") order.push("statuses");
+      },
+    });
     const deps: CommandDeps = {
-      ...stubDeps({ stack: twoIsolated, track }),
+      ...pcDeps({ stack: twoIsolated, pc }),
       waitForHealth: async () => {
         order.push("wait");
-      },
-      getServiceStatuses: async () => {
-        order.push("statuses");
-        return [];
       },
     };
     await runUp(deps);
     expect(order).toEqual(["wait", "statuses"]);
   });
 
-  it("does not call getServiceStatuses when the health-wait threw HEALTH_TIMEOUT", async () => {
+  it("does not read the service rows when the health-wait threw HEALTH_TIMEOUT", async () => {
     // The stack is left running (ADR-0005), but the agent reads the
     // `HEALTH_TIMEOUT` error envelope, not the success envelope — so the
     // success-only `services[]` fetch must be skipped.
-    const track: StubSpawn = { invocations: [], touchSocket: false };
-    let called = false;
+    const base = pcDeps({ stack: twoIsolated });
     const deps: CommandDeps = {
-      ...stubDeps({ stack: twoIsolated, track }),
+      ...base,
       waitForHealth: async () => {
         const err = new Error("timed out") as Error & { code: string };
         err.code = "HEALTH_TIMEOUT";
         throw err;
       },
-      getServiceStatuses: async () => {
-        called = true;
-        return [];
-      },
     };
     await expect(runUp(deps)).rejects.toThrow(/timed out/);
-    expect(called).toBe(false);
+    expect(base.pc.requests.filter((r) => r.op === "list")).toEqual([]);
+    expect(base.pc.isUp(base.inst.socketPath)).toBe(true);
   });
 });
 
@@ -2348,16 +2215,18 @@ describe("runUpDryRun — namespace selection preview (#176)", () => {
   };
 
   it("a bare dry run previews the `default`-only selection", async () => {
-    const result = await runUpDryRun(stubDeps({ stack: mixed }));
+    const deps = pcDeps({ stack: mixed });
+    const result = await runUpDryRun(deps);
     expect(result.namespaces).toEqual(["default"]);
     expect(result.selectedServices).toEqual(["web"]);
     // The derived config still carries every service; `-n` filters at launch.
     expect(Object.keys(result.config.processes).sort()).toEqual(["api", "web"]);
+    expect(deps.pc.requests).toEqual([]);
   });
 
   it("`-n` is previewed verbatim and exactly", async () => {
     const result = await runUpDryRun({
-      ...stubDeps({ stack: mixed }),
+      ...pcDeps({ stack: mixed }),
       namespaces: ["local-backend"],
     });
     expect(result.namespaces).toEqual(["local-backend"]);
@@ -2366,7 +2235,7 @@ describe("runUpDryRun — namespace selection preview (#176)", () => {
 
   it("a bare dry run of an all-namespaced stack fails NO_SERVICES_SELECTED without touching the registry", async () => {
     const registryRef = { snapshot: {} as RegistrySnapshot };
-    const deps = stubDeps({
+    const deps = pcDeps({
       stack: { services: [{ ...isolated("api", "node api.js", ["API_PORT"]), namespace: "app" }] },
       registryRef,
     });
@@ -2379,7 +2248,7 @@ describe("runUpDryRun — namespace selection preview (#176)", () => {
 
   it("`-n` naming only a namespace with no services fails NO_SERVICES_SELECTED in a dry run, registry untouched (#203)", async () => {
     const registryRef = { snapshot: {} as RegistrySnapshot };
-    const deps = stubDeps({
+    const deps = pcDeps({
       stack: { services: [{ ...isolated("api", "node api.js", ["API_PORT"]), namespace: "app" }] },
       registryRef,
     });
@@ -2400,18 +2269,6 @@ describe("runUpDryRun — namespace selection preview (#176)", () => {
  * NO_SERVICES_SELECTED where the real bare `up` succeeded.
  */
 describe("runUpDryRun — a running instance (#210)", () => {
-  const running = (name: string, pid?: number): ServiceStatus => ({
-    name,
-    status: "Running",
-    health: "unknown",
-    ...(pid !== undefined ? { pid } : {}),
-  });
-  const killed = (name: string): ServiceStatus => ({
-    name,
-    status: "Completed",
-    health: "unknown",
-    exitCode: -1,
-  });
   const noDefault: ResolvedStack = {
     services: [
       { ...isolated("api", "sleep 300", ["API_PORT"]), namespace: "local-backend" },
@@ -2419,35 +2276,51 @@ describe("runUpDryRun — a running instance (#210)", () => {
     ],
   };
 
+  /** The config a stack's services boot from: just what process-compose selects on. */
+  const bootConfig = (stack: ResolvedStack) => ({
+    processes: Object.fromEntries(
+      stack.services.map((s) => [
+        s.name,
+        { command: s.command, ...(s.namespace !== undefined ? { namespace: s.namespace } : {}) },
+      ]),
+    ),
+  });
+
   /**
-   * A live worktree instance (socket file present, probe `running`) whose
-   * project is `rows`, with every side-effecting seam recording its use.
+   * A live worktree instance on the in-memory process-compose, booted from
+   * `boot.from` (default: `stack`) with `boot.namespaces`; the `boot.dead`
+   * processes were then killed (exit -1). Pids start at `boot.firstPid`.
+   * `effects` counts the side-effecting seams; process-compose's requests are
+   * on `pc`. `boot: false` boots nothing.
    */
-  function live(stack: ResolvedStack, rows: ServiceStatus[], extra: Partial<CommandDeps> = {}) {
-    const tmp = tmpAnchor();
-    const track: StubSpawn = { invocations: [], touchSocket: false };
+  async function live(
+    stack: ResolvedStack,
+    boot:
+      | {
+          namespaces: string[];
+          dead?: string[];
+          firstPid?: number;
+          from?: ResolvedStack;
+        }
+      | false,
+    extra: Partial<CommandDeps> = {},
+  ) {
     const registryRef = { snapshot: {} as RegistrySnapshot };
-    const base = stubDeps({
-      stack,
-      track,
-      registryRef,
-      anchorOverride: tmp.anchor,
-      worktreeRootOverride: tmp.worktreeRoot,
-    });
+    const pc = createInMemoryProcessCompose(
+      boot === false || boot.firstPid === undefined ? {} : { firstPid: boot.firstPid },
+    );
+    const base = pcDeps({ stack, registryRef, pc });
+    const { inst, anchor } = base;
     const id = base.expectedWorktreeId;
-    const paths = instancePaths(tmp.anchor, id);
-    mkdirSync(runDir(tmp.anchor), { recursive: true });
-    writeFileSync(paths.socketPath, "");
-    const effects = {
-      spawned: [] as string[][],
-      controlRequests: 0,
-      lifecycleLock: 0,
-      hashWrites: 0,
-      reads: 0,
-    };
-    const inner = base.driver?.spawner;
-    if (inner === undefined) throw new Error("expected stub spawner");
-    const deps: StubbedDeps = {
+    if (boot !== false) {
+      mkdirSync(runDir(anchor), { recursive: true });
+      writeFileSync(inst.configPath, stringifyYaml(bootConfig(boot.from ?? stack)));
+      await pc.driver.up(inst, boot.namespaces);
+      for (const name of boot.dead ?? []) pc.exit(inst.socketPath, name, -1);
+    }
+    const bootRequests = pc.requests.length;
+    const effects = { lifecycleLock: 0, hashWrites: 0 };
+    const deps: PcDeps = {
       ...base,
       readStoredHash: () => stackHash(stack),
       writeStoredHash: () => {
@@ -2457,24 +2330,14 @@ describe("runUpDryRun — a running instance (#210)", () => {
         effects.lifecycleLock++;
         return fn();
       },
-      getServiceStatuses: async () => {
-        effects.reads++;
-        return rows;
-      },
-      driver: {
-        ...base.driver,
-        spawner: (binary, args, options) => {
-          effects.spawned.push([...args]);
-          return inner(binary, args, options);
-        },
-        controlRequest: () => {
-          effects.controlRequests++;
-          return Promise.resolve({ status: 200, body: "{}" });
-        },
-      },
+      // An old run's pid is not some unrelated process on this machine.
+      isProcessAlive: () => false,
       ...extra,
     };
-    return { deps, effects, paths, id, anchor: tmp.anchor, registryRef };
+    /** process-compose's requests since the boot, by op. */
+    const since = (...ops: PcRequest["op"][]) =>
+      pc.requests.slice(bootRequests).filter((r) => ops.includes(r.op));
+    return { deps, effects, since, pc, paths: inst, id, anchor, registryRef };
   }
 
   async function dryFailure(deps: CommandDeps) {
@@ -2485,7 +2348,7 @@ describe("runUpDryRun — a running instance (#210)", () => {
   }
 
   it("a bare dry run targets the booted namespaces, as the real bare up does (no default services)", async () => {
-    const { deps, effects } = live(noDefault, [running("api")]);
+    const { deps, since } = await live(noDefault, { namespaces: ["local-backend"] });
     const dry = await runUpDryRun(deps);
     expect(dry.instance).toBe("running");
     expect(dry.namespaces).toEqual(["local-backend"]);
@@ -2502,11 +2365,12 @@ describe("runUpDryRun — a running instance (#210)", () => {
       },
     });
     expect(waited).toEqual([dry.selectedServices]);
-    expect(effects.spawned.filter((a) => a[0] !== "process")).toEqual([]);
+    // Neither started, stopped nor attached an instance.
+    expect(since("up", "down", "attach")).toEqual([]);
   });
 
   it("-n naming a namespace the instance was not booted with fails NAMESPACE_NOT_RUNNING, registry untouched", async () => {
-    const { deps, id, registryRef } = live(noDefault, [running("api")]);
+    const { deps, id, registryRef } = await live(noDefault, { namespaces: ["local-backend"] });
     const err = await dryFailure({ ...deps, namespaces: ["local-backend", "jobs"] });
     expect(err?.code).toBe("NAMESPACE_NOT_RUNNING");
     expect(err?.details).toEqual({
@@ -2519,7 +2383,7 @@ describe("runUpDryRun — a running instance (#210)", () => {
   });
 
   it("-n naming only a namespace with no services still fails NO_SERVICES_SELECTED (#203)", async () => {
-    const { deps } = live(noDefault, [running("api")]);
+    const { deps } = await live(noDefault, { namespaces: ["local-backend"] });
     const err = await dryFailure({ ...deps, namespaces: ["nope"] });
     expect(err?.code).toBe("NO_SERVICES_SELECTED");
   });
@@ -2532,24 +2396,30 @@ describe("runUpDryRun — a running instance (#210)", () => {
         isolated("ok", "sleep 300"),
       ],
     };
-    const { deps, effects } = live(stack, [killed("web"), killed("db"), running("ok")]);
+    const { deps, effects, since, pc, paths } = await live(stack, {
+      namespaces: ["default"],
+      dead: ["web", "db"],
+    });
     const dry = await runUpDryRun(deps);
     // `depends_on` order, as the real restart uses.
     expect(dry.wouldRestart).toEqual(["db", "web"]);
-    expect(effects.spawned).toEqual([]);
+    expect(since("up", "down", "attach", "start", "stop", "reload")).toEqual([]);
+    expect(pc.rows(paths.socketPath).filter((r) => r.running).map((r) => r.name)).toEqual(["ok"]);
     expect(effects.lifecycleLock).toBe(0);
   });
 
   it("reports a drifted stack as a reload without reloading, writing the config or the hash", async () => {
     const stack: ResolvedStack = { services: [isolated("web", "node b.js", ["WEB_PORT"])] };
-    const { deps, effects, paths } = live(stack, [running("web")], {
-      readStoredHash: () => "older-hash",
-    });
+    const { deps, effects, since, paths } = await live(
+      stack,
+      { namespaces: ["default"] },
+      { readStoredHash: () => "older-hash" },
+    );
     writeFileSync(paths.configPath, "processes: {}\n");
     const dry = await runUpDryRun(deps);
     expect(dry.instance).toBe("running");
     expect(dry.wouldReload).toBe(true);
-    expect(effects.controlRequests).toBe(0);
+    expect(since("reload")).toEqual([]);
     expect(effects.hashWrites).toBe(0);
     expect(readFileSync(paths.configPath, "utf8")).toBe("processes: {}\n");
   });
@@ -2558,9 +2428,12 @@ describe("runUpDryRun — a running instance (#210)", () => {
     const stack: ResolvedStack = {
       services: [isolated("web", "node b.js"), isolated("api", "node api.js")],
     };
-    const { deps, anchor, id } = live(stack, [running("api", 200)], {
-      isProcessAlive: (pid) => pid === 100,
-    });
+    // The reload has not landed yet: the instance still lists only api.
+    const { deps, anchor, id } = await live(
+      stack,
+      { namespaces: ["default"], firstPid: 200, from: { services: [stack.services[1]!] } },
+      { isProcessAlive: (pid) => pid === 100 },
+    );
     const marker: PendingReload = { services: ["web"], oldRuns: [{ name: "web", pid: 100 }] };
     writePendingReload(anchor, id, marker);
     const err = await dryFailure(deps);
@@ -2571,9 +2444,7 @@ describe("runUpDryRun — a running instance (#210)", () => {
 
   it("a converged pending reload passes, but only the real up clears its marker", async () => {
     const stack: ResolvedStack = { services: [isolated("web", "node b.js")] };
-    const { deps, anchor, id } = live(stack, [running("web", 101)], {
-      isProcessAlive: () => false,
-    });
+    const { deps, anchor, id } = await live(stack, { namespaces: ["default"], firstPid: 101 });
     const marker: PendingReload = { services: ["web"], oldRuns: [{ name: "web", pid: 100 }] };
     writePendingReload(anchor, id, marker);
     const dry = await runUpDryRun(deps);
@@ -2582,29 +2453,29 @@ describe("runUpDryRun — a running instance (#210)", () => {
   });
 
   it("a stale socket file previews a fresh start and is left in place", async () => {
-    const { deps, paths, effects } = live(noDefault, [], {
-      probeSocket: async () => "stale" as const,
-    });
+    // process-compose died without cleaning up: its socket file stays, nothing answers.
+    const { deps, paths, since, pc } = await live(noDefault, { namespaces: ["jobs"] });
+    pc.crash(paths.socketPath);
     const dry = await runUpDryRun({ ...deps, namespaces: ["jobs"] });
     expect(dry.instance).toBe("fresh");
     expect(dry.selectedServices).toEqual(["worker"]);
     expect(existsSync(paths.socketPath)).toBe(true);
-    expect(effects.reads).toBe(0);
+    expect(since("list")).toEqual([]);
   });
 
   it("a socket whose liveness stays unknown fails INSTANCE_UNRESPONSIVE and is kept", async () => {
-    const { deps, paths } = live(noDefault, [], {
-      probeSocket: async () => "unknown" as const,
-      probeRetryDelaysMs: [],
-    });
+    const { deps, paths } = await live(
+      noDefault,
+      { namespaces: ["local-backend"] },
+      { probeSocket: async () => "unknown" as const, probeRetryDelaysMs: [] },
+    );
     const err = await dryFailure(deps);
     expect(err?.code).toBe("INSTANCE_UNRESPONSIVE");
     expect(existsSync(paths.socketPath)).toBe(true);
   });
 
   it("with no instance running, a bare dry run of a stack with no default services still fails NO_SERVICES_SELECTED", async () => {
-    const { deps, paths } = live(noDefault, []);
-    rmSync(paths.socketPath);
+    const { deps } = await live(noDefault, false);
     const err = await dryFailure(deps);
     expect(err?.code).toBe("NO_SERVICES_SELECTED");
   });
@@ -2612,7 +2483,8 @@ describe("runUpDryRun — a running instance (#210)", () => {
   /**
    * The real `up` hot-reloads a drifted stack before it reads the selection
    * back, so the preview must decide against the project the reload leaves.
-   * `before` is the config the instance runs (on disk); `rows` the project.
+   * `before` is the config the instance runs (on disk); process-compose's
+   * reload works out the project the drifted config leaves.
    */
   describe("a drifted stack is previewed after its reload", () => {
     const lb = (name: string) => ({ ...isolated(name, `run ${name}`), namespace: "local-backend" });
@@ -2620,28 +2492,13 @@ describe("runUpDryRun — a running instance (#210)", () => {
     const before: ResolvedStack = { services: [lb("api"), lb("db"), jobs("worker")] };
 
     /** A live instance booted with `-n local-backend` from `before`, now drifted to `after`. */
-    function drifted(after: ResolvedStack, projectAfterReload: string[]) {
-      let rows = [running("api"), running("db")];
-      const fixture = live(after, rows, {
-        readStoredHash: () => stackHash(before),
-        getServiceStatuses: async () => rows,
-      });
-      const processes = Object.fromEntries(
-        before.services.map((s) => [s.name, { command: s.command, namespace: s.namespace }]),
+    async function drifted(after: ResolvedStack) {
+      const fixture = await live(
+        after,
+        { namespaces: ["local-backend"], from: before },
+        { readStoredHash: () => stackHash(before) },
       );
-      writeFileSync(fixture.paths.configPath, stringifyYaml({ processes }));
-      // What process-compose does on `project update` (verified on v1.122.0).
-      const reloaded: CommandDeps = {
-        ...fixture.deps,
-        driver: {
-          ...fixture.deps.driver,
-          controlRequest: () => {
-            rows = projectAfterReload.map((n) => running(n));
-            return Promise.resolve({ status: 200, body: "{}" });
-          },
-        },
-      };
-      return { dry: fixture.deps, real: reloaded };
+      return { deps: fixture.deps, project: () => fixture.pc.rows(fixture.paths.socketPath) };
     }
 
     async function realChecks(deps: CommandDeps): Promise<string[] | string> {
@@ -2661,43 +2518,46 @@ describe("runUpDryRun — a running instance (#210)", () => {
       const after: ResolvedStack = {
         services: [lb("api"), lb("db"), lb("cache"), jobs("worker")],
       };
-      const scoped = drifted(after, ["api", "cache", "db"]);
-      const dryScoped = await runUpDryRun({ ...scoped.dry, namespaces: ["local-backend"] });
+      const scoped = await drifted(after);
+      const dryScoped = await runUpDryRun({ ...scoped.deps, namespaces: ["local-backend"] });
       expect(dryScoped.wouldReload).toBe(true);
       expect(dryScoped.selectedServices).toEqual(["api", "db", "cache"]);
-      expect(await realChecks({ ...scoped.real, namespaces: ["local-backend"] })).toEqual(
+      expect(await realChecks({ ...scoped.deps, namespaces: ["local-backend"] })).toEqual(
         dryScoped.selectedServices,
       );
+      expect(scoped.project().map((r) => r.name)).toEqual(["api", "db", "cache"]);
 
-      const bare = drifted(after, ["api", "cache", "db"]);
-      const dryBare = await runUpDryRun(bare.dry);
+      const bare = await drifted(after);
+      const dryBare = await runUpDryRun(bare.deps);
       expect(dryBare.namespaces).toEqual(["local-backend"]);
       expect(dryBare.selectedServices).toEqual(["api", "db", "cache"]);
-      expect(await realChecks(bare.real)).toEqual(dryBare.selectedServices);
+      expect(await realChecks(bare.deps)).toEqual(dryBare.selectedServices);
     });
 
     it("a service removed from a booted namespace", async () => {
       const after: ResolvedStack = { services: [lb("api"), jobs("worker")] };
-      const { dry, real } = drifted(after, ["api"]);
-      const preview = await runUpDryRun(dry);
+      const { deps, project } = await drifted(after);
+      const preview = await runUpDryRun(deps);
       expect(preview.namespaces).toEqual(["local-backend"]);
       expect(preview.selectedServices).toEqual(["api"]);
-      expect(await realChecks(real)).toEqual(preview.selectedServices);
+      expect(await realChecks(deps)).toEqual(preview.selectedServices);
+      expect(project().map((r) => r.name)).toEqual(["api"]);
     });
 
     it("a service moved to an unbooted namespace leaves the project", async () => {
       const after: ResolvedStack = { services: [jobs("api"), lb("db"), jobs("worker")] };
-      const bare = drifted(after, ["db"]);
-      const preview = await runUpDryRun(bare.dry);
+      const bare = await drifted(after);
+      const preview = await runUpDryRun(bare.deps);
       expect(preview.namespaces).toEqual(["local-backend"]);
       expect(preview.selectedServices).toEqual(["db"]);
-      expect(await realChecks(bare.real)).toEqual(preview.selectedServices);
+      expect(await realChecks(bare.deps)).toEqual(preview.selectedServices);
+      expect(bare.project().map((r) => r.name)).toEqual(["db"]);
 
-      const scoped = drifted(after, ["db"]);
-      const err = await dryFailure({ ...scoped.dry, namespaces: ["jobs"] });
+      const scoped = await drifted(after);
+      const err = await dryFailure({ ...scoped.deps, namespaces: ["jobs"] });
       expect(err?.code).toBe("NAMESPACE_NOT_RUNNING");
       expect(err?.details?.["services"]).toEqual(["api", "worker"]);
-      expect(await realChecks({ ...scoped.real, namespaces: ["jobs"] })).toBe(
+      expect(await realChecks({ ...scoped.deps, namespaces: ["jobs"] })).toBe(
         "NAMESPACE_NOT_RUNNING",
       );
     });
@@ -2706,7 +2566,10 @@ describe("runUpDryRun — a running instance (#210)", () => {
       const stack: ResolvedStack = {
         services: [isolated("edited", "run a"), isolated("kept", "run k"), isolated("ok", "run o")],
       };
-      const { deps, paths } = live(stack, [killed("edited"), killed("kept"), running("ok")]);
+      const { deps, paths } = await live(stack, {
+        namespaces: ["default"],
+        dead: ["edited", "kept"],
+      });
       // The config the instance runs: exactly what `stack` derives to.
       const current = await runUpDryRun(deps);
       writeFileSync(paths.configPath, stringifyYaml(current.config));
@@ -2726,26 +2589,36 @@ describe("runUpDryRun — a running instance (#210)", () => {
   it("the real up keeps the pending-reload marker when its read fails (#191)", async () => {
     // A failed read is no evidence the reload converged.
     const stack: ResolvedStack = { services: [isolated("web", "node b.js")] };
+    const { deps, anchor, id, pc, since } = await live(
+      stack,
+      { namespaces: ["default"], firstPid: 101 },
+      { waitForHealth: async () => {} },
+    );
+    // process-compose fails its first `process list`, then answers.
     let reads = 0;
-    const { deps, anchor, id } = live(stack, [], {
-      isProcessAlive: () => false,
-      waitForHealth: async () => {},
-      getServiceStatuses: async () => {
-        reads++;
-        if (reads === 1) throw new Error("process list failed");
-        return [running("web", 101)];
+    const flaky: CommandDeps = {
+      ...deps,
+      processCompose: {
+        ...pc.driver,
+        getServiceStatuses: async (socketPath, opts) => {
+          reads++;
+          if (reads === 1) throw new Error("process list failed");
+          return pc.driver.getServiceStatuses(socketPath, opts);
+        },
       },
-    });
+    };
     const marker: PendingReload = { services: ["web"], oldRuns: [{ name: "web", pid: 100 }] };
     writePendingReload(anchor, id, marker);
-    await runUp(deps);
+    await runUp(flaky);
     expect(reads).toBeGreaterThanOrEqual(2);
+    expect(since("list").length).toBe(reads - 1);
     expect(readPendingReload(anchor, id)).toEqual(marker);
   });
 
   it("caps its process list read at 5s by default, and at --wait-timeout when given", async () => {
-    const failing = () => Promise.reject(new Error("process list hung"));
-    const { deps } = live(noDefault, [], { getServiceStatuses: failing });
+    // process-compose stops answering: every `process list` fails.
+    const { deps, pc, paths } = await live(noDefault, { namespaces: ["local-backend"] });
+    pc.freeze(paths.socketPath);
     vi.useFakeTimers();
     try {
       const outcome = runUpDryRun(deps).then(
@@ -2769,8 +2642,7 @@ describe("runUpDryRun — derive the config(s) with no side effects (#124)", () 
     const stack: ResolvedStack = {
       services: [isolated("web", "node server.js", ["WEB_PORT", "METRICS_PORT"])],
     };
-    const track: StubSpawn = { invocations: [], touchSocket: false };
-    const deps = stubDeps({ stack, track });
+    const deps = pcDeps({ stack });
 
     const result = await runUpDryRun(deps);
 
@@ -2788,13 +2660,10 @@ describe("runUpDryRun — derive the config(s) with no side effects (#124)", () 
     });
     expect(result.config).toEqual(expected.config);
 
-    // No spawn, no config file on disk.
-    expect(track.invocations).toEqual([]);
-    const paths = instancePaths(
-      result.worktreeRoot.replace(/\/wt\/login$/, "/.git"),
-      deps.expectedWorktreeId,
-    );
-    expect(existsSync(paths.configPath)).toBe(false);
+    // Nothing started, no config file on disk.
+    expect(deps.pc.requests).toEqual([]);
+    expect(deps.pc.isUp(deps.inst.socketPath)).toBe(false);
+    expect(existsSync(deps.inst.configPath)).toBe(false);
   });
 
   it("derives both the worktree and shared config(s) + injects shared ports into env", async () => {
@@ -2804,8 +2673,8 @@ describe("runUpDryRun — derive the config(s) with no side effects (#124)", () 
         shared("postgres", "postgres -D ./pgdata", ["DB_PORT"]),
       ],
     };
-    const track: StubSpawn = { invocations: [], touchSocket: false };
-    const result = await runUpDryRun(stubDeps({ stack, track }));
+    const deps = pcDeps({ stack });
+    const result = await runUpDryRun(deps);
 
     expect(result.sharedConfig).toBeDefined();
     expect(result.sharedEnv).toBeDefined();
@@ -2821,14 +2690,15 @@ describe("runUpDryRun — derive the config(s) with no side effects (#124)", () 
     expect(result.sharedConfig).toEqual(expectedShared.config);
 
     // Dry run never lazy-starts the shared instance.
-    expect(track.invocations).toEqual([]);
+    expect(deps.pc.requests).toEqual([]);
+    expect(deps.pc.isUp(deps.sharedInst.socketPath)).toBe(false);
   });
 
   it("omits the shared config when the stack declares no shared services", async () => {
     const stack: ResolvedStack = {
       services: [isolated("web", "node x.js", ["WEB_PORT"])],
     };
-    const result = await runUpDryRun(stubDeps({ stack }));
+    const result = await runUpDryRun(pcDeps({ stack }));
     expect(result.sharedConfig).toBeUndefined();
     expect(result.sharedEnv).toBeUndefined();
   });
@@ -2844,7 +2714,7 @@ describe("runUpDryRun — derive the config(s) with no side effects (#124)", () 
     const stack: ResolvedStack = {
       services: [web, shared("db", "postgres", ["DB_PORT"])],
     };
-    const result = await runUpDryRun(stubDeps({ stack }));
+    const result = await runUpDryRun(pcDeps({ stack }));
 
     expect(result.droppedEdges).toEqual([
       { from: "web", to: "db", fromTier: "isolated", toTier: "shared" },
@@ -2861,7 +2731,7 @@ describe("runUpDryRun — derive the config(s) with no side effects (#124)", () 
         isolated("api", "serve ${DEVTREES_WORKTREE_ID} ${HOME}"),
       ],
     };
-    const result = await runUpDryRun(stubDeps({ stack }));
+    const result = await runUpDryRun(pcDeps({ stack }));
     expect(result.bracedEnvVars).toEqual([
       { service: "web", variable: "WEB_PORT" },
       { service: "api", variable: "DEVTREES_WORKTREE_ID" },
@@ -2877,11 +2747,11 @@ describe("runUpDryRun — derive the config(s) with no side effects (#124)", () 
         { ...isolated("api", "node api.js"), namespace: "two", dependsOn: [{ name: "db" }] },
       ],
     };
-    const result = await runUpDryRun({ ...stubDeps({ stack }), namespaces: ["two"] });
+    const result = await runUpDryRun({ ...pcDeps({ stack }), namespaces: ["two"] });
     expect(result.droppedNamespaceEdges).toEqual([
       { from: "api", to: "db", toNamespaces: ["one", "three"] },
     ]);
-    const kept = await runUpDryRun({ ...stubDeps({ stack }), namespaces: ["two", "three"] });
+    const kept = await runUpDryRun({ ...pcDeps({ stack }), namespaces: ["two", "three"] });
     expect(kept.droppedNamespaceEdges).toEqual([]);
   });
 
@@ -2890,7 +2760,7 @@ describe("runUpDryRun — derive the config(s) with no side effects (#124)", () 
     const stack: ResolvedStack = {
       services: [web, isolated("api", "node api.js", ["API_PORT"])],
     };
-    const result = await runUpDryRun(stubDeps({ stack }));
+    const result = await runUpDryRun(pcDeps({ stack }));
     expect(result.droppedEdges).toEqual([]);
     expect(result.config.processes.web?.depends_on).toEqual({
       api: { condition: expect.any(String) },
@@ -2909,7 +2779,7 @@ describe("runUpDryRun — derive the config(s) with no side effects (#124)", () 
     let hashWritten = false;
     let healthWaited = false;
     const deps: CommandDeps = {
-      ...stubDeps({ stack }),
+      ...pcDeps({ stack }),
       withLifecycleLock: async (_a, _i, fn) => {
         lifecycleLockTaken = true;
         return fn();
@@ -2942,7 +2812,7 @@ describe("runUpDryRun — derive the config(s) with no side effects (#124)", () 
       services: [isolated("web", "node x.js", ["WEB_PORT"])],
     };
     let registryLockTaken = false;
-    const base = stubDeps({ stack });
+    const base = pcDeps({ stack });
     const deps: CommandDeps = {
       ...base,
       withRegistryLock: async (anchor, mutate) => {
@@ -3152,123 +3022,72 @@ describe("runLs — instance enumeration", () => {
  * Tracker for `process-compose attach` invocations — the spawner records the
  * args so the test can assert which socket path was attached against.
  */
-interface AttachInvocation {
-  args: ReadonlyArray<string>;
-}
-
-function makeAttachSpawner(track: { invocations: AttachInvocation[] }) {
-  return (_binary: string, args: ReadonlyArray<string>, _options: unknown): SpawnedProcess => {
-    if (args[0] === "attach") {
-      track.invocations.push({ args });
-    }
-    return spawnedOk();
-  };
-}
-
 /**
- * Build a `CommandDeps` whose `driver` collaborates with the attach spawner;
- * unlike `stubDeps`, this skips the allocator/lock plumbing because `runAttach`
- * does not allocate ports or read the stack.
+ * A `CommandDeps` for `runAttach` on the in-memory process-compose; unlike
+ * `pcDeps`, this skips the allocator/lock plumbing because `runAttach` does
+ * not allocate ports or read the stack. `boot` starts an instance (one
+ * `web` process) the way `up` leaves it running.
  */
-function attachDeps(opts: {
-  anchor: string;
-  worktreeRoot: string;
-  worktreeId: string;
-  track: { invocations: AttachInvocation[] };
-}): CommandDeps {
+function attachFixture(worktreeId = "login") {
+  const tmp = tmpAnchor();
   const git = (args: ReadonlyArray<string>): string => {
     const flag = args[1];
-    if (flag === "--git-common-dir") return opts.anchor;
-    if (flag === "--show-toplevel") return join(opts.worktreeRoot, opts.worktreeId);
+    if (flag === "--git-common-dir") return tmp.anchor;
+    if (flag === "--show-toplevel") return join(tmp.worktreeRoot, worktreeId);
     if (flag === "--is-bare-repository") return "false";
     throw new Error(`unexpected git invocation: ${args.join(" ")}`);
   };
-  return {
-    cwd: join(opts.worktreeRoot, opts.worktreeId),
+  const pc = createInMemoryProcessCompose();
+  const deps: CommandDeps = {
+    cwd: join(tmp.worktreeRoot, worktreeId),
     git,
-    driver: {
-      exists: () => Promise.resolve(true),
-      spawner: makeAttachSpawner(opts.track),
-    },
+    processCompose: pc.driver,
+    probeSocket: (path) => pc.probeSocket(path),
   };
+  const inst = instancePaths(tmp.anchor, idFor(tmp.worktreeRoot, worktreeId));
+  const sharedInst = sharedInstancePaths(tmp.anchor);
+  async function boot(target: InstanceRef): Promise<void> {
+    mkdirSync(runDir(tmp.anchor), { recursive: true });
+    writeFileSync(target.configPath, stringifyYaml({ processes: { web: { command: "x" } } }));
+    await pc.driver.up(target);
+  }
+  /** The TUI attaches process-compose received. */
+  const attaches = () => pc.requests.filter((r) => r.op === "attach");
+  return { deps, pc, inst, sharedInst, boot, attaches };
 }
 
 describe("runAttach — attach to a running instance", () => {
   it("attaches the worktree instance by default — driver receives that socket", async () => {
-    const tmp = tmpAnchor();
-    const worktreeId = "login";
-    const derivedId = idFor(tmp.worktreeRoot, worktreeId);
-    const paths = {
-      configPath: join(tmp.anchor, "devtrees", `${derivedId}.yaml`),
-      socketPath: instancePaths(tmp.anchor, derivedId).socketPath,
-    };
-    // Mimic a running instance: the control socket file exists.
-    mkdtempSync(join(tmpdir(), "dt-noop-")); // (no-op; keep symmetric with other tests)
-    // Use the actual path layout — create the directory and socket file.
-    const { mkdirSync } = await import("node:fs");
-    mkdirSync(runDir(tmp.anchor), { recursive: true });
-    writeFileSync(paths.socketPath, "");
-
-    const track = { invocations: [] as AttachInvocation[] };
-    const deps = attachDeps({
-      anchor: tmp.anchor,
-      worktreeRoot: tmp.worktreeRoot,
-      worktreeId,
-      track,
-    });
+    const { deps, inst, boot, attaches } = attachFixture();
+    await boot(inst);
 
     await runAttach(deps, { shared: false });
-    expect(track.invocations).toHaveLength(1);
-    expect(track.invocations[0]?.args).toContain(paths.socketPath);
+    expect(attaches()).toEqual([{ op: "attach", socketPath: inst.socketPath }]);
   });
 
   it("attaches the shared instance with { shared: true }", async () => {
-    const tmp = tmpAnchor();
-    const { mkdirSync } = await import("node:fs");
-    const sharedSocket = sharedInstancePaths(tmp.anchor).socketPath;
-    mkdirSync(runDir(tmp.anchor), { recursive: true });
-    writeFileSync(sharedSocket, "");
-
-    const track = { invocations: [] as AttachInvocation[] };
-    const deps = attachDeps({
-      anchor: tmp.anchor,
-      worktreeRoot: tmp.worktreeRoot,
-      worktreeId: "login",
-      track,
-    });
+    const { deps, sharedInst, boot, attaches } = attachFixture();
+    await boot(sharedInst);
 
     await runAttach(deps, { shared: true });
-    expect(track.invocations).toHaveLength(1);
-    expect(track.invocations[0]?.args).toContain(sharedSocket);
+    expect(attaches()).toEqual([{ op: "attach", socketPath: sharedInst.socketPath }]);
   });
 
   it("throws a clear error when the worktree instance is not running", async () => {
-    const tmp = tmpAnchor();
-    const track = { invocations: [] as AttachInvocation[] };
-    const deps = attachDeps({
-      anchor: tmp.anchor,
-      worktreeRoot: tmp.worktreeRoot,
-      worktreeId: "login",
-      track,
-    });
-    // No socket file exists.
+    // Only the shared instance runs: attach must not fall back to it.
+    const { deps, sharedInst, boot, pc } = attachFixture();
+    await boot(sharedInst);
     await expect(runAttach(deps, { shared: false })).rejects.toThrow(/no worktree instance.*login/);
-    expect(track.invocations).toEqual([]);
+    expect(pc.requests.filter((r) => r.op !== "up")).toEqual([]);
   });
 
   it("throws a clear error when the shared instance is not running", async () => {
-    const tmp = tmpAnchor();
-    const track = { invocations: [] as AttachInvocation[] };
-    const deps = attachDeps({
-      anchor: tmp.anchor,
-      worktreeRoot: tmp.worktreeRoot,
-      worktreeId: "login",
-      track,
-    });
+    const { deps, inst, boot, pc } = attachFixture();
+    await boot(inst);
     await expect(runAttach(deps, { shared: true })).rejects.toThrow(
       /no shared instance is running/,
     );
-    expect(track.invocations).toEqual([]);
+    expect(pc.requests.filter((r) => r.op !== "up")).toEqual([]);
   });
 });
 
@@ -3961,70 +3780,49 @@ describe("runEnv — pure read of injected env", () => {
  * lock-free promise.
  */
 
-interface LogsInvocation {
-  args: ReadonlyArray<string>;
-  socket: string;
-  service: string;
-}
-
 /**
- * Stub spawner that records every `process logs` invocation and returns a
- * fake child that emits the canned lines for that service on stdout, then
- * exits 0. Tests assert on `invocations` and on the collected `LogEvent`s.
+ * A `CommandDeps` for `runLogs` on the in-memory process-compose — no
+ * allocator/lock plumbing needed. `boot` writes an instance's derived config
+ * (`--all` enumerates services from it) and starts the instance from it;
+ * `pc.log` makes a process write a line.
  */
-function makeLogsSpawner(
-  invocations: LogsInvocation[],
-  linesPerService: Readonly<Record<string, ReadonlyArray<string>>>,
-) {
-  return (_binary: string, args: ReadonlyArray<string>, _options: unknown): SpawnedProcess => {
-    const service = args[2] ?? "";
-    const ui = args.indexOf("-u");
-    const socket = ui >= 0 ? (args[ui + 1] ?? "") : "";
-    invocations.push({ args, socket, service });
-
-    const lines = linesPerService[service] ?? [];
-    const stdout = Readable.from(lines.map((l) => `${l}\n`).join(""));
-    const stderr = Readable.from("");
-    const emitter = new EventEmitter();
-    stdout.on("end", () => queueMicrotask(() => emitter.emit("exit", 0)));
-
-    return {
-      stdout,
-      stderr,
-      on(event: "error" | "exit", cb: (arg: never) => void): void {
-        emitter.on(event, cb as (...args: unknown[]) => void);
-      },
-      kill: () => {
-        stdout.destroy();
-        return true;
-      },
-    };
-  };
-}
-
-/** Build a CommandDeps for runLogs tests — no allocator/lock plumbing needed. */
-function logsDeps(opts: {
-  anchor: string;
-  worktreeRoot: string;
-  worktreeId: string;
-  invocations: LogsInvocation[];
-  linesPerService: Readonly<Record<string, ReadonlyArray<string>>>;
-}): CommandDeps {
+function logsFixture(worktreeId = "login") {
+  const tmp = tmpAnchor();
   const git = (args: ReadonlyArray<string>): string => {
     const flag = args[1];
-    if (flag === "--git-common-dir") return opts.anchor;
-    if (flag === "--show-toplevel") return join(opts.worktreeRoot, opts.worktreeId);
+    if (flag === "--git-common-dir") return tmp.anchor;
+    if (flag === "--show-toplevel") return join(tmp.worktreeRoot, worktreeId);
     if (flag === "--is-bare-repository") return "false";
     throw new Error(`unexpected git invocation: ${args.join(" ")}`);
   };
-  return {
-    cwd: join(opts.worktreeRoot, opts.worktreeId),
+  const pc = createInMemoryProcessCompose();
+  const deps: CommandDeps = {
+    cwd: join(tmp.worktreeRoot, worktreeId),
     git,
-    driver: {
-      exists: () => Promise.resolve(true),
-      spawner: makeLogsSpawner(opts.invocations, opts.linesPerService),
-    },
+    processCompose: pc.driver,
+    probeSocket: (path) => pc.probeSocket(path),
   };
+  const inst = instancePaths(tmp.anchor, idFor(tmp.worktreeRoot, worktreeId));
+  const sharedInst = sharedInstancePaths(tmp.anchor);
+  /** Start `target` running `services`, each having logged its `lines`. */
+  async function boot(
+    target: InstanceRef,
+    services: ReadonlyArray<string>,
+    lines: Readonly<Record<string, ReadonlyArray<string>>> = {},
+  ): Promise<void> {
+    mkdirSync(dirname(target.configPath), { recursive: true });
+    mkdirSync(runDir(tmp.anchor), { recursive: true });
+    const processes: Record<string, { command: string }> = {};
+    for (const s of services) processes[s] = { command: "sleep 1" };
+    writeFileSync(target.configPath, stringifyYaml({ processes }));
+    await pc.driver.up(target);
+    for (const [service, logged] of Object.entries(lines)) {
+      for (const line of logged) pc.log(target.socketPath, service, line);
+    }
+  }
+  /** The `process logs` reads process-compose served. */
+  const logReads = () => pc.requests.filter((r) => r.op === "logs");
+  return { deps, pc, inst, sharedInst, boot, logReads };
 }
 
 async function collectLogs(
@@ -4040,46 +3838,10 @@ async function collectLogs(
   return out;
 }
 
-/** Write a minimal derived config to the anchor so --all enumeration works. */
-function writeDerivedConfig(
-  anchor: string,
-  fileStem: string,
-  services: ReadonlyArray<string>,
-): string {
-  const dir = join(anchor, "devtrees");
-  mkdirSync(dir, { recursive: true });
-  const processes: Record<string, { command: string }> = {};
-  for (const s of services) processes[s] = { command: "sleep 1" };
-  const path = join(dir, `${fileStem}.yaml`);
-  writeFileSync(path, stringifyYaml({ processes }));
-  return path;
-}
-
-/** Touch the control socket file so existence checks pass. */
-function touchSocket(anchor: string, fileStem: string): string {
-  const dir = runDir(anchor);
-  mkdirSync(dir, { recursive: true });
-  const path = join(dir, `${fileStem}.sock`);
-  writeFileSync(path, "");
-  return path;
-}
-
 describe("runLogs — stream service logs without locking", () => {
   it("streams the worktree instance's named service from its socket", async () => {
-    const tmp = tmpAnchor();
-    const worktreeId = "login";
-    const stem = idFor(tmp.worktreeRoot, worktreeId);
-    const socketPath = touchSocket(tmp.anchor, stem);
-    writeDerivedConfig(tmp.anchor, stem, ["web", "worker"]);
-
-    const invocations: LogsInvocation[] = [];
-    const deps = logsDeps({
-      anchor: tmp.anchor,
-      worktreeRoot: tmp.worktreeRoot,
-      worktreeId,
-      invocations,
-      linesPerService: { web: ["hello", "world"] },
-    });
+    const { deps, inst, boot, logReads } = logsFixture();
+    await boot(inst, ["web", "worker"], { web: ["hello", "world"], worker: ["other"] });
 
     const result = await runLogs(deps, { service: "web" });
     expect(result.services).toEqual(["web"]);
@@ -4088,77 +3850,40 @@ describe("runLogs — stream service logs without locking", () => {
       { service: "web", line: "hello" },
       { service: "web", line: "world" },
     ]);
-    expect(invocations).toHaveLength(1);
-    expect(invocations[0]?.socket).toBe(socketPath);
-    expect(invocations[0]?.service).toBe("web");
+    expect(logReads()).toEqual([{ op: "logs", socketPath: inst.socketPath, services: ["web"] }]);
   });
 
   it("streams the shared instance with { shared: true } (different socket)", async () => {
-    const tmp = tmpAnchor();
-    const sharedSocket = touchSocket(tmp.anchor, "shared");
-    writeDerivedConfig(tmp.anchor, "shared", ["postgres"]);
-
-    const invocations: LogsInvocation[] = [];
-    const deps = logsDeps({
-      anchor: tmp.anchor,
-      worktreeRoot: tmp.worktreeRoot,
-      worktreeId: "login",
-      invocations,
-      linesPerService: { postgres: ["ready to accept connections"] },
-    });
+    const { deps, inst, sharedInst, boot, logReads } = logsFixture();
+    await boot(sharedInst, ["postgres"], { postgres: ["ready to accept connections"] });
+    await boot(inst, ["web"], { web: ["not this one"] });
 
     const result = await runLogs(deps, { service: "postgres", shared: true });
     const events = await collectLogs(result.events);
     expect(events).toEqual([{ service: "postgres", line: "ready to accept connections" }]);
-    expect(invocations[0]?.socket).toBe(sharedSocket);
+    expect(logReads().map((r) => r.socketPath)).toEqual([sharedInst.socketPath]);
   });
 
   it("throws a clear error when the worktree control socket is missing (→ INSTANCE_NOT_FOUND)", async () => {
-    const tmp = tmpAnchor();
-    // No socket file written.
-    const invocations: LogsInvocation[] = [];
-    const deps = logsDeps({
-      anchor: tmp.anchor,
-      worktreeRoot: tmp.worktreeRoot,
-      worktreeId: "login",
-      invocations,
-      linesPerService: {},
-    });
+    // Only the shared instance runs.
+    const { deps, sharedInst, boot, logReads } = logsFixture();
+    await boot(sharedInst, ["web"]);
     await expect(runLogs(deps, { service: "web" })).rejects.toThrow(/no worktree instance.*login/);
-    expect(invocations).toEqual([]);
+    expect(logReads()).toEqual([]);
   });
 
   it("throws when --shared is set and the shared socket is missing", async () => {
-    const tmp = tmpAnchor();
-    const invocations: LogsInvocation[] = [];
-    const deps = logsDeps({
-      anchor: tmp.anchor,
-      worktreeRoot: tmp.worktreeRoot,
-      worktreeId: "login",
-      invocations,
-      linesPerService: {},
-    });
+    const { deps, inst, boot, logReads } = logsFixture();
+    await boot(inst, ["postgres"]);
     await expect(runLogs(deps, { service: "postgres", shared: true })).rejects.toThrow(
       /no shared instance is running/,
     );
-    expect(invocations).toEqual([]);
+    expect(logReads()).toEqual([]);
   });
 
   it("rejects an unknown service with SERVICE_NOT_FOUND before spawning anything (#109)", async () => {
-    const tmp = tmpAnchor();
-    const worktreeId = "login";
-    const stem = idFor(tmp.worktreeRoot, worktreeId);
-    touchSocket(tmp.anchor, stem);
-    writeDerivedConfig(tmp.anchor, stem, ["web", "worker"]);
-
-    const invocations: LogsInvocation[] = [];
-    const deps = logsDeps({
-      anchor: tmp.anchor,
-      worktreeRoot: tmp.worktreeRoot,
-      worktreeId,
-      invocations,
-      linesPerService: {},
-    });
+    const { deps, inst, boot, logReads } = logsFixture();
+    await boot(inst, ["web", "worker"]);
 
     const err = (await runLogs(deps, { service: "nosuchservice" }).then(
       () => undefined,
@@ -4174,23 +3899,13 @@ describe("runLogs — stream service logs without locking", () => {
       service: "nosuchservice",
       valid_services: ["web", "worker"],
     });
-    // Fail-fast: no `process logs` subprocess may have been spawned.
-    expect(invocations).toEqual([]);
+    // Fail-fast: no `process logs` read may have been made.
+    expect(logReads()).toEqual([]);
   });
 
   it("rejects an unknown service on the shared instance the same way (#109)", async () => {
-    const tmp = tmpAnchor();
-    touchSocket(tmp.anchor, "shared");
-    writeDerivedConfig(tmp.anchor, "shared", ["postgres"]);
-
-    const invocations: LogsInvocation[] = [];
-    const deps = logsDeps({
-      anchor: tmp.anchor,
-      worktreeRoot: tmp.worktreeRoot,
-      worktreeId: "login",
-      invocations,
-      linesPerService: {},
-    });
+    const { deps, sharedInst, boot, logReads } = logsFixture();
+    await boot(sharedInst, ["postgres"]);
 
     const err = (await runLogs(deps, { service: "web", shared: true }).then(
       () => undefined,
@@ -4201,83 +3916,55 @@ describe("runLogs — stream service logs without locking", () => {
     expect(err?.message).toContain("web");
     expect(err?.message).toContain("postgres");
     expect(err?.details).toEqual({ service: "web", valid_services: ["postgres"] });
-    expect(invocations).toEqual([]);
+    expect(logReads()).toEqual([]);
   });
 
   it("with { all: true }, enumerates services from the derived config and interleaves them", async () => {
-    const tmp = tmpAnchor();
-    const worktreeId = "login";
-    const stem = idFor(tmp.worktreeRoot, worktreeId);
-    touchSocket(tmp.anchor, stem);
-    writeDerivedConfig(tmp.anchor, stem, ["web", "worker"]);
-
-    const invocations: LogsInvocation[] = [];
-    const deps = logsDeps({
-      anchor: tmp.anchor,
-      worktreeRoot: tmp.worktreeRoot,
-      worktreeId,
-      invocations,
-      linesPerService: { web: ["w1", "w2"], worker: ["k1"] },
-    });
+    const { deps, inst, boot, logReads } = logsFixture();
+    await boot(inst, ["web", "worker"], { web: ["w1", "w2"], worker: ["k1"] });
 
     const result = await runLogs(deps, { all: true });
     expect([...result.services].sort()).toEqual(["web", "worker"]);
     const events = await collectLogs(result.events);
     // Both services must appear; order is not guaranteed (real interleave).
     expect(events.map((e) => e.line).sort()).toEqual(["k1", "w1", "w2"]);
-    // One subprocess per service.
-    expect(invocations.map((i) => i.service).sort()).toEqual(["web", "worker"]);
+    // One read per service.
+    expect(logReads().flatMap((r) => r.services ?? []).sort()).toEqual(["web", "worker"]);
   });
 
-  it("forwards follow and tail to the driver's argv", async () => {
-    const tmp = tmpAnchor();
-    const worktreeId = "login";
-    const stem = idFor(tmp.worktreeRoot, worktreeId);
-    touchSocket(tmp.anchor, stem);
-    writeDerivedConfig(tmp.anchor, stem, ["web"]);
-
-    const invocations: LogsInvocation[] = [];
-    const deps = logsDeps({
-      anchor: tmp.anchor,
-      worktreeRoot: tmp.worktreeRoot,
-      worktreeId,
-      invocations,
-      linesPerService: { web: ["a"] },
-    });
-    const result = await runLogs(deps, { service: "web", follow: true, tail: 10 });
-    // Drain so the spawn happens.
-    await collectLogs(result.events);
-    const args = invocations[0]?.args ?? [];
-    expect(args).toContain("-f");
-    const ni = args.indexOf("-n");
-    expect(ni).toBeGreaterThan(-1);
-    expect(args[ni + 1]).toBe("10");
+  it("forwards follow and tail to the driver: the last N lines, then new ones as they come", async () => {
+    const { deps, pc, inst, boot } = logsFixture();
+    await boot(inst, ["web"], { web: ["old", "a", "b"] });
+    const result = await runLogs(deps, { service: "web", follow: true, tail: 2 });
+    const seen: string[] = [];
+    const drained = (async () => {
+      for await (const ev of result.events) {
+        seen.push(ev.line);
+        // Following: a line logged after the history is streamed too.
+        if (ev.line === "b") pc.log(inst.socketPath, "web", "c");
+      }
+    })();
+    await vi.waitFor(() => expect(seen).toEqual(["a", "b", "c"]));
+    // The follow ends when the instance goes away.
+    await pc.driver.down(inst);
+    await drained;
+    expect(seen).toEqual(["a", "b", "c"]);
   });
 
   it("does not take the allocation-registry lock (lock-free path)", async () => {
-    const tmp = tmpAnchor();
-    const worktreeId = "login";
-    const stem = idFor(tmp.worktreeRoot, worktreeId);
-    touchSocket(tmp.anchor, stem);
-    writeDerivedConfig(tmp.anchor, stem, ["web"]);
+    const { deps: base, inst, boot } = logsFixture();
+    await boot(inst, ["web"], { web: ["a"] });
 
-    const invocations: LogsInvocation[] = [];
     let lockCalls = 0;
     const deps: CommandDeps = {
-      ...logsDeps({
-        anchor: tmp.anchor,
-        worktreeRoot: tmp.worktreeRoot,
-        worktreeId,
-        invocations,
-        linesPerService: { web: ["a"] },
-      }),
+      ...base,
       withRegistryLock: () => {
         lockCalls++;
         throw new Error("runLogs must not take the allocation-registry lock");
       },
     };
     const result = await runLogs(deps, { service: "web" });
-    await collectLogs(result.events);
+    expect(await collectLogs(result.events)).toEqual([{ service: "web", line: "a" }]);
     expect(lockCalls).toBe(0);
   });
 });
@@ -4340,20 +4027,8 @@ describe("filterLogEventsSince — drop events older than the cutoff (#88)", () 
 
 describe("runLogs — --since window (#88)", () => {
   it("streams fresh events unchanged when the window is wide (sinceMs wiring)", async () => {
-    const tmp = tmpAnchor();
-    const worktreeId = "login";
-    const stem = idFor(tmp.worktreeRoot, worktreeId);
-    touchSocket(tmp.anchor, stem);
-    writeDerivedConfig(tmp.anchor, stem, ["web"]);
-
-    const invocations: LogsInvocation[] = [];
-    const deps = logsDeps({
-      anchor: tmp.anchor,
-      worktreeRoot: tmp.worktreeRoot,
-      worktreeId,
-      invocations,
-      linesPerService: { web: ["hello", "world"] },
-    });
+    const { deps, inst, boot } = logsFixture();
+    await boot(inst, ["web"], { web: ["hello", "world"] });
 
     // Events are stamped at read time (now), so a 1h window keeps them all.
     const result = await runLogs(deps, { service: "web", sinceMs: 3_600_000 });
@@ -4365,23 +4040,12 @@ describe("runLogs — --since window (#88)", () => {
   });
 
   it("rejects a non-finite or negative sinceMs before spawning anything", async () => {
-    const tmp = tmpAnchor();
-    const worktreeId = "login";
-    const stem = idFor(tmp.worktreeRoot, worktreeId);
-    touchSocket(tmp.anchor, stem);
-    writeDerivedConfig(tmp.anchor, stem, ["web"]);
+    const { deps, inst, boot, logReads } = logsFixture();
+    await boot(inst, ["web"], { web: ["a"] });
 
     for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, -5_000]) {
-      const invocations: LogsInvocation[] = [];
-      const deps = logsDeps({
-        anchor: tmp.anchor,
-        worktreeRoot: tmp.worktreeRoot,
-        worktreeId,
-        invocations,
-        linesPerService: { web: ["a"] },
-      });
       await expect(runLogs(deps, { service: "web", sinceMs: bad })).rejects.toThrow(/since/);
-      expect(invocations).toHaveLength(0);
+      expect(logReads()).toHaveLength(0);
     }
   });
 });
@@ -4414,24 +4078,12 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     };
   }
 
-  /**
-   * `stubDeps` whose instance reports `web` running. The drift path reads the
-   * project before reloading (#191), and the stub spawner's empty `process
-   * list` would look like a reload still pending.
-   */
-  function liveStubDeps(opts: Parameters<typeof stubDeps>[0]): StubbedDeps {
-    return {
-      ...stubDeps(opts),
-      getServiceStatuses: async () => [
-        { name: "web", status: "Running", health: "ready", pid: 4242 },
-      ],
-    };
-  }
+  /** The config reloads process-compose received. */
+  const reloads = (pc: InMemoryProcessCompose) => pc.requests.filter((r) => r.op === "reload");
 
   it("writes the stack hash to the hash store after a successful first up", async () => {
-    const track: StubSpawn = { invocations: [], touchSocket: false };
     const hashes = hashStore();
-    const base = stubDeps({ stack: stackA, track });
+    const base = pcDeps({ stack: stackA });
     const deps: CommandDeps = {
       ...base,
       readStoredHash: hashes.read,
@@ -4448,14 +4100,12 @@ describe("runUp — idempotency + drift detection (#31)", () => {
   });
 
   it("a second up against a running instance with unchanged config is a noop: returns the envelope, no driver.up, no registry write", async () => {
-    // The stub spawner pre-creates the socket on the first up, so `existsSync`
-    // sees the instance as running for the second call.
-    const track: StubSpawn = { invocations: [], touchSocket: true };
     const hashes = hashStore();
     const registryRef = { snapshot: {} as RegistrySnapshot };
     let writeCalls = 0;
+    const base = pcDeps({ stack: stackA, registryRef });
     const deps: CommandDeps = {
-      ...stubDeps({ stack: stackA, track, registryRef }),
+      ...base,
       readStoredHash: hashes.read,
       writeStoredHash: (anchor, id, h) => {
         writeCalls++;
@@ -4465,45 +4115,31 @@ describe("runUp — idempotency + drift detection (#31)", () => {
 
     const first = await runUp(deps);
     const firstWriteCount = writeCalls;
-    const firstUpInvocations = track.invocations.filter(
-      (i) => !i.socketPath.endsWith("shared.sock"),
-    ).length;
+    const webPid = base.pc.pidOf(base.inst.socketPath, "web");
 
     const second = await runUp(deps);
 
     // Same envelope shape.
     expect(second.env).toEqual(first.env);
     expect(second.blockBase).toBe(first.blockBase);
-    // No additional driver.up spawn.
-    const secondUpInvocations = track.invocations.filter(
-      (i) => !i.socketPath.endsWith("shared.sock"),
-    ).length;
-    expect(secondUpInvocations).toBe(firstUpInvocations);
+    // Started once; the running web was left alone.
+    expect(upsOn(base.pc, base.inst.socketPath)).toHaveLength(1);
+    expect(base.pc.pidOf(base.inst.socketPath, "web")).toBe(webPid);
     // No additional hash store write.
     expect(writeCalls).toBe(firstWriteCount);
   });
 
-  it("noop path populates services[] from getServiceStatuses against the running instance", async () => {
-    const track: StubSpawn = { invocations: [], touchSocket: true };
+  it("noop path populates services[] from process-compose's rows for the running instance", async () => {
+    const probed: ResolvedStack = {
+      services: [{ ...isolated("web", "node a.js", ["WEB_PORT"]), readinessProbe: { exec: {} } }],
+    };
     const hashes = hashStore();
-    let firstCall = true;
     const deps: CommandDeps = {
-      ...stubDeps({ stack: stackA, track }),
+      ...pcDeps({ stack: probed }),
       readStoredHash: hashes.read,
       writeStoredHash: hashes.write,
-      getServiceStatuses: async () => {
-        // First call (in initial up) returns ready; second call (noop) returns the same.
-        return [
-          {
-            name: "web",
-            status: "Running",
-            health: firstCall ? "ready" : ((firstCall = false), "ready"),
-          },
-        ];
-      },
     };
     await runUp(deps);
-    firstCall = false;
     const second = await runUp(deps);
     expect(second.services).toEqual([
       { name: "web", status: "Running", health: "ready", ports: { WEB_PORT: second.blockBase } },
@@ -4511,64 +4147,51 @@ describe("runUp — idempotency + drift detection (#31)", () => {
   });
 
   it("on drift, calls driver.reloadConfig and on success returns the new envelope + updates the stored hash", async () => {
-    const track: StubSpawn = { invocations: [], touchSocket: true };
     const hashes = hashStore();
 
     // Seed the hash store with the OLD stack's hash so the second up sees drift.
-    const baseDeps = liveStubDeps({ stack: stackA, track });
-    const reloadCalls: ControlRequest[] = [];
-    const controlRequest = reloadAnswering(200, reloadCalls);
+    const baseDeps = pcDeps({ stack: stackA });
+    const { pc, inst } = baseDeps;
     const firstDeps: CommandDeps = {
       ...baseDeps,
-      driver: { ...baseDeps.driver, controlRequest },
       readStoredHash: hashes.read,
       writeStoredHash: hashes.write,
     };
 
     await runUp(firstDeps);
-    const upInvocationsAfterFirst = track.invocations.length;
+    const webPid = pc.pidOf(inst.socketPath, "web");
 
     // Now swap to a different stack — same worktree/anchor/registry deps —
     // so the second up sees drift relative to the stored hash.
     const secondDeps: CommandDeps = { ...firstDeps, readStack: () => stackB };
     const result = await runUp(secondDeps);
 
-    expect(reloadCalls).toHaveLength(1);
-    // The reload asks the worktree's own instance to re-read its config
-    // server-side, never via `project update` (#194).
-    const worktreeSpawn = track.invocations.find((i) => !i.socketPath.endsWith("/shared.sock"));
-    expect(reloadCalls[0]).toMatchObject({
-      socketPath: worktreeSpawn?.socketPath,
-      method: "POST",
-      path: "/project/configuration",
-    });
-    // Driver.up was NOT called a second time — reload, not restart.
-    expect(track.invocations.length).toBe(upInvocationsAfterFirst);
+    // The reload asks the worktree's own instance to re-read its config.
+    expect(reloads(pc)).toEqual([{ op: "reload", socketPath: inst.socketPath }]);
+    // Driver.up was NOT called a second time — reload, not restart of the
+    // instance; process-compose restarted the changed web.
+    expect(upsOn(pc, inst.socketPath)).toHaveLength(1);
+    expect(pc.pidOf(inst.socketPath, "web")).not.toBe(webPid);
+    expect(pc.rows(inst.socketPath)).toMatchObject([{ name: "web", status: "Running" }]);
     // Envelope is well-formed.
     expect(result.env.WEB_PORT).toBeDefined();
     // Stored hash was updated to the new stack's hash.
     const anchorStore = Object.values(hashes.raw)[0];
     if (!anchorStore) throw new Error("expected hash store entry");
-    const { stackHash } = await import("./hash.js");
     expect(anchorStore[baseDeps.expectedWorktreeId]).toBe(stackHash(stackB));
   });
 
   it("a probe-only edit triggers the drift/reload path on the next up (#86)", async () => {
-    const track: StubSpawn = { invocations: [], touchSocket: true };
     const hashes = hashStore();
 
-    const baseDeps = liveStubDeps({ stack: stackA, track });
-    const reloadCalls: ControlRequest[] = [];
-    const controlRequest = reloadAnswering(200, reloadCalls);
+    const baseDeps = pcDeps({ stack: stackA });
     const firstDeps: CommandDeps = {
       ...baseDeps,
-      driver: { ...baseDeps.driver, controlRequest },
       readStoredHash: hashes.read,
       writeStoredHash: hashes.write,
     };
 
     await runUp(firstDeps);
-    const upInvocationsAfterFirst = track.invocations.length;
 
     // Same stack except a readiness_probe was added — previously a silent
     // no-op because the hash omitted passthrough blocks.
@@ -4584,54 +4207,49 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     const result = await runUp(secondDeps);
 
     // Drift was detected: reload ran instead of the noop branch.
-    expect(reloadCalls).toHaveLength(1);
-    expect(track.invocations.length).toBe(upInvocationsAfterFirst);
+    expect(reloads(baseDeps.pc)).toHaveLength(1);
+    expect(upsOn(baseDeps.pc, baseDeps.inst.socketPath)).toHaveLength(1);
     expect(result.env.WEB_PORT).toBeDefined();
     // Stored hash now reflects the probed stack.
     const anchorStore = Object.values(hashes.raw)[0];
     if (!anchorStore) throw new Error("expected hash store entry");
-    const { stackHash } = await import("./hash.js");
     expect(anchorStore[baseDeps.expectedWorktreeId]).toBe(stackHash(probed));
   });
 
   it("a namespace-only edit triggers the drift/reload path on the next up (#175)", async () => {
-    const track: StubSpawn = { invocations: [], touchSocket: true };
     const hashes = hashStore();
-    const baseDeps = liveStubDeps({ stack: stackA, track });
-    const reloadCalls: ControlRequest[] = [];
-    const controlRequest = reloadAnswering(200, reloadCalls);
+    // `api` stays in `default`, so the instance keeps running once `web` leaves it.
+    const api = isolated("api", "node api.js");
+    const baseDeps = pcDeps({ stack: { services: [...stackA.services, api] } });
     const firstDeps: CommandDeps = {
       ...baseDeps,
-      driver: { ...baseDeps.driver, controlRequest },
       readStoredHash: hashes.read,
       writeStoredHash: hashes.write,
     };
     await runUp(firstDeps);
-    const upInvocationsAfterFirst = track.invocations.length;
 
     const moved: ResolvedStack = {
-      services: [{ ...isolated("web", "node a.js", ["WEB_PORT"]), namespace: "backend" }],
+      services: [{ ...isolated("web", "node a.js", ["WEB_PORT"]), namespace: "backend" }, api],
     };
     await runUp({ ...firstDeps, readStack: () => moved });
 
-    expect(reloadCalls).toHaveLength(1);
-    expect(track.invocations.length).toBe(upInvocationsAfterFirst);
+    expect(reloads(baseDeps.pc)).toHaveLength(1);
+    expect(upsOn(baseDeps.pc, baseDeps.inst.socketPath)).toHaveLength(1);
+    // The reload dropped web from the instance booted with `-n default`.
+    expect(baseDeps.pc.rows(baseDeps.inst.socketPath).map((r) => r.name)).toEqual(["api"]);
     const anchorStore = Object.values(hashes.raw)[0];
     if (!anchorStore) throw new Error("expected hash store entry");
-    const { stackHash } = await import("./hash.js");
     expect(anchorStore[baseDeps.expectedWorktreeId]).toBe(stackHash(moved));
   });
 
   it("on drift, if driver.reloadConfig reports not_supported, throws an Error tagged code:CONFIG_DRIFT and does not update the stored hash", async () => {
-    const track: StubSpawn = { invocations: [], touchSocket: true };
     const hashes = hashStore();
 
-    const baseDeps = liveStubDeps({ stack: stackA, track });
-    // The reload route answers 404 → driver classifies as not_supported.
-    const controlRequest = reloadAnswering(404);
+    const baseDeps = pcDeps({ stack: stackA });
+    // A process-compose build without the reload route.
     const firstDeps: CommandDeps = {
       ...baseDeps,
-      driver: { ...baseDeps.driver, controlRequest },
+      processCompose: reloadFailing(baseDeps.pc, { ok: false, reason: "not_supported" }),
       readStoredHash: hashes.read,
       writeStoredHash: hashes.write,
     };
@@ -4639,6 +4257,7 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     await runUp(firstDeps);
     const storedAfterFirst = Object.values(hashes.raw)[0]?.[baseDeps.expectedWorktreeId];
     if (storedAfterFirst === undefined) throw new Error("expected a stored hash after first up");
+    const webPid = baseDeps.pc.pidOf(baseDeps.inst.socketPath, "web");
 
     const secondDeps: CommandDeps = { ...firstDeps, readStack: () => stackB };
     const err = await runUp(secondDeps).then(
@@ -4652,6 +4271,8 @@ describe("runUp — idempotency + drift detection (#31)", () => {
 
     // Hash store unchanged — the stored hash still reflects stackA.
     expect(Object.values(hashes.raw)[0]?.[baseDeps.expectedWorktreeId]).toBe(storedAfterFirst);
+    // The instance keeps running unchanged.
+    expect(baseDeps.pc.pidOf(baseDeps.inst.socketPath, "web")).toBe(webPid);
   });
 
   it("on failed reload, the on-disk derived config is restored to match the running instance (#92)", async () => {
@@ -4659,62 +4280,59 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     // reload; on failure the on-disk config no longer matched the running
     // instance, so `ls` (which reads ports from the derived config) reported
     // ports that were never bound.
-    const track: StubSpawn = { invocations: [], touchSocket: true };
     const hashes = hashStore();
 
-    const baseDeps = liveStubDeps({ stack: stackA, track });
-    // process-compose refuses the reload → reloadConfig reports failure.
-    const controlRequest = reloadAnswering(400);
+    const baseDeps = pcDeps({ stack: stackA });
+    // process-compose refuses the reload.
     const firstDeps: CommandDeps = {
       ...baseDeps,
-      driver: { ...baseDeps.driver, controlRequest },
+      processCompose: reloadFailing(baseDeps.pc, {
+        ok: false,
+        reason: "error",
+        message: "process-compose config reload answered HTTP 400",
+      }),
       readStoredHash: hashes.read,
       writeStoredHash: hashes.write,
     };
 
     await runUp(firstDeps);
-    const worktreeSpawn = track.invocations.find((i) => !i.socketPath.endsWith("/shared.sock"));
-    if (worktreeSpawn === undefined) throw new Error("expected a worktree spawn");
-    const configBefore = readFileSync(worktreeSpawn.configPath, "utf8");
+    const { configPath } = baseDeps.inst;
+    const configBefore = readFileSync(configPath, "utf8");
 
     const secondDeps: CommandDeps = { ...firstDeps, readStack: () => stackB };
     await expect(runUp(secondDeps)).rejects.toThrow(/drift/i);
 
     // The on-disk derived config still describes what the instance is
     // actually running (stackA), byte-for-byte.
-    expect(readFileSync(worktreeSpawn.configPath, "utf8")).toBe(configBefore);
-    const parsed = parseYaml(readFileSync(worktreeSpawn.configPath, "utf8")) as {
+    expect(readFileSync(configPath, "utf8")).toBe(configBefore);
+    const parsed = parseYaml(readFileSync(configPath, "utf8")) as {
       processes: Record<string, { command: string }>;
     };
     expect(parsed.processes.web?.command).toBe("node a.js");
   });
 
-  it("on drift, a reload that never answers is bounded: CONFIG_DRIFT, request aborted, config restored, hash invalidated (#191)", async () => {
+  it("on drift, a reload that never answers is bounded: CONFIG_DRIFT, config restored, hash invalidated (#191)", async () => {
     // process-compose's config reload blocks until each changed process's old
     // incarnation exits. When it never exits (a shutdown.command that does not stop
     // it, or SIGTERM ignored with no shutdown.timeout_seconds), `up` used to hang.
-    const track: StubSpawn = { invocations: [], touchSocket: true };
+    // The driver bounds the request and reports reason:'timeout' (its abort is
+    // covered in src/driver.test.ts).
     const hashes = hashStore();
-    const baseDeps = liveStubDeps({ stack: stackA, track });
-    const aborted: boolean[] = [];
-    const controlRequest: ControlRequester = ({ signal }) =>
-      new Promise((_resolve, reject) => {
-        signal.addEventListener("abort", () => {
-          aborted.push(true);
-          reject(new Error("aborted"));
-        });
-      });
+    const baseDeps = pcDeps({ stack: stackA });
     const firstDeps: CommandDeps = {
       ...baseDeps,
-      driver: { ...baseDeps.driver, controlRequest, reloadTimeoutMs: 50 },
+      processCompose: reloadFailing(baseDeps.pc, {
+        ok: false,
+        reason: "timeout",
+        message: "process-compose config reload did not finish within 0s",
+      }),
       readStoredHash: hashes.read,
       writeStoredHash: hashes.write,
     };
 
     await runUp(firstDeps);
-    const worktreeSpawn = track.invocations.find((i) => !i.socketPath.endsWith("/shared.sock"));
-    if (worktreeSpawn === undefined) throw new Error("expected a worktree spawn");
-    const configBefore = readFileSync(worktreeSpawn.configPath, "utf8");
+    const { configPath } = baseDeps.inst;
+    const configBefore = readFileSync(configPath, "utf8");
     const storedBefore = Object.values(hashes.raw)[0]?.[baseDeps.expectedWorktreeId];
     expect(storedBefore).toMatch(/^[0-9a-f]{64}$/);
 
@@ -4728,8 +4346,7 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     expect(err.message).toMatch(/did not finish within/);
     expect(err.message).toMatch(/refuses with `reload_pending`/);
     expect(err.message).toMatch(/shutdown\.command/);
-    expect(aborted).toEqual([true]);
-    expect(readFileSync(worktreeSpawn.configPath, "utf8")).toBe(configBefore);
+    expect(readFileSync(configPath, "utf8")).toBe(configBefore);
     // Neither the old hash nor the new one: process-compose is still applying
     // the new config, so the next `up` must see drift once that converges.
     const storedAfter = Object.values(hashes.raw)[0]?.[baseDeps.expectedWorktreeId];
@@ -4738,46 +4355,37 @@ describe("runUp — idempotency + drift detection (#31)", () => {
   });
 
   it("on successful reload, the new derived config is on disk (#92)", async () => {
-    const track: StubSpawn = { invocations: [], touchSocket: true };
     const hashes = hashStore();
 
-    const baseDeps = liveStubDeps({ stack: stackA, track });
-    const controlRequest = reloadAnswering(200);
+    const baseDeps = pcDeps({ stack: stackA });
     const firstDeps: CommandDeps = {
       ...baseDeps,
-      driver: { ...baseDeps.driver, controlRequest },
       readStoredHash: hashes.read,
       writeStoredHash: hashes.write,
     };
 
     await runUp(firstDeps);
-    const worktreeSpawn = track.invocations.find((i) => !i.socketPath.endsWith("/shared.sock"));
-    if (worktreeSpawn === undefined) throw new Error("expected a worktree spawn");
 
     const secondDeps: CommandDeps = { ...firstDeps, readStack: () => stackB };
     await runUp(secondDeps);
 
-    const parsed = parseYaml(readFileSync(worktreeSpawn.configPath, "utf8")) as {
+    const parsed = parseYaml(readFileSync(baseDeps.inst.configPath, "utf8")) as {
       processes: Record<string, { command: string }>;
     };
     expect(parsed.processes.web?.command).toBe("node b.js");
   });
 
   it("noop path does NOT call driver.reloadConfig (no process-compose churn when the config matches)", async () => {
-    const track: StubSpawn = { invocations: [], touchSocket: true };
     const hashes = hashStore();
-    const baseDeps = liveStubDeps({ stack: stackA, track });
-    const reloadCalls: ControlRequest[] = [];
-    const controlRequest = reloadAnswering(200, reloadCalls);
+    const baseDeps = pcDeps({ stack: stackA });
     const deps: CommandDeps = {
       ...baseDeps,
-      driver: { ...baseDeps.driver, controlRequest },
       readStoredHash: hashes.read,
       writeStoredHash: hashes.write,
     };
     await runUp(deps);
     await runUp(deps);
-    expect(reloadCalls).toHaveLength(0);
+    expect(reloads(baseDeps.pc)).toHaveLength(0);
   });
 });
 
@@ -4788,12 +4396,6 @@ describe("runUp — idempotency + drift detection (#31)", () => {
  * until the pending update has converged.
  */
 describe("runUp — pending-reload guard (#191)", () => {
-  const row = (name: string, pid: number): ServiceStatus => ({
-    name,
-    status: "Running",
-    health: "ready",
-    pid,
-  });
   type Svc = ReturnType<typeof isolated> & { namespace?: string | string[] };
   const svc = (name: string, command: string, namespace?: string | string[]): Svc => ({
     ...isolated(name, command),
@@ -4806,87 +4408,141 @@ describe("runUp — pending-reload guard (#191)", () => {
     services: [svc("web", "node b.js"), svc("api", "node api.js")],
   };
 
+  type Processes = Record<string, Record<string, unknown>>;
+  const processesIn = (path: string): Processes =>
+    (parseYaml(readFileSync(path, "utf8")) as { processes?: Processes }).processes ?? {};
+
   /**
-   * A live instance whose project (`rows`), live PIDs and reload behaviour
-   * the test drives. `reload: "hang"` never answers, like process-compose
-   * waiting on an old process that will not stop.
+   * An instance on the in-memory process-compose (pids from 100) whose config
+   * reload the test drives. `reload: "hang"` never finishes, like
+   * process-compose waiting on an old process that will not stop: the
+   * request times out and process-compose keeps applying the update in the
+   * background. The test then moves that update along:
+   *
+   *  - `begin()`: process-compose drops each changed or removed process; its
+   *    old run stays alive (stuck) until it exits or devtrees kills it;
+   *  - `finish()`: the update lands; the changed processes run again with new pids.
+   *
+   * The OS process table (`ps`, liveness, kill) is process-compose (pid 9)
+   * with every running process and stuck old run as its child.
    */
-  function fixture(stack: ResolvedStack = stackA, rows: ServiceStatus[] = []) {
+  function fixture(stack: ResolvedStack = stackA) {
+    const pc = createInMemoryProcessCompose({ firstPid: 100 });
+    const base = pcDeps({ stack, pc });
+    const { inst } = base;
     const state = {
       stack,
-      rows,
-      alive: new Set(rows.flatMap((r) => (r.pid !== undefined ? [r.pid] : []))),
-      reload: 200 as 200 | "hang",
+      reload: "ok" as "ok" | "hang",
       reloads: 0,
+      /** Old runs process-compose stopped tracking that have not exited. */
+      stuck: new Set<number>(),
       /** What process-compose does once devtrees SIGKILLs `pid`. */
       onKill: undefined as ((pid: number) => void) | undefined,
       /** What process-compose does when a reload request arrives. */
       onReload: undefined as (() => void) | undefined,
     };
-    const track: StubSpawn = { invocations: [], touchSocket: true };
-    const base = stubDeps({ stack, track });
-    const controlRequest: ControlRequester = ({ signal }) => {
-      state.reloads++;
-      state.onReload?.();
-      if (state.reload === 200) return Promise.resolve({ status: 200, body: "{}" });
-      return new Promise((_resolve, reject) => {
-        signal.addEventListener("abort", () => reject(new Error("aborted")));
-      });
+    /** The config process-compose last finished applying, and the one it is applying. */
+    let applied: Processes = {};
+    let pending: Processes | undefined;
+
+    /** Apply `processes` to the running instance, as process-compose's reload does. */
+    async function apply(processes: Processes): Promise<void> {
+      const scratch = { configPath: `${inst.configPath}.applying`, socketPath: inst.socketPath };
+      writeFileSync(scratch.configPath, stringifyYaml({ processes }));
+      await pc.driver.reloadConfig(scratch);
+      rmSync(scratch.configPath, { force: true });
+    }
+
+    const runningPids = (): number[] => {
+      if (!pc.isUp(inst.socketPath)) return [];
+      return pc.rows(inst.socketPath).flatMap((r) => (r.running && r.pid ? [r.pid] : []));
     };
-    const worktreeSpawn = () => {
-      const spawn = track.invocations.find((i) => !i.socketPath.endsWith("/shared.sock"));
-      if (spawn === undefined) throw new Error("expected a worktree spawn");
-      return spawn;
+    const alive = (pid: number) => state.stuck.has(pid) || runningPids().includes(pid);
+
+    const driver: Driver = {
+      ...pc.driver,
+      async up(target, namespaces) {
+        await pc.driver.up(target, namespaces);
+        if (target.socketPath === inst.socketPath) applied = processesIn(target.configPath);
+      },
+      async reloadConfig(target, opts) {
+        state.reloads++;
+        state.onReload?.();
+        if (state.reload === "ok") {
+          const result = await pc.driver.reloadConfig(target, opts);
+          applied = processesIn(target.configPath);
+          return result;
+        }
+        pending = processesIn(target.configPath);
+        return {
+          ok: false,
+          reason: "timeout",
+          message:
+            "process-compose config reload did not finish within 0s; a changed service's " +
+            "old process has not stopped",
+        };
+      },
     };
-    // `ps`: the instance's process-compose (pid 9) and each live pid as its
-    // child, so a timed-out reload can record the old runs' identity (#206).
-    const readProcessTable = async () => [
-      { pid: 9, ppid: 1, pgid: 9, command: `process-compose up -u ${worktreeSpawn().socketPath}` },
-      ...[...state.alive].map((pid) => ({ pid, ppid: 9, pgid: pid, command: `cmd-${pid}` })),
-    ];
-    // `process list`, as the bounded `down` reads it through the driver.
-    const spawner: NonNullable<CommandDeps["driver"]>["spawner"] = (binary, args, options) => {
-      if (args[0] !== "process" || args[1] !== "list") {
-        // `process-compose down` stops every service it lists (#155: the
-        // tree sweep after it then has nothing left to kill).
-        if (args[0] === "down") for (const r of state.rows) if (r.pid) state.alive.delete(r.pid);
-        return base.driver?.spawner?.(binary, args, options) ?? spawnedOk();
-      }
-      const emitter = new EventEmitter() as EventEmitter & { stdout: Readable };
-      const listed = state.rows.map((r) => ({ ...r, is_ready: "-", is_running: true }));
-      emitter.stdout = Readable.from([JSON.stringify(listed)]);
-      emitter.stdout.on("end", () => queueMicrotask(() => emitter.emit("exit", 0)));
-      return emitter as unknown as SpawnedProcess;
+
+    const pendingUpdate = {
+      /** process-compose drops what the update changes or removes; their old runs live on. */
+      async begin(): Promise<void> {
+        if (pending === undefined) throw new Error("no reload is pending");
+        const next = pending;
+        const unchanged = Object.fromEntries(
+          Object.entries(next).filter(([name, def]) => isDeepStrictEqual(applied[name], def)),
+        );
+        for (const name of Object.keys(applied)) {
+          if (!(name in unchanged)) {
+            const pid = pc.pidOf(inst.socketPath, name);
+            if (pid !== undefined) state.stuck.add(pid);
+          }
+        }
+        await apply(unchanged);
+      },
+      /** The update lands: what it changed or added runs again. */
+      async finish(): Promise<void> {
+        if (pending === undefined) throw new Error("no reload is pending");
+        await apply(pending);
+        applied = pending;
+        pending = undefined;
+      },
     };
+
     const deps: CommandDeps = {
       ...base,
       readStack: () => state.stack,
-      driver: { ...base.driver, spawner, controlRequest, reloadTimeoutMs: 50 },
-      getServiceStatuses: async () => state.rows,
-      isProcessAlive: (pid) => state.alive.has(pid),
-      // Never the real `process.kill`: a SIGKILL drops the pid from the fake table.
+      processCompose: driver,
+      isProcessAlive: alive,
+      // Never the real `process.kill`: a SIGKILL ends the stuck old run.
       stop: {
-        readProcessTable,
+        readProcessTable: async () => [
+          { pid: 9, ppid: 1, pgid: 9, command: `process-compose up -u ${inst.socketPath}` },
+          ...[...state.stuck, ...runningPids()].map((pid) => ({
+            pid,
+            ppid: 9,
+            pgid: pid,
+            command: `cmd-${pid}`,
+          })),
+        ],
         kill: (target) => {
-          state.alive.delete(Math.abs(target));
+          state.stuck.delete(Math.abs(target));
           state.onKill?.(Math.abs(target));
         },
         // process-compose (pid 9) stays up throughout.
-        isAlive: (pid) => pid === 9 || state.alive.has(pid),
+        isAlive: (pid) => pid === 9 || alive(pid),
         settleMs: 20,
         pollMs: 2,
         stuckGraceMs: 0,
       },
     };
-    const where = (): { anchor: string; id: string } => {
-      const spawn = worktreeSpawn();
-      return { anchor: dirname(dirname(spawn.configPath)), id: base.expectedWorktreeId };
-    };
-    const marker = (): PendingReload | undefined => {
-      const { anchor, id } = where();
-      return readPendingReload(anchor, id);
-    };
-    return { state, deps, marker, where };
+    const where = (): { anchor: string; id: string } => ({
+      anchor: base.anchor,
+      id: base.expectedWorktreeId,
+    });
+    const marker = (): PendingReload | undefined => readPendingReload(base.anchor, base.expectedWorktreeId);
+    const pidOf = (name: string) => pc.pidOf(inst.socketPath, name);
+    return { state, deps, marker, where, pendingUpdate, pc, inst, pidOf };
   }
 
   async function upError(deps: CommandDeps): Promise<Error & { code?: string; details?: unknown }> {
@@ -4899,8 +4555,9 @@ describe("runUp — pending-reload guard (#191)", () => {
   }
 
   it("timeout -> retry refused -> recovery succeeds: the marker is set, holds, then clears", async () => {
-    const { state, deps, marker } = fixture(stackA, [row("web", 100), row("api", 200)]);
+    const { state, deps, marker, pendingUpdate, pidOf } = fixture(stackA);
     await runUp(deps);
+    expect(pidOf("web")).toBe(100);
 
     state.stack = stackB;
     state.reload = "hang";
@@ -4912,7 +4569,7 @@ describe("runUp — pending-reload guard (#191)", () => {
     });
 
     // process-compose dropped `web` and is waiting for pid 100 to exit.
-    state.rows = [row("api", 200)];
+    await pendingUpdate.begin();
     const retry = await upError(deps);
     expect(retry.code).toBe("CONFIG_DRIFT");
     expect(retry.details).toEqual({ reason: "reload_pending", services: ["web"], pids: [100] });
@@ -4921,29 +4578,28 @@ describe("runUp — pending-reload guard (#191)", () => {
 
     // The old process exited, but the pending update has not started the
     // new one yet: still pending, now without a PID to kill.
-    state.alive.delete(100);
+    state.stuck.delete(100);
     const between = await upError(deps);
     expect(between.details).toEqual({ reason: "reload_pending", services: ["web"], pids: [] });
     expect(state.reloads).toBe(1);
 
     // The pending update finished: `up` resyncs and the marker is gone.
-    state.rows = [row("web", 101), row("api", 200)];
-    state.alive.add(101);
-    state.reload = 200;
+    await pendingUpdate.finish();
+    state.reload = "ok";
     await runUp(deps);
     expect(state.reloads).toBe(2);
     expect(marker()).toBeUndefined();
   });
 
   it("reverting devtrees.yaml mid-reload: refused while pending, then the reverted config is re-applied", async () => {
-    const { state, deps, marker, where } = fixture(stackA, [row("web", 100), row("api", 200)]);
+    const { state, deps, marker, where, pendingUpdate, pc, inst } = fixture(stackA);
     await runUp(deps);
     state.stack = stackB;
     state.reload = "hang";
     await upError(deps);
     // Reverting devtrees.yaml does not stop process-compose applying stackB.
     state.stack = stackA;
-    state.rows = [row("api", 200)];
+    await pendingUpdate.begin();
     const err = await upError(deps);
     expect(err.details).toMatchObject({ reason: "reload_pending", services: ["web"] });
     expect(marker()).toBeDefined();
@@ -4951,10 +4607,9 @@ describe("runUp — pending-reload guard (#191)", () => {
     // The old process exits and process-compose finishes applying stackB.
     // devtrees.yaml, the derived config and (before #191's fix) the stored
     // hash all said stackA, so `up` used to see no drift and leave B running.
-    state.alive.delete(100);
-    state.rows = [row("web", 101), row("api", 200)];
-    state.alive.add(101);
-    state.reload = 200;
+    state.stuck.delete(100);
+    await pendingUpdate.finish();
+    state.reload = "ok";
     await runUp(deps);
     expect(state.reloads).toBe(2);
     expect(marker()).toBeUndefined();
@@ -4963,13 +4618,14 @@ describe("runUp — pending-reload guard (#191)", () => {
       processes: Record<string, { command: string }>;
     };
     expect(onDisk.processes.web?.command).toBe("node a.js");
+    expect(pc.rows(inst.socketPath).map((r) => r.name)).toEqual(["api", "web"]);
     // Converged: the next `up` is a noop.
     await runUp(deps);
     expect(state.reloads).toBe(2);
   });
 
   it("retries an empty ps read when it records the old runs' identity", async () => {
-    const { state, deps, marker } = fixture(stackA, [row("web", 100), row("api", 200)]);
+    const { state, deps, marker } = fixture(stackA);
     await runUp(deps);
     state.stack = stackB;
     state.reload = "hang";
@@ -4984,13 +4640,14 @@ describe("runUp — pending-reload guard (#191)", () => {
   });
 
   it("records when an old run was already unlisted at the timeout, for down's grace period (#206)", async () => {
-    const { state, deps, marker } = fixture(stackA, [row("web", 100), row("api", 200)]);
+    const { state, deps, marker, pendingUpdate } = fixture(stackA);
     await runUp(deps);
     state.stack = stackB;
     state.reload = "hang";
     // process-compose drops `web` as soon as its update begins.
     state.onReload = () => {
-      state.rows = [row("api", 200)];
+      // The reload request has just reached process-compose; its update begins.
+      queueMicrotask(() => void pendingUpdate.begin());
     };
     const before = Date.now();
     await upError(deps);
@@ -5000,32 +4657,31 @@ describe("runUp — pending-reload guard (#191)", () => {
   });
 
   it("down kills the stuck old run, waits for the new copy, stops, and clears the marker", async () => {
-    const { state, deps, marker } = fixture(stackA, [row("web", 100), row("api", 200)]);
+    const { state, deps, marker, pendingUpdate, pc, inst } = fixture(stackA);
     await runUp(deps);
     state.stack = stackB;
     state.reload = "hang";
     await upError(deps);
     expect(marker()).toBeDefined();
     // process-compose dropped `web` and waits on pid 100. Once it dies, the
-    // pending update lists `web` again as 101.
-    state.rows = [row("api", 200)];
+    // pending update lists `web` again with a new pid.
+    await pendingUpdate.begin();
     state.onKill = (pid) => {
-      if (pid !== 100) return;
-      state.alive.add(101);
-      state.rows = [row("web", 101), row("api", 200)];
+      if (pid === 100) void pendingUpdate.finish();
     };
     const result = await runDown(deps);
     expect(result.forceKilled).toEqual([{ service: "web", pid: 100 }]);
     expect(marker()).toBeUndefined();
+    expect(pc.isUp(inst.socketPath)).toBe(false);
   });
 
   it("down does not stop the instance while the pending update never finishes, and keeps the marker", async () => {
-    const { state, deps, marker } = fixture(stackA, [row("web", 100), row("api", 200)]);
+    const { state, deps, marker, pendingUpdate, pc, inst } = fixture(stackA);
     await runUp(deps);
     state.stack = stackB;
     state.reload = "hang";
     await upError(deps);
-    state.rows = [row("api", 200)];
+    await pendingUpdate.begin();
     const err = await runDown(deps).then(
       () => undefined,
       (e: unknown) => e as Error & { code?: string; details?: Record<string, unknown> },
@@ -5033,55 +4689,77 @@ describe("runUp — pending-reload guard (#191)", () => {
     expect(err?.code).toBe("DOWN_TIMEOUT");
     expect(err?.details).toMatchObject({ pending_reload: ["web"], stuck_services: [] });
     expect(marker()).toBeDefined();
+    expect(pc.isUp(inst.socketPath)).toBe(true);
   });
 
   it("a fresh start clears a marker left by an instance that is gone", async () => {
-    const { deps, marker, where } = fixture(stackA, [row("web", 100), row("api", 200)]);
+    const { deps, marker, where, pc, inst } = fixture(stackA);
     await runUp(deps);
     const { anchor, id } = where();
     writePendingReload(anchor, id, { services: ["web"], oldRuns: [{ name: "web", pid: 100 }] });
     // The instance died (stale socket): this `up` starts a new one.
-    await runUp({ ...deps, probeSocket: async () => "stale" as const });
+    pc.crash(inst.socketPath);
+    await runUp(deps);
     expect(marker()).toBeUndefined();
+    expect(upsOn(pc, inst.socketPath)).toHaveLength(2);
+    expect(pc.isUp(inst.socketPath)).toBe(true);
   });
 
   it("no marker: a service absent from the project does not block a reload", async () => {
     // Without a marker there is nothing to wait on: the project's shape alone
     // is not evidence (a timed-out rename leaves a stale on-disk config).
-    const { state, deps } = fixture(stackA, [row("web", 100), row("api", 200)]);
+    const { state, deps, pendingUpdate, pc, inst, where } = fixture(stackA);
     await runUp(deps);
-    state.rows = [row("api", 200)];
+    // process-compose dropped `web` (an update it is still applying), and no
+    // marker records it.
     state.stack = stackB;
+    state.reload = "hang";
+    await upError(deps);
+    await pendingUpdate.begin();
+    clearPendingReload(where().anchor, where().id);
+    expect(pc.rows(inst.socketPath).map((r) => r.name)).toEqual(["api"]);
+    state.reload = "ok";
     await runUp(deps);
-    expect(state.reloads).toBe(1);
+    expect(state.reloads).toBe(2);
   });
 
   it("a timed-out rename converges: once the old pid exits, up succeeds and the next up is a noop", async () => {
     const before: ResolvedStack = {
       services: [svc("keeper", "node k.js"), svc("web", "node a.js")],
     };
-    const { state, deps, marker } = fixture(before, [row("keeper", 50), row("web", 100)]);
+    const { state, deps, marker, pendingUpdate, pc, inst, pidOf } = fixture(before);
     await runUp(deps);
+    const webPid = pidOf("web");
     // Rename web -> web2; the old `web` never stops, so the reload times out.
     state.stack = { services: [svc("keeper", "node k.js"), svc("web2", "node a.js")] };
     state.reload = "hang";
     await upError(deps);
     expect(marker()).toEqual({
       services: [],
-      oldRuns: [{ name: "web", pid: 100, identity: { ppid: 9, pgid: 100, command: "cmd-100" } }],
+      oldRuns: [
+        {
+          name: "web",
+          pid: webPid,
+          identity: { ppid: 9, pgid: webPid, command: `cmd-${webPid}` },
+        },
+      ],
     });
 
     // Still pending while the old pid lives...
-    state.rows = [row("keeper", 50)];
+    await pendingUpdate.begin();
     const pending = await upError(deps);
-    expect(pending.details).toEqual({ reason: "reload_pending", services: ["web"], pids: [100] });
+    expect(pending.details).toEqual({
+      reason: "reload_pending",
+      services: ["web"],
+      pids: [webPid],
+    });
 
     // ...and converged once it exits: process-compose runs keeper + web2. The
     // restored on-disk config still names `web`; that must not read as stuck.
-    state.alive.delete(100);
-    state.rows = [row("keeper", 50), row("web2", 101)];
-    state.alive.add(101);
-    state.reload = 200;
+    state.stuck.delete(webPid!);
+    await pendingUpdate.finish();
+    expect(pc.rows(inst.socketPath).map((r) => r.name)).toEqual(["keeper", "web2"]);
+    state.reload = "ok";
     await runUp(deps);
     expect(state.reloads).toBe(2);
     expect(marker()).toBeUndefined();
@@ -5093,7 +4771,7 @@ describe("runUp — pending-reload guard (#191)", () => {
     const wide: ResolvedStack = {
       services: [svc("web", "node a.js", "one"), svc("worker", "node w.js", "two")],
     };
-    const { state, deps } = fixture(wide, [row("web", 100), row("worker", 300)]);
+    const { state, deps, pendingUpdate } = fixture(wide);
     await runUp({ ...deps, namespaces: ["one", "two"] });
     state.stack = {
       services: [svc("web", "node b.js", "one"), svc("worker", "node w.js", "two")],
@@ -5101,8 +4779,8 @@ describe("runUp — pending-reload guard (#191)", () => {
     state.reload = "hang";
     await upError({ ...deps, namespaces: ["one"] });
     // The old `web` exited; process-compose has not started the new one yet.
-    state.alive.delete(100);
-    state.rows = [row("worker", 300)];
+    await pendingUpdate.begin();
+    state.stuck.delete(100);
     const err = await upError({ ...deps, namespaces: ["one"] });
     expect(err.details).toEqual({ reason: "reload_pending", services: ["web"], pids: [] });
     expect(err.message).toContain("`devtrees down && devtrees up -n one -n two`");
@@ -5111,11 +4789,12 @@ describe("runUp — pending-reload guard (#191)", () => {
   it("an empty-selection instance can no longer exist: `-n nope` is refused before any boot or reload (#203)", async () => {
     // process-compose exits after reloading an empty project, so `up -n nope`
     // never boots one (it used to, #176).
-    const { state, deps } = fixture(stackA, []);
+    const { state, deps, pc } = fixture(stackA);
     await expect(upError({ ...deps, namespaces: ["nope"] })).resolves.toMatchObject({
       code: "NO_SERVICES_SELECTED",
     });
     expect(state.reloads).toBe(0);
+    expect(ups(pc)).toEqual([]);
   });
 
   it("an instance booted through a list-valued namespace reloads normally (#179)", async () => {
@@ -5128,8 +4807,9 @@ describe("runUp — pending-reload guard (#191)", () => {
     };
     // Booted `-n two`: `db` is present through `two`, `web` (only `one`) is
     // legitimately absent.
-    const { state, deps } = fixture(stack, [row("db", 100), row("worker", 300)]);
+    const { state, deps, pc, inst } = fixture(stack);
     await runUp({ ...deps, namespaces: ["two"] });
+    expect(pc.rows(inst.socketPath).map((r) => r.name)).toEqual(["db", "worker"]);
     state.stack = {
       services: [
         svc("db", "node db.js", ["one", "two"]),
@@ -5145,7 +4825,7 @@ describe("runUp — pending-reload guard (#191)", () => {
     const wide: ResolvedStack = {
       services: [svc("web", "node a.js", "one"), svc("worker", "node w.js", "two")],
     };
-    const { state, deps } = fixture(wide, [row("web", 100), row("worker", 300)]);
+    const { state, deps } = fixture(wide);
     await runUp({ ...deps, namespaces: ["one", "two"] });
     state.stack = {
       services: [svc("web", "node b.js", "one"), svc("worker", "node w.js", "two")],
@@ -5164,70 +4844,90 @@ describe("runUp — pending-reload guard (#191)", () => {
  * SHARED_SERVICE_DEAD, and nothing is ever stopped.
  */
 describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
-  const running = (name: string): ServiceStatus => ({ name, status: "Running", health: "unknown" });
-  const killed = (name: string): ServiceStatus => ({
-    name,
-    status: "Completed",
-    health: "unknown",
-    exitCode: -1,
+  /** A process-compose config entry for `s`: what process-compose selects and probes on. */
+  const procOf = (s: ResolvedService) => ({
+    command: s.command,
+    ...(s.namespace !== undefined ? { namespace: s.namespace } : {}),
+    ...(s.readinessProbe !== undefined ? { readiness_probe: s.readinessProbe } : {}),
   });
 
   /**
-   * Fake a live worktree instance (and a live shared one when the stack has
-   * shared services) whose stored hash matches, so `runUp` takes the
-   * already-running path with no reload. `rows` is what process-compose
-   * reports per socket. The real health wait runs (no `waitForHealth` stub).
+   * A live worktree instance on the in-memory process-compose, booted with
+   * `boot.namespaces` (default `default`) from the stack's isolated services,
+   * plus a live shared instance of its shared services when it has any. The
+   * stored hash matches, so `runUp` takes the already-running path with no
+   * reload. The real health wait runs (no `waitForHealth` stub).
+   *
+   * Tests make things happen to the processes through `pc` (`exit`,
+   * `backoff`, `setReady`, `refuse`), and to the requests as they arrive
+   * through `on`. `ours(...ops)` lists the requests `up` made since the
+   * boot; `byOthers` makes requests on someone else's behalf (a concurrent
+   * `devtrees` or a human), which `ours` leaves out.
    */
-  function liveInstance(
+  async function liveInstance(
     stack: ResolvedStack,
-    rows: { worktree: ServiceStatus[]; shared?: ServiceStatus[] },
+    boot: { namespaces?: string[]; worktree?: boolean } = {},
     extra: Partial<CommandDeps> = {},
   ) {
-    const tmp = tmpAnchor();
-    const track: StubSpawn = { invocations: [], touchSocket: false };
-    const spawned: string[][] = [];
-    const base = stubDeps({
-      stack,
-      track,
-      anchorOverride: tmp.anchor,
-      worktreeRootOverride: tmp.worktreeRoot,
+    const hooks: Array<{ op: PcRequest["op"]; fn: (r: PcRequest) => void }> = [];
+    const others = new Set<PcRequest>();
+    let external = false;
+    const pc = createInMemoryProcessCompose({
+      onRequest: (r) => {
+        if (external) others.add(r);
+        for (const h of hooks) if (h.op === r.op) h.fn(r);
+      },
     });
-    const inner = base.driver?.spawner;
-    if (inner === undefined) throw new Error("expected stub spawner");
-    const wtSocket = instancePaths(tmp.anchor, base.expectedWorktreeId).socketPath;
-    const sharedSocket = sharedInstancePaths(tmp.anchor).socketPath;
-    mkdirSync(runDir(tmp.anchor), { recursive: true });
-    writeFileSync(wtSocket, "");
-    if (rows.shared !== undefined) writeFileSync(sharedSocket, "");
-    const statusReads: string[] = [];
+    const base = pcDeps({ stack, pc });
+    const { inst, sharedInst, anchor } = base;
+    mkdirSync(runDir(anchor), { recursive: true });
+    const config = (tier: "isolated" | "shared") => ({
+      processes: Object.fromEntries(
+        stack.services.filter((s) => s.tier === tier).map((s) => [s.name, procOf(s)]),
+      ),
+    });
+    if (stack.services.some((s) => s.tier === "shared")) {
+      writeFileSync(sharedInst.configPath, stringifyYaml(config("shared")));
+      await pc.driver.up(sharedInst);
+    }
+    if (boot.worktree !== false) {
+      writeFileSync(inst.configPath, stringifyYaml(config("isolated")));
+      await pc.driver.up(inst, boot.namespaces ?? ["default"]);
+    }
+    const booted = pc.requests.length;
     const deps: CommandDeps = {
       ...base,
       waitForHealth: undefined,
       readStoredHash: () => stackHash(stack),
       writeStoredHash: () => {},
-      getServiceStatuses: async (socketPath) => {
-        statusReads.push(socketPath);
-        if (socketPath === wtSocket) return rows.worktree;
-        if (socketPath === sharedSocket) return rows.shared ?? [];
-        throw new Error(`unexpected socket ${socketPath}`);
-      },
-      driver: {
-        ...base.driver,
-        spawner: (binary, args, options) => {
-          spawned.push([...args]);
-          return inner(binary, args, options);
-        },
-      },
       ...extra,
     };
     return {
       deps,
-      spawned,
-      statusReads,
-      wtSocket,
-      sharedSocket,
+      pc,
+      wtSocket: inst.socketPath,
+      sharedSocket: sharedInst.socketPath,
       id: base.expectedWorktreeId,
-      anchor: tmp.anchor,
+      anchor,
+      /** Run `fn` as each `op` request reaches process-compose, before it is answered. */
+      on(op: PcRequest["op"], fn: (r: PcRequest) => void) {
+        hooks.push({ op, fn });
+      },
+      /** Requests made in `fn` are someone else's, not `up`'s. */
+      byOthers(fn: () => void) {
+        external = true;
+        try {
+          fn();
+        } finally {
+          external = false;
+        }
+      },
+      /** The requests `up` made since the boot, by op (all of them when none given). */
+      ours(...ops: PcRequest["op"][]) {
+        return pc.requests
+          .slice(booted)
+          .filter((r) => !others.has(r) && (ops.length === 0 || ops.includes(r.op)));
+      },
     };
   }
 
@@ -5237,6 +4937,9 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
       (e: unknown) => e as Error & { code?: string; details?: Record<string, unknown> },
     );
   }
+
+  /** Requests that start, stop, reload or attach an instance. */
+  const lifecycle = ["up", "down", "reload", "attach"] as const;
 
   const twoNamespaces: ResolvedStack = {
     services: [
@@ -5257,9 +4960,9 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
   it("#179: warns about edges the effective (read-back) selection drops on a bare up", async () => {
     // Booted with -n one: web and db present, api absent. web -> api is dropped.
     const warnings: string[] = [];
-    const { deps } = liveInstance(
+    const { deps } = await liveInstance(
       listNamespaces,
-      { worktree: [running("db"), running("web")] },
+      { namespaces: ["one"] },
       { warn: (m) => warnings.push(m), waitForHealth: async () => {} },
     );
     const result = await runUp(deps);
@@ -5271,7 +4974,7 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
   });
 
   it("#203: -n naming only a namespace with no services fails NO_SERVICES_SELECTED, not NAMESPACE_NOT_RUNNING", async () => {
-    const { deps, spawned, id } = liveInstance(twoNamespaces, { worktree: [running("a")] });
+    const { deps, ours, id } = await liveInstance(twoNamespaces, { namespaces: ["one"] });
     const err = await failure({ ...deps, namespaces: ["nope"] });
     expect(err?.code).toBe("NO_SERVICES_SELECTED");
     expect(err?.details).toEqual({
@@ -5279,14 +4982,14 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
       selected_namespaces: ["nope"],
       namespaces: ["one", "two"],
     });
-    expect(spawned.filter((a) => a[0] !== "process")).toEqual([]);
+    expect(ours(...lifecycle)).toEqual([]);
   });
 
   it("#203: -n one -n nope on a running instance keeps today's behaviour for the real namespace", async () => {
     const waited: string[][] = [];
-    const { deps } = liveInstance(
+    const { deps } = await liveInstance(
       twoNamespaces,
-      { worktree: [running("a")] },
+      { namespaces: ["one"] },
       {
         waitForHealth: async ({ serviceNames }) => {
           waited.push([...serviceNames]);
@@ -5298,7 +5001,7 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
   });
 
   it("#170: -n naming a namespace the instance was not booted with fails with NAMESPACE_NOT_RUNNING", async () => {
-    const { deps, spawned, id } = liveInstance(twoNamespaces, { worktree: [running("a")] });
+    const { deps, ours, id } = await liveInstance(twoNamespaces, { namespaces: ["one"] });
     const err = await failure({ ...deps, namespaces: ["one", "two"] });
     expect(err?.code).toBe("NAMESPACE_NOT_RUNNING");
     expect(err?.message).toContain("'two'");
@@ -5310,14 +5013,14 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
       remedy: "devtrees down && devtrees up -n one -n two",
     });
     // Nothing was started, stopped or reloaded.
-    expect(spawned.filter((a) => a[0] !== "process")).toEqual([]);
+    expect(ours(...lifecycle, "start", "stop")).toEqual([]);
   });
 
   it("a narrower -n than what runs leaves the rest alone and does not fail", async () => {
     const waited: string[][] = [];
-    const { deps, spawned } = liveInstance(
+    const { deps, ours, pc, wtSocket } = await liveInstance(
       twoNamespaces,
-      { worktree: [running("a"), killed("b")] },
+      { namespaces: ["one", "two"] },
       {
         namespaces: ["one"],
         waitForHealth: async ({ serviceNames }) => {
@@ -5325,12 +5028,13 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
         },
       },
     );
+    pc.exit(wtSocket, "b", -1);
     await expect(runUp(deps)).resolves.toBeDefined();
     // Only `one` is checked — `b` being dead in `two` is not this call's
     // business, so it is not restarted either (#178).
     expect(waited).toEqual([["a"]]);
-    expect(spawned.filter((a) => a[0] !== "process")).toEqual([]);
-    expect(spawned.filter((a) => a[1] === "start")).toEqual([]);
+    expect(ours(...lifecycle, "start", "stop")).toEqual([]);
+    expect(pc.rows(wtSocket).find((r) => r.name === "b")).toMatchObject({ status: "Completed" });
   });
 
   describe("restarting dead isolated services (#178)", () => {
@@ -5340,88 +5044,63 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
         { ...isolated("keeper", "sleep 100000"), namespace: "test" },
       ],
     };
-    const killedWithPid = (name: string, pid: number, exitCode = -1): ServiceStatus => ({
-      ...killed(name),
-      exitCode,
-      pid,
-    });
-    const starts = (spawned: string[][]) =>
-      spawned.filter((a) => a[0] === "process" && a[1] === "start");
-
-    /**
-     * Status reads that serve `before` until a `process start` has been
-     * spawned, then each entry of `after` in turn (the last one repeats;
-     * `before` again when `after` is empty).
-     */
-    function reads(
-      spawned: string[][],
-      before: ServiceStatus[],
-      after: ServiceStatus[][],
-    ): (socketPath: string) => Promise<ServiceStatus[]> {
-      let i = 0;
-      return async () => {
-        if (starts(spawned).length === 0) return before;
-        const rows = after[Math.min(i, after.length - 1)] ?? before;
-        i += 1;
-        return rows;
-      };
-    }
 
     it("#162: a killed service is started again over the control socket, then up succeeds", async () => {
-      const { deps, spawned, wtSocket } = liveInstance(
+      const { deps, ours, pc, wtSocket } = await liveInstance(
         toyStack,
-        { worktree: [] },
+        { namespaces: ["test"] },
         { namespaces: ["test"], waitTimeoutMs: 10_000 },
       );
-      const result = await runUp({
-        ...deps,
-        getServiceStatuses: reads(
-          spawned,
-          [killedWithPid("toy", 41), running("keeper")],
-          [[running("toy"), running("keeper")]],
-        ),
-      });
-      expect(starts(spawned)).toEqual([["process", "start", "toy", "-U", "-u", wtSocket]]);
+      pc.exit(wtSocket, "toy", -1);
+      const deadPid = pc.pidOf(wtSocket, "toy");
+      const result = await runUp(deps);
+      expect(ours("start")).toEqual([{ op: "start", socketPath: wtSocket, services: ["toy"] }]);
       expect(result.restarted).toEqual(["toy"]);
+      expect(pc.rows(wtSocket).find((r) => r.name === "toy")).toMatchObject({ status: "Running" });
+      expect(pc.pidOf(wtSocket, "toy")).not.toBe(deadPid);
       // Never stops anything: no `down`, no `up`, no reload.
-      expect(spawned.filter((a) => a[0] !== "process")).toEqual([]);
+      expect(ours(...lifecycle, "stop")).toEqual([]);
     });
 
     it("the stale pre-restart row read right after `process start` does not fail-fast", async () => {
-      // Same pid as before the restart: still the old corpse, not a new death.
-      const stale = [killedWithPid("toy", 41), running("keeper")];
-      const { deps, spawned } = liveInstance(
+      // process-compose accepts the start but lists the old corpse (same pid:
+      // not a new death) for three more reads before the new run shows up.
+      const { deps, pc, wtSocket, on } = await liveInstance(
         toyStack,
-        { worktree: [] },
+        { namespaces: ["test"] },
         { namespaces: ["test"], waitTimeoutMs: 10_000 },
       );
-      const result = await runUp({
+      pc.exit(wtSocket, "toy", -1);
+      let staleReads: number | undefined;
+      const lagging: CommandDeps = {
         ...deps,
-        getServiceStatuses: reads(spawned, stale, [
-          stale,
-          stale,
-          stale,
-          [running("toy"), running("keeper")],
-        ]),
+        processCompose: {
+          ...pc.driver,
+          startProcess: async () => {
+            staleReads = 3;
+            return { ok: true, alreadyRunning: false };
+          },
+        },
+      };
+      on("list", () => {
+        if (staleReads !== undefined && staleReads-- === 0) void pc.driver.startProcess(wtSocket, "toy");
       });
+      const result = await runUp(lagging);
       expect(result.restarted).toEqual(["toy"]);
+      expect(pc.rows(wtSocket).find((r) => r.name === "toy")).toMatchObject({ status: "Running" });
     });
 
     it("a restarted service that dies again (new pid) fails fast with HEALTH_TIMEOUT naming it", async () => {
-      const { deps, spawned } = liveInstance(
+      const { deps, ours, pc, wtSocket, on } = await liveInstance(
         toyStack,
-        { worktree: [] },
+        { namespaces: ["test"] },
         { namespaces: ["test"], waitTimeoutMs: 60_000 },
       );
+      pc.exit(wtSocket, "toy", -1);
+      // The new run exits 1 at once.
+      on("start", () => queueMicrotask(() => pc.exit(wtSocket, "toy", 1)));
       const started = Date.now();
-      const err = await failure({
-        ...deps,
-        getServiceStatuses: reads(
-          spawned,
-          [killedWithPid("toy", 41), running("keeper")],
-          [[killedWithPid("toy", 77, 1), running("keeper")]],
-        ),
-      });
+      const err = await failure(deps);
       expect(Date.now() - started).toBeLessThan(10_000);
       expect(err?.code).toBe("HEALTH_TIMEOUT");
       expect(err?.message).toContain("toy (Completed, exit 1)");
@@ -5430,39 +5109,55 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
       expect(err?.details).toMatchObject({
         dead_services: [{ name: "toy", status: "Completed", exit_code: 1 }],
       });
-      expect(starts(spawned)).toHaveLength(1);
+      expect(ours("start")).toHaveLength(1);
     });
 
     it("a restarted service that dies again after being read running fails fast too", async () => {
-      const { deps, spawned } = liveInstance(
-        toyStack,
-        { worktree: [] },
+      // toy is probed: read running but not ready yet once after the restart,
+      // then it is killed.
+      const probedToy: ResolvedStack = {
+        services: toyStack.services.map((s) =>
+          s.name === "toy" ? { ...s, readinessProbe: { exec: { command: "x" } } } : s,
+        ),
+      };
+      const { deps, pc, wtSocket, on } = await liveInstance(
+        probedToy,
+        { namespaces: ["test"] },
         { namespaces: ["test"], waitTimeoutMs: 60_000 },
       );
-      const started = Date.now();
-      const err = await failure({
-        ...deps,
-        getServiceStatuses: reads(
-          spawned,
-          [killed("toy"), running("keeper")],
-          [[{ name: "toy", status: "Running", health: "not_ready" }], [killed("toy")]],
-        ),
+      pc.exit(wtSocket, "toy", -1);
+      let readsSinceStart: number | undefined;
+      on("start", () => {
+        readsSinceStart = 0;
+        queueMicrotask(() => pc.setReady(wtSocket, "toy", false));
       });
+      on("list", () => {
+        if (readsSinceStart !== undefined && ++readsSinceStart === 2) pc.exit(wtSocket, "toy", -1);
+      });
+      const started = Date.now();
+      const err = await failure(deps);
+      expect(readsSinceStart).toBeGreaterThanOrEqual(2);
       expect(Date.now() - started).toBeLessThan(10_000);
       expect(err?.code).toBe("HEALTH_TIMEOUT");
       expect(err?.message).toContain("died again");
     });
 
-    it("without pids, a restarted service never read alive is reported dead at the deadline, not before", async () => {
-      const { deps, spawned } = liveInstance(
+    it("a restarted service process-compose never runs (its old row stays) is reported dead at the deadline, not before", async () => {
+      // process-compose accepts the start, but the row keeps the old run's
+      // pid: never read alive, never a new death, so dead only at the deadline.
+      const { deps, pc, wtSocket } = await liveInstance(
         toyStack,
-        { worktree: [] },
+        { namespaces: ["test"] },
         { namespaces: ["test"], waitTimeoutMs: 600 },
       );
+      pc.exit(wtSocket, "toy", -1);
       const started = Date.now();
       const err = await failure({
         ...deps,
-        getServiceStatuses: reads(spawned, [killed("toy"), running("keeper")], []),
+        processCompose: {
+          ...pc.driver,
+          startProcess: async () => ({ ok: true, alreadyRunning: false }),
+        },
       });
       expect(Date.now() - started).toBeGreaterThanOrEqual(550);
       expect(err?.code).toBe("HEALTH_TIMEOUT");
@@ -5476,81 +5171,51 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
           isolated("keeper", "sleep 100000"),
         ],
       };
-      const { deps, spawned } = liveInstance(stack, { worktree: [] }, { waitTimeoutMs: 400 });
-      const err = await failure({
-        ...deps,
-        getServiceStatuses: reads(
-          spawned,
-          [killed("toy"), running("keeper")],
-          [[{ name: "toy", status: "Running", health: "not_ready" }, running("keeper")]],
-        ),
-      });
+      const { deps, ours, pc, wtSocket, on } = await liveInstance(stack, {}, { waitTimeoutMs: 400 });
+      pc.exit(wtSocket, "toy", -1);
+      // The new run fails its readiness probe.
+      on("start", () => queueMicrotask(() => pc.setReady(wtSocket, "toy", false)));
+      const err = await failure(deps);
       expect(err?.code).toBe("HEALTH_TIMEOUT");
       expect(err?.message).toContain("healthy [toy] after 400ms");
-      expect(starts(spawned)).toHaveLength(1);
+      expect(ours("start")).toHaveLength(1);
     });
 
     it("a failing one-shot (non-zero exit) is restarted; an exit-0 one-shot is not", async () => {
       const stack: ResolvedStack = {
         services: [isolated("seed", "x"), isolated("migrate", "true"), isolated("web", "y")],
       };
-      const done: ServiceStatus = {
-        name: "migrate",
-        status: "Completed",
-        health: "unknown",
-        exitCode: 0,
-      };
-      const seedDone: ServiceStatus = { ...done, name: "seed" };
-      const { deps, spawned } = liveInstance(stack, { worktree: [] });
-      const result = await runUp({
-        ...deps,
-        getServiceStatuses: reads(
-          spawned,
-          [killedWithPid("seed", 5, 3), done, running("web")],
-          [[seedDone, done, running("web")]],
-        ),
-      });
-      expect(starts(spawned).map((a) => a[2])).toEqual(["seed"]);
+      const { deps, ours, pc, wtSocket, on } = await liveInstance(stack);
+      pc.exit(wtSocket, "seed", 3);
+      pc.exit(wtSocket, "migrate", 0);
+      // The restarted seed runs to completion this time.
+      on("start", () => queueMicrotask(() => pc.exit(wtSocket, "seed", 0)));
+      const result = await runUp(deps);
+      expect(ours("start").map((r) => r.services)).toEqual([["seed"]]);
       expect(result.restarted).toEqual(["seed"]);
     });
 
     it("a service process-compose is already Restarting is left to its restart policy", async () => {
-      const { deps, spawned } = liveInstance(
+      const { deps, ours, pc, wtSocket } = await liveInstance(
         toyStack,
-        {
-          worktree: [
-            { name: "toy", status: "Restarting", health: "unknown", exitCode: -1 },
-            running("keeper"),
-          ],
-        },
+        { namespaces: ["test"] },
         { namespaces: ["test"], waitForHealth: async () => {} },
       );
+      pc.backoff(wtSocket, "toy");
       const result = await runUp(deps);
-      expect(starts(spawned)).toEqual([]);
+      expect(ours("start")).toEqual([]);
       expect(result.restarted).toEqual([]);
     });
 
     it("a refused start fails with SERVICE_START_FAILED naming the service and the down + up remedy", async () => {
-      const { deps, spawned, id } = liveInstance(
+      const { deps, ours, pc, wtSocket, id } = await liveInstance(
         toyStack,
-        { worktree: [killed("toy"), running("keeper")] },
+        { namespaces: ["test"] },
         { namespaces: ["test"] },
       );
-      const recording = deps.driver?.spawner;
-      if (recording === undefined) throw new Error("expected spawner");
-      const err = await failure({
-        ...deps,
-        driver: {
-          ...deps.driver,
-          spawner: (binary, args, options) => {
-            if (args[0] === "process" && args[1] === "start") {
-              spawned.push([...args]);
-              return refusedStart('FTL failed to start process toy error="no such process"');
-            }
-            return recording(binary, args, options);
-          },
-        },
-      });
+      pc.exit(wtSocket, "toy", -1);
+      pc.refuse("start", "toy", 'FTL failed to start process toy error="no such process"');
+      const err = await failure(deps);
       expect(err?.code).toBe("SERVICE_START_FAILED");
       expect(err?.message).toContain("toy");
       expect(err?.message).toContain("devtrees down && devtrees up -n test");
@@ -5561,36 +5226,28 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
         ],
         remedy: "devtrees down && devtrees up -n test",
       });
-      expect(spawned.filter((a) => a[0] !== "process")).toEqual([]);
+      expect(ours(...lifecycle, "stop")).toEqual([]);
     });
 
     it("process-compose refusing because the service is already running is not a failure", async () => {
-      const { deps, spawned } = liveInstance(toyStack, { worktree: [] }, { namespaces: ["test"] });
-      const recording = deps.driver?.spawner;
-      if (recording === undefined) throw new Error("expected spawner");
-      const result = await runUp({
-        ...deps,
-        getServiceStatuses: reads(
-          spawned,
-          [killed("toy"), running("keeper")],
-          [[running("toy"), running("keeper")]],
-        ),
-        driver: {
-          ...deps.driver,
-          spawner: (binary, args, options) => {
-            if (args[0] === "process" && args[1] === "start") {
-              spawned.push([...args]);
-              return refusedStart(
-                "FTL failed to start process toy: process toy is already running",
-              );
-            }
-            return recording(binary, args, options);
-          },
-        },
+      const { deps, ours, pc, wtSocket, on, byOthers } = await liveInstance(
+        toyStack,
+        { namespaces: ["test"] },
+        { namespaces: ["test"] },
+      );
+      pc.exit(wtSocket, "toy", -1);
+      // Someone else starts toy just before up's start reaches process-compose.
+      let beaten = false;
+      on("start", () => {
+        if (beaten) return;
+        beaten = true;
+        byOthers(() => void pc.driver.startProcess(wtSocket, "toy"));
       });
+      const result = await runUp(deps);
       // Someone else started it: not reported as restarted by this `up`.
       expect(result.restarted).toEqual([]);
-      expect(starts(spawned)).toHaveLength(1);
+      expect(ours("start")).toHaveLength(1);
+      expect(pc.rows(wtSocket).find((r) => r.name === "toy")).toMatchObject({ status: "Running" });
     });
 
     it("dead services are started in depends_on order, not declaration order", async () => {
@@ -5602,62 +5259,55 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
           isolated("keeper", "k"),
         ],
       };
-      const { deps, spawned } = liveInstance(stack, { worktree: [] });
-      const result = await runUp({
-        ...deps,
-        getServiceStatuses: reads(
-          spawned,
-          [killed("web"), killed("api"), killed("db"), running("keeper")],
-          [[running("web"), running("api"), running("db"), running("keeper")]],
-        ),
-      });
-      expect(starts(spawned).map((a) => a[2])).toEqual(["db", "api", "web"]);
+      const { deps, ours, pc, wtSocket } = await liveInstance(stack);
+      for (const name of ["web", "api", "db"]) pc.exit(wtSocket, name, -1);
+      const result = await runUp(deps);
+      expect(ours("start").map((r) => r.services)).toEqual([["db"], ["api"], ["web"]]);
       expect(result.restarted).toEqual(["db", "api", "web"]);
+      expect(pc.rows(wtSocket).every((r) => r.status === "Running")).toBe(true);
     });
 
     it("a `down` holding the lifecycle lock: up starts nothing and fails LOCK_CONTENTION", async () => {
-      const { deps, spawned, anchor, id } = liveInstance(
-        toyStack,
-        { worktree: [killed("toy"), running("keeper")] },
-        {
-          namespaces: ["test"],
-          // Up's own spawn-window lock passes; the restart's lock is held by
-          // the "down" below and only retried briefly.
-          withLifecycleLock: (a, i, fn) =>
-            withLifecycleLock(a, i, fn, { retries: 3, retryDelayMs: 10 }),
-        },
-      );
       let release: () => void = () => {};
       const held = new Promise<void>((r) => (release = r));
       let down: Promise<void> | undefined;
-      const err = await failure({
-        ...deps,
-        // The first read runs after up's spawn-window lock is released: a
-        // `down` takes the lifecycle lock right then, before up's restart.
-        getServiceStatuses: async () => {
-          if (down === undefined) {
-            let acquired: () => void = () => {};
-            const isHeld = new Promise<void>((r) => (acquired = r));
-            down = withLifecycleLock(anchor, id, async () => {
-              acquired();
-              await held;
-            });
-            await isHeld;
-          }
-          return [killed("toy"), running("keeper")];
+      let locks = 0;
+      const { deps, ours, pc, wtSocket } = await liveInstance(
+        toyStack,
+        { namespaces: ["test"] },
+        {
+          namespaces: ["test"],
+          // Up's own spawn-window lock passes. Right after it is released, a
+          // `down` takes the lifecycle lock, before up's restart: the
+          // restart's lock is held and only retried briefly.
+          withLifecycleLock: async (a, i, fn) => {
+            if (++locks === 2 && down === undefined) {
+              let acquired: () => void = () => {};
+              const isHeld = new Promise<void>((r) => (acquired = r));
+              down = withLifecycleLock(a, i, async () => {
+                acquired();
+                await held;
+              });
+              await isHeld;
+            }
+            return withLifecycleLock(a, i, fn, { retries: 3, retryDelayMs: 10 });
+          },
         },
-      });
+      );
+      pc.exit(wtSocket, "toy", -1);
+      const err = await failure(deps);
       release();
       await down;
+      expect(locks).toBe(2);
       expect(err?.code).toBe("LOCK_CONTENTION");
-      expect(starts(spawned)).toEqual([]);
+      expect(ours("start")).toEqual([]);
     });
 
     it("an instance that stopped between the read and the lock: nothing started, INSTANCE_NOT_FOUND", async () => {
       let probes = 0;
-      const { deps, spawned, id } = liveInstance(
+      const { deps, ours, pc, wtSocket, id } = await liveInstance(
         toyStack,
-        { worktree: [killed("toy"), running("keeper")] },
+        { namespaces: ["test"] },
         {
           namespaces: ["test"],
           // Live for up's own spawn-window gate, gone by the restart's re-probe
@@ -5665,18 +5315,19 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
           probeSocket: async () => (++probes === 1 ? "running" : "stale"),
         },
       );
+      pc.exit(wtSocket, "toy", -1);
       const err = await failure(deps);
       expect(err?.code).toBe("INSTANCE_NOT_FOUND");
       expect(err?.message).toContain("Nothing was started");
       expect(err?.details).toEqual({ worktree_id: id });
-      expect(starts(spawned)).toEqual([]);
+      expect(ours("start")).toEqual([]);
     });
 
     it("an instance that stops answering before the restart: nothing started, INSTANCE_UNRESPONSIVE, socket kept (#186)", async () => {
       let probes = 0;
-      const { deps, spawned, id, wtSocket } = liveInstance(
+      const { deps, ours, pc, id, wtSocket } = await liveInstance(
         toyStack,
-        { worktree: [killed("toy"), running("keeper")] },
+        { namespaces: ["test"] },
         {
           namespaces: ["test"],
           probeRetryDelaysMs: [0, 0],
@@ -5685,28 +5336,28 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
           probeSocket: async () => (++probes === 1 ? "running" : "unknown"),
         },
       );
+      pc.exit(wtSocket, "toy", -1);
       const err = await failure(deps);
       expect(err?.code).toBe("INSTANCE_UNRESPONSIVE");
       expect(err?.details).toMatchObject({ instance: id, socket_path: wtSocket, attempts: 3 });
-      expect(starts(spawned)).toEqual([]);
+      expect(ours("start")).toEqual([]);
       expect(existsSync(wtSocket)).toBe(true);
     });
 
     it("re-reads under the lock: a service no longer dead there is not started", async () => {
-      let readsSoFar = 0;
-      const { deps, spawned } = liveInstance(
+      const { deps, ours, pc, wtSocket, on, byOthers } = await liveInstance(
         toyStack,
-        { worktree: [] },
-        {
-          namespaces: ["test"],
-          getServiceStatuses: async () =>
-            ++readsSoFar === 1
-              ? [killed("toy"), running("keeper")]
-              : [running("toy"), running("keeper")],
-        },
+        { namespaces: ["test"] },
+        { namespaces: ["test"] },
       );
+      pc.exit(wtSocket, "toy", -1);
+      // Someone else starts toy between up's first read and its re-read.
+      let reads = 0;
+      on("list", () => {
+        if (++reads === 2) byOthers(() => void pc.driver.startProcess(wtSocket, "toy"));
+      });
       const result = await runUp(deps);
-      expect(starts(spawned)).toEqual([]);
+      expect(ours("start")).toEqual([]);
       expect(result.restarted).toEqual([]);
     });
   });
@@ -5715,12 +5366,8 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
     const stack: ResolvedStack = {
       services: [isolated("migrate", "true"), isolated("web", "node a.js")],
     };
-    const { deps } = liveInstance(stack, {
-      worktree: [
-        { name: "migrate", status: "Completed", health: "unknown", exitCode: 0 },
-        running("web"),
-      ],
-    });
+    const { deps, pc, wtSocket } = await liveInstance(stack);
+    pc.exit(wtSocket, "migrate", 0);
     await expect(runUp(deps)).resolves.toBeDefined();
   });
 
@@ -5728,11 +5375,8 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
     const stack: ResolvedStack = {
       services: [{ ...isolated("web", "node a.js"), readinessProbe: { exec: { command: "x" } } }],
     };
-    const { deps } = liveInstance(
-      stack,
-      { worktree: [{ name: "web", status: "Running", health: "not_ready" }] },
-      { waitTimeoutMs: 300 },
-    );
+    const { deps, pc, wtSocket } = await liveInstance(stack, {}, { waitTimeoutMs: 300 });
+    pc.setReady(wtSocket, "web", false);
     const err = await failure(deps);
     expect(err?.code).toBe("HEALTH_TIMEOUT");
     expect(err?.message).toContain("after 300ms");
@@ -5741,15 +5385,17 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
   // These shared instances record no shared state (pre-#83): with no revision
   // to check drift against, a dead shared service is reported, not restarted
   // (#240). With state, `up` restarts it — see "restarting dead shared
-  // services (#240)" below.
+  // services (#240)" below. `cache` keeps the shared process-compose running.
   it("a dead shared service in a stateless (pre-#83) shared instance fails SHARED_SERVICE_DEAD unknown_revision", async () => {
     const stack: ResolvedStack = {
-      services: [shared("db", "postgres", ["DB_PORT"]), isolated("web", "node a.js")],
+      services: [
+        shared("db", "postgres", ["DB_PORT"]),
+        shared("cache", "redis-server"),
+        isolated("web", "node a.js"),
+      ],
     };
-    const { deps, spawned } = liveInstance(stack, {
-      worktree: [running("web")],
-      shared: [killed("db")],
-    });
+    const { deps, ours, pc, sharedSocket } = await liveInstance(stack);
+    pc.exit(sharedSocket, "db", -1);
     const err = await failure(deps);
     expect(err?.code).toBe("SHARED_SERVICE_DEAD");
     expect(err?.message).toContain("db (Completed, exit -1)");
@@ -5759,8 +5405,7 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
       remedy: "devtrees down --shared && devtrees up",
     });
     // Reported, not restarted.
-    expect(spawned.filter((a) => a[0] !== "process")).toEqual([]);
-    expect(spawned.filter((a) => a[1] === "start")).toEqual([]);
+    expect(ours(...lifecycle, "start", "stop")).toEqual([]);
   });
 
   it("a FRESH up against a stateless running shared instance with a dead service fails SHARED_SERVICE_DEAD before spawning", async () => {
@@ -5769,80 +5414,69 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
     const stack: ResolvedStack = {
       services: [
         shared("db", "postgres", ["DB_PORT"]),
+        shared("cache", "redis-server"),
         { ...isolated("web", "node a.js"), namespace: "test" },
       ],
     };
-    const { deps, spawned, wtSocket } = liveInstance(
+    const { deps, ours, pc, sharedSocket, wtSocket } = await liveInstance(
       stack,
-      { worktree: [], shared: [killed("db")] },
+      { worktree: false },
       { namespaces: ["test"] },
     );
-    rmSync(wtSocket, { force: true });
+    pc.exit(sharedSocket, "db", -1);
     const err = await failure(deps);
     expect(err?.code).toBe("SHARED_SERVICE_DEAD");
     expect(err?.details).toMatchObject({ remedy: "devtrees down --shared && devtrees up" });
-    // Nothing spawned: neither the worktree instance nor a shared restart.
-    expect(spawned.filter((a) => a[0] !== "process")).toEqual([]);
+    // Nothing started: neither the worktree instance nor a shared restart.
+    expect(ours(...lifecycle, "start", "stop")).toEqual([]);
+    expect(pc.isUp(wtSocket)).toBe(false);
   });
 
   it("a selection read that keeps failing is HEALTH_TIMEOUT, never a success over an unknown selection", async () => {
     const stack: ResolvedStack = { services: [isolated("web", "node a.js")] };
-    const { deps } = liveInstance(
-      stack,
-      { worktree: [] },
-      {
-        waitTimeoutMs: 300,
-        getServiceStatuses: async () => {
-          throw new Error("connect ECONNREFUSED");
-        },
-      },
-    );
+    const { deps, pc, wtSocket } = await liveInstance(stack, {}, { waitTimeoutMs: 300 });
+    // process-compose stops answering.
+    pc.freeze(wtSocket);
     await expect(runUp(deps)).rejects.toMatchObject({ code: "HEALTH_TIMEOUT" });
   });
 
   it("#192: a status read that keeps failing prints one retry notice through warn", async () => {
     const stack: ResolvedStack = { services: [isolated("web", "node a.js")] };
     const warnings: string[] = [];
-    const { deps } = liveInstance(
+    const { deps, pc, wtSocket } = await liveInstance(
       stack,
-      { worktree: [] },
-      {
-        waitTimeoutMs: 300,
-        warn: (m) => warnings.push(m),
-        getServiceStatuses: async () => {
-          throw new Error("process list did not answer within 5s");
-        },
-      },
+      {},
+      { waitTimeoutMs: 300, warn: (m) => warnings.push(m) },
     );
+    pc.freeze(wtSocket);
     await expect(runUp(deps)).rejects.toMatchObject({ code: "HEALTH_TIMEOUT" });
     const notices = warnings.filter((w) => /service status failed/.test(w));
     expect(notices).toHaveLength(1);
-    expect(notices[0]).toContain("did not answer within 5s");
+    expect(notices[0]).toContain("did not answer within");
   });
 
   it("#192: a status read that hangs is cut off at the wait budget, not waited on forever", async () => {
     const stack: ResolvedStack = { services: [isolated("web", "node a.js")] };
-    const { deps } = liveInstance(
+    const warnings: string[] = [];
+    const { deps, pc, wtSocket } = await liveInstance(
       stack,
-      { worktree: [] },
-      {
-        waitTimeoutMs: 150,
-        getServiceStatuses: (_socket, opts) =>
-          new Promise((_resolve, reject) => {
-            setTimeout(() => reject(new Error("wedged")), opts?.timeoutMs);
-          }),
-      },
+      {},
+      { waitTimeoutMs: 150, warn: (m) => warnings.push(m) },
     );
+    pc.freeze(wtSocket);
     const started = Date.now();
     await expect(runUp(deps)).rejects.toMatchObject({ code: "HEALTH_TIMEOUT" });
     expect(Date.now() - started).toBeLessThan(1500);
+    // The read was bounded by the 150ms wait budget, not the 5s default.
+    const notice = warnings.find((w) => /service status failed/.test(w));
+    expect(notice).toContain("did not answer within 0s");
   });
 
   it("a healthy re-up reads the instance once: the selection read is the health poll and the envelope", async () => {
     const stack: ResolvedStack = { services: [isolated("web", "node a.js", ["WEB_PORT"])] };
-    const { deps, statusReads, wtSocket } = liveInstance(stack, { worktree: [running("web")] });
+    const { deps, ours, wtSocket } = await liveInstance(stack);
     const result = await runUp(deps);
-    expect(statusReads.filter((p) => p === wtSocket)).toHaveLength(1);
+    expect(ours("list").filter((r) => r.socketPath === wtSocket)).toHaveLength(1);
     expect(result.services).toEqual([
       { name: "web", status: "Running", health: "unknown", ports: { WEB_PORT: result.blockBase } },
     ]);
@@ -5852,15 +5486,15 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
     const stack: ResolvedStack = {
       services: [shared("db", "postgres", ["DB_PORT"]), isolated("web", "node a.js")],
     };
-    const { deps } = liveInstance(stack, { worktree: [running("web")], shared: [running("db")] });
+    const { deps } = await liveInstance(stack);
     await expect(runUp(deps)).resolves.toBeDefined();
   });
 
   it("never attaches on the running path, even when a TTY is present", async () => {
     const stack: ResolvedStack = { services: [isolated("web", "node a.js")] };
-    const { deps, spawned } = liveInstance(stack, { worktree: [running("web")] }, { attach: true });
+    const { deps, ours } = await liveInstance(stack, {}, { attach: true });
     await runUp(deps);
-    expect(spawned.some((a) => a[0] === "attach")).toBe(false);
+    expect(ours("attach")).toEqual([]);
   });
 });
 
