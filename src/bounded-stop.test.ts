@@ -140,6 +140,17 @@ describe("boundedStopServices (#223)", () => {
     expect(result).toEqual({ forceKilled: [], survivors: [], unsettled: [] });
   });
 
+  it.each(["Terminating", "running"])(
+    "treats a refusal as real only for a service exactly `Running`: a %s one is stopped within the budget",
+    async (state) => {
+      const w = stopWorld({ refuse: "Failed to stop: 'web'" });
+      w.rows.set("web", { ...w.rows.get("web")!, status: state });
+      const result = await boundedStopServices(target(["web"], w), w.driver, w.seams);
+      expect(w.kills).toEqual([[-201, "SIGKILL"]]);
+      expect(result.forceKilled).toEqual([{ service: "web", pid: 201 }]);
+    },
+  );
+
   describe("process-compose exiting during the stop (B1)", () => {
     it("fails INSTANCE_NOT_FOUND at once when a read fails and the instance is gone", async () => {
       const w = stopWorld({ stuck: ["web"] });

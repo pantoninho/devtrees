@@ -36,22 +36,12 @@ import { stateDir } from "./paths.js";
 import { forwarderLabel, isPortForwarder } from "./port-connect.js";
 import type { HookFailure } from "./reaper.js";
 import { writeAtomic } from "./registry.js";
-
-/**
- * Did this daemon's launch fail, as the pre-stop `process list` shows it?
- * `Error` (it could not start), or `Completed` with a non-zero exit code.
- * An unknown exit code is not a failure: running a hook twice is the worse
- * mistake.
- */
-function launchFailed(status: ServiceStatus): boolean {
-  if (status.status === "Error") return true;
-  return status.status === "Completed" && status.exitCode !== undefined && status.exitCode !== 0;
-}
+import { launchFailed } from "./service-state.js";
 
 /**
  * The slice of `config` whose `shutdown.command`s process-compose skipped:
  * the daemons whose launch had failed when the stop began (`statuses`, read
- * before it). `undefined` when there are none.
+ * before it; `launchFailed`). `undefined` when there are none.
  */
 export function daemonHooksSkipped(
   config: DerivedConfig,

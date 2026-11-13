@@ -246,6 +246,22 @@ describe("boundedRestart (#222)", () => {
     expect(tableReads).toBe(0);
   });
 
+  // Pins today's behaviour, a known bug (#263): an idle service holds no
+  // process, yet restart reads it as active and stops it before starting.
+  it.each(["Skipped", "Disabled"])(
+    "a %s service takes the stop-then-start path (#263)",
+    async (state) => {
+      const w = world();
+      const idle: ServiceStatus = { name: "mobile", status: state, health: "unknown", pid: 201 };
+      await boundedRestart(
+        { ...w.target, statuses: [idle, running("api", 202)] },
+        w.driver,
+        w.seams,
+      );
+      expect(w.calls[0]).toBe("stop mobile");
+    },
+  );
+
   it("a start whose client timed out counts when the service now reads running", async () => {
     const w = world();
     const driver: RestartDriver = {
