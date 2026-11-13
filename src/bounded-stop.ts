@@ -161,3 +161,16 @@ function activeAmong(
   const wanted = new Set(names);
   return rows.filter((r) => wanted.has(r.name) && isRunning(r));
 }
+
+/** One stderr warning per old-run process SIGKILL could not stop. */
+export function warnSurvivors(
+  survivors: ReadonlyArray<ServiceProcess>,
+  warn: (message: string) => void,
+): void {
+  for (const s of survivors) {
+    warn(
+      `devtrees restart: WARNING — ${s.service}'s old process (pid ${s.pid}, ${s.command}) ` +
+        "survived SIGKILL and may still hold its port.",
+    );
+  }
+}

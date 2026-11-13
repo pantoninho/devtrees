@@ -29,6 +29,7 @@ import {
   probeSocket as defaultProbeSocket,
   readDeclaredPorts,
   readDerivedConfig,
+  readWorktreePath,
   type InstanceInfo,
   type InstanceStatus,
   type Service,
@@ -53,10 +54,10 @@ import { findDeadReservations, findOrphans, parseWorktreeIds } from "./prune.js"
 import { reapShutdownHooks, type ReapDeps, type ReapOutcome } from "./reaper.js";
 import { loadStack, type ResolvedService, type ResolvedStack } from "./stack.js";
 import {
-  boundedDown,
   DownTimeoutError,
   readProcessTable,
   readSupervisedTable,
+  stopInstance,
   type ForceKilled,
   type ServiceProcess,
   type StopDriver,
@@ -65,7 +66,6 @@ import {
 } from "./bounded-down.js";
 import {
   createDriver,
-  downTimeoutMs,
   mergeAsyncIterables,
   READ_TIMEOUT_MS,
   reloadTimeoutMs,
@@ -114,7 +114,7 @@ import {
 } from "./down-survivors.js";
 import { stackHash } from "./hash.js";
 import { boundedRestart } from "./bounded-restart.js";
-import { boundedStopServices, StopRefusedError } from "./bounded-stop.js";
+import { boundedStopServices, StopRefusedError, warnSurvivors } from "./bounded-stop.js";
 import {
   inProgressDependants,
   planSharedDown,
@@ -3033,82 +3033,6 @@ function portSurvivorSeams(deps: CommandDeps): PortSurvivorSeams {
   };
 }
 
-/**
- * Stop a live instance with the bounded `down` (#190): a budget of 30s plus
- * every `shutdown.timeout_seconds` in its derived config, then a surgical
- * SIGKILL of the service processes that kept it from stopping. The old runs
- * a pending reload is stuck on (`pendingReload`, #206) are killed before
- * the stop, which begins only once that reload has finished. Throws
- * `DOWN_TIMEOUT` (nothing removed) when process-compose still has not
- * exited, or when the reload never finished and the stop was not begun.
- */
-function stopInstance(
-  driver: StopDriver,
-  paths: { readonly configPath: string; readonly socketPath: string },
-  instance: string,
-  command: "down" | "prune",
-  seams: StopSeams | undefined,
-  pendingReload?: PendingReload,
-): Promise<StopResult> {
-  const config = readDerivedConfig(paths.configPath);
-  return boundedDown(
-    {
-      inst: { configPath: paths.configPath, socketPath: paths.socketPath },
-      instance,
-      command,
-      timeoutMs: downTimeoutMs(config, seams?.baseTimeoutMs),
-      remedy: (pid, pending) =>
-        downTimeoutRemedy(instance, command, paths.socketPath, pid, pending),
-      pendingReload,
-      unsignalled: unsignalledServices(config),
-    },
-    driver,
-    seams,
-  );
-}
-
-/**
- * The `details.remedy` a `DOWN_TIMEOUT` carries (#190). devtrees does not
- * kill process-compose itself: that would skip the shutdown hooks it has not
- * run yet. The operator does, knowingly, and the follow-up command cleans up.
- */
-function downTimeoutRemedy(
-  instance: string,
-  command: "down" | "prune",
-  socketPath: string,
-  processComposePid: number | undefined,
-  pending?: { readonly oldRuns: ReadonlyArray<ForceKilled> },
-): string {
-  const shared = instance === SHARED_INSTANCE_ID;
-  const retry =
-    command === "prune" ? "devtrees prune" : shared ? "devtrees down --shared" : "devtrees down";
-  // A pending reload (#206): process-compose's own shutdown waits on the
-  // same old process, so stopping process-compose by hand does not help.
-  // Killing the old process does, and is safe while no stop is running.
-  if (pending !== undefined) {
-    if (pending.oldRuns.length === 0) return `Retry \`${retry}\` in a moment.`;
-    const pids = pending.oldRuns.map((r) => r.pid).join(" ");
-    return (
-      `Kill the old process first (\`kill ${pids}\`, then \`kill -9 ${pids}\` if it ignores ` +
-      `that; safe now, as no stop is running), then retry \`${retry}\`. Stopping ` +
-      "process-compose by hand does not help: its own shutdown waits on the same process."
-    );
-  }
-  const pid = processComposePid === undefined ? "<pid>" : String(processComposePid);
-  const find =
-    processComposePid === undefined
-      ? `find process-compose with \`lsof -U -a ${socketPath}\` and stop it`
-      : "stop process-compose by hand";
-  const after = shared
-    ? "Shutdown hooks it had not run yet will not run: check for anything they would have cleaned up."
-    : "With process-compose gone, devtrees runs the shutdown hooks itself.";
-  return (
-    `Retry \`${retry}\` in a moment. If it still does not finish, ${find} ` +
-    `(\`kill ${pid}\`, then \`kill -9 ${pid}\` if it ignores that) and run \`${retry}\` ` +
-    `again to clean up. ${after}`
-  );
-}
-
 // --- restart (ADR-0009, #222) -----------------------------------------------
 
 export interface RestartResult {
@@ -3340,19 +3264,6 @@ async function restartOne(
     forceKilled: outcome.forceKilled,
     survivors: outcome.survivors,
   };
-}
-
-/** One stderr warning per old-run process SIGKILL could not stop. */
-function warnSurvivors(
-  survivors: ReadonlyArray<ServiceProcess>,
-  warn: (message: string) => void,
-): void {
-  for (const s of survivors) {
-    warn(
-      `devtrees restart: WARNING — ${s.service}'s old process (pid ${s.pid}, ${s.command}) ` +
-        "survived SIGKILL and may still hold its port.",
-    );
-  }
 }
 
 /** What each service `depends_on`, for `SERVICE_PENDING`'s remedy. */
@@ -4167,30 +4078,6 @@ async function reapDerivedConfig(
   const outcome = await reap(config, { cwd: anchor });
   if (outcome.failures.length === 0) return undefined;
   return { orphanId, worktreePath: readWorktreePath(configPath), failures: outcome.failures };
-}
-
-/**
- * Recover the `working_dir` of the first process in a derived process-compose
- * config — devtrees always pins this to the worktree root at `up` time, so
- * the path is the orphan's last-known anchor location. Returns "" when the
- * file is missing or unparsable; `runPrune` still emits the field so the
- * envelope shape stays stable.
- */
-function readWorktreePath(configPath: string): string {
-  if (!existsSync(configPath)) return "";
-  try {
-    const doc = (parseYaml(readFileSync(configPath, "utf8")) ?? {}) as {
-      processes?: Record<string, { working_dir?: unknown }>;
-    };
-    for (const proc of Object.values(doc.processes ?? {})) {
-      if (typeof proc.working_dir === "string" && proc.working_dir !== "") {
-        return proc.working_dir;
-      }
-    }
-  } catch {
-    // Best-effort: a malformed config can't block the sweep.
-  }
-  return "";
 }
 
 export interface EnvResult {

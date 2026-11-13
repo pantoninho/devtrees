@@ -738,3 +738,27 @@ function bootedNamespaces(
   const present = new Set([...rows.map((r) => r.name), ...pendingServices]);
   return [...resolveRunningSelection([...declared.values()], present, undefined).namespaces];
 }
+
+/**
+ * Recover the `working_dir` of the first process in a derived process-compose
+ * config — devtrees always pins this to the worktree root at `up` time, so
+ * the path is the orphan's last-known anchor location. Returns "" when the
+ * file is missing or unparsable; `runPrune` still emits the field so the
+ * envelope shape stays stable.
+ */
+export function readWorktreePath(configPath: string): string {
+  if (!existsSync(configPath)) return "";
+  try {
+    const doc = (parseYaml(readFileSync(configPath, "utf8")) ?? {}) as {
+      processes?: Record<string, { working_dir?: unknown }>;
+    };
+    for (const proc of Object.values(doc.processes ?? {})) {
+      if (typeof proc.working_dir === "string" && proc.working_dir !== "") {
+        return proc.working_dir;
+      }
+    }
+  } catch {
+    // Best-effort: a malformed config can't block the sweep.
+  }
+  return "";
+}

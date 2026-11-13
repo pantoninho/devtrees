@@ -55,7 +55,10 @@
 
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import type { DownOutcome, InstanceRef, ServiceStatus } from "./driver.js";
+import { downTimeoutMs, type DownOutcome, type InstanceRef, type ServiceStatus } from "./driver.js";
+import { unsignalledServices } from "./down-survivors.js";
+import { readDerivedConfig } from "./instances.js";
+import { SHARED_INSTANCE_ID } from "./paths.js";
 import { stuckFromMarker, type OldRun, type PendingReload } from "./reload-pending.js";
 
 /** One row of the process table, as `ps -o pid=,ppid=,pgid=,lstart=,command=` prints it. */
@@ -1051,4 +1054,80 @@ async function waitForExit(
   const gone = (): boolean =>
     supervisorPid === undefined ? !exists(socketPath) : !isAlive(supervisorPid);
   return pollUntil(gone, seams.graceMs ?? DOWN_GRACE_MS, seams.pollMs ?? DOWN_POLL_MS);
+}
+
+/**
+ * Stop a live instance with the bounded `down` (#190): a budget of 30s plus
+ * every `shutdown.timeout_seconds` in its derived config, then a surgical
+ * SIGKILL of the service processes that kept it from stopping. The old runs
+ * a pending reload is stuck on (`pendingReload`, #206) are killed before
+ * the stop, which begins only once that reload has finished. Throws
+ * `DOWN_TIMEOUT` (nothing removed) when process-compose still has not
+ * exited, or when the reload never finished and the stop was not begun.
+ */
+export function stopInstance(
+  driver: StopDriver,
+  paths: { readonly configPath: string; readonly socketPath: string },
+  instance: string,
+  command: "down" | "prune",
+  seams: StopSeams | undefined,
+  pendingReload?: PendingReload,
+): Promise<StopResult> {
+  const config = readDerivedConfig(paths.configPath);
+  return boundedDown(
+    {
+      inst: { configPath: paths.configPath, socketPath: paths.socketPath },
+      instance,
+      command,
+      timeoutMs: downTimeoutMs(config, seams?.baseTimeoutMs),
+      remedy: (pid, pending) =>
+        downTimeoutRemedy(instance, command, paths.socketPath, pid, pending),
+      pendingReload,
+      unsignalled: unsignalledServices(config),
+    },
+    driver,
+    seams,
+  );
+}
+
+/**
+ * The `details.remedy` a `DOWN_TIMEOUT` carries (#190). devtrees does not
+ * kill process-compose itself: that would skip the shutdown hooks it has not
+ * run yet. The operator does, knowingly, and the follow-up command cleans up.
+ */
+function downTimeoutRemedy(
+  instance: string,
+  command: "down" | "prune",
+  socketPath: string,
+  processComposePid: number | undefined,
+  pending?: { readonly oldRuns: ReadonlyArray<ForceKilled> },
+): string {
+  const shared = instance === SHARED_INSTANCE_ID;
+  const retry =
+    command === "prune" ? "devtrees prune" : shared ? "devtrees down --shared" : "devtrees down";
+  // A pending reload (#206): process-compose's own shutdown waits on the
+  // same old process, so stopping process-compose by hand does not help.
+  // Killing the old process does, and is safe while no stop is running.
+  if (pending !== undefined) {
+    if (pending.oldRuns.length === 0) return `Retry \`${retry}\` in a moment.`;
+    const pids = pending.oldRuns.map((r) => r.pid).join(" ");
+    return (
+      `Kill the old process first (\`kill ${pids}\`, then \`kill -9 ${pids}\` if it ignores ` +
+      `that; safe now, as no stop is running), then retry \`${retry}\`. Stopping ` +
+      "process-compose by hand does not help: its own shutdown waits on the same process."
+    );
+  }
+  const pid = processComposePid === undefined ? "<pid>" : String(processComposePid);
+  const find =
+    processComposePid === undefined
+      ? `find process-compose with \`lsof -U -a ${socketPath}\` and stop it`
+      : "stop process-compose by hand";
+  const after = shared
+    ? "Shutdown hooks it had not run yet will not run: check for anything they would have cleaned up."
+    : "With process-compose gone, devtrees runs the shutdown hooks itself.";
+  return (
+    `Retry \`${retry}\` in a moment. If it still does not finish, ${find} ` +
+    `(\`kill ${pid}\`, then \`kill -9 ${pid}\` if it ignores that) and run \`${retry}\` ` +
+    `again to clean up. ${after}`
+  );
 }
