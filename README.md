@@ -6,8 +6,6 @@ Several coding agents can work on one repo in parallel, each in its own git work
 
 devtrees is a thin layer over [process-compose](https://github.com/F1bonacc1/process-compose). You mark each service `isolated` (one copy per worktree, with its own ports) or `shared` (one instance for the whole repo, e.g. Postgres). Then `devtrees up` in any worktree starts that worktree's stack. Ports are allocated for you and injected as env vars. The CLI is built to be driven by agents too: it prints JSON, it doesn't block in a non-TTY shell, and its errors have codes.
 
-Used daily on a production monorepo.
-
 ![Two worktrees run the same stack side by side: each gets its own web port, both share one db.](docs/demo.gif)
 
 ## Quick start
