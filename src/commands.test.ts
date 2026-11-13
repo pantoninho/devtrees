@@ -10,7 +10,6 @@
  */
 
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
-import { EventEmitter } from "node:events";
 import {
   existsSync,
   mkdirSync,
@@ -22,9 +21,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { Readable } from "node:stream";
 import { isDeepStrictEqual } from "node:util";
-import type { SpawnOptions } from "node:child_process";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import {
   filterLogEventsSince,
@@ -175,30 +172,6 @@ function reloadAnswering(status: number, seen: ControlRequest[] = []): ControlRe
   };
 }
 
-/**
- * A `process-compose process start` child that refuses: writes `stderr` the
- * way the real binary logs a refusal, then exits 1 (issue #178).
- */
-function refusedStart(stderr: string): SpawnedProcess {
-  const exitHandlers: Array<(code: number | null) => void> = [];
-  setTimeout(() => {
-    for (const h of exitHandlers) h(1);
-  }, 5);
-  return {
-    on(event: "error" | "exit", cb: (arg: never) => void): void {
-      if (event === "exit") exitHandlers.push(cb as (code: number | null) => void);
-    },
-    stderr: Readable.from([stderr]),
-  };
-}
-
-/** Find the shared-instance up-spawn in a tracker, asserting it happened. */
-function findSharedSpawn(track: StubSpawn): UpInvocation {
-  const spawn = track.invocations.find((i) => i.socketPath.endsWith("/shared.sock"));
-  if (spawn === undefined) throw new Error("expected a shared.sock spawn");
-  return spawn;
-}
-
 /** Allocate a temp anchor + worktree-root + registry ref for a multi-worktree test. */
 function multiWorktreeFixture(prefix: string): {
   sharedAnchor: string;
@@ -340,6 +313,53 @@ function stubDeps(opts: {
 }
 
 /**
+ * The command deps that put a command on the in-memory process-compose
+ * (src/in-memory-driver.ts, #255): the Driver and the liveness probe answer
+ * from the model, and the bounded stop's process-table seams see no OS
+ * processes, so the model's pids never reach a real `ps` or `kill`.
+ */
+function inMemoryPcDeps(pc: InMemoryProcessCompose) {
+  return {
+    processCompose: pc.driver,
+    probeSocket: (socketPath: string) => pc.probeSocket(socketPath),
+    stop: {
+      readProcessTable: async () => [],
+      isAlive: () => false,
+      kill: () => {},
+      pollMs: 1,
+      treeGraceMs: 1,
+    },
+  } satisfies CommandDeps;
+}
+
+/** `deps` with its spawner-backed driver swapped for a fresh in-memory process-compose. */
+function onInMemoryPc<D extends CommandDeps>(
+  deps: D,
+  opts: InMemoryProcessComposeOptions = {},
+): { deps: D; pc: InMemoryProcessCompose } {
+  const pc = createInMemoryProcessCompose(opts);
+  const { driver: _spawnerDriver, ...rest } = deps;
+  const pcDeps = inMemoryPcDeps(pc);
+  return {
+    pc,
+    deps: { ...rest, ...pcDeps, stop: { ...pcDeps.stop, ...deps.stop } } as D,
+  };
+}
+
+/** The worktree and shared instance sockets of a stub-deps worktree. */
+function socketsOf(deps: StubbedDeps): { worktree: string; shared: string } {
+  const anchor = (deps.git!(["rev-parse", "--git-common-dir"]) as string).trim();
+  return {
+    worktree: instancePaths(anchor, deps.expectedWorktreeId).socketPath,
+    shared: sharedInstancePaths(anchor).socketPath,
+  };
+}
+
+/** The `op` requests process-compose received, oldest first. */
+const requestsOf = (pc: InMemoryProcessCompose, op: PcRequest["op"]) =>
+  pc.requests.filter((r) => r.op === op);
+
+/**
  * `stubDeps` with process-compose as the in-memory adapter
  * (src/in-memory-driver.ts) instead of an argv-parsing spawner: `up` boots a
  * process table from the derived config, binds the control socket and
@@ -379,8 +399,10 @@ function pcDeps(
     ...base
   } = stubDeps({ ...opts, probeSocket: opts.probeSocket ?? ((path) => pc.probeSocket(path)) });
   const anchor = base.git!(["rev-parse", "--git-common-dir"]);
+  const onPc = inMemoryPcDeps(pc);
   return {
     ...base,
+    stop: { ...onPc.stop, ...base.stop },
     processCompose:
       onBoot === undefined
         ? pc.driver
@@ -400,7 +422,7 @@ function pcDeps(
 
 /** The `up` requests process-compose received on `socketPath`. */
 function upsOn(pc: InMemoryProcessCompose, socketPath: string): PcRequest[] {
-  return pc.requests.filter((r) => r.op === "up" && r.socketPath === socketPath);
+  return requestsOf(pc, "up").filter((r) => r.socketPath === socketPath);
 }
 
 /**
@@ -429,11 +451,6 @@ function reloadFailing(
   failure: Extract<ReloadResult, { ok: false }>,
 ): Driver {
   return { ...pc.driver, reloadConfig: async () => failure };
-}
-
-/** Every `up` request process-compose received, on any socket. */
-function ups(pc: InMemoryProcessCompose): PcRequest[] {
-  return pc.requests.filter((r) => r.op === "up");
 }
 
 describe("runUp — port injection", () => {
@@ -488,7 +505,7 @@ describe("runUp — minimum process-compose version (#173)", () => {
     });
     // Nothing allocated, nothing started.
     expect(registryRef.snapshot).toEqual({});
-    expect(ups(pc)).toEqual([]);
+    expect(requestsOf(pc, "up")).toEqual([]);
     expect(pc.isUp(deps.inst.socketPath)).toBe(false);
   });
 });
@@ -612,7 +629,7 @@ describe("runUp — shared tier lazy start", () => {
     const result = await runUp(deps);
 
     // Two instances up: the shared one and the worktree instance.
-    expect(ups(deps.pc)).toHaveLength(2);
+    expect(requestsOf(deps.pc, "up")).toHaveLength(2);
     expect(upsOn(deps.pc, deps.sharedInst.socketPath)).toHaveLength(1);
     expect(deps.pc.isUp(deps.sharedInst.socketPath)).toBe(true);
     expect(deps.pc.isUp(deps.inst.socketPath)).toBe(true);
@@ -1570,7 +1587,7 @@ describe("runUp — namespace selection (#128)", () => {
     });
     expect(err?.message).toContain("Available namespaces: app, local-backend");
     expect(err?.message).toContain("devtrees up -n app");
-    expect(ups(deps.pc)).toEqual([]);
+    expect(requestsOf(deps.pc, "up")).toEqual([]);
   });
 
   it("`-n` naming only a namespace with NO services fails NO_SERVICES_SELECTED before any state is written (#203)", async () => {
@@ -1589,7 +1606,7 @@ describe("runUp — namespace selection (#128)", () => {
     expect(err?.message).toContain("-n nope");
     expect(err?.message).toContain("Available namespaces: app, local-backend");
     expect(err?.message).toContain("devtrees up -n app");
-    expect(ups(deps.pc)).toEqual([]);
+    expect(requestsOf(deps.pc, "up")).toEqual([]);
     expect(registryRef.snapshot).toEqual({});
   });
 
@@ -1610,12 +1627,12 @@ describe("runUp — namespace selection (#128)", () => {
   it("a bare up on a RUNNING instance is not a fresh start: no NO_SERVICES_SELECTED, no spawn (#177's scope)", async () => {
     const baseDeps = pcDeps({ stack: allNamespaced });
     await runUp({ ...baseDeps, namespaces: ["app"], waitForHealth: async () => {} });
-    const upsAfterBoot = ups(baseDeps.pc).length;
+    const upsAfterBoot = requestsOf(baseDeps.pc, "up").length;
     const webPid = baseDeps.pc.pidOf(baseDeps.inst.socketPath, "web");
     // Bare re-up against the live instance takes the reconcile path unchanged.
     const result = await runUp(baseDeps);
     expect(result.worktreeId).toBe(baseDeps.expectedWorktreeId);
-    expect(ups(baseDeps.pc)).toHaveLength(upsAfterBoot);
+    expect(requestsOf(baseDeps.pc, "up")).toHaveLength(upsAfterBoot);
     expect(baseDeps.pc.pidOf(baseDeps.inst.socketPath, "web")).toBe(webPid);
   });
 });
@@ -1748,53 +1765,6 @@ describe("runUp — state envelope on success (#30)", () => {
     expect(base.pc.isUp(base.inst.socketPath)).toBe(true);
   });
 });
-
-/**
- * The command deps that put a command on the in-memory process-compose
- * (src/in-memory-driver.ts, #255): the Driver and the liveness probe answer
- * from the model, and the bounded stop's process-table seams see no OS
- * processes, so the model's pids never reach a real `ps` or `kill`.
- */
-function inMemoryPcDeps(pc: InMemoryProcessCompose) {
-  return {
-    processCompose: pc.driver,
-    probeSocket: (socketPath: string) => pc.probeSocket(socketPath),
-    stop: {
-      readProcessTable: async () => [],
-      isAlive: () => false,
-      kill: () => {},
-      pollMs: 1,
-      treeGraceMs: 1,
-    },
-  } satisfies CommandDeps;
-}
-
-/** `deps` with its spawner-backed driver swapped for a fresh in-memory process-compose. */
-function onInMemoryPc<D extends CommandDeps>(
-  deps: D,
-  opts: InMemoryProcessComposeOptions = {},
-): { deps: D; pc: InMemoryProcessCompose } {
-  const pc = createInMemoryProcessCompose(opts);
-  const { driver: _spawnerDriver, ...rest } = deps;
-  const pcDeps = inMemoryPcDeps(pc);
-  return {
-    pc,
-    deps: { ...rest, ...pcDeps, stop: { ...pcDeps.stop, ...deps.stop } } as D,
-  };
-}
-
-/** The worktree and shared instance sockets of a stub-deps worktree. */
-function socketsOf(deps: StubbedDeps): { worktree: string; shared: string } {
-  const anchor = (deps.git!(["rev-parse", "--git-common-dir"]) as string).trim();
-  return {
-    worktree: instancePaths(anchor, deps.expectedWorktreeId).socketPath,
-    shared: sharedInstancePaths(anchor).socketPath,
-  };
-}
-
-/** The `op` requests process-compose received, oldest first. */
-const requestsOf = (pc: InMemoryProcessCompose, op: PcRequest["op"]) =>
-  pc.requests.filter((r) => r.op === op);
 
 describe("runDown — shared lifecycle is decoupled from worktree lifecycle", () => {
   const mixedStack: ResolvedStack = {
@@ -3025,11 +2995,6 @@ describe("runLs — instance enumeration", () => {
   });
 });
 
-/**
-
- * Tracker for `process-compose attach` invocations — the spawner records the
- * args so the test can assert which socket path was attached against.
- */
 /**
  * A `CommandDeps` for `runAttach` on the in-memory process-compose; unlike
  * `pcDeps`, this skips the allocator/lock plumbing because `runAttach` does
@@ -4807,7 +4772,7 @@ describe("runUp — pending-reload guard (#191)", () => {
       code: "NO_SERVICES_SELECTED",
     });
     expect(state.reloads).toBe(0);
-    expect(ups(pc)).toEqual([]);
+    expect(requestsOf(pc, "up")).toEqual([]);
   });
 
   it("an instance booted through a list-valued namespace reloads normally (#179)", async () => {
@@ -5583,7 +5548,7 @@ describe("runUp — stale port block detection (#58)", () => {
     // The human message lists the collision too (#155), not just `details`.
     expect(err.message).toContain(`WEB_PORT ${blockBase}: pid 12345 (node stale.mjs)`);
     // Aborted before the start.
-    expect(ups(base.pc)).toEqual([]);
+    expect(requestsOf(base.pc, "up")).toEqual([]);
   });
 
   it("collects every collision (not just the first) so the agent can kill all orphans in one pass", async () => {
@@ -6390,7 +6355,7 @@ describe("runUp — control socket path length guard (issue #156)", () => {
 
     expect(result.worktreeId).toBe(deps.expectedWorktreeId);
     expect(Buffer.byteLength(result.socketPath)).toBeLessThanOrEqual(SOCKET_PATH_MAX_BYTES);
-    expect(ups(deps.pc)).toHaveLength(1);
+    expect(requestsOf(deps.pc, "up")).toHaveLength(1);
     expect(deps.pc.isUp(result.socketPath)).toBe(true);
   });
 });
@@ -7229,7 +7194,7 @@ describe("STALE_PORT_BLOCK holders that refuse connections (#155)", () => {
     // An accepting port forwarder is labelled too (#217's wildcard probe sees OrbStack forwards).
     expect(first.message).toContain("never this process");
     // Neither failed up started process-compose.
-    expect(ups(base.pc)).toEqual([]);
+    expect(requestsOf(base.pc, "up")).toEqual([]);
   });
 });
 
