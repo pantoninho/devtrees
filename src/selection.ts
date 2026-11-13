@@ -593,7 +593,7 @@ export function selectRunningUp(
 // --- named services (ADR-0009) ----------------------------------------------
 
 /** The distinct names among `names` that are in `shared`, in the order named. */
-export function sharedAmong(
+function sharedAmong(
   shared: ReadonlyArray<string>,
   isolated: ReadonlyArray<DeclaredService>,
   names: ReadonlyArray<string>,
@@ -606,7 +606,7 @@ export function sharedAmong(
 }
 
 /** The first of `names` not in `declared`, if any. */
-export function unknownService(
+function unknownService(
   declared: ReadonlyArray<DeclaredService>,
   names: ReadonlyArray<string>,
 ): string | undefined {
@@ -618,7 +618,7 @@ export function unknownService(
  * The declared services `names` refers to, each once, in `depends_on` order
  * (a dependency before its dependents). Check `unknownService` first.
  */
-export function orderedTargets(
+function orderedTargets(
   declared: ReadonlyArray<DeclaredService>,
   names: ReadonlyArray<string>,
 ): DeclaredService[] {
@@ -627,7 +627,7 @@ export function orderedTargets(
 }
 
 /** The targets absent from the running project (`present`), in order. */
-export function unbootedServices(
+function unbootedServices(
   targets: ReadonlyArray<DeclaredService>,
   present: ReadonlySet<string>,
 ): DeclaredService[] {
@@ -639,9 +639,7 @@ export function unbootedServices(
  * missing services it declares: every namespace of a missing service is
  * unbooted, since one booted namespace would have put it in the project.
  */
-export function notBootedNamespaces(
-  missing: ReadonlyArray<DeclaredService>,
-): NamespaceNotRunning[] {
+function notBootedNamespaces(missing: ReadonlyArray<DeclaredService>): NamespaceNotRunning[] {
   const namespaces = [...new Set(missing.flatMap((s) => serviceNamespaces(s)))];
   return namespaces.map((namespace) => ({
     namespace,
@@ -652,7 +650,7 @@ export function notBootedNamespaces(
 }
 
 /** What a per-service verb's `-n` flags expand to (#224). */
-export interface NamespaceExpansion {
+interface NamespaceExpansion {
   /** The isolated services in any of the namespaces, in declared order. */
   readonly services: ReadonlyArray<string>;
   /** Requested namespaces with no isolated service: `NO_SERVICES_SELECTED`. */
@@ -668,7 +666,7 @@ export interface NamespaceExpansion {
  * they are returned in `skippedShared` for the verb to report. A namespace
  * that selects no isolated service is returned in `empty`.
  */
-export function expandNamespaces(
+function expandNamespaces(
   declared: ReadonlyArray<DeclaredService>,
   shared: ReadonlyArray<Pick<ResolvedService, "name" | "namespace">>,
   namespaces: ReadonlyArray<string>,
