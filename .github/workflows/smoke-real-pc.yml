@@ -6,39 +6,32 @@ name: Smoke (real process-compose)
 # port binding, hot-reload — is exercised in CI.
 #
 # Gating:
-#   - Triggers on PRs that touch the modules whose contract this smoke exists
-#     to protect; unrelated PRs (docs, build config, lint settings) don't pay
-#     the cost.
+#   - Triggers on any PR that changes non-test source under `src/`. The
+#     smoke drives the BUILT CLI, so every production module is in its blast
+#     radius; a hand-kept list of modules went stale (health, selection,
+#     bounded-*, reaper, ... were missing, so refactors of them skipped the
+#     real binary until the nightly run, issue #264). Test-only and docs-only
+#     PRs don't pay the cost.
 #   - Nightly cron catches process-compose-side regressions without blocking
 #     every PR.
 #   - Does NOT run on every push to `main` — pinned releases land via PR.
 on:
   pull_request:
     paths:
-      # The smoke drives the BUILT CLI, so the entrypoint (envelope routing,
-      # error-classification dispatch) and the bundler config (a bundling
-      # regression broke the artifact once — issue #65/#66) are in scope, as
-      # is the port-probe module (probe convergence against real OS port
-      # binding is what this smoke exists to catch). Issue #93.
-      - "src/cli.ts"
-      - "src/commands.ts"
-      - "src/driver.ts"
-      - "src/deriver.ts"
-      - "src/stack.ts"
-      - "src/output.ts"
-      - "src/allocator.ts"
-      - "src/instances.ts"
-      - "src/port-probe.ts"
-      # The deriver templates `log_location` through `logsDir` (paths.ts), and
-      # `commands.ts` creates the per-instance logs dir from it (#136) — a
-      # regression there only surfaces against the real binary.
-      - "src/paths.ts"
-      # The shared port map, the namespaced shared teardown and the lifecycle
-      # locks it reads (#238, #239) are what scenarios 124-134 drive.
-      - "src/registry.ts"
-      - "src/shared-down.ts"
-      - "src/shared-ports.ts"
+      # GitHub evaluates `paths` in order and a later pattern overrides an
+      # earlier one, so the order below is load-bearing:
+      #   1. any file under src/ triggers (every production module);
+      #   2. test files and the shared test setup are carved back out, since a
+      #      change there cannot alter what the built CLI does;
+      #   3. the smoke suite itself is re-included, because editing it must
+      #      run it even though it matches the test carve-out in (2).
+      - "src/**"
+      - "!src/**/*.test.ts"
+      - "!src/test-setup.ts"
       - "src/real-pc.smoke.test.ts"
+      # Non-source triggers: the bundler config (a bundling regression broke
+      # the artifact once, issue #65/#66), the agent-surface fixtures the
+      # smoke drives, and this workflow.
       - "test/fixtures/agent-surface/**"
       - "vite.config.ts"
       - ".github/workflows/smoke-real-pc.yml"
