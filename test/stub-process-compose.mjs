@@ -17,11 +17,18 @@
  *        Records <name> as restarted, so `process list` reports it running
  *        again (issue #178), and asks the `up` parent over the control socket
  *        to spawn a new run when its current one has exited (#265). See the
- *        `process list` notes for the env knobs.
+ *        `process list` notes for the env knobs. Unlike the real binary, a
+ *        start while the current run is alive answers OK: the real one refuses
+ *        ("process X is already running", exit 1). Kept for the
+ *        DEVTREES_STUB_DEAD tests, whose "dead" process still runs.
  *   process stop <name...> -U -u <socket>
  *        Records the names as stopped, so `process list` reports them
  *        `Completed` until a reload drops them from the config (#239), and
  *        asks the `up` parent to SIGTERM each one's process group (#265).
+ *        A stop naming a Skipped process exits 1 like the real binary, but a
+ *        mixed `process stop f b` prints only "Failed to stop: 'b'" where the
+ *        real one says "Successfully stopped 'f' but encountered failures
+ *        for: 'b'".
  *   version
  *        Prints a version (`$STUB_PC_VERSION`, default v1.122.0; `--short`
  *        prints it bare) so the presence and minimum-version probes work.
@@ -494,7 +501,8 @@ if (cmd === "up") {
     // Without a knob, a row reports its real run (#265, from `<socket>.procs`):
     // `Running` while it runs, or, once it exited, `Completed` with its exit
     // code (-1 when a signal ended it) and the pid of the run that exited. A
-    // stopped name whose run is still exiting reads `Terminating`. Running
+    // stopped name whose run is still exiting reads `Terminating` (exit_code
+    // 0, the old pid, is_running false, as the real binary reports). Running
     // rows still carry no pid, unlike the real binary: tests that stand in for
     // an old run with their own pid (the #191 pending-reload marker) rely on
     // it, so a test reads a run's pid from the process itself instead.
@@ -547,11 +555,16 @@ if (cmd === "up") {
       if (doneNames.has(name)) return stopped(0, 1000);
       return undefined;
     };
-    /** A stopped process: `Terminating` while its run is still exiting. */
+    /**
+     * A stopped process: `Terminating` while its run is still exiting. As on
+     * process-compose v1.122.0 (a SIGTERM-ignoring run with a 4s shutdown
+     * timeout), that row carries exit_code 0, the old run's pid and
+     * is_running false; it reads `Completed`, -1 once the run exited.
+     */
     const stoppedRun = (run, stopped) => {
       if (run === undefined) return stopped(-1, 1000);
       if (run.exitCode === undefined) {
-        return { ...stopped(-1, run.pid), status: "Terminating", is_running: true };
+        return { ...stopped(0, run.pid), status: "Terminating" };
       }
       return stopped(-1, run.pid);
     };
