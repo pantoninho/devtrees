@@ -84,7 +84,6 @@ function stubDriverDeps(worktree: string): {
   attach: false;
   waitForHealth: () => Promise<void>;
   waitForSharedReady: () => Promise<void>;
-  getServiceStatuses: () => Promise<never[]>;
 } {
   return {
     cwd: worktree,
@@ -98,12 +97,6 @@ function stubDriverDeps(worktree: string): {
     // Same for the wait on an already-running shared instance (#240): this
     // stub reports no rows, which that wait would read as never healthy.
     waitForSharedReady: () => Promise.resolve(),
-    // The issue-#30 `up --json` envelope publishes per-service rows via the
-    // driver's `getServiceStatuses` (same hook `ls --json` uses, issue #29).
-    // Default it to an empty snapshot for up/down-focused e2e tests so this
-    // call doesn't race the stub's async socket setup; the real shape is
-    // exercised in commands.test.ts and through `runLs` in the #29 e2e.
-    getServiceStatuses: () => Promise.resolve([]),
   };
 }
 
