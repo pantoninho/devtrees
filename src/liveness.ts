@@ -106,3 +106,26 @@ export function unresponsiveRemedy(socketPath: string, context: LivenessContext)
     `(\`kill -CONT <pid>\`), or kill it, then run \`${down}\` to clean up.`
   );
 }
+
+/**
+ * The deadline both post-spawn socket waits run on. Kept as one constant so
+ * the worktree and shared waits can't drift apart: #156 established there is
+ * no timing component to the failures they report (a bind that can't succeed
+ * never succeeds), so this is a fail-fast bound, not a tuning knob.
+ */
+export const SOCKET_WAIT_TIMEOUT_MS = 3000;
+
+/**
+ * Poll until `socketPath` shows up on disk; `true` if it did, `false` on
+ * deadline. The worktree and shared socket waits turn `false` into their own
+ * envelope — this is deliberately the only shared part, because attributing
+ * the failure to the wrong instance is exactly the bug #157 fixed.
+ */
+export async function pollForSocket(socketPath: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(socketPath)) return true;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  return false;
+}

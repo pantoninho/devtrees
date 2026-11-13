@@ -15,6 +15,7 @@
 
 import { READ_TIMEOUT_MS, type Driver, type ServiceStatus } from "./driver.js";
 import { probeSocket, type InstanceStatus } from "./instances.js";
+import type { ResolvedService } from "./stack.js";
 import {
   deadServicesDetails,
   describeDeadServices,
@@ -823,4 +824,16 @@ export async function startInOrder(args: {
     restarted.push(stalePid === undefined ? { name } : { name, stalePid });
   }
   return { restarted, failed };
+}
+
+/**
+ * The names of the services in `services` that declare a readiness probe.
+ * The health waits gate these on `health === "ready"` instead of bare process
+ * state — process-compose keeps a probed service's status at `Running` while
+ * the probe verdict arrives in the separate readiness field (issue #108).
+ */
+export function probedNames(
+  services: ReadonlyArray<Pick<ResolvedService, "name" | "readinessProbe">>,
+): string[] {
+  return services.filter((s) => s.readinessProbe !== undefined).map((s) => s.name);
 }
