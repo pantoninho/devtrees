@@ -13,7 +13,17 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 import { deriveWorktreeId } from "./anchor.js";
-import { runAttach, runDown, runLs, runPrune, runRestart, runUp } from "./commands.js";
+import {
+  runAttach,
+  runDown,
+  runLs,
+  runPrune,
+  runRestart,
+  runUp,
+  type CommandEnv,
+  type CommandOptions,
+  type UpOptions,
+} from "./commands.js";
 import { instancePaths, runDir, sharedInstancePaths } from "./paths.js";
 
 // Unix domain socket paths are capped (~104 bytes on macOS, ~108 on Linux).
@@ -77,26 +87,34 @@ function makeRepo(
   return { root, main, worktrees };
 }
 
+/**
+ * A worktree's commands against the stub: `env` is the driver config that
+ * runs the stub instead of a real process-compose (plus `extra`), `at` runs a
+ * command from `worktree`, and `up` is `at` for `up`, never attaching.
+ */
+interface StubDeps {
+  readonly env: CommandEnv;
+  readonly at: CommandOptions;
+  readonly up: UpOptions;
+}
+
 /** The driver config that runs the stub instead of a real process-compose. */
-function stubDriverDeps(worktree: string): {
-  cwd: string;
-  driver: { binary: string; prefixArgs: string[] };
-  attach: false;
-  waitForHealth: () => Promise<void>;
-  waitForSharedReady: () => Promise<void>;
-} {
+function stubDriverDeps(worktree: string, extra: CommandEnv = {}): StubDeps {
   return {
-    cwd: worktree,
-    driver: { binary: process.execPath, prefixArgs: [STUB] },
-    attach: false,
-    // Skip the real poll loop for up/down-focused e2e tests — the
-    // wait-for-healthy contract is unit-tested in health.test.ts, and the
-    // default driver-backed wait is exercised against the stub in the #87
-    // e2e below.
-    waitForHealth: () => Promise.resolve(),
-    // Same for the wait on an already-running shared instance (#240): this
-    // stub reports no rows, which that wait would read as never healthy.
-    waitForSharedReady: () => Promise.resolve(),
+    env: {
+      driver: { binary: process.execPath, prefixArgs: [STUB] },
+      // Skip the real poll loop for up/down-focused e2e tests — the
+      // wait-for-healthy contract is unit-tested in health.test.ts, and the
+      // default driver-backed wait is exercised against the stub in the #87
+      // e2e below.
+      waitForHealth: () => Promise.resolve(),
+      // Same for the wait on an already-running shared instance (#240): this
+      // stub reports no rows, which that wait would read as never healthy.
+      waitForSharedReady: () => Promise.resolve(),
+      ...extra,
+    },
+    at: { cwd: worktree },
+    up: { cwd: worktree, attach: false },
   };
 }
 
@@ -161,8 +179,8 @@ describe("e2e smoke — up then down a single isolated service", () => {
 
     const deps = stubDriverDeps(worktree);
 
-    const up = await runUp(deps as never);
-    cleanups.push(() => runDown(deps as never));
+    const up = await runUp(deps.env, deps.up);
+    cleanups.push(() => runDown(deps.env, deps.at));
 
     // Acceptance: the worktree id is resolved from the directory, not the
     // branch — slug prefix of the basename plus a path-hash suffix (#82).
@@ -184,7 +202,7 @@ describe("e2e smoke — up then down a single isolated service", () => {
     expect(existsSync(join(absCommon, "devtrees", `${up.worktreeId}.yaml`))).toBe(true);
 
     // Acceptance: down stops the worktree instance cleanly.
-    await runDown(deps as never);
+    await runDown(deps.env, deps.at);
     expect(await waitForGone(port)).toBe(true);
   }, 20000);
 });
@@ -202,21 +220,20 @@ describe("e2e — default health wait goes through the injected driver (#87)", (
     // whatever `process-compose` happens to be on PATH. Before #87 the
     // default shelled out to the hardcoded name and spun to HEALTH_TIMEOUT
     // against a perfectly healthy stack.
-    const deps = {
-      cwd: worktree,
-      driver: { binary: process.execPath, prefixArgs: [STUB] },
-      attach: false,
-      waitTimeoutMs: 8000,
+    const deps: StubDeps = {
+      env: { driver: { binary: process.execPath, prefixArgs: [STUB] } },
+      at: { cwd: worktree },
+      up: { cwd: worktree, attach: false, waitTimeoutMs: 8000 },
     };
 
-    const up = await runUp(deps as never);
-    cleanups.push(() => runDown(deps as never));
+    const up = await runUp(deps.env, deps.up);
+    cleanups.push(() => runDown(deps.env, deps.at));
 
     expect(up.worktreeId).toMatch(/^login-[0-9a-f]{8}$/);
     const port = Number(up.env.WEB_PORT);
     expect(await waitForHttp(port)).toBe(true);
 
-    await runDown(deps as never);
+    await runDown(deps.env, deps.at);
     expect(await waitForGone(port)).toBe(true);
   }, 20000);
 });
@@ -335,13 +352,13 @@ describe("e2e — shared instance lifecycle across two worktrees", () => {
     const billingDeps = stubDriverDeps(billingWt);
 
     // Acceptance: first up lazy-starts the shared instance.
-    const login = await runUp(loginDeps as never);
+    const login = await runUp(loginDeps.env, loginDeps.up);
     // Register shared tear-down here too: if the test times out before the
     // second worktree's cleanup gets pushed, this still reaps the shared
     // stub (otherwise its long-lived parent leaks past the suite).
     cleanups.push(async () => {
-      await runDown(loginDeps as never).catch(() => {});
-      await runDown(loginDeps as never, { shared: true }).catch(() => {});
+      await runDown(loginDeps.env, loginDeps.at).catch(() => {});
+      await runDown(loginDeps.env, { ...loginDeps.at, shared: true }).catch(() => {});
     });
     expect(login.sharedStarted).toBe(true);
     expect(await waitForHttp(Number(login.env.WEB_PORT))).toBe(true);
@@ -354,13 +371,13 @@ describe("e2e — shared instance lifecycle across two worktrees", () => {
     expect(existsSync(sharedSocket)).toBe(true);
 
     // Acceptance: a second worktree up reuses the running shared instance.
-    const billing = await runUp(billingDeps as never);
+    const billing = await runUp(billingDeps.env, billingDeps.up);
     // Include the shared tear-down in cleanup so a timeout before the test
     // body reaches `runDown(..., {shared:true})` still reaps the shared stub
     // (otherwise its parent process leaks past the suite).
     cleanups.push(async () => {
-      await runDown(billingDeps as never).catch(() => {});
-      await runDown(billingDeps as never, { shared: true }).catch(() => {});
+      await runDown(billingDeps.env, billingDeps.at).catch(() => {});
+      await runDown(billingDeps.env, { ...billingDeps.at, shared: true }).catch(() => {});
     });
     expect(billing.sharedStarted).toBe(false);
     // Shared DB_PORT is identical in both worktrees (repo-wide injection).
@@ -374,14 +391,14 @@ describe("e2e — shared instance lifecycle across two worktrees", () => {
     expect(await httpRes.text()).toContain(billing.env.DB_PORT);
 
     // Acceptance: plain down in one worktree leaves shared up for the other.
-    await runDown(loginDeps as never);
+    await runDown(loginDeps.env, loginDeps.at);
     expect(await waitForGone(Number(login.env.WEB_PORT))).toBe(true);
     expect(existsSync(sharedSocket)).toBe(true);
     expect(await waitForTcp(Number(billing.env.DB_PORT))).toBe(true);
 
     // Acceptance: down --shared tears shared down explicitly.
-    await runDown(billingDeps as never);
-    await runDown(billingDeps as never, { shared: true });
+    await runDown(billingDeps.env, billingDeps.at);
+    await runDown(billingDeps.env, { ...billingDeps.at, shared: true });
     expect(await waitForGone(Number(billing.env.DB_PORT))).toBe(true);
     expect(existsSync(sharedSocket)).toBe(false);
   }, 30000);
@@ -405,39 +422,39 @@ describe("e2e — shared instance lifecycle across two worktrees", () => {
     const absCommon = commonDir.startsWith("/") ? commonDir : join(loginWt, commonDir);
     const sharedSocket = sharedInstancePaths(absCommon).socketPath;
 
-    const first = await runUp(deps as never);
+    const first = await runUp(deps.env, deps.up);
     cleanups.push(async () => {
-      await runDown(deps as never).catch(() => {});
-      await runDown(deps as never, { shared: true }).catch(() => {});
+      await runDown(deps.env, deps.at).catch(() => {});
+      await runDown(deps.env, { ...deps.at, shared: true }).catch(() => {});
     });
     expect(first.sharedStarted).toBe(true);
     expect(await waitForTcp(Number(first.env.DB_PORT))).toBe(true);
 
     // ls --json sees the shared instance as running, on the first DB_PORT.
-    const lsBefore = await runLs({ cwd: loginWt, driver: deps.driver });
+    const lsBefore = await runLs({ driver: deps.env.driver }, { cwd: loginWt });
     const sharedBefore = lsBefore.instances.find((i) => i.id === "shared");
     expect(sharedBefore?.status).toBe("running");
     expect(sharedBefore?.ports.DB_PORT).toBe(Number(first.env.DB_PORT));
 
     // Tear the worktree down first so the second `up` re-runs the full
     // lazy-start path (the idempotency branch short-circuits otherwise).
-    await runDown(deps as never);
-    await runDown(deps as never, { shared: true });
+    await runDown(deps.env, deps.at);
+    await runDown(deps.env, { ...deps.at, shared: true });
     expect(await waitForGone(Number(first.env.DB_PORT))).toBe(true);
     expect(existsSync(sharedSocket)).toBe(false);
 
     // ls --json no longer reports the shared instance (socket-driven liveness).
-    const lsAfterDown = await runLs({ cwd: loginWt, driver: deps.driver });
+    const lsAfterDown = await runLs({ driver: deps.env.driver }, { cwd: loginWt });
     expect(lsAfterDown.instances.find((i) => i.id === "shared")).toBeUndefined();
 
     // The next up reuses the same shared block — DB_PORT is identical.
-    const second = await runUp(deps as never);
+    const second = await runUp(deps.env, deps.up);
     expect(second.sharedStarted).toBe(true);
     expect(second.env.DB_PORT).toBe(first.env.DB_PORT);
     expect(await waitForTcp(Number(second.env.DB_PORT))).toBe(true);
 
     // ls --json shows shared back up on the original DB_PORT.
-    const lsAfterUp = await runLs({ cwd: loginWt, driver: deps.driver });
+    const lsAfterUp = await runLs({ driver: deps.env.driver }, { cwd: loginWt });
     const sharedAfter = lsAfterUp.instances.find((i) => i.id === "shared");
     expect(sharedAfter?.status).toBe("running");
     expect(sharedAfter?.ports.DB_PORT).toBe(Number(first.env.DB_PORT));
@@ -463,10 +480,10 @@ describe("e2e — shared instance lifecycle across two worktrees", () => {
     const absCommon = commonDir.startsWith("/") ? commonDir : join(loginWt, commonDir);
     const sharedSocket = sharedInstancePaths(absCommon).socketPath;
 
-    const first = await runUp(deps as never);
+    const first = await runUp(deps.env, deps.up);
     cleanups.push(async () => {
-      await runDown(deps as never).catch(() => {});
-      await runDown(deps as never, { shared: true }).catch(() => {});
+      await runDown(deps.env, deps.at).catch(() => {});
+      await runDown(deps.env, { ...deps.at, shared: true }).catch(() => {});
     });
     expect(first.sharedStarted).toBe(true);
     expect(await waitForTcp(Number(first.env.DB_PORT))).toBe(true);
@@ -474,7 +491,7 @@ describe("e2e — shared instance lifecycle across two worktrees", () => {
 
     // Only `down --shared` — the worktree itself stays up so the next `up`
     // hits the idempotency branch.
-    await runDown(deps as never, { shared: true });
+    await runDown(deps.env, { ...deps.at, shared: true });
     expect(await waitForGone(Number(first.env.DB_PORT))).toBe(true);
     expect(existsSync(sharedSocket)).toBe(false);
 
@@ -484,7 +501,7 @@ describe("e2e — shared instance lifecycle across two worktrees", () => {
 
     // Re-`up` from the same (still-running) worktree must lazy-restart
     // shared, and the envelope must report it (acceptance, #56).
-    const second = await runUp(deps as never);
+    const second = await runUp(deps.env, deps.up);
     expect(second.sharedStarted).toBe(true);
     expect(existsSync(sharedSocket)).toBe(true);
     expect(await waitForTcp(Number(second.env.DB_PORT))).toBe(true);
@@ -517,18 +534,18 @@ describe("e2e — devtrees ls discovers worktree instances + the shared instance
     const loginDeps = stubDriverDeps(loginWt);
     const billingDeps = stubDriverDeps(billingWt);
 
-    const login = await runUp(loginDeps as never);
+    const login = await runUp(loginDeps.env, loginDeps.up);
     // Register shared tear-down here too: if the test times out before the
     // second worktree's cleanup gets pushed, this still reaps the shared
     // stub (otherwise its long-lived parent leaks past the suite).
     cleanups.push(async () => {
-      await runDown(loginDeps as never).catch(() => {});
-      await runDown(loginDeps as never, { shared: true }).catch(() => {});
+      await runDown(loginDeps.env, loginDeps.at).catch(() => {});
+      await runDown(loginDeps.env, { ...loginDeps.at, shared: true }).catch(() => {});
     });
-    const billing = await runUp(billingDeps as never);
+    const billing = await runUp(billingDeps.env, billingDeps.up);
     cleanups.push(async () => {
-      await runDown(billingDeps as never).catch(() => {});
-      await runDown(billingDeps as never, { shared: true }).catch(() => {});
+      await runDown(billingDeps.env, billingDeps.at).catch(() => {});
+      await runDown(billingDeps.env, { ...billingDeps.at, shared: true }).catch(() => {});
     });
 
     // The stub `process-compose` creates its control socket from a detached
@@ -543,7 +560,7 @@ describe("e2e — devtrees ls discovers worktree instances + the shared instance
     // worktree and the answer is the same. The driver dep points at the stub
     // so `getServiceStatuses` (issue #29) reaches the stub's `process list`
     // rather than the real process-compose binary against a stub UDS.
-    const lsFromLogin = await runLs({ cwd: loginWt, driver: loginDeps.driver });
+    const lsFromLogin = await runLs({ driver: loginDeps.env.driver }, { cwd: loginWt });
     const ids = lsFromLogin.instances.map((i) => i.id).sort();
     expect(ids).toEqual([billing.worktreeId, login.worktreeId, "shared"].sort());
 
@@ -567,7 +584,7 @@ describe("e2e — devtrees ls discovers worktree instances + the shared instance
     expect(sharedEntry?.ports.DB_PORT).toBe(Number(login.env.DB_PORT));
 
     // Acceptance: ls from the other worktree returns the same set.
-    const lsFromBilling = await runLs({ cwd: billingWt, driver: billingDeps.driver });
+    const lsFromBilling = await runLs({ driver: billingDeps.env.driver }, { cwd: billingWt });
     expect(lsFromBilling.instances.map((i) => i.id).sort()).toEqual(ids);
   }, 30000);
 
@@ -586,17 +603,17 @@ describe("e2e — devtrees ls discovers worktree instances + the shared instance
     writeMixedTierStack(loginWt);
 
     const deps = stubDriverDeps(loginWt);
-    const up = await runUp(deps as never);
+    const up = await runUp(deps.env, deps.up);
     cleanups.push(async () => {
-      await runDown(deps as never).catch(() => {});
-      await runDown(deps as never, { shared: true }).catch(() => {});
+      await runDown(deps.env, deps.at).catch(() => {});
+      await runDown(deps.env, { ...deps.at, shared: true }).catch(() => {});
     });
     expect(await waitForHttp(Number(up.env.WEB_PORT))).toBe(true);
 
     // `getServiceStatuses` is per-driver; ls must use the same stub-pointing
     // driver deps the up/down path used so the call reaches the stub
     // (otherwise it'd shell out to a non-existent real `process-compose`).
-    const ls = await runLs({ cwd: loginWt, driver: deps.driver });
+    const ls = await runLs({ driver: deps.env.driver }, { cwd: loginWt });
 
     const login = ls.instances.find((i) => i.id === up.worktreeId);
     const shared = ls.instances.find((i) => i.id === "shared");
@@ -671,8 +688,8 @@ describe("e2e — readiness_probe / liveness_probe / availability passthrough (#
     writeProbeStack(worktree);
 
     const deps = stubDriverDeps(worktree);
-    const up = await runUp(deps as never);
-    cleanups.push(() => runDown(deps as never));
+    const up = await runUp(deps.env, deps.up);
+    cleanups.push(() => runDown(deps.env, deps.at));
 
     expect(await waitForHttp(Number(up.env.WEB_PORT))).toBe(true);
 
@@ -703,12 +720,12 @@ describe("e2e — readiness_probe / liveness_probe / availability passthrough (#
     // service as ready. (Against the real process-compose this is the
     // converged-probe assertion. Against the stub it's a smoke check that
     // the driver→stub path returns `is_ready: "Ready"`.)
-    const ls = await runLs({ cwd: worktree, driver: deps.driver });
+    const ls = await runLs({ driver: deps.env.driver }, { cwd: worktree });
     const login = ls.instances.find((i) => i.id === up.worktreeId);
     expect(login?.services?.[0]?.name).toBe("web");
     expect(login?.services?.[0]?.health).toBe("ready");
 
-    await runDown(deps as never);
+    await runDown(deps.env, deps.at);
     expect(await waitForGone(Number(up.env.WEB_PORT))).toBe(true);
   }, 20000);
 });
@@ -778,15 +795,12 @@ describe("e2e — cross-tier wiring: isolated waits for shared health (ADR-0003)
       throw new Error("shared readiness file never appeared");
     };
 
-    const deps = {
-      ...stubDriverDeps(worktree),
-      waitForSharedHealth,
-    };
+    const deps = stubDriverDeps(worktree, { waitForSharedHealth });
 
-    const up = await runUp(deps as never);
+    const up = await runUp(deps.env, deps.up);
     cleanups.push(async () => {
-      await runDown(deps as never).catch(() => {});
-      await runDown(deps as never, { shared: true }).catch(() => {});
+      await runDown(deps.env, deps.at).catch(() => {});
+      await runDown(deps.env, { ...deps.at, shared: true }).catch(() => {});
     });
 
     // Acceptance: web is up and reaches the shared DB port via the injection.
@@ -837,7 +851,7 @@ describe("e2e — shared→isolated depends_on is rejected at load time (ADR-000
     );
 
     const deps = stubDriverDeps(worktree);
-    await expect(runUp(deps as never)).rejects.toThrow(/shared.*depends_on.*isolated/i);
+    await expect(runUp(deps.env, deps.up)).rejects.toThrow(/shared.*depends_on.*isolated/i);
   });
 });
 
@@ -864,9 +878,9 @@ describe("e2e — devtrees prune reconciles against git worktree list", () => {
     const loginDeps = stubDriverDeps(loginWt);
     const billingDeps = stubDriverDeps(billingWt);
 
-    const login = await runUp(loginDeps as never);
-    const billing = await runUp(billingDeps as never);
-    cleanups.push(() => runDown(billingDeps as never));
+    const login = await runUp(loginDeps.env, loginDeps.up);
+    const billing = await runUp(billingDeps.env, billingDeps.up);
+    cleanups.push(() => runDown(billingDeps.env, billingDeps.at));
 
     expect(await waitForHttp(Number(login.env.WEB_PORT))).toBe(true);
     expect(await waitForHttp(Number(billing.env.WEB_PORT))).toBe(true);
@@ -885,10 +899,10 @@ describe("e2e — devtrees prune reconciles against git worktree list", () => {
 
     // Prune from the surviving worktree (cwd doesn't have to be the orphan —
     // discovery is anchor-wide).
-    const result = await runPrune({
-      cwd: billingWt,
-      driver: { binary: process.execPath, prefixArgs: [STUB] },
-    });
+    const result = await runPrune(
+      { driver: { binary: process.execPath, prefixArgs: [STUB] } },
+      { cwd: billingWt },
+    );
 
     // Acceptance: prune reports the orphan, the surviving instance is left alone.
     expect(result.pruned.map((p) => p.id).sort()).toEqual([login.worktreeId]);
@@ -903,10 +917,10 @@ describe("e2e — devtrees prune reconciles against git worktree list", () => {
     expect(existsSync(billingSocket)).toBe(true);
 
     // Acceptance: a follow-up prune is a no-op (idempotent).
-    const second = await runPrune({
-      cwd: billingWt,
-      driver: { binary: process.execPath, prefixArgs: [STUB] },
-    });
+    const second = await runPrune(
+      { driver: { binary: process.execPath, prefixArgs: [STUB] } },
+      { cwd: billingWt },
+    );
     expect(second.pruned).toEqual([]);
   }, 30000);
 });
@@ -925,8 +939,8 @@ describe("e2e smoke — extend an existing process-compose.yaml", () => {
 
     const deps = stubDriverDeps(worktree);
 
-    const up = await runUp(deps as never);
-    cleanups.push(() => runDown(deps as never));
+    const up = await runUp(deps.env, deps.up);
+    cleanups.push(() => runDown(deps.env, deps.at));
 
     const port = Number(up.env.WEB_PORT);
     expect(await waitForHttp(port)).toBe(true);
@@ -948,7 +962,7 @@ describe("e2e smoke — extend an existing process-compose.yaml", () => {
       expect("tier" in proc).toBe(false);
     }
 
-    await runDown(deps as never);
+    await runDown(deps.env, deps.at);
     expect(await waitForGone(port)).toBe(true);
   }, 20000);
 });
@@ -964,10 +978,10 @@ describe("e2e — attach to a running worktree instance", () => {
     const deps = stubDriverDeps(worktree);
 
     // Acceptance: attaching with nothing running is a clear, non-zero error.
-    await expect(runAttach(deps as never)).rejects.toThrow(/no worktree instance is running/);
+    await expect(runAttach(deps.env, deps.at)).rejects.toThrow(/no worktree instance is running/);
 
-    const up = await runUp(deps as never);
-    cleanups.push(() => runDown(deps as never));
+    const up = await runUp(deps.env, deps.up);
+    cleanups.push(() => runDown(deps.env, deps.at));
     expect(await waitForHttp(Number(up.env.WEB_PORT))).toBe(true);
 
     // Acceptance: attach reaches `process-compose attach` against the
@@ -978,10 +992,10 @@ describe("e2e — attach to a running worktree instance", () => {
     const sock = instancePaths(absCommon, up.worktreeId).socketPath;
     expect(existsSync(sock)).toBe(true);
 
-    await runAttach(deps as never);
+    await runAttach(deps.env, deps.at);
     expect(existsSync(`${sock}.attached`)).toBe(true);
 
-    await runDown(deps as never);
+    await runDown(deps.env, deps.at);
     expect(await waitForGone(Number(up.env.WEB_PORT))).toBe(true);
   }, 20000);
 });
@@ -1038,7 +1052,7 @@ describe("e2e — teardown-leak invariant: stub parents and children are reaped 
     writeStackConfig(worktree);
     const deps = stubDriverDeps(worktree);
 
-    const up = await runUp(deps as never);
+    const up = await runUp(deps.env, deps.up);
     expect(await waitForHttp(Number(up.env.WEB_PORT))).toBe(true);
 
     // Snapshot every process this test spawned. The socket path uniquely
@@ -1053,7 +1067,7 @@ describe("e2e — teardown-leak invariant: stub parents and children are reaped 
     expect(ourPids.length).toBeGreaterThan(0);
     expect(stubParents.length).toBeGreaterThan(0);
 
-    await runDown(deps as never);
+    await runDown(deps.env, deps.at);
 
     const survivors = await waitForReaped(ourPids, 4000);
     expect(survivors).toEqual([]);
@@ -1081,7 +1095,7 @@ describe("e2e — teardown-leak invariant: stub parents and children are reaped 
     writeMixedTierStack(worktree);
     const deps = stubDriverDeps(worktree);
 
-    const up = await runUp(deps as never);
+    const up = await runUp(deps.env, deps.up);
     expect(await waitForHttp(Number(up.env.WEB_PORT))).toBe(true);
 
     // Snapshot the stub parents (worktree + shared) and every recorded service
@@ -1110,8 +1124,8 @@ describe("e2e — teardown-leak invariant: stub parents and children are reaped 
     const localCleanups: Array<() => void | Promise<unknown>> = [];
     localCleanups.push(() => rmSync(repo.root, { recursive: true, force: true }));
     localCleanups.push(async () => {
-      await runDown(deps as never).catch(() => {});
-      await runDown(deps as never, { shared: true }).catch(() => {});
+      await runDown(deps.env, deps.at).catch(() => {});
+      await runDown(deps.env, { ...deps.at, shared: true }).catch(() => {});
     });
     while (localCleanups.length) {
       const fn = localCleanups.pop();
@@ -1139,14 +1153,14 @@ describe("e2e — attach to the shared instance", () => {
     const deps = stubDriverDeps(worktree);
 
     // Acceptance: attaching --shared with nothing running is a clear error.
-    await expect(runAttach(deps as never, { shared: true })).rejects.toThrow(
+    await expect(runAttach(deps.env, { ...deps.at, shared: true })).rejects.toThrow(
       /no shared instance is running/,
     );
 
-    const up = await runUp(deps as never);
+    const up = await runUp(deps.env, deps.up);
     cleanups.push(async () => {
-      await runDown(deps as never).catch(() => {});
-      await runDown(deps as never, { shared: true }).catch(() => {});
+      await runDown(deps.env, deps.at).catch(() => {});
+      await runDown(deps.env, { ...deps.at, shared: true }).catch(() => {});
     });
     expect(up.sharedStarted).toBe(true);
     expect(await waitForTcp(Number(up.env.DB_PORT))).toBe(true);
@@ -1156,11 +1170,11 @@ describe("e2e — attach to the shared instance", () => {
     const sharedSock = sharedInstancePaths(absCommon).socketPath;
     expect(existsSync(sharedSock)).toBe(true);
 
-    await runAttach(deps as never, { shared: true });
+    await runAttach(deps.env, { ...deps.at, shared: true });
     expect(existsSync(`${sharedSock}.attached`)).toBe(true);
 
-    await runDown(deps as never);
-    await runDown(deps as never, { shared: true });
+    await runDown(deps.env, deps.at);
+    await runDown(deps.env, { ...deps.at, shared: true });
     expect(existsSync(sharedSock)).toBe(false);
   }, 30000);
 });
@@ -1227,7 +1241,7 @@ describe("e2e — STALE_PORT_BLOCK pre-flight (#58)", () => {
     const socketPath = join(devtreesDir, "run", `${worktreeId}.sock`);
     expect(existsSync(socketPath)).toBe(false);
 
-    const err = await runUp(deps as never).then(
+    const err = await runUp(deps.env, deps.up).then(
       () => undefined,
       (e: unknown) => e as Error & { code?: string; details?: unknown },
     );
@@ -1342,10 +1356,10 @@ describe("e2e — crash recovery: stale control sockets (#80)", () => {
   async function upWithSharedTeardown(
     deps: ReturnType<typeof stubDriverDeps>,
   ): Promise<Awaited<ReturnType<typeof runUp>>> {
-    const up = await runUp(deps as never);
+    const up = await runUp(deps.env, deps.up);
     cleanups.push(async () => {
-      await runDown(deps as never).catch(() => {});
-      await runDown(deps as never, { shared: true }).catch(() => {});
+      await runDown(deps.env, deps.at).catch(() => {});
+      await runDown(deps.env, { ...deps.at, shared: true }).catch(() => {});
     });
     return up;
   }
@@ -1356,8 +1370,8 @@ describe("e2e — crash recovery: stale control sockets (#80)", () => {
       writeStack: writeStackConfig,
     });
 
-    const first = await runUp(deps as never);
-    cleanups.push(() => runDown(deps as never).catch(() => {}));
+    const first = await runUp(deps.env, deps.up);
+    cleanups.push(() => runDown(deps.env, deps.at).catch(() => {}));
     const port = Number(first.env.WEB_PORT);
     expect(await waitForHttp(port)).toBe(true);
 
@@ -1368,7 +1382,7 @@ describe("e2e — crash recovery: stale control sockets (#80)", () => {
 
     // Acceptance: up starts a fresh instance and returns the normal started
     // envelope — the service is genuinely serving again on its stable block.
-    const second = await runUp(deps as never);
+    const second = await runUp(deps.env, deps.up);
     expect(second.worktreeId).toBe(first.worktreeId);
     expect(Number(second.env.WEB_PORT)).toBe(port);
     expect(await waitForHttp(port)).toBe(true);
@@ -1392,7 +1406,7 @@ describe("e2e — crash recovery: stale control sockets (#80)", () => {
 
     // Acceptance: the next up restarts the shared instance — even though the
     // worktree's own instance is still live and takes the idempotent branch.
-    const second = await runUp(deps as never);
+    const second = await runUp(deps.env, deps.up);
     expect(second.sharedStarted).toBe(true);
     expect(Number(second.env.DB_PORT)).toBe(dbPort);
     expect(await waitForTcp(dbPort)).toBe(true);
@@ -1413,7 +1427,7 @@ describe("e2e — crash recovery: stale control sockets (#80)", () => {
 
     // Acceptance: an idempotent no-op — resolves cleanly and unlinks the
     // orphaned socket so the next up lazy-starts a fresh shared instance.
-    const result = await runDown(deps as never, { shared: true });
+    const result = await runDown(deps.env, { ...deps.at, shared: true });
     expect(result).toEqual({ shared: true, stopped: false, forceKilled: [] });
     expect(existsSync(socketPath)).toBe(false);
   }, 30000);
@@ -1504,9 +1518,9 @@ describe("e2e — prune reaps out-of-band resources via the shutdown hook from a
     const loginDeps = stubDriverDeps(loginWt);
     const billingDeps = stubDriverDeps(billingWt);
 
-    const login = await runUp(loginDeps as never);
-    const billing = await runUp(billingDeps as never);
-    cleanups.push(() => runDown(billingDeps as never).catch(() => {}));
+    const login = await runUp(loginDeps.env, loginDeps.up);
+    const billing = await runUp(billingDeps.env, billingDeps.up);
+    cleanups.push(() => runDown(billingDeps.env, billingDeps.at).catch(() => {}));
 
     // The daemon launched; the hook has NOT fired yet.
     expect(await waitForFile(upMarker)).toBe(true);
@@ -1518,10 +1532,10 @@ describe("e2e — prune reaps out-of-band resources via the shutdown hook from a
     git(billingWt, "worktree", "remove", "--force", loginWt);
     expect(existsSync(loginWt)).toBe(false);
 
-    const result = await runPrune({
-      cwd: billingWt,
-      driver: { binary: process.execPath, prefixArgs: [STUB] },
-    });
+    const result = await runPrune(
+      { driver: { binary: process.execPath, prefixArgs: [STUB] } },
+      { cwd: billingWt },
+    );
 
     // Acceptance #1: the orphan was reported, and its out-of-band reap fired —
     // the down-marker exists ONLY because devtrees ran the hook from the anchor
@@ -1553,9 +1567,9 @@ describe("e2e — prune reaps out-of-band resources via the shutdown hook from a
     const loginDeps = stubDriverDeps(loginWt);
     const billingDeps = stubDriverDeps(billingWt);
 
-    const login = await runUp(loginDeps as never);
-    await runUp(billingDeps as never);
-    cleanups.push(() => runDown(billingDeps as never).catch(() => {}));
+    const login = await runUp(loginDeps.env, loginDeps.up);
+    await runUp(billingDeps.env, billingDeps.up);
+    cleanups.push(() => runDown(billingDeps.env, billingDeps.at).catch(() => {}));
     expect(await waitForFile(upMarker)).toBe(true);
 
     // SIGKILL the login supervisor so its socket probes stale — the
@@ -1585,10 +1599,10 @@ describe("e2e — prune reaps out-of-band resources via the shutdown hook from a
 
     git(billingWt, "worktree", "remove", "--force", loginWt);
 
-    const result = await runPrune({
-      cwd: billingWt,
-      driver: { binary: process.execPath, prefixArgs: [STUB] },
-    });
+    const result = await runPrune(
+      { driver: { binary: process.execPath, prefixArgs: [STUB] } },
+      { cwd: billingWt },
+    );
 
     // Acceptance #2: even with a stale/SIGKILLed supervisor, devtrees runs the
     // hook directly from the anchor, so the reap fires.
@@ -1678,7 +1692,8 @@ describe("e2e — restart <service...> (#222, #265)", () => {
     stateDir: string;
     worktreeId: string;
     env: Record<string, string>;
-    restartDeps: Record<string, unknown>;
+    restartDeps: CommandEnv;
+    restartOptions: { readonly cwd: string; readonly waitTimeoutMs: number };
   }> {
     const repo = makeRepo(prefix, ["login"]);
     cleanups.push(() => rmSync(repo.root, { recursive: true, force: true }));
@@ -1692,14 +1707,15 @@ describe("e2e — restart <service...> (#222, #265)", () => {
             binary: "/usr/bin/env",
             prefixArgs: [`DEVTREES_STUB_SKIPPED=${opts.skipped}`, process.execPath, STUB],
           };
-    const restartDeps = { cwd: worktree, driver, attach: false, waitTimeoutMs: 10_000 };
-    const upDeps = {
-      ...stubDriverDeps(worktree),
-      driver,
+    const restartDeps: CommandEnv = { driver };
+    const restartOptions = { cwd: worktree, waitTimeoutMs: 10_000 };
+    const upDeps = stubDriverDeps(worktree, { driver });
+    const upOptions: UpOptions = {
+      ...upDeps.up,
       ...(opts.namespaces === undefined ? {} : { namespaces: opts.namespaces }),
     };
-    const up = await runUp(upDeps as never);
-    cleanups.push(() => runDown(upDeps as never));
+    const up = await runUp(upDeps.env, upOptions);
+    cleanups.push(() => runDown(upDeps.env, upDeps.at));
     const commonDir = git(worktree, "rev-parse", "--git-common-dir");
     const absCommon = commonDir.startsWith("/") ? commonDir : join(worktree, commonDir);
     return {
@@ -1709,6 +1725,7 @@ describe("e2e — restart <service...> (#222, #265)", () => {
       worktreeId: up.worktreeId,
       env: up.env,
       restartDeps,
+      restartOptions,
     };
   }
 
@@ -1784,7 +1801,10 @@ describe("e2e — restart <service...> (#222, #265)", () => {
     const api = await waitForRun(stack.worktree, "api");
     const web = await waitForRun(stack.worktree, "web");
 
-    const result = await runRestart(stack.restartDeps as never, ["web"]);
+    const result = await runRestart(stack.restartDeps, {
+      ...stack.restartOptions,
+      services: ["web"],
+    });
 
     expect(result).toMatchObject({
       worktreeId: stack.worktreeId,
@@ -1811,7 +1831,10 @@ describe("e2e — restart <service...> (#222, #265)", () => {
     const web = await waitForRun(stack.worktree, "web");
     const worker = await waitForRun(stack.worktree, "worker");
 
-    const result = await runRestart(stack.restartDeps as never, ["web", "api"]);
+    const result = await runRestart(stack.restartDeps, {
+      ...stack.restartOptions,
+      services: ["web", "api"],
+    });
 
     expect(result.restarted).toEqual(["api", "web"]);
     expect(result.services.map((s) => s.name)).toEqual(["api", "web"]);
@@ -1833,7 +1856,11 @@ describe("e2e — restart <service...> (#222, #265)", () => {
     const web = await waitForRun(stack.worktree, "web");
     const worker = await waitForRun(stack.worktree, "worker");
 
-    const result = await runRestart(stack.restartDeps as never, [], ["jobs"]);
+    const result = await runRestart(stack.restartDeps, {
+      ...stack.restartOptions,
+      services: [],
+      namespaces: ["jobs"],
+    });
 
     expect(result).toMatchObject({ restarted: ["worker"], skippedShared: [] });
     await waitForRun(stack.worktree, "worker", worker);
@@ -1857,7 +1884,10 @@ describe("e2e — restart <service...> (#222, #265)", () => {
     ).toMatchObject({ status: "Completed", exit_code: -1 });
     expect(await served(stack.env.WEB_PORT)).toBeUndefined();
 
-    const result = await runRestart(stack.restartDeps as never, ["web"]);
+    const result = await runRestart(stack.restartDeps, {
+      ...stack.restartOptions,
+      services: ["web"],
+    });
 
     expect(result).toMatchObject({ restarted: ["web"], forceKilled: [] });
     await waitForRun(stack.worktree, "web", web);
@@ -1876,7 +1906,10 @@ describe("e2e — restart <service...> (#222, #265)", () => {
       await waitForRow(stack.socketPath, "web", (r) => r?.status === "Completed"),
     ).toMatchObject({ status: "Completed", exit_code: 3 });
 
-    const result = await runRestart(stack.restartDeps as never, ["web"]);
+    const result = await runRestart(stack.restartDeps, {
+      ...stack.restartOptions,
+      services: ["web"],
+    });
 
     expect(result).toMatchObject({ restarted: ["web"], forceKilled: [] });
     await waitForRun(stack.worktree, "web", web);
@@ -1890,7 +1923,9 @@ describe("e2e — restart <service...> (#222, #265)", () => {
     const api = await waitForRun(stack.worktree, "api");
     const web = await waitForRun(stack.worktree, "web");
 
-    const unknown = await restartError(runRestart(stack.restartDeps as never, ["web", "nope"]));
+    const unknown = await restartError(
+      runRestart(stack.restartDeps, { ...stack.restartOptions, services: ["web", "nope"] }),
+    );
     expect(unknown.code).toBe("SERVICE_NOT_FOUND");
     expect(unknown.details).toMatchObject({
       service: "nope",
@@ -1898,9 +1933,17 @@ describe("e2e — restart <service...> (#222, #265)", () => {
     });
 
     // `worker` is declared, but its namespace (`jobs`) was not booted.
-    const unbooted = await restartError(runRestart(stack.restartDeps as never, ["worker"]));
+    const unbooted = await restartError(
+      runRestart(stack.restartDeps, { ...stack.restartOptions, services: ["worker"] }),
+    );
     expect(unbooted.code).toBe("NAMESPACE_NOT_RUNNING");
-    const unbootedNs = await restartError(runRestart(stack.restartDeps as never, [], ["jobs"]));
+    const unbootedNs = await restartError(
+      runRestart(stack.restartDeps, {
+        ...stack.restartOptions,
+        services: [],
+        namespaces: ["jobs"],
+      }),
+    );
     expect(unbootedNs.code).toBe("NAMESPACE_NOT_RUNNING");
 
     expect(runOf(stack.worktree, "api")).toEqual(api);
@@ -1924,7 +1967,9 @@ describe("e2e — restart <service...> (#222, #265)", () => {
     );
     cleanups.push(() => rmSync(marker, { force: true }));
 
-    const err = await restartError(runRestart(stack.restartDeps as never, ["web"]));
+    const err = await restartError(
+      runRestart(stack.restartDeps, { ...stack.restartOptions, services: ["web"] }),
+    );
 
     expect(err.code).toBe("CONFIG_DRIFT");
     expect(err.details).toMatchObject({ reason: "reload_pending" });
@@ -1953,7 +1998,9 @@ describe("e2e — restart <service...> (#222, #265)", () => {
     });
 
     const startedAt = Date.now();
-    const err = await restartError(runRestart(stack.restartDeps as never, ["web"]));
+    const err = await restartError(
+      runRestart(stack.restartDeps, { ...stack.restartOptions, services: ["web"] }),
+    );
 
     expect(err.code).toBe("SERVICE_SKIPPED");
     expect(err.details).toMatchObject({
