@@ -727,6 +727,97 @@ describe("runUp — shared instance dies before binding its socket (#92)", () =>
 });
 
 /**
+ * Issue #262 — a shared service whose command exits at once (e.g. `node
+ * server.mjs` where the file exists only in the worktree, while shared
+ * services run from the anchor) was reported as started. The lazy start only
+ * waited for the control socket; the selected shared services were waited on
+ * only when an isolated service `depends_on` one (the cross-tier wait,
+ * ADR-0003), so a stack without such an edge saw `shared_started: true` for a
+ * dead service. Both stacks below have no cross-tier edge.
+ */
+describe("runUp — a lazy-started shared service that exits at once (#262)", () => {
+  const exitedRow = (name: string): ServiceStatus => ({
+    name,
+    status: "Completed",
+    health: "unknown",
+    exitCode: 1,
+    pid: 4242,
+  });
+  const liveRow = (name: string): ServiceStatus => ({
+    name,
+    status: "Running",
+    health: "ready",
+  });
+
+  it("one of two shared services dies: fails SHARED_SERVICE_DEAD died_while_waiting", async () => {
+    // `cache` keeps process-compose (and its socket) alive; `api` exits 1.
+    const stack: ResolvedStack = {
+      services: [
+        isolated("web", "sleep 300", ["WEB_PORT"]),
+        shared("cache", "sleep 300"),
+        shared("api", "node server.mjs", ["API_PORT"]),
+      ],
+    };
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const base = stubDeps({ stack, track });
+    const deps: CommandDeps = {
+      ...base,
+      // The real wait on the shared services, not the suite's no-op.
+      waitForSharedReady: undefined,
+      waitTimeoutMs: 5_000,
+      getServiceStatuses: async (socketPath) =>
+        socketPath.endsWith("/shared.sock") ? [liveRow("cache"), exitedRow("api")] : [],
+    };
+
+    const err = await runUp(deps).then(
+      () => undefined,
+      (e: unknown) => e as Error & { code?: string; details?: Record<string, unknown> },
+    );
+    if (err === undefined) throw new Error("expected runUp to reject, not report shared started");
+    expect(err.code).toBe("SHARED_SERVICE_DEAD");
+    expect(err.details).toMatchObject({
+      reason: "died_while_waiting",
+      dead_services: [{ name: "api", exit_code: 1 }],
+    });
+    // Waited on before the worktree spawns, like the cross-tier wait.
+    const worktreeSpawn = track.invocations.find((i) => !i.socketPath.endsWith("/shared.sock"));
+    expect(worktreeSpawn).toBeUndefined();
+  });
+
+  it("the only shared service dies, so process-compose exits: up fails, not shared_started", async () => {
+    // process-compose exits once nothing runs, removing its socket: the first
+    // read after the socket appeared finds nothing listening.
+    const stack: ResolvedStack = {
+      services: [
+        isolated("web", "sleep 300", ["WEB_PORT"]),
+        shared("api", "node server.mjs", ["API_PORT"]),
+      ],
+    };
+    const track: StubSpawn = { invocations: [], touchSocket: true };
+    const base = stubDeps({ stack, track });
+    const deps: CommandDeps = {
+      ...base,
+      waitForSharedReady: undefined,
+      waitTimeoutMs: 5_000,
+      probeSocket: async (socketPath) => (existsSync(socketPath) ? "running" : "stale"),
+      getServiceStatuses: async (socketPath) => {
+        if (!socketPath.endsWith("/shared.sock")) return [];
+        rmSync(socketPath, { force: true });
+        throw Object.assign(new Error(`connect ENOENT ${socketPath}`), { code: "ENOENT" });
+      },
+    };
+
+    // The error code is pending a decision (see the issue): no existing code
+    // says "the lazy-started shared instance exited after binding its socket".
+    const outcome = await runUp(deps).then(
+      (r) => ({ resolved: r.sharedStarted }),
+      (e: unknown) => ({ rejected: (e as { code?: string }).code }),
+    );
+    expect(outcome).toMatchObject({ rejected: expect.any(String) });
+  });
+});
+
+/**
  * The worktree instance's post-spawn socket wait (#91) shares its shape with
  * the shared instance's (#92) but not its identity. It used to throw
  * `SharedStartFailedError` verbatim, so a worktree instance that died before
