@@ -1,7 +1,10 @@
 /**
- * The shared instance module (#257) at its interface: `ensure`, `preview`
- * and `ports` against a temp anchor and the in-memory process-compose. The
- * real-binary behaviour is in the smoke suite (src/real-pc.smoke.test.ts).
+ * The shared instance module (#257, #258) at its interface: `ensure`,
+ * `preview`, `ports`, `down`, `portMap`, `prunePorts`, `endpoint` and
+ * `services` against a temp anchor and the in-memory process-compose. The
+ * namespaced teardown (`downNamespaces`) is in
+ * src/shared-instance.teardown.test.ts. The real-binary behaviour is in the
+ * smoke suite (src/real-pc.smoke.test.ts).
  */
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -21,7 +24,7 @@ import {
   type SharedInstanceDeps,
   type SharedRequest,
 } from "./shared-instance.js";
-import { readSharedPortMap } from "./shared-ports.js";
+import { readSharedPortMap, writeSharedPortMap } from "./shared-ports.js";
 import { readSharedState, writeSharedState } from "./shared-state.js";
 import type { ResolvedService, ResolvedStack } from "./stack.js";
 
@@ -93,6 +96,14 @@ function setup() {
     warn: (message) => warnings.push(message),
     waitTimeoutMs: 2_000,
     previewReadTimeoutMs: 2_000,
+    stop: {
+      readProcessTable: async () => [],
+      isAlive: () => false,
+      kill: () => {},
+      pollMs: 1,
+      treeGraceMs: 1,
+      graceMs: 1,
+    },
   };
   const shared = openSharedInstance(deps);
   const sock = sharedInstancePaths(anchor).socketPath;
@@ -342,6 +353,112 @@ describe("shared instance: ports (#257)", () => {
   });
 });
 
+describe("shared instance: down, `down --shared` (#258)", () => {
+  it("stops the whole shared instance under the shared lock and drops its config, keeping the port map", async () => {
+    const { anchor, pc, log, sock, shared, ensure } = setup();
+    await ensure(["cache"]);
+    log.length = 0;
+    expect(await shared.down()).toEqual({ stopped: true, forceKilled: [] });
+    expect(log).toEqual(["lock", "down", "unlock"]);
+    expect(pc.isUp(sock)).toBe(false);
+    expect(existsSync(sharedInstancePaths(anchor).configPath)).toBe(false);
+    // The port map is a repo-wide reservation: it survives the teardown (ADR-0011).
+    expect(readSharedPortMap(anchor)).toEqual({ PG_PORT: 30000, CACHE_PORT: 30001 });
+  });
+
+  it("is a no-op when the shared instance is not running", async () => {
+    const { log, shared } = setup();
+    expect(await shared.down()).toEqual({ stopped: false, forceKilled: [] });
+    expect(log).toEqual(["lock", "unlock"]);
+  });
+
+  it("unlinks the socket a crashed instance left behind, and stops nothing (#80)", async () => {
+    const { log, pc, sock, shared, ensure } = setup();
+    await ensure(["default"]);
+    pc.crash(sock);
+    log.length = 0;
+    expect(await shared.down()).toEqual({ stopped: false, forceKilled: [] });
+    expect(existsSync(sock)).toBe(false);
+    expect(log).toEqual(["lock", "unlock"]);
+  });
+});
+
+describe("shared instance: portMap, `ls`'s shared ports (#258)", () => {
+  it("lists every recorded port, active only while the running shared instance binds it", async () => {
+    const { shared, ensure } = setup();
+    expect(shared.portMap(false)).toEqual({});
+    await ensure(["default"]);
+    expect(shared.portMap(true)).toEqual({
+      PG_PORT: { port: 30000, origin: "active" },
+      CACHE_PORT: { port: 30001, origin: "recorded" },
+    });
+    expect(shared.portMap(false)).toEqual({
+      PG_PORT: { port: 30000, origin: "recorded" },
+      CACHE_PORT: { port: 30001, origin: "recorded" },
+    });
+  });
+});
+
+describe("shared instance: prunePorts, `prune --shared-ports` (#258)", () => {
+  /** A running shared instance whose map also records a name nothing holds. */
+  async function withStaleName() {
+    const fx = setup();
+    await fx.ensure(["default"]);
+    writeSharedPortMap(fx.anchor, { ...readSharedPortMap(fx.anchor), OLD_PORT: 30005 });
+    fx.log.length = 0;
+    return fx;
+  }
+
+  it("drops a recorded name nothing holds, under the shared lock, and keeps the held ones", async () => {
+    const { anchor, log, shared } = await withStaleName();
+    const result = await shared.prunePorts({ sharedBlock: () => BLOCK });
+    expect(result).toEqual({
+      dropped: ["OLD_PORT"],
+      kept: ["CACHE_PORT", "PG_PORT"],
+      outOfBlock: [],
+      dryRun: false,
+      blockedBy: [],
+    });
+    expect(log).toEqual(["lock", "unlock"]);
+    expect(readSharedPortMap(anchor)).toEqual({ PG_PORT: 30000, CACHE_PORT: 30001 });
+  });
+
+  it("the dry run reports the same without the lock or a write", async () => {
+    const { anchor, log, shared } = await withStaleName();
+    const result = await shared.prunePorts({ dryRun: true, sharedBlock: () => BLOCK });
+    expect(result).toMatchObject({ dropped: ["OLD_PORT"], dryRun: true, blockedBy: [] });
+    expect(log).toEqual([]);
+    expect(readSharedPortMap(anchor)).toMatchObject({ OLD_PORT: 30005 });
+  });
+
+  it("refuses LOCK_CONTENTION while a worktree's lifecycle command is in flight; the dry run names it", async () => {
+    const { anchor, shared } = await withStaleName();
+    const id = "billing-0a1b2c3d";
+    const [err, preview] = await withLifecycleLock(anchor, id, async () => [
+      await failure(shared.prunePorts({ sharedBlock: () => BLOCK })),
+      await shared.prunePorts({ dryRun: true, sharedBlock: () => BLOCK }),
+    ]);
+    expect(err).toMatchObject({ code: "LOCK_CONTENTION" });
+    expect(preview).toMatchObject({ dropped: ["OLD_PORT"], blockedBy: [id] });
+    expect(readSharedPortMap(anchor)).toMatchObject({ OLD_PORT: 30005 });
+  });
+});
+
+describe("shared instance: endpoint and services (#258)", () => {
+  it("names the control socket and config only while the socket file is there, and the services its config runs", async () => {
+    const { anchor, shared, ensure } = setup();
+    expect(shared.endpoint()).toBeUndefined();
+    expect(shared.services()).toEqual([]);
+    await ensure(["cache"]);
+    const { socketPath, configPath } = sharedInstancePaths(anchor);
+    expect(shared.endpoint()).toEqual({ socketPath, configPath });
+    expect(shared.services().map((s) => [s.name, s.namespace])).toEqual([
+      ["pg", undefined],
+      ["cache", "cache"],
+    ]);
+  });
+});
+
 describe("worktree up with a substituted shared instance (#257)", () => {
   /** A worktree `up` whose shared side is `sharedInstance`, on the in-memory process-compose. */
   function worktreeUp(sharedInstance: SharedInstance) {
@@ -391,6 +508,15 @@ describe("worktree up with a substituted shared instance (#257)", () => {
       },
       preview: () => Promise.reject(new Error("not previewed")),
       ports: () => Promise.reject(new Error("not read")),
+      down: () => Promise.reject(new Error("not torn down")),
+      downNamespaces: () => Promise.reject(new Error("not torn down")),
+      previewDownNamespaces: () => Promise.reject(new Error("not previewed")),
+      portMap: () => {
+        throw new Error("not listed");
+      },
+      prunePorts: () => Promise.reject(new Error("not pruned")),
+      endpoint: () => undefined,
+      services: () => [],
     };
     const { deps, pc, anchor, id } = worktreeUp(fake);
     const result = await runUp(deps);
