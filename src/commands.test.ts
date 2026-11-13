@@ -6279,19 +6279,21 @@ describe("runUp / runEnv — shared port map persistence & drift (#83)", () => {
   it("falls back to positional offsets when shared is running but no state was persisted (pre-#83 instance)", async () => {
     const fixture = pcFixture("dt-legacy-");
     // Simulate a shared instance started by an older devtrees: shared runs,
-    // but there is no shared-state.json.
+    // but nothing records its ports — no shared-state.json, no shared port
+    // map (#238), and no derived shared config to read the live env from.
     const login = worktreeDeps(fixture, stackA, "login");
     const a = await runUp(login);
     rmSync(join(fixture.sharedAnchor, "devtrees", "shared-state.json"));
+    rmSync(sharedPortMapFile(fixture.sharedAnchor));
+    rmSync(login.sharedInst.configPath);
     expect(fixture.pc.isUp(login.sharedInst.socketPath)).toBe(true);
 
-    const result = await runUp(worktreeDeps(fixture, stackA, "billing"));
+    // A branch that reorders the shared services: positional offsets follow
+    // its own order, so DB_PORT and CACHE_PORT trade places.
+    const result = await runUp(worktreeDeps(fixture, stackBReordered, "billing"));
     expect(result.sharedStarted).toBe(false);
-    expect(result.env.DB_PORT).toBeDefined();
-    expect(result.env.CACHE_PORT).toBeDefined();
-    // Positional offsets over the same stack land on the ports shared bound.
-    expect(result.env.DB_PORT).toBe(a.env.DB_PORT);
-    expect(result.env.CACHE_PORT).toBe(a.env.CACHE_PORT);
+    expect(result.env.DB_PORT).toBe(a.env.CACHE_PORT);
+    expect(result.env.CACHE_PORT).toBe(a.env.DB_PORT);
   });
 
   it("runEnv reads the persisted map so a reordered branch sees what shared actually bound", async () => {
@@ -8266,19 +8268,22 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
     });
 
     it("drift first: a drifted selected service fails SHARED_DRIFT and nothing is restarted", async () => {
-      const fixture = await sharedRunning("dt-rds-drift-");
-      const billing = againstDead(fixture, drifted, "billing", {
+      // `cache` keeps the shared process-compose up while both are dead.
+      const withCache = (stack: ResolvedStack): ResolvedStack => ({
+        services: [...stack.services, shared("cache", "redis-server", ["CACHE_PORT"])],
+      });
+      const fixture = await sharedRunning("dt-rds-drift-", withCache(base));
+      const billing = againstDead(fixture, withCache(drifted), "billing", {
         namespaces: ["app", "db-shared"],
       });
-      // postgres (not drifted) is dead; db-shared (drifted) keeps the shared
-      // process-compose up: with nothing running it would exit.
-      kill(fixture, "postgres");
+      kill(fixture, "postgres", "db-shared");
       const err = await failure(runUp(billing.deps));
       expect(err?.code).toBe("SHARED_DRIFT");
       expect(billing.starts).toEqual([]);
-      expect(fixture.pc.rows(billing.sharedSock).find((r) => r.name === "postgres")?.status).toBe(
-        "Completed",
-      );
+      const statusOf = (name: string) =>
+        fixture.pc.rows(billing.sharedSock).find((r) => r.name === name)?.status;
+      expect(statusOf("postgres")).toBe("Completed");
+      expect(statusOf("db-shared")).toBe("Completed");
     });
 
     it("a dead namespaced shared service this up does not select is left dead", async () => {
@@ -8509,10 +8514,12 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
   it("a shared instance with no shared state (pre-#83) cannot have a namespaced service added: SHARED_ACTIVATION_FAILED", async () => {
     const fixture = nsFixture("dt-nss-pre83-");
     // A shared instance an older devtrees started: it runs postgres, but
-    // there is no shared-state.json and no shared port map.
+    // there is no shared-state.json, no shared port map and no derived
+    // shared config to read its ports back from.
     await runUp(wt(fixture, base, "orders", { namespaces: ["app", "db"] }).deps);
     rmSync(join(fixture.sharedAnchor, "devtrees", "shared-state.json"));
     rmSync(sharedPortMapFile(fixture.sharedAnchor));
+    rmSync(sharedInstancePaths(fixture.sharedAnchor).configPath);
 
     // Always-on only: the old positional fallback still applies.
     const ok = await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
