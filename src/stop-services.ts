@@ -12,7 +12,7 @@ import { join } from "node:path";
 import type { DerivedConfig } from "./deriver.js";
 import { downTimeoutMs, type ServiceStatus } from "./driver.js";
 import { stateDir } from "./paths.js";
-import { isRunning, keepsInstanceAlive } from "./service-state.js";
+import { isPending, isRunning, keepsInstanceAlive } from "./service-state.js";
 
 /** An error tagged with a stable `code` and `details` for the `--json` envelope. */
 function codedError(code: string, message: string, details: Record<string, unknown>): Error {
@@ -67,11 +67,6 @@ export function instanceNotRunningError(
         `steps (most likely a concurrent \`devtrees down\`).${alreadyRestarted(done)} ` +
         "Run `devtrees up` to start it again.";
   return codedError("INSTANCE_NOT_FOUND", message, { worktree_id: worktreeId });
-}
-
-/** Is the row a service still waiting on its dependencies, never started? */
-function isPending(row: Pick<ServiceStatus, "status">): boolean {
-  return row.status.toLowerCase() === "pending";
 }
 
 /**

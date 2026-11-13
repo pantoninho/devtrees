@@ -218,7 +218,7 @@ import {
   type PendingReload,
   type StuckReload,
 } from "./reload-pending.js";
-import { classifyService, dependencyOrder, findDeadServices } from "./service-state.js";
+import { dependencyOrder, findDeadServices, isActiveOrIdle } from "./service-state.js";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -4720,7 +4720,7 @@ function assertRestartKeepsInstance(
 ): void {
   for (const name of pending) {
     const row = target.rows.find((r) => r.name === name);
-    if (row === undefined || classifyService(row) !== "active") continue;
+    if (row === undefined || !isActiveOrIdle(row)) continue;
     assertNotLastRunning(target.rows, [name], target.anchor.worktreeId, {
       remedy: restartRemedy(target),
       done,

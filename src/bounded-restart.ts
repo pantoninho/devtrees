@@ -39,7 +39,7 @@ import {
   type ServiceStopTarget,
 } from "./bounded-stop.js";
 import type { ServiceStatus, StartResult } from "./driver.js";
-import { classifyService } from "./service-state.js";
+import { isActiveOrIdle } from "./service-state.js";
 
 /** The slice of the driver `boundedRestart` uses. */
 export interface RestartDriver extends ServiceStopDriver {
@@ -77,7 +77,7 @@ export async function boundedRestart(
   seams: StopSeams = {},
 ): Promise<RestartOutcome> {
   const before = target.statuses.find((r) => r.name === target.service);
-  if (before === undefined || classifyService(before) !== "active") {
+  if (before === undefined || !isActiveOrIdle(before)) {
     const started = await startChecked(target, driver);
     return started.ok ? { ok: true, forceKilled: [], survivors: [] } : started;
   }
@@ -91,7 +91,7 @@ export async function boundedRestart(
   if (stopped.unsettled.length > 0) {
     // Its restart policy may have brought a new run up already: that is the restart.
     const now = await listed(target, driver);
-    const fresh = now !== undefined && now.pid !== before.pid && classifyService(now) === "active";
+    const fresh = now !== undefined && now.pid !== before.pid && isActiveOrIdle(now);
     if (!fresh) return { ok: false, message: oldRunListed(target.service, before, "still active") };
     return { ok: true, forceKilled: stopped.forceKilled, survivors: stopped.survivors };
   }
@@ -116,9 +116,7 @@ async function startChecked(target: RestartTarget, driver: RestartDriver): Promi
   const started = await driver.startProcess(target.socketPath, target.service);
   if (started.ok || started.timedOut !== true) return started;
   const row = await listed(target, driver);
-  return row !== undefined && classifyService(row) === "active"
-    ? { ok: true, alreadyRunning: false }
-    : started;
+  return row !== undefined && isActiveOrIdle(row) ? { ok: true, alreadyRunning: false } : started;
 }
 
 /**

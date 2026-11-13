@@ -23,7 +23,7 @@ import {
   type StopSeams,
 } from "./bounded-down.js";
 import type { ServiceStatus } from "./driver.js";
-import { isRunning } from "./service-state.js";
+import { isRunning, reportsRunning } from "./service-state.js";
 import { instanceExitedError } from "./stop-services.js";
 
 /** The slice of the driver `boundedStopServices` uses. */
@@ -128,7 +128,7 @@ export async function boundedStopServices(
   };
   const request = await driver.stopProcesses(target.socketPath, target.services);
   if (!request.ok && !(await settled())) {
-    const running = (rows ?? []).filter((r) => names.has(r.name) && r.status === "Running");
+    const running = (rows ?? []).filter((r) => names.has(r.name) && reportsRunning(r));
     if (running.length > 0) throw new StopRefusedError(target.services, request.message);
   }
 

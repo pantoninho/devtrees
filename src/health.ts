@@ -16,10 +16,11 @@
 import { READ_TIMEOUT_MS, type ServiceStatus } from "./driver.js";
 import { probeSocket, type InstanceStatus } from "./instances.js";
 import {
-  classifyService,
   deadServicesDetails,
   describeDeadServices,
   findDeadServices,
+  isDead,
+  isHealthyForWait,
   type DeadService,
 } from "./service-state.js";
 
@@ -263,23 +264,6 @@ function createFailureNotifier(
   };
 }
 
-/**
- * "Healthy enough" for a service WITHOUT a readiness probe = the process is
- * up: `Running`, `Launched` for an `is_daemon` service whose launch command
- * returned (#262: the wait after a lazy start reads it), or `Completed` for
- * one-shot jobs (`Ready` is kept for forward-compatibility with status
- * vocabularies that fold readiness into the status string). Anything else
- * (`Pending`, `Restarting`, `Failed`) means we keep waiting.
- *
- * Services WITH a readiness probe never gate on this set. Empirically
- * process-compose keeps their `status` at `Running` while the probe verdict
- * arrives in the separate `is_ready` field (the driver normalises it into
- * `ServiceStatus.health`), so a status-only gate would pass the instant the
- * process spawns — before the first probe can fire (issue #108). Probed
- * services are healthy only when `health === "ready"`.
- */
-const HEALTHY_STATES = new Set(["running", "launched", "ready", "completed"]);
-
 const SHARED_HEALTH_TIMEOUT_MS = 30_000;
 const HEALTH_POLL_MS = 200;
 
@@ -315,7 +299,7 @@ interface PollVerdict {
  * One poll: read the instance's per-service state through the driver and
  * report whether every named service is healthy, and which are dead. Probed
  * services (those in `probedServiceNames`) require `health === "ready"`; the
- * rest gate on process state (`HEALTHY_STATES`). A failed read (socket not
+ * rest gate on process state (`isHealthyForWait`). A failed read (socket not
  * reachable yet — the instance is still starting, or wedged and the read timed
  * out) is "not ready, keep polling", never an error; the verdict carries the
  * cause in `readError`.
@@ -344,8 +328,7 @@ async function poll(
   const pending = serviceNames.filter((name) => {
     const row = rows.get(name);
     if (row === undefined || deadNames.has(name)) return true;
-    if (probed.has(name)) return row.health !== "ready";
-    return !HEALTHY_STATES.has(row.status.toLowerCase());
+    return !isHealthyForWait(row, probed.has(name));
   });
   return { healthy: pending.length === 0, dead, pending, rows: statuses };
 }
@@ -376,7 +359,7 @@ function createRestartTracker(
     const rows = new Map(verdict.rows.map((r) => [r.name, r]));
     for (const name of awaiting.keys()) {
       const row = rows.get(name);
-      if (row !== undefined && classifyService(row) !== "dead") awaiting.delete(name);
+      if (row !== undefined && !isDead(row)) awaiting.delete(name);
     }
     return verdict.dead.filter((d) => {
       if (!awaiting.has(d.name)) return true;
