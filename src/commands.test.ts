@@ -49,13 +49,13 @@ import {
 import { deriveWorktreeId } from "./anchor.js";
 import { deriveSharedConfig, deriveWorktreeConfig, type DerivedConfig } from "./deriver.js";
 import type { RegistrySnapshot } from "./allocator.js";
-import type {
-  ControlRequest,
-  ControlRequester,
-  Driver,
-  LogEvent,
-  ServiceStatus,
-  SpawnedProcess,
+import {
+  parseServiceStatuses,
+  type ControlRequest,
+  type ControlRequester,
+  type LogEvent,
+  type ServiceStatus,
+  type SpawnedProcess,
 } from "./driver.js";
 import {
   createInMemoryProcessCompose,
@@ -6940,25 +6940,22 @@ describe("bounded down — force-kill and DOWN_TIMEOUT (#190)", () => {
   const WEB_PID = 201;
 
   /**
-   * The in-memory process-compose (its first process runs as WEB_PID), as
-   * seen through a Driver whose `down` never finishes within its budget: a
-   * service ignores SIGTERM. The adapter does not model a stuck service, so
-   * only `down` is replaced: it waits out the budget and reports the timeout,
-   * as the real driver does once it kills the hung client. Every other
-   * operation, and every status read, is the model's.
+   * The in-memory process-compose (its first process runs as WEB_PID) whose
+   * server stops answering once it is asked to `down`: a service ignores
+   * SIGTERM, so the `down` does not finish within its budget and reports the
+   * timeout. The rows read before it (the pre-stop snapshot) are the model's.
    */
   function stuckPc() {
-    const pc = createInMemoryProcessCompose({ firstPid: WEB_PID });
     const downs: string[] = [];
-    const driver: Driver = {
-      ...pc.driver,
-      down: async (inst, opts = {}) => {
-        downs.push(inst.socketPath);
-        await new Promise((r) => setTimeout(r, opts.timeoutMs ?? 0));
-        return { stopped: false, reason: "timeout" };
+    const pc: InMemoryProcessCompose = createInMemoryProcessCompose({
+      firstPid: WEB_PID,
+      onRequest: (r) => {
+        if (r.op !== "down") return;
+        downs.push(r.socketPath);
+        pc.freeze(r.socketPath);
       },
-    };
-    return { pc, downs, pcDeps: { ...inMemoryPcDeps(pc), processCompose: driver } };
+    });
+    return { pc, downs, pcDeps: inMemoryPcDeps(pc) };
   }
 
   /**
@@ -7380,26 +7377,21 @@ describe("runDown after process-compose stops (#155)", () => {
   };
 
   /**
-   * A live instance whose `process list` reads `rows`, through a spawner
-   * fake. Only for the statuses the in-memory process-compose does not model
-   * (a daemon's `Launched`, `Error`); everything else uses `pcInstance`.
+   * A live instance on the in-memory process-compose whose status reads
+   * answer `rows`, parsed as `process list -o json` prints them. Only for
+   * the statuses the adapter does not model (a daemon's `Launched`,
+   * `Error`); everything else uses `pcInstance`.
    */
   async function liveInstance(
     rows: ReadonlyArray<{ name: string; status: string; exit_code?: number }>,
     declared: ResolvedStack = stack,
   ) {
-    const deps = stubDeps({ stack: declared, track: { invocations: [], touchSocket: true } });
+    const { deps, pc } = onInMemoryPc(stubDeps({ stack: declared }));
     const up = await runUp(deps);
-    const base = deps.driver;
-    const spawner: NonNullable<CommandDeps["driver"]>["spawner"] = (binary, args, options) => {
-      if (args[0] !== "process" || args[1] !== "list") {
-        return base?.spawner?.(binary, args, options) ?? spawnedOk();
-      }
-      const emitter = new EventEmitter() as EventEmitter & { stdout: Readable };
-      const listed = rows.map((r) => ({ ...r, is_ready: "-", is_running: false }));
-      emitter.stdout = Readable.from([JSON.stringify(listed)]);
-      emitter.stdout.on("end", () => queueMicrotask(() => emitter.emit("exit", 0)));
-      return emitter as unknown as SpawnedProcess;
+    const listed = rows.map((r) => ({ ...r, is_ready: "-", is_running: false }));
+    const driver = {
+      ...pc.driver,
+      getServiceStatuses: async () => parseServiceStatuses(JSON.stringify(listed)),
     };
     const reaped: string[][] = [];
     const reap: CommandDeps["reap"] = async (config) => {
@@ -7407,7 +7399,7 @@ describe("runDown after process-compose stops (#155)", () => {
       return { ranCount: Object.keys(config.processes).length, failures: [] };
     };
     const port = (name: string): number => Number(up.env[name]);
-    return { deps: { ...deps, driver: { ...base, spawner }, reap }, reaped, port };
+    return { deps: { ...deps, processCompose: driver, reap }, reaped, port };
   }
 
   /**
