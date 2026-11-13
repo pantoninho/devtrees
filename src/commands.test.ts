@@ -5520,24 +5520,21 @@ describe("runUp — stale port block detection (#58)", () => {
       return { free: false as const, pid: 12345, command: "node stale.mjs" };
     };
     // First, run the deps once to learn the block base, then arm the holder.
-    // Pin the worktree root so both stubDeps calls derive the same id.
+    // Pin the worktree root so both pcDeps calls derive the same id.
     const loginId = idFor("/wt", "login");
-    const probeDeps = stubDeps({ stack, worktreeRootOverride: "/wt" });
+    const probeDeps = pcDeps({ stack, worktreeRootOverride: "/wt" });
     const probeResult = await runUp(probeDeps);
     const blockBase = probeResult.blockBase;
-    // Reset for a fresh first-up against a clean anchor (separate stubDeps()
-    // call gives us a fresh tmp anchor with no socket present).
+    // Reset for a fresh first-up against a clean anchor (separate pcDeps()
+    // call gives us a fresh tmp anchor with no instance running).
     heldPorts.add(blockBase); // WEB_PORT (offset 0)
 
-    const deps: CommandDeps = {
-      ...stubDeps({
-        stack,
-        worktreeRootOverride: "/wt",
-        initialRegistry: { [loginId]: blockBase },
-      }),
-      portHolder,
-      portAccepts: async () => true,
-    };
+    const base = pcDeps({
+      stack,
+      worktreeRootOverride: "/wt",
+      initialRegistry: { [loginId]: blockBase },
+    });
+    const deps: CommandDeps = { ...base, portHolder, portAccepts: async () => true };
 
     const err = await runUp(deps).then(
       () => undefined,
@@ -5568,6 +5565,8 @@ describe("runUp — stale port block detection (#58)", () => {
     });
     // The human message lists the collision too (#155), not just `details`.
     expect(err.message).toContain(`WEB_PORT ${blockBase}: pid 12345 (node stale.mjs)`);
+    // Aborted before the start.
+    expect(ups(base.pc)).toEqual([]);
   });
 
   it("collects every collision (not just the first) so the agent can kill all orphans in one pass", async () => {
@@ -5576,7 +5575,7 @@ describe("runUp — stale port block detection (#58)", () => {
       pid: port, // pid = port for easy assertion
       command: `proc@${port}`,
     });
-    const deps: CommandDeps = { ...stubDeps({ stack }), portHolder, portAccepts: async () => true };
+    const deps: CommandDeps = { ...pcDeps({ stack }), portHolder, portAccepts: async () => true };
     const err = await runUp(deps).then(
       () => undefined,
       (e: unknown) => e as Error & { details?: unknown },
@@ -5589,7 +5588,7 @@ describe("runUp — stale port block detection (#58)", () => {
 
   it("reports collision even when the holder probe can't identify the pid/command (lsof missing / degraded)", async () => {
     const portHolder = async () => ({ free: false as const, pid: null, command: null }) as const;
-    const deps: CommandDeps = { ...stubDeps({ stack }), portHolder, portAccepts: async () => true };
+    const deps: CommandDeps = { ...pcDeps({ stack }), portHolder, portAccepts: async () => true };
     const err = await runUp(deps).then(
       () => undefined,
       (e: unknown) => e as Error & { code?: string; details?: unknown },
@@ -5604,32 +5603,32 @@ describe("runUp — stale port block detection (#58)", () => {
   });
 
   it("skips the check on the idempotent re-up path — the listeners on those ports ARE our own", async () => {
-    // touchSocket: true makes the first up create the socket, so a second up
-    // takes the idempotent branch. If the pre-flight ran on that branch it
-    // would trip on our own listener and break re-runs.
-    const track: StubSpawn = { invocations: [], touchSocket: true };
+    // The first up starts the instance, so a second up takes the idempotent
+    // branch. If the pre-flight ran on that branch it would trip on our own
+    // listener and break re-runs.
     let holderCalls = 0;
     const portHolder = async () => {
       holderCalls++;
       return { free: false as const, pid: 999, command: "node should-not-trip" };
     };
     // First up uses a non-tripping holder to get us into the running state.
-    const base = stubDeps({ stack, track });
+    const base = pcDeps({ stack });
     const deps: CommandDeps = {
       ...base,
       portHolder: async () => ({ free: true as const }),
     };
     await runUp(deps);
-    // Second up: socket present → idempotent path. Swap in the tripping
+    // Second up: instance running → idempotent path. Swap in the tripping
     // holder; if the check ran, this call would reject.
     const drifted: CommandDeps = { ...deps, portHolder };
     const result = await runUp(drifted);
     expect(result.worktreeId).toBe(base.expectedWorktreeId);
     expect(holderCalls).toBe(0);
+    expect(upsOn(base.pc, base.inst.socketPath)).toHaveLength(1);
   });
 
   it("clean start (no holder reports a collision) does not throw — the happy path is unchanged", async () => {
-    const base = stubDeps({ stack });
+    const base = pcDeps({ stack });
     const deps: CommandDeps = {
       ...base,
       portHolder: async () => ({ free: true as const }),
@@ -5637,6 +5636,7 @@ describe("runUp — stale port block detection (#58)", () => {
     const result = await runUp(deps);
     expect(result.worktreeId).toBe(base.expectedWorktreeId);
     expect(Number(result.env.WEB_PORT)).toBeGreaterThanOrEqual(20000);
+    expect(base.pc.isUp(base.inst.socketPath)).toBe(true);
   });
 
   it("only probes declared named ports — not the full 32-port allocation block (PRD §port block)", async () => {
@@ -5645,7 +5645,7 @@ describe("runUp — stale port block detection (#58)", () => {
       probed.push(port);
       return { free: true as const };
     };
-    const deps: CommandDeps = { ...stubDeps({ stack }), portHolder, portAccepts: async () => true };
+    const deps: CommandDeps = { ...pcDeps({ stack }), portHolder, portAccepts: async () => true };
     const result = await runUp(deps);
     // The stack declares 2 named ports; the block holds 32. The check must
     // touch only the two.
@@ -5665,68 +5665,56 @@ describe("runUp — crash recovery: stale control socket (#80)", () => {
   const stack: ResolvedStack = { services: [isolated("web", "node server.js", ["WEB_PORT"])] };
 
   /**
-   * Pre-create an orphaned socket file the way a SIGKILLed instance leaves
-   * one — at the path-hash-suffixed id (#82) the resolver will derive for
-   * `<worktreeRoot>/login`.
+   * An instance SIGKILLed the way a crash leaves it: its socket file stays,
+   * nothing listens on it.
    */
-  function orphanSocket(anchor: string, worktreeRoot: string): string {
-    const paths = instancePaths(anchor, idFor(worktreeRoot, "login"));
-    mkdirSync(paths.runDir, { recursive: true });
-    writeFileSync(paths.socketPath, "");
-    return paths.socketPath;
+  async function crashedInstance(deps: PcDeps, inst: InstanceRef): Promise<void> {
+    mkdirSync(dirname(inst.socketPath), { recursive: true });
+    writeFileSync(inst.configPath, stringifyYaml({ processes: { web: { command: "x" } } }));
+    await deps.pc.driver.up(inst);
+    deps.pc.crash(inst.socketPath);
   }
 
   it("starts a fresh instance when the socket file exists but nothing listens (post-SIGKILL)", async () => {
-    const tmp = tmpAnchor();
-    const socketPath = orphanSocket(tmp.anchor, tmp.worktreeRoot);
-    const track: StubSpawn = { invocations: [], touchSocket: true };
-    const deps = stubDeps({
-      stack,
-      track,
-      anchorOverride: tmp.anchor,
-      worktreeRootOverride: tmp.worktreeRoot,
-      probeSocket: async () => "stale",
-    });
+    const deps = pcDeps({ stack });
+    await crashedInstance(deps, deps.inst);
+    const { socketPath } = deps.inst;
+    expect(existsSync(socketPath)).toBe(true);
 
     const result = await runUp(deps);
 
-    // Not a silent no-op: the driver was spawned against this worktree's socket.
-    const worktreeSpawns = track.invocations.filter((i) => i.socketPath === socketPath);
-    expect(worktreeSpawns).toHaveLength(1);
+    // Not a silent no-op: a fresh instance was started on this worktree's socket.
+    expect(upsOn(deps.pc, socketPath)).toHaveLength(2);
+    expect(deps.pc.isUp(socketPath)).toBe(true);
     // Normal started envelope, exactly as a first up would return.
     expect(result.worktreeId).toBe(deps.expectedWorktreeId);
     expect(Number(result.env.WEB_PORT)).toBeGreaterThanOrEqual(20000);
   });
 
   it("unlinks the stale socket file when detected", async () => {
-    const tmp = tmpAnchor();
-    const socketPath = orphanSocket(tmp.anchor, tmp.worktreeRoot);
-    // touchSocket: false — nothing recreates the file, so its absence after
-    // `runUp` proves the stale file was unlinked, not merely overwritten.
-    const track: StubSpawn = { invocations: [], touchSocket: false };
-    const deps = stubDeps({
-      stack,
-      track,
-      anchorOverride: tmp.anchor,
-      worktreeRootOverride: tmp.worktreeRoot,
-      probeSocket: async () => "stale",
+    // Whether the stale file was still there when the fresh start reached
+    // process-compose: it must have been unlinked, not merely bound over.
+    const seenAtStart: boolean[] = [];
+    let socketPath = "";
+    const pc = createInMemoryProcessCompose({
+      onRequest: (r) => {
+        if (r.op === "up" && r.socketPath === socketPath) seenAtStart.push(existsSync(socketPath));
+      },
     });
+    const deps = pcDeps({ stack, pc });
+    await crashedInstance(deps, deps.inst);
+    socketPath = deps.inst.socketPath;
 
     await runUp(deps);
 
-    expect(existsSync(socketPath)).toBe(false);
+    expect(seenAtStart).toEqual([false]);
   });
 
   it("a stale socket does not disable the STALE_PORT_BLOCK pre-flight (#58)", async () => {
-    const tmp = tmpAnchor();
-    orphanSocket(tmp.anchor, tmp.worktreeRoot);
+    const base = pcDeps({ stack });
+    await crashedInstance(base, base.inst);
     const deps: CommandDeps = {
-      ...stubDeps({
-        stack,
-        anchorOverride: tmp.anchor,
-        worktreeRootOverride: tmp.worktreeRoot,
-        probeSocket: async () => "stale",
-      }),
+      ...base,
       // An orphaned process still squats this worktree's block.
       portHolder: async () => ({ free: false as const, pid: 4242, command: "node orphan.mjs" }),
       portAccepts: async () => true,
@@ -5738,28 +5726,29 @@ describe("runUp — crash recovery: stale control socket (#80)", () => {
     );
     if (err === undefined) throw new Error("expected runUp to reject");
     expect(err.code).toBe("STALE_PORT_BLOCK");
+    expect(base.pc.isUp(base.inst.socketPath)).toBe(false);
   });
 
   it("a live socket (probe says running) still takes the idempotent no-op path", async () => {
-    const tmp = tmpAnchor();
-    const socketPath = orphanSocket(tmp.anchor, tmp.worktreeRoot);
     const probed: string[] = [];
-    const track: StubSpawn = { invocations: [], touchSocket: false };
-    const deps = stubDeps({
+    const pc = createInMemoryProcessCompose();
+    const deps = pcDeps({
       stack,
-      track,
-      anchorOverride: tmp.anchor,
-      worktreeRootOverride: tmp.worktreeRoot,
+      pc,
       probeSocket: async (p) => {
         probed.push(p);
-        return "running";
+        return pc.probeSocket(p);
       },
     });
+    await runUp(deps);
+    const { socketPath } = deps.inst;
+    const webPid = pc.pidOf(socketPath, "web");
 
     const result = await runUp(deps);
 
-    // No fresh spawn, socket left in place, envelope still emitted.
-    expect(track.invocations).toHaveLength(0);
+    // No fresh start, socket left in place, envelope still emitted.
+    expect(upsOn(pc, socketPath)).toHaveLength(1);
+    expect(pc.pidOf(socketPath, "web")).toBe(webPid);
     expect(existsSync(socketPath)).toBe(true);
     expect(result.worktreeId).toBe(deps.expectedWorktreeId);
     expect(probed).toContain(socketPath);
@@ -5780,52 +5769,42 @@ describe("runUp — crash recovery: stale shared socket (#80)", () => {
     ],
   };
 
-  /** Pre-create an orphaned shared socket the way a SIGKILLed instance leaves one. */
-  function orphanSharedSocket(anchor: string): string {
-    const paths = sharedInstancePaths(anchor);
-    mkdirSync(paths.runDir, { recursive: true });
-    writeFileSync(paths.socketPath, "");
-    return paths.socketPath;
+  /** A running shared instance of `postgres`. */
+  async function sharedInstance(deps: PcDeps): Promise<void> {
+    mkdirSync(dirname(deps.sharedInst.socketPath), { recursive: true });
+    writeFileSync(
+      deps.sharedInst.configPath,
+      stringifyYaml({ processes: { postgres: { command: "postgres" } } }),
+    );
+    await deps.pc.driver.up(deps.sharedInst);
   }
 
   it("restarts the shared instance when its socket file exists but nothing listens", async () => {
-    const tmp = tmpAnchor();
-    const sharedSocket = orphanSharedSocket(tmp.anchor);
-    const track: StubSpawn = { invocations: [], touchSocket: true };
-    const deps = stubDeps({
-      stack: mixedStack,
-      track,
-      anchorOverride: tmp.anchor,
-      worktreeRootOverride: tmp.worktreeRoot,
-      // The shared socket is dead; the worktree's own socket doesn't exist yet.
-      probeSocket: async () => "stale",
-    });
+    const deps = pcDeps({ stack: mixedStack });
+    await sharedInstance(deps);
+    // SIGKILLed: the socket file stays behind, nothing listens.
+    deps.pc.crash(deps.sharedInst.socketPath);
+    expect(existsSync(deps.sharedInst.socketPath)).toBe(true);
 
     const result = await runUp(deps);
 
     // The lazy-start actually restarted shared — and reports having done so.
-    const sharedSpawn = findSharedSpawn(track);
-    expect(sharedSpawn.socketPath).toBe(sharedSocket);
+    expect(upsOn(deps.pc, deps.sharedInst.socketPath)).toHaveLength(2);
+    expect(deps.pc.isUp(deps.sharedInst.socketPath)).toBe(true);
     expect(result.sharedStarted).toBe(true);
   });
 
   it("a live shared socket is left alone — lazy start stays idempotent", async () => {
-    const tmp = tmpAnchor();
-    const sharedSocket = orphanSharedSocket(tmp.anchor);
-    const track: StubSpawn = { invocations: [], touchSocket: true };
-    const deps = stubDeps({
-      stack: mixedStack,
-      track,
-      anchorOverride: tmp.anchor,
-      worktreeRootOverride: tmp.worktreeRoot,
-      probeSocket: async () => "running",
-    });
+    const deps = pcDeps({ stack: mixedStack });
+    await sharedInstance(deps);
+    const pid = deps.pc.pidOf(deps.sharedInst.socketPath, "postgres");
 
     const result = await runUp(deps);
 
-    expect(track.invocations.some((i) => i.socketPath === sharedSocket)).toBe(false);
+    expect(upsOn(deps.pc, deps.sharedInst.socketPath)).toHaveLength(1);
+    expect(deps.pc.pidOf(deps.sharedInst.socketPath, "postgres")).toBe(pid);
     expect(result.sharedStarted).toBe(false);
-    expect(existsSync(sharedSocket)).toBe(true);
+    expect(existsSync(deps.sharedInst.socketPath)).toBe(true);
   });
 });
 
