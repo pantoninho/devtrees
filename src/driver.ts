@@ -34,12 +34,12 @@ export class MissingProcessComposeError extends Error {
  * that accepts a list-valued `namespace` (issue #173), which namespace
  * selection builds on.
  */
-const MIN_PROCESS_COMPOSE_VERSION = "1.122.0";
+export const MIN_PROCESS_COMPOSE_VERSION = "1.122.0";
 
 const PROCESS_COMPOSE_UPGRADE_URL = "https://f1bonacc1.github.io/process-compose/installation/";
 
 /** Raised when the installed process-compose is older than the supported minimum. */
-class ProcessComposeTooOldError extends Error {
+export class ProcessComposeTooOldError extends Error {
   readonly code = "PROCESS_COMPOSE_TOO_OLD" as const;
   readonly details: {
     readonly installed_version: string | null;
@@ -136,7 +136,7 @@ export const RELOAD_CONFIG_ROUTE = "/project/configuration";
  * did not finish within its budget (`timeout`). Every failure routes through
  * `runUp` to the `CONFIG_DRIFT` envelope, with the reason in its details.
  */
-type ReloadResult =
+export type ReloadResult =
   | { readonly ok: true }
   | {
       readonly ok: false;
@@ -255,7 +255,9 @@ export function buildProcessStopArgs(
  * Outcome of a `stopProcesses` call: `ok:false` carries process-compose's
  * own complaint (its output, the exit code, or the timeout).
  */
-type StopRequestResult = { readonly ok: true } | { readonly ok: false; readonly message: string };
+export type StopRequestResult =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly message: string };
 
 /** Budget for one `process stop` call: it returns once the stop is requested. */
 const STOP_REQUEST_TIMEOUT_MS = 10_000;
@@ -565,10 +567,50 @@ function defaultExists(binary: string): Promise<boolean> {
 }
 
 /**
- * A driver bound to a binary + spawner. Operations start/stop a per-instance
- * server and attach a TUI, each over the instance's UDS.
+ * The process-compose Driver: every operation devtrees asks of a
+ * process-compose instance, each addressed by the instance's control socket
+ * (ADR-0007). Two adapters implement it: `createDriver`, which shells out to
+ * the real binary (or the `.mjs` stub), and the in-memory process-compose in
+ * src/in-memory-driver.ts, which tests inject through the command deps.
+ *
+ * It models process-compose, not devtrees: it knows nothing of tiers,
+ * classification or selection, only processes, namespaces and the rows
+ * process-compose reports for them.
  */
-export function createDriver(deps: DriverDeps = {}) {
+export interface Driver {
+  /**
+   * Start the instance's server in the background, booting the processes of
+   * `namespaces` (all of them when empty). Resolves once the server is
+   * launched, not once its socket answers: the caller waits for that.
+   */
+  up(inst: InstanceRef, namespaces?: ReadonlyArray<string>): Promise<void>;
+  /** Fail with `ProcessComposeTooOldError` unless process-compose is new enough (#173). */
+  assertSupportedVersion(): Promise<void>;
+  /** Stop the running instance, bounded by `timeoutMs` (#190). */
+  down(inst: InstanceRef, opts?: { readonly timeoutMs?: number }): Promise<DownOutcome>;
+  /** Attach a TUI to the running instance. */
+  attach(inst: InstanceRef): Promise<void>;
+  /** Read every booted process's row from the running instance. Rejects when it does not answer. */
+  getServiceStatuses(
+    socketPath: string,
+    opts?: { readonly timeoutMs?: number },
+  ): Promise<ServiceStatus[]>;
+  /** Start one process of the running instance (#178). */
+  startProcess(socketPath: string, service: string): Promise<StartResult>;
+  /** Ask the running instance to stop `services` (#223); does not wait for them to exit. */
+  stopProcesses(socketPath: string, services: ReadonlyArray<string>): Promise<StopRequestResult>;
+  /** Stream one process's log lines. */
+  streamLogs(socketPath: string, opts: StreamLogsOptions): AsyncIterable<LogEvent>;
+  /** Make the running instance re-read its config file and apply the difference (#194). */
+  reloadConfig(inst: InstanceRef, opts?: { readonly timeoutMs?: number }): Promise<ReloadResult>;
+}
+
+/**
+ * The Driver adapter that shells out to the process-compose binary (or the
+ * `.mjs` stub, through `prefixArgs`). Every operation goes over the instance's
+ * UDS.
+ */
+export function createDriver(deps: DriverDeps = {}): Driver {
   const binary = deps.binary ?? "process-compose";
   const prefix = deps.prefixArgs ?? [];
   const exists = deps.exists ?? defaultExists;

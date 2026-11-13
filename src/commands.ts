@@ -71,6 +71,7 @@ import {
   mergeAsyncIterables,
   READ_TIMEOUT_MS,
   reloadTimeoutMs,
+  type Driver,
   type DriverDeps,
   type LogEvent,
   type ServiceStatus,
@@ -1262,6 +1263,12 @@ export interface CommandDeps {
   readonly allocator?: AllocatorOptions;
   readonly driver?: DriverDeps;
   /**
+   * A whole process-compose Driver to use instead of the real one built from
+   * `driver`. Tests inject the in-memory process-compose here
+   * (src/in-memory-driver.ts). Default: `createDriver(driver)`.
+   */
+  readonly processCompose?: Driver;
+  /**
    * Seams and budgets for the bounded stop (issue #190): the process-table
    * read, the kill, the base `down` budget and the post-escalation grace.
    * Default: real `ps`/`process.kill`, 30s base, 10s grace.
@@ -1859,9 +1866,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
 
   // Refuse an unsupported process-compose before allocating ports or touching
   // any state (issue #173): one cheap subprocess, and nothing to roll back.
-  await (
-    deps.assertProcessComposeVersion ?? (() => createDriver(deps.driver).assertSupportedVersion())
-  )();
+  await (deps.assertProcessComposeVersion ?? (() => driverOf(deps).assertSupportedVersion()))();
 
   const options = resolveAllocatorOptions(stack, deps.allocator ?? DEFAULT_ALLOCATOR);
 
@@ -1894,7 +1899,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
   // and checked here rather than at the spawn so no config or logs dir is
   // written for a start that cannot succeed.
   assertSocketPathFits(paths.socketPath);
-  const driver = createDriver(deps.driver);
+  const driver = driverOf(deps);
   const inst = { configPath: paths.configPath, socketPath: paths.socketPath };
 
   // Per-worktree lifecycle lock (issue #91): the liveness-check →
@@ -2232,7 +2237,7 @@ async function collectIsolatedServices(
   socketPath: string,
   portFor: (name: string) => number | undefined,
   deps: CommandDeps,
-  driver: ReturnType<typeof createDriver>,
+  driver: Driver,
   /** Rows the caller already read from this instance; skips the re-read. */
   preRead?: ServiceStatus[],
 ): Promise<Service[]> {
@@ -2468,7 +2473,7 @@ async function previewRunning(
   socketPath: string,
   deps: CommandDeps,
 ): Promise<RunningPreview> {
-  const driver = createDriver(deps.driver);
+  const driver = driverOf(deps);
   const rows = await readStatusesWithin(
     { getServiceStatuses: statusReader(deps, driver) },
     socketPath,
@@ -2532,7 +2537,7 @@ async function previewSharedRestarts(
   if (state === undefined) return [];
   const plan = planSharedSelection(selected, state.services);
   if (plan.drifted.length > 0 || plan.portConflicts.length > 0) return [];
-  const rows = await statusReader(deps, createDriver(deps.driver))(socketPath, {
+  const rows = await statusReader(deps, driverOf(deps))(socketPath, {
     timeoutMs: deps.waitTimeoutMs ?? DRY_RUN_READ_TIMEOUT_MS,
   }).catch(() => undefined);
   if (rows === undefined) return [];
@@ -2637,7 +2642,7 @@ export async function runAttach(
   options: AttachOptions = {},
 ): Promise<void> {
   const { anchor } = resolve(deps);
-  const driver = createDriver(deps.driver);
+  const driver = driverOf(deps);
 
   if (options.shared) {
     const paths = sharedInstancePaths(anchor.anchor);
@@ -2706,7 +2711,7 @@ async function prepareShared(args: {
   readonly namespaces: ReadonlyArray<string>;
   readonly seed: SharedPortSeed;
   readonly sharedLock: WithSharedLock;
-  readonly driver: ReturnType<typeof createDriver>;
+  readonly driver: Driver;
   readonly deps: CommandDeps;
   readonly probe: LivenessProbe;
   readonly warn: (message: string) => void;
@@ -2780,7 +2785,7 @@ async function prepareShared(args: {
 async function waitSharedReady(
   args: {
     readonly anchor: { readonly anchor: string };
-    readonly driver: ReturnType<typeof createDriver>;
+    readonly driver: Driver;
     readonly deps: CommandDeps;
     readonly warn: (message: string) => void;
     readonly stack: ResolvedStack;
@@ -2844,10 +2849,7 @@ async function runningSharedNamespaces(args: {
   const { stack, anchor, deps } = args;
   if (deps.namespaces !== undefined && deps.namespaces.length > 0) return deps.namespaces;
   if (!hasNamespacedShared(stack)) return [];
-  const rows = await statusReader(
-    deps,
-    createDriver(deps.driver),
-  )(args.socketPath).catch(() => undefined);
+  const rows = await statusReader(deps, driverOf(deps))(args.socketPath).catch(() => undefined);
   if (rows === undefined) return [];
   const readHash = deps.readStoredHash ?? defaultReadStoredHash;
   const { configPath } = instancePaths(anchor.anchor, anchor.worktreeId);
@@ -2901,7 +2903,7 @@ interface SharedPortSeed {
 
 /** What `ensureSharedStarted` needs besides the stack and the selection. */
 interface EnsureSharedDeps {
-  readonly driver: ReturnType<typeof createDriver>;
+  readonly driver: Driver;
   readonly probe: LivenessProbe;
   /** Socket-bind wait window for the lazy start (issue #92). Default: 3s. */
   readonly socketTimeoutMs?: number;
@@ -3167,7 +3169,7 @@ async function restartDeadShared(args: {
   readonly rows: ReadonlyArray<ServiceStatus>;
   readonly names: ReadonlyArray<string>;
   readonly socketPath: string;
-  readonly driver: ReturnType<typeof createDriver>;
+  readonly driver: Driver;
   readonly remedyFor?: ((services: ReadonlyArray<string>) => string) | undefined;
 }): Promise<RestartedService[]> {
   const dead = findDeadServices(args.rows, args.names);
@@ -3575,7 +3577,7 @@ export async function runDown(
   options: DownOptions = {},
 ): Promise<DownResult> {
   const { anchor } = resolve(deps);
-  const driver = createDriver(deps.driver);
+  const driver = driverOf(deps);
 
   if (options.shared) {
     const sharedLock = deps.withSharedLock ?? defaultWithSharedLock;
@@ -3818,7 +3820,7 @@ export async function runSharedNamespaceDown(
 ): Promise<SharedNamespaceDownResult> {
   const { anchor } = resolve(deps);
   const sharedLock = deps.withSharedLock ?? defaultWithSharedLock;
-  const driver = createDriver(deps.driver);
+  const driver = driverOf(deps);
   const deadline = Date.now() + (deps.lifecycleWaitMs ?? LIFECYCLE_WAIT_MS);
   for (;;) {
     const attempt = await sharedLock(anchor.anchor, () =>
@@ -3866,7 +3868,7 @@ async function waitForLocksToClear(
  */
 async function sharedNamespaceDownAttempt(
   deps: CommandDeps,
-  driver: ReturnType<typeof createDriver>,
+  driver: Driver,
   anchor: string,
   options: SharedNamespaceDownOptions,
   deadline: number,
@@ -3982,7 +3984,7 @@ async function readSharedRowsOrFail(
   socketPath: string,
   context: LivenessContext,
 ): Promise<ServiceStatus[]> {
-  const read = statusReader(deps, createDriver(deps.driver));
+  const read = statusReader(deps, driverOf(deps));
   try {
     return await readStatusesWithin({ getServiceStatuses: read }, socketPath, READ_TIMEOUT_MS, {
       probe: probeOf(deps),
@@ -4027,7 +4029,7 @@ async function findWorktreeDependants(
   opts: { readonly readOnly: boolean },
 ): Promise<SharedDependant[]> {
   const discover = deps.discover ?? discoverInstances;
-  const read = statusReader(deps, createDriver(deps.driver));
+  const read = statusReader(deps, driverOf(deps));
   const probe = probeOf(deps);
   const instances = await discover(anchor, {
     getServiceStatuses: (socketPath) =>
@@ -4223,7 +4225,7 @@ async function stopWholeShared(
  */
 async function stopSharedTargets(
   deps: CommandDeps,
-  driver: ReturnType<typeof createDriver>,
+  driver: Driver,
   anchor: string,
   seen: SharedDownInspection,
 ): Promise<{
@@ -4302,7 +4304,7 @@ async function reapSkippedSharedHooks(
  * instance still lists a process the config no longer holds.
  */
 async function removeSharedProcesses(
-  driver: ReturnType<typeof createDriver>,
+  driver: Driver,
   anchor: string,
   seen: SharedDownInspection,
 ): Promise<void> {
@@ -4581,7 +4583,7 @@ export async function runRestart(
 ): Promise<RestartResult> {
   const { anchor } = resolve(deps);
   const lifecycleLock = deps.withLifecycleLock ?? defaultWithLifecycleLock;
-  const driver = createDriver(deps.driver);
+  const driver = driverOf(deps);
   const warn = deps.warn ?? defaultWarn;
   // One health-wait budget for every service; the stops and starts do not spend it.
   let budget = deps.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS;
@@ -4708,7 +4710,7 @@ function assertRestartKeepsInstance(
 async function restartOne(
   target: NamedServices,
   name: string,
-  driver: ReturnType<typeof createDriver>,
+  driver: Driver,
   deps: CommandDeps,
   done: ReadonlyArray<string>,
 ): Promise<{
@@ -4832,7 +4834,7 @@ export async function bareRestartRemedy(deps: CommandDeps = {}): Promise<BareRes
     );
     if (!live) return everyNamespace(declared);
     const rows = await readStatusesWithin(
-      { getServiceStatuses: statusReader(deps, createDriver(deps.driver)) },
+      { getServiceStatuses: statusReader(deps, driverOf(deps)) },
       paths.socketPath,
       RESTART_READ_TIMEOUT_MS,
       { notify: () => {}, probe: probeOf(deps) },
@@ -4937,6 +4939,12 @@ export interface LsDeps {
    */
   readonly driver?: DriverDeps;
   /**
+   * A whole process-compose Driver to use instead of the real one built from
+   * `driver`. Tests inject the in-memory process-compose here
+   * (src/in-memory-driver.ts). Default: `createDriver(driver)`.
+   */
+  readonly processCompose?: Driver;
+  /**
    * Budget for one instance's service read, retries included (#226). Default:
    * `READ_TIMEOUT_MS` (5s). An instance that does not answer within it is
    * listed with its services unknown.
@@ -4970,7 +4978,7 @@ export interface LsResult {
 export async function runLs(deps: LsDeps = {}): Promise<LsResult> {
   const { anchor } = resolve(deps);
   const discover = deps.discover ?? discoverInstances;
-  const driver = createDriver(deps.driver ?? {});
+  const driver = driverOf(deps);
   const budgetMs = deps.readTimeoutMs ?? READ_TIMEOUT_MS;
   // Each instance's read is bounded like the dry run's (#210, #226): retried
   // while it fails, killed at the deadline. Discovery reads every instance
@@ -5023,6 +5031,12 @@ export interface PruneDeps {
    * without launching `process-compose`.
    */
   readonly driver?: DriverDeps;
+  /**
+   * A whole process-compose Driver to use instead of the real one built from
+   * `driver`. Tests inject the in-memory process-compose here
+   * (src/in-memory-driver.ts). Default: `createDriver(driver)`.
+   */
+  readonly processCompose?: Driver;
   /**
    * Acquire the allocation-registry lock to delete each orphan's entry under
    * the same read-modify-write semantics `up`/`down` use. Default: real lock
@@ -5356,7 +5370,7 @@ export async function runPrune(deps: PruneDeps = {}): Promise<PruneResult> {
   const discover = deps.discover ?? discoverInstances;
   const lock = deps.withRegistryLock ?? defaultWithRegistryLock;
   const readReg = deps.readRegistry ?? readRegistry;
-  const driver = createDriver(deps.driver);
+  const driver = driverOf(deps);
   const reap = deps.reap ?? reapShutdownHooks;
 
   const instances = await discover(anchor.anchor);
@@ -5470,7 +5484,7 @@ async function reapAndCleanupOrphan(
   orphan: InstanceInfo,
   anchor: string,
   reap: Reaper,
-  driver: ReturnType<typeof createDriver>,
+  driver: Driver,
   seams: StopSeams | undefined,
 ): Promise<{
   warning?: ReapWarning;
@@ -5521,7 +5535,7 @@ async function reapAndCleanupOrphan(
 async function stopOrphanSupervisor(
   orphan: InstanceInfo,
   configPath: string,
-  driver: ReturnType<typeof createDriver>,
+  driver: Driver,
   seams: StopSeams | undefined,
   pendingReload: PendingReload | undefined,
 ): Promise<{
@@ -5882,7 +5896,7 @@ export async function runLogs(
     throw new Error("devtrees logs: specify a service (e.g. `devtrees logs web`) or pass `--all`.");
   }
 
-  const driver = createDriver(deps.driver);
+  const driver = driverOf(deps);
   const streams = services.map((service) => {
     const driverOpts: StreamLogsOptions = {
       service,
@@ -6024,7 +6038,7 @@ async function resolveNamedServices(
     command,
   );
   const rows = await readStatusesWithin(
-    { getServiceStatuses: statusReader(deps, createDriver(deps.driver)) },
+    { getServiceStatuses: statusReader(deps, driverOf(deps)) },
     paths.socketPath,
     Math.min(deps.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS, READ_TIMEOUT_MS),
     { notify: deps.warn ?? defaultWarn, probe: probeOf(deps) },
@@ -6257,7 +6271,7 @@ async function reconcileRunning(args: {
   };
   readonly derived: ReturnType<typeof deriveWorktreeConfig>;
   readonly inst: { readonly configPath: string; readonly socketPath: string };
-  readonly driver: ReturnType<typeof createDriver>;
+  readonly driver: Driver;
   readonly deps: CommandDeps;
   readonly readHash: (anchor: string, id: string) => string | undefined;
   readonly writeHash: (anchor: string, id: string, hash: string) => void;
@@ -6307,7 +6321,7 @@ async function applyReload(args: {
   readonly paths: { readonly configPath: string };
   readonly derived: ReturnType<typeof deriveWorktreeConfig>;
   readonly inst: { readonly configPath: string; readonly socketPath: string };
-  readonly driver: ReturnType<typeof createDriver>;
+  readonly driver: Driver;
   readonly deps: CommandDeps;
   readonly previousConfig: string | undefined;
   readonly rows: ServiceStatus[] | undefined;
@@ -6544,7 +6558,7 @@ async function verifyRunning(args: {
   readonly anchor: { readonly anchor: string; readonly worktreeId: string };
   readonly socketPath: string;
   readonly deps: CommandDeps;
-  readonly driver: ReturnType<typeof createDriver>;
+  readonly driver: Driver;
   readonly warn: (message: string) => void;
 }): Promise<{
   readonly rows: ServiceStatus[] | undefined;
@@ -6655,7 +6669,7 @@ async function restartDeadServices(args: {
   readonly names: ReadonlyArray<string>;
   readonly socketPath: string;
   readonly deps: CommandDeps;
-  readonly driver: ReturnType<typeof createDriver>;
+  readonly driver: Driver;
   readonly remedy: string;
   readonly warn: (message: string) => void;
 }): Promise<{ restarted: RestartedService[]; firstRead: ServiceStatus[] }> {
@@ -6706,7 +6720,7 @@ async function startServices(args: {
   readonly rows: ReadonlyArray<ServiceStatus>;
   readonly names: ReadonlyArray<string>;
   readonly socketPath: string;
-  readonly driver: ReturnType<typeof createDriver>;
+  readonly driver: Driver;
   readonly remedy: string;
 }): Promise<RestartedService[]> {
   const { restarted, failed } = await startInOrder(args);
@@ -6728,7 +6742,7 @@ async function startInOrder(args: {
   readonly rows: ReadonlyArray<ServiceStatus>;
   readonly names: ReadonlyArray<string>;
   readonly socketPath: string;
-  readonly driver: ReturnType<typeof createDriver>;
+  readonly driver: Driver;
 }): Promise<{
   readonly restarted: RestartedService[];
   readonly failed: Array<{ name: string; message: string }>;
@@ -6963,6 +6977,14 @@ async function waitForSelectedHealth(
     ...(opts.command !== undefined ? { command: opts.command } : {}),
   });
   return lastRows;
+}
+
+/** The process-compose Driver a command talks to: the injected one, else the real one. */
+function driverOf(deps: {
+  readonly driver?: DriverDeps;
+  readonly processCompose?: Driver;
+}): Driver {
+  return deps.processCompose ?? createDriver(deps.driver);
 }
 
 /** The control-socket probe the health waits use after a failed read (#205): the injected seam, else `probeSocket`. */
