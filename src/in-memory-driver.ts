@@ -426,13 +426,26 @@ export function createInMemoryProcessCompose(
   ): AsyncGenerator<LogEvent> {
     const { srv, p } = logSource(socketPath, logOpts.service);
     let next = Math.max(0, p.logs.length - (logOpts.tail ?? p.logs.length));
+    const { signal } = logOpts;
+    const aborted =
+      signal === undefined
+        ? undefined
+        : new Promise<void>((resolve) => {
+            if (signal.aborted) resolve();
+            else signal.addEventListener("abort", () => resolve(), { once: true });
+          });
+    // A function, not an inline read: the abort lands while this generator is
+    // suspended, which flow narrowing does not see.
+    const isAborted = (): boolean => signal?.aborted === true;
     for (;;) {
+      if (isAborted()) return;
       while (next < p.logs.length) {
         const line = p.logs[next++] ?? "";
         yield { ts: new Date().toISOString(), service: logOpts.service, stream: "stdout", line };
+        if (isAborted()) return;
       }
       if (logOpts.follow !== true || servers.get(socketPath) !== srv) return;
-      await nextEvent(srv);
+      await (aborted === undefined ? nextEvent(srv) : Promise.race([nextEvent(srv), aborted]));
     }
   }
 

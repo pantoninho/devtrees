@@ -3824,6 +3824,22 @@ describe("runLogs — stream service logs without locking", () => {
     expect(seen).toEqual(["a", "b", "c"]);
   });
 
+  it("an aborted signal ends a quiet follow on every service, with the instance still up (#282)", async () => {
+    const { deps, pc, inst, boot } = logsFixture();
+    await boot(inst, ["web", "worker"], { web: ["a"], worker: ["b"] });
+    const controller = new AbortController();
+    const result = await runLogs(deps, { all: true, follow: true, signal: controller.signal });
+    const seen: string[] = [];
+    const drained = (async () => {
+      for await (const ev of result.events) seen.push(ev.line);
+    })();
+    await vi.waitFor(() => expect([...seen].sort()).toEqual(["a", "b"]));
+    // Nothing more is logged, so each follower is parked waiting for a line.
+    controller.abort();
+    await drained;
+    expect(pc.isUp(inst.socketPath)).toBe(true);
+  });
+
   it("does not take the allocation-registry lock (lock-free path)", async () => {
     const { deps: base, inst, boot } = logsFixture();
     await boot(inst, ["web"], { web: ["a"] });
