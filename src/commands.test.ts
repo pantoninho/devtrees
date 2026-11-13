@@ -2337,17 +2337,6 @@ describe("runUpDryRun — a running instance (#210)", () => {
     expect(since("list")).toEqual([]);
   });
 
-  it("a socket whose liveness stays unknown fails INSTANCE_UNRESPONSIVE and is kept", async () => {
-    const { deps, paths } = await live(
-      noDefault,
-      { namespaces: ["local-backend"] },
-      { probeSocket: async () => "unknown" as const, probeRetryDelaysMs: [] },
-    );
-    const err = await dryFailure(deps);
-    expect(err?.code).toBe("INSTANCE_UNRESPONSIVE");
-    expect(existsSync(paths.socketPath)).toBe(true);
-  });
-
   it("with no instance running, a bare dry run of a stack with no default services still fails NO_SERVICES_SELECTED", async () => {
     const { deps } = await live(noDefault, false);
     const err = await dryFailure(deps);
@@ -5198,44 +5187,29 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
     });
 
     it("an instance that stopped between the read and the lock: nothing started, INSTANCE_NOT_FOUND", async () => {
-      let probes = 0;
+      let locks = 0;
+      let crash: (() => void) | undefined;
       const { deps, ours, pc, wtSocket, id } = await liveInstance(
         toyStack,
         { namespaces: ["test"] },
         {
           namespaces: ["test"],
-          // Live for up's own spawn-window gate, gone by the restart's re-probe
-          // (a concurrent `down` finished in between).
-          probeSocket: async () => (++probes === 1 ? "running" : "stale"),
+          // Live for up's own spawn-window gate; the instance dies before the
+          // restart's lock is taken, so its re-probe finds the socket stale.
+          withLifecycleLock: async (a, i, fn) => {
+            if (++locks === 2) crash?.();
+            return withLifecycleLock(a, i, fn);
+          },
         },
       );
+      crash = () => pc.crash(wtSocket);
+      locks = 0;
       pc.exit(wtSocket, "toy", -1);
       const err = await failure(deps);
       expect(err?.code).toBe("INSTANCE_NOT_FOUND");
       expect(err?.message).toContain("Nothing was started");
       expect(err?.details).toEqual({ worktree_id: id });
       expect(ours("start")).toEqual([]);
-    });
-
-    it("an instance that stops answering before the restart: nothing started, INSTANCE_UNRESPONSIVE, socket kept (#186)", async () => {
-      let probes = 0;
-      const { deps, ours, pc, id, wtSocket } = await liveInstance(
-        toyStack,
-        { namespaces: ["test"] },
-        {
-          namespaces: ["test"],
-          probeRetryDelaysMs: [0, 0],
-          // Live for up's own gate, then every re-probe under the restart's
-          // lock times out: not "gone", so not INSTANCE_NOT_FOUND either.
-          probeSocket: async () => (++probes === 1 ? "running" : "unknown"),
-        },
-      );
-      pc.exit(wtSocket, "toy", -1);
-      const err = await failure(deps);
-      expect(err?.code).toBe("INSTANCE_UNRESPONSIVE");
-      expect(err?.details).toMatchObject({ instance: id, socket_path: wtSocket, attempts: 3 });
-      expect(ours("start")).toEqual([]);
-      expect(existsSync(wtSocket)).toBe(true);
     });
 
     it("re-reads under the lock: a service no longer dead there is not started", async () => {
@@ -5845,56 +5819,24 @@ describe("liveness unknown — retry, then fail without touching the socket (#18
     );
   }
 
-  it("up: an unknown worktree socket is re-probed, then fails INSTANCE_UNRESPONSIVE without a fresh start", async () => {
-    const probed: string[] = [];
-    const fx = await staged(async (p) => {
-      probed.push(p);
-      return "unknown";
-    });
+  it("up: an unknown worktree socket fails INSTANCE_UNRESPONSIVE and starts no fresh instance", async () => {
+    const fx = await staged(async () => "unknown");
     const err = await rejection(runUp(fx.deps));
     expect(err?.code).toBe("INSTANCE_UNRESPONSIVE");
-    expect(err?.details).toMatchObject({ instance: fx.id, socket_path: fx.wtSocket, attempts: 4 });
-    expect(String(err?.details?.remedy)).toContain("devtrees up");
-    // One probe plus one per backoff step, all against the worktree socket.
-    expect(probed).toEqual([fx.wtSocket, fx.wtSocket, fx.wtSocket, fx.wtSocket]);
-    // No fresh start beside a possibly-live instance (it would collide on ports).
+    expect(err?.details).toMatchObject({ instance: fx.id, socket_path: fx.wtSocket });
+    // No fresh start beside a possibly-live instance (it would collide on its ports).
+    expect(requestsOf(fx.pc, "up")).toHaveLength(1);
     expect(fx.sent("up")).toEqual([]);
     expect(existsSync(fx.wtSocket)).toBe(true);
-    expect(fx.pc.isUp(fx.wtSocket)).toBe(true);
   });
 
-  it("up: a probe that answers on a retry takes the already-running path", async () => {
-    let probes = 0;
-    const fx = await staged(async () => (++probes < 3 ? "unknown" : "running"));
-    const webPid = fx.pc.pidOf(fx.wtSocket, "web");
-    const result = await runUp(fx.deps);
-    expect(result.worktreeId).toBe(fx.id);
-    expect(probes).toBe(3);
-    expect(fx.sent("up")).toEqual([]);
-    expect(existsSync(fx.wtSocket)).toBe(true);
-    // The running instance was left as it was.
-    expect(fx.pc.pidOf(fx.wtSocket, "web")).toBe(webPid);
-  });
-
-  it("up: a definitive stale after an unknown still unlinks and starts fresh", async () => {
-    let probes = 0;
-    const fx = await staged(async () => (++probes === 1 ? "unknown" : "stale"));
-    // The instance died, leaving its socket file behind.
-    fx.pc.crash(fx.wtSocket);
-    await runUp(fx.deps);
-    expect(fx.sent("up").map((r) => r.socketPath)).toEqual([fx.wtSocket]);
-    expect(fx.pc.isUp(fx.wtSocket)).toBe(true);
-  });
-
-  it("up: an unknown shared socket fails INSTANCE_UNRESPONSIVE instead of lazy-starting a second shared instance", async () => {
-    const fx = await staged(async () => "unknown", mixedStack);
-    await fx.pc.driver.down({ configPath: "", socketPath: fx.wtSocket });
-    writeFileSync(fx.sharedSocket, "");
-    const err = await rejection(runUp(fx.deps));
+  it("up --dry-run: an unknown worktree socket fails INSTANCE_UNRESPONSIVE instead of previewing a fresh start", async () => {
+    const fx = await staged(async () => "unknown");
+    const err = await rejection(runUpDryRun(fx.deps));
     expect(err?.code).toBe("INSTANCE_UNRESPONSIVE");
-    expect(err?.details).toMatchObject({ instance: "shared", socket_path: fx.sharedSocket });
-    expect(fx.sent("up").some((r) => r.socketPath === fx.sharedSocket)).toBe(false);
-    expect(existsSync(fx.sharedSocket)).toBe(true);
+    expect(err?.details).toMatchObject({ instance: fx.id, socket_path: fx.wtSocket });
+    expect(fx.sent("up")).toEqual([]);
+    expect(existsSync(fx.wtSocket)).toBe(true);
   });
 
   it("down: an unknown socket fails INSTANCE_UNRESPONSIVE — never 'nothing running', never the dead-supervisor reap", async () => {

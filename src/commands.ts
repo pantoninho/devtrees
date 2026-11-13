@@ -85,18 +85,20 @@ import {
   type PortHolderReport,
 } from "./port-probe.js";
 import { acceptsConnections, forwarderLabel, isPortForwarder } from "./port-connect.js";
+import { SOCKET_WAIT_TIMEOUT_MS, pollForSocket, type LivenessProbe } from "./liveness.js";
 import {
-  instanceUnresponsiveError,
-  SOCKET_WAIT_TIMEOUT_MS,
-  pollForSocket,
-  socketIsLive,
-  unresponsiveRemedy,
-  type LivenessProbe,
-} from "./liveness.js";
+  configDriftError,
+  serviceStartFailed,
+  derivedProcesses,
+  openWorktreeInstance,
+  type LiveInstance,
+  type LiveInstanceSeams,
+  type OpenContext,
+  type OpenOptions,
+} from "./live-instance.js";
 import {
   clearDownIncomplete,
   daemonHooksSkipped,
-  unsignalledServices,
   downIncomplete,
   readDownIncomplete,
   writeDownIncomplete,
@@ -106,7 +108,6 @@ import {
   type PortSurvivorSeams,
 } from "./down-survivors.js";
 import { stackHash } from "./hash.js";
-import { boundedRestart } from "./bounded-restart.js";
 import { warnSurvivors } from "./bounded-stop.js";
 import {
   assertNotLastRunning,
@@ -116,7 +117,6 @@ import {
   instanceExitedError,
   instanceNotRunningError,
   partitionRunning,
-  stopTimeoutMs,
 } from "./stop-services.js";
 import {
   readStoredHash as defaultReadStoredHash,
@@ -126,10 +126,8 @@ import type { SharedFieldChange } from "./shared-state.js";
 import type { SharedBlock, SharedPortEntry } from "./shared-ports.js";
 import {
   createWaitForHealth,
-  isGone,
   readStatusesWithin,
   probedNames,
-  startInOrder,
   type RestartedService,
   type WaitForHealth,
   type WaitingCommand,
@@ -145,13 +143,11 @@ import {
   hasNamespacedShared,
   namespaceOf,
   namespaceSelected,
-  provenNamespaces,
   selectFreshUp,
   selectNamedServices,
-  selectRunningUp,
   selectSharedServices,
-  serviceNamespaces,
   serviceNotFoundError,
+  type DerivedProcesses as DerivedProcessMap,
   type DroppedNamespaceEdge,
   type NamedServiceCommand,
 } from "./selection.js";
@@ -161,12 +157,10 @@ import {
   isProcessAlive,
   planPendingReload,
   readPendingReload,
-  stuckFromMarker,
   writePendingReload,
   type PendingReload,
-  type StuckReload,
 } from "./reload-pending.js";
-import { dependencyOrder, findDeadServices, idleState, isActiveOrIdle } from "./service-state.js";
+import { findDeadServices, idleState, isActiveOrIdle } from "./service-state.js";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -197,45 +191,6 @@ export type {
 // health module (issue #87); re-exported here so `CommandDeps` callers keep a
 // single import site.
 export type { WaitForHealth, WaitForSharedHealth } from "./health.js";
-
-/**
- * Thrown when `up` detects config drift against a running instance and the
- * driver could not hot-reload (older process-compose without `project
- * update`, or any failure to apply the new config). The instance keeps
- * running unchanged; the CLI maps this to the `CONFIG_DRIFT` error
- * envelope so an agent can decide whether to `down` + `up` or hand off to
- * a human (ADR-0005).
- *
- * `details.reason` lets an agent branch without parsing the message:
- * `timeout` means process-compose is still waiting for a changed service's
- * old process to exit (it is no longer listed, but the pending-reload marker
- * records it, so `down` force-kills it before stopping, #206).
- * `not_supported` / `error`
- * mean the reload was refused and the instance is untouched.
- * `reload_pending` (#191) means `up` did not reload at all: an earlier
- * reload is still waiting on an old process, and a second one would start an
- * untracked copy of the service. `details.services` names the stuck services
- * and `details.pids` the old processes to kill (empty when the old process
- * has exited but the service is not back yet). It can fire with no drift: reverting devtrees.yaml
- * does not stop process-compose applying the pending config.
- */
-type ConfigDriftDetails =
-  | { readonly reason: "timeout" | "not_supported" | "error" }
-  | {
-      readonly reason: "reload_pending";
-      readonly services: ReadonlyArray<string>;
-      readonly pids: ReadonlyArray<number>;
-    };
-
-class ConfigDriftError extends Error {
-  readonly code = "CONFIG_DRIFT";
-  readonly details: ConfigDriftDetails;
-  constructor(message: string, details: ConfigDriftDetails) {
-    super(message);
-    this.name = "ConfigDriftError";
-    this.details = details;
-  }
-}
 
 /**
  * The worktree-instance counterpart of `SharedStartFailedError` (issue #157).
@@ -270,29 +225,6 @@ class WorktreeStartFailedError extends Error {
     super(message);
     this.name = "WorktreeStartFailedError";
     this.details = details;
-  }
-}
-
-/**
- * Thrown when `up` asks process-compose to restart a dead selected service
- * on a running instance and the start request itself fails (ADR-0008, issue
- * #178): process-compose refused or errored. Distinct from `HEALTH_TIMEOUT`,
- * which is a service that started but never became healthy. Nothing is
- * stopped; the instance keeps running and `details.remedy` is the `down` +
- * `up` that restarts the whole stack.
- */
-class ServiceStartFailedError extends Error {
-  readonly code = "SERVICE_START_FAILED" as const;
-  constructor(
-    message: string,
-    readonly details: {
-      readonly worktree_id: string;
-      readonly services: ReadonlyArray<{ readonly name: string; readonly message: string }>;
-      readonly remedy: string;
-    },
-  ) {
-    super(message);
-    this.name = "ServiceStartFailedError";
   }
 }
 
@@ -1069,7 +1001,6 @@ function resolveUpSeams(deps: CommandDeps) {
     warn: deps.warn ?? defaultWarn,
     readHash: deps.readStoredHash ?? defaultReadStoredHash,
     writeHash: deps.writeStoredHash ?? defaultWriteStoredHash,
-    probe: resolveProbe(deps),
     ...resolveLifecycleSeams(deps),
   } as const;
 }
@@ -1234,10 +1165,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     // here so this up falls through to the fresh-start path. A socket whose
     // liveness stays unknown (#186) fails INSTANCE_UNRESPONSIVE instead: a
     // fresh start beside a live-but-busy instance would collide on its ports.
-    const ownInstanceLive = await socketIsLive(paths.socketPath, seams.probe, {
-      command: "up",
-      instance: anchor.worktreeId,
-    });
+    const own = await openOwnInstance(deps, anchor, { command: "up" }, {}, driver);
 
     // Fresh-start namespace selection (issue #176, ADR-0008): resolved here,
     // so a bare `up` that would select nothing fails with
@@ -1245,9 +1173,11 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     // (the port reservation has already been made, as for every
     // post-allocation failure). `undefined` on the running-instance path,
     // whose bare-`up` target is #177's to define.
-    const freshSelection = ownInstanceLive
-      ? undefined
-      : selectFreshUp(stack, anchor.worktreeId, deps.namespaces);
+    const gate =
+      own === undefined
+        ? { own, fresh: selectFreshUp(stack, anchor.worktreeId, deps.namespaces) }
+        : { own, fresh: undefined };
+    const freshSelection = gate.fresh;
 
     // Pre-flight stale-port-block check (issue #58). Self-gates on the
     // own-instance-live flag so the idempotent re-up path skips the probe
@@ -1263,7 +1193,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
       portHolder,
       portAccepts,
       warn,
-      ownInstanceLive,
+      ownInstanceLive: own !== undefined,
     });
 
     // Lazy-start the shared instance if any shared services are declared. Runs
@@ -1289,8 +1219,9 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     // namespaces the instance booted. The fresh path's shared closure is its
     // selection's (`UpSelection.shared`).
     const sharedNamespaces =
-      freshSelection?.namespaces ??
-      (await runningSharedNamespaces({ stack, anchor, socketPath: paths.socketPath, deps }));
+      gate.own === undefined
+        ? gate.fresh.namespaces
+        : await runningSharedNamespaces({ stack, anchor, own: gate.own, deps });
     const shared = await sharedInstance.ensure({
       stack,
       worktreeId: anchor.worktreeId,
@@ -1334,10 +1265,11 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     //   - match  -> noop (no driver.up, no registry write)
     //   - drift  -> attempt hot-reload via the driver; map failure to CONFIG_DRIFT.
     // Either way the instance is then verified outside the lock (ADR-0008).
-    if (freshSelection === undefined) {
+    if (gate.own !== undefined) {
       await reconcileRunning({
         stack,
         anchor,
+        own: gate.own,
         paths,
         derived,
         inst,
@@ -1348,6 +1280,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
       });
       return {
         kind: "running",
+        own: gate.own,
         env: derived.env,
         sharedStarted,
         sharedActivated: shared.activated,
@@ -1362,7 +1295,8 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     // Warned before the spawn, so the line is on screen before any attach and
     // survives a later HEALTH_TIMEOUT. The running path warns in
     // `verifyRunning`, against the selection it reads back.
-    const nsEdges = freshSelection.droppedNamespaceEdges;
+    const fresh = gate.fresh;
+    const nsEdges = fresh.droppedNamespaceEdges;
     warnDroppedNamespaceEdges(nsEdges, warn);
 
     // The run dir now lives outside the git dir (issue #156), so the anchor
@@ -1391,7 +1325,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
 
     // Always a non-empty selection: a bare fresh `up` passes `-n default`, so
     // process-compose never falls back to starting every namespace (#176).
-    await driver.up(inst, freshSelection.namespaces);
+    await driver.up(inst, fresh.namespaces);
 
     // `driver.up` is fire-and-forget: spawn returns before the child binds the
     // UDS. Hold the lifecycle lock until the socket is observable so the next
@@ -1417,8 +1351,8 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
       sharedActivated: shared.activated,
       sharedRestarted: shared.restarted,
       sharedChanges,
-      selected: freshSelection.isolated,
-      namespaces: freshSelection.namespaces,
+      selected: fresh.isolated,
+      namespaces: fresh.namespaces,
       droppedNamespaceEdges: nsEdges,
     } as const;
   });
@@ -1446,7 +1380,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     const verified = await verifyRunning({
       stack,
       anchor,
-      socketPath: paths.socketPath,
+      own: outcome.own,
       deps,
       driver,
       warn,
@@ -1608,16 +1542,11 @@ export async function runUpDryRun(deps: CommandDeps = {}): Promise<DryRunResult>
   // one when this worktree's instance is live, else a fresh start (#176). Both
   // raise the errors the real `up` would, and both run before the registry is
   // touched, so a failing preview has no side effect at all.
-  const socketPath = instancePaths(anchor.anchor, anchor.worktreeId).socketPath;
-  const live = await socketIsLive(
-    socketPath,
-    resolveProbe(deps),
-    { command: "up", instance: anchor.worktreeId },
-    { readOnly: true },
-  );
-  const preview: RunningPreview = live
-    ? await previewRunning(stack, anchor, socketPath, deps)
-    : previewFresh(stack, anchor.worktreeId, deps.namespaces);
+  const own = await openOwnInstance(deps, anchor, { command: "up" }, { readOnly: true });
+  const preview: RunningPreview =
+    own === undefined
+      ? previewFresh(stack, anchor.worktreeId, deps.namespaces)
+      : await previewRunning(stack, anchor, own, deps);
   const options = resolveAllocatorOptions(stack, deps.allocator ?? DEFAULT_ALLOCATOR);
 
   const allocated = await allocateAndBuildPortMaps({
@@ -1720,9 +1649,9 @@ function previewFresh(
  * A running instance's preview (#210), decided by the same checks the real
  * `up` makes, in the same order, from read-only inputs: one bounded `process
  * list` read, the stored stack hash, the pending-reload marker and the
- * on-disk derived config. It raises `reload_pending` (`assertNoPendingReload`,
- * which `reconcileRunning` uses) and `NAMESPACE_NOT_RUNNING`
- * (`planRunningInstance`, which `verifyRunning` uses). Nothing is reloaded,
+ * on-disk derived config, through the live instance handle (#259). It raises
+ * `reload_pending` (`assertNoPendingReload`, which `reconcileRunning` uses)
+ * and `NAMESPACE_NOT_RUNNING` (`planUp`, which `verifyRunning` uses). Nothing is reloaded,
  * restarted or written, no lock is taken, and a converged marker is left for
  * the real `up` to clear.
  *
@@ -1743,25 +1672,14 @@ function previewFresh(
 async function previewRunning(
   stack: ResolvedStack,
   anchor: { readonly anchor: string; readonly worktreeId: string },
-  socketPath: string,
+  own: LiveInstance,
   deps: CommandDeps,
 ): Promise<RunningPreview> {
-  const driver = driverOf(deps);
-  const rows = await readStatusesWithin(
-    { getServiceStatuses: statusReader(driver) },
-    socketPath,
-    deps.waitTimeoutMs ?? DRY_RUN_READ_TIMEOUT_MS,
-    { probe: probeOf(deps) },
-  );
+  const rows = await own.rows(deps.waitTimeoutMs ?? DRY_RUN_READ_TIMEOUT_MS);
   const readHash = deps.readStoredHash ?? defaultReadStoredHash;
   const wouldReload = readHash(anchor.anchor, anchor.worktreeId) !== stackHash(stack);
-  const { configPath } = instancePaths(anchor.anchor, anchor.worktreeId);
-  const previous = derivedProcesses(
-    existsSync(configPath) ? readFileSync(configPath, "utf8") : undefined,
-  );
-  assertNoPendingReload({
-    anchor,
-    marker: readPendingReload(anchor.anchor, anchor.worktreeId),
+  const previous = own.processes();
+  own.assertNoPendingReload({
     rows,
     previous,
     isolated: stack.services.filter((s) => s.tier === "isolated"),
@@ -1770,7 +1688,7 @@ async function previewRunning(
   });
   const reload = wouldReload && previous !== undefined;
   const projected = reload ? rowsAfterReload(stack, previous, rows) : rows;
-  const plan = planRunningInstance(stack, anchor.worktreeId, projected, deps.namespaces);
+  const plan = own.planUp(stack, projected, deps.namespaces);
   return {
     plan: {
       instance: "running",
@@ -1923,19 +1841,16 @@ function sharedBlockOf(
 async function runningSharedNamespaces(args: {
   readonly stack: ResolvedStack;
   readonly anchor: { readonly anchor: string; readonly worktreeId: string };
-  readonly socketPath: string;
+  readonly own: LiveInstance;
   readonly deps: CommandDeps;
 }): Promise<ReadonlyArray<string>> {
-  const { stack, anchor, deps } = args;
+  const { stack, anchor, own, deps } = args;
   if (deps.namespaces !== undefined && deps.namespaces.length > 0) return deps.namespaces;
   if (!hasNamespacedShared(stack)) return [];
-  const rows = await statusReader(driverOf(deps))(args.socketPath).catch(() => undefined);
+  const rows = await own.tryRows();
   if (rows === undefined) return [];
   const readHash = deps.readStoredHash ?? defaultReadStoredHash;
-  const { configPath } = instancePaths(anchor.anchor, anchor.worktreeId);
-  const previous = derivedProcesses(
-    existsSync(configPath) ? readFileSync(configPath, "utf8") : undefined,
-  );
+  const previous = own.processes();
   const reload =
     previous !== undefined && readHash(anchor.anchor, anchor.worktreeId) !== stackHash(stack);
   const projected = reload ? rowsAfterReload(stack, previous, rows) : rows;
@@ -2141,10 +2056,8 @@ export async function runDown(
       // Unknown liveness (#186) throws INSTANCE_UNRESPONSIVE out of the lock:
       // neither "nothing running" nor the dead-supervisor reap below may run
       // against an instance that might still be live.
-      const wasLive = await socketIsLive(paths.socketPath, resolveProbe(deps), {
-        command: "down",
-        instance: anchor.worktreeId,
-      });
+      const wasLive =
+        (await openOwnInstance(deps, anchor, { command: "down" }, {}, driver)) !== undefined;
       // Live supervisor: a graceful `process-compose down` fires each process's
       // `shutdown.command` from its `working_dir` (the worktree, which is present
       // on the normal `down` path). devtrees must NOT also run the hook directly
@@ -2418,7 +2331,7 @@ export async function runRestart(
       assertNotPending(pending, waitingOn(target), anchor.worktreeId);
       assertRestartKeepsInstance(target, ahead, restarted);
       const name = order[i] ?? "";
-      return { target, name, ...(await restartOne(target, name, driver, deps, restarted)) };
+      return { target, name, ...(await restartOne(target, name, deps, restarted)) };
     });
     forceKilled.push(...step.forceKilled);
     warnSurvivors(step.survivors, warn);
@@ -2449,11 +2362,9 @@ export async function runRestart(
 }
 
 /**
- * `resolveNamedServices` for one restart step. Two things read differently
- * from the resolver's own errors: a process-compose that never answers the status read is
- * `INSTANCE_UNRESPONSIVE` (nothing was touched; it is not a health wait),
- * and an instance gone after earlier steps restarted services (a concurrent
- * `down` between two lock windows) says which ones.
+ * `resolveNamedServices` for one restart step. An instance gone after
+ * earlier steps restarted services (a concurrent `down` between two lock
+ * windows) says which ones.
  */
 async function resolveRestartStep(
   deps: CommandDeps,
@@ -2466,20 +2377,6 @@ async function resolveRestartStep(
     return await resolveNamedServices(deps, names, "restart", namespaces);
   } catch (err) {
     const code = (err as { code?: unknown }).code;
-    if (code === "HEALTH_TIMEOUT") {
-      const socketPath = instancePaths(anchor.anchor, anchor.worktreeId).socketPath;
-      const retry = namedServicesInvocation("restart", names, namespaces);
-      throw instanceUnresponsiveError("restart", {
-        instance: anchor.worktreeId,
-        socket_path: socketPath,
-        attempts: 1,
-        remedy: unresponsiveRemedy(socketPath, {
-          command: "restart",
-          retry,
-          instance: anchor.worktreeId,
-        }),
-      });
-    }
     if (code === "INSTANCE_NOT_FOUND" && done.length > 0) {
       throw instanceNotRunningError("restart", anchor.worktreeId, done);
     }
@@ -2520,7 +2417,6 @@ function assertRestartKeepsInstance(
 async function restartOne(
   target: NamedServices,
   name: string,
-  driver: Driver,
   deps: CommandDeps,
   done: ReadonlyArray<string>,
 ): Promise<{
@@ -2529,32 +2425,16 @@ async function restartOne(
   survivors: ReadonlyArray<ServiceProcess>;
 }> {
   const before = target.rows.find((r) => r.name === name);
-  const read = statusReader(driver);
   const id = target.anchor.worktreeId;
-  const gone = () => isGone(probeOf(deps), target.socketPath);
-  const outcome = await boundedRestart(
-    {
-      socketPath: target.socketPath,
-      service: name,
-      statuses: target.rows,
-      timeoutMs: stopTimeoutMs(target.config, [name], deps.stop?.baseTimeoutMs),
-      unsignalled: unsignalledServices(target.config),
-      instance: id,
-      instanceGone: gone,
-    },
-    {
-      stopProcesses: (socket, services) => driver.stopProcesses(socket, services),
-      startProcess: (socket, service) => driver.startProcess(socket, service),
-      getServiceStatuses: (socket) => read(socket),
-    },
-    deps.stop,
-  ).catch((err: unknown) => {
-    // process-compose exited during the stop: name what was restarted before.
-    if ((err as { code?: unknown }).code !== "INSTANCE_NOT_FOUND") throw err;
-    throw instanceExitedError(id, [name], done);
-  });
+  const outcome = await target.instance
+    .restart(name, { rows: target.rows, config: target.config, seams: deps.stop })
+    .catch((err: unknown) => {
+      // process-compose exited during the stop: name what was restarted before.
+      if ((err as { code?: unknown }).code !== "INSTANCE_NOT_FOUND") throw err;
+      throw instanceExitedError(id, [name], done);
+    });
   if (!outcome.ok) {
-    if (await gone()) throw instanceExitedError(id, [name], done);
+    if (await target.instance.gone()) throw instanceExitedError(id, [name], done);
     throw restartFailedError(target, name, outcome.message, done);
   }
   return {
@@ -2623,19 +2503,9 @@ export async function bareRestartRemedy(deps: CommandDeps = {}): Promise<BareRes
     const fromConfig = declaredServices(derivedProcesses(configText));
     declared = fromConfig.length > 0 ? fromConfig : declaredIsolated(deps, anchor.worktreeRoot);
     if (fromConfig.length === 0) return everyNamespace(declared);
-    const live = await socketIsLive(
-      paths.socketPath,
-      resolveProbe(deps),
-      { command: "restart", instance: anchor.worktreeId },
-      { readOnly: true },
-    );
-    if (!live) return everyNamespace(declared);
-    const rows = await readStatusesWithin(
-      { getServiceStatuses: statusReader(driverOf(deps)) },
-      paths.socketPath,
-      RESTART_READ_TIMEOUT_MS,
-      { notify: () => {}, probe: probeOf(deps) },
-    );
+    const own = await openOwnInstance(deps, anchor, { command: "restart" }, { readOnly: true });
+    if (own === undefined) return everyNamespace(declared);
+    const rows = await own.rows(RESTART_READ_TIMEOUT_MS, { notify: () => {} });
     const present = new Set(rows.map((r) => r.name));
     const booted = bootedNamespaces(fromConfig, present);
     if (booted.length === 0) return everyNamespace(declared);
@@ -2695,7 +2565,7 @@ function restartFailedError(
   name: string,
   message: string,
   done: ReadonlyArray<string>,
-): ServiceStartFailedError {
+): Error {
   const worktreeId = target.anchor.worktreeId;
   // The refused service and the ones after it: those before it were restarted.
   const rest = target.services.filter((s) => !done.includes(s));
@@ -2704,7 +2574,7 @@ function restartFailedError(
     done.length > 0
       ? `${done.join(", ")} ${done.length === 1 ? "was" : "were"} restarted before it; the`
       : "The";
-  return new ServiceStartFailedError(
+  return serviceStartFailed(
     `devtrees restart: process-compose refused to restart '${name}' in '${worktreeId}': ` +
       `${message}. ${before} services after it were not touched, and the worktree ` +
       `instance is still running. Retry with \`${remedy}\`, or read why with ` +
@@ -3523,6 +3393,8 @@ export async function* filterLogEventsSince(
 /** What `resolveNamedServices` hands a per-service verb. */
 interface NamedServices {
   readonly anchor: { readonly anchor: string; readonly worktreeId: string };
+  /** The worktree instance, opened live (#259). */
+  readonly instance: LiveInstance;
   readonly socketPath: string;
   readonly configPath: string;
   /** The running instance's derived config, the source of the declared services. */
@@ -3576,18 +3448,10 @@ async function resolveNamedServices(
   namespaces: ReadonlyArray<string> = [],
 ): Promise<NamedServices> {
   const { anchor } = resolve(deps);
-  const paths = instancePaths(anchor.anchor, anchor.worktreeId);
   const retry = namedServicesInvocation(command, named, namespaces);
-  const live = await socketIsLive(paths.socketPath, resolveProbe(deps), {
-    command,
-    instance: anchor.worktreeId,
-    retry,
-  });
-  if (!live) throw instanceNotRunningError(command, anchor.worktreeId);
-  const configText = existsSync(paths.configPath)
-    ? readFileSync(paths.configPath, "utf8")
-    : undefined;
-  const processes = derivedProcesses(configText);
+  const own = await openOwnInstance(deps, anchor, { command, retry });
+  if (own === undefined) throw instanceNotRunningError(command, anchor.worktreeId);
+  const processes = own.processes();
   const declared = declaredServices(processes);
   const request = {
     worktreeId: anchor.worktreeId,
@@ -3598,15 +3462,13 @@ async function resolveNamedServices(
     namespaces,
   };
   const selection = selectNamedServices(request);
-  const rows = await readStatusesWithin(
-    { getServiceStatuses: statusReader(driverOf(deps)) },
-    paths.socketPath,
+  // A process-compose that never answers is INSTANCE_UNRESPONSIVE: nothing
+  // was touched, so it is not a health wait.
+  const rows = await own.rows(
     Math.min(deps.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS, READ_TIMEOUT_MS),
-    { notify: deps.warn ?? defaultWarn, probe: probeOf(deps) },
+    { notify: deps.warn ?? defaultWarn, unresponsive: true },
   );
-  assertNoPendingReload({
-    anchor,
-    marker: readPendingReload(anchor.anchor, anchor.worktreeId),
+  own.assertNoPendingReload({
     rows,
     previous: processes,
     isolated: declared,
@@ -3618,9 +3480,10 @@ async function resolveNamedServices(
   assertNamedTargetsBooted(request, selection, rows);
   return {
     anchor: { anchor: anchor.anchor, worktreeId: anchor.worktreeId },
-    socketPath: paths.socketPath,
-    configPath: paths.configPath,
-    config: readDerivedConfig(paths.configPath),
+    instance: own,
+    socketPath: own.socketPath,
+    configPath: own.configPath,
+    config: readDerivedConfig(own.configPath),
     services: selection.isolated.map((s) => s.name),
     rows,
     skippedShared: selection.skippedShared,
@@ -3726,6 +3589,8 @@ const RELOAD_TIMEOUT_REMEDIATION =
 async function reconcileRunning(args: {
   readonly stack: ResolvedStack;
   readonly anchor: { readonly anchor: string; readonly worktreeId: string };
+  /** This worktree's instance, opened live under the lifecycle lock (#259). */
+  readonly own: LiveInstance;
   readonly paths: {
     readonly configPath: string;
     readonly socketPath: string;
@@ -3754,12 +3619,8 @@ async function reconcileRunning(args: {
     : undefined;
   // One bounded read; it doubles as the pre-reload snapshot the marker's old
   // PIDs come from. A failed read is `undefined`, not evidence of anything.
-  const rows = await statusReader(args.driver)(paths.socketPath, {
-    timeoutMs: READ_TIMEOUT_MS,
-  }).catch(() => undefined);
-  const converged = assertNoPendingReload({
-    anchor,
-    marker,
+  const rows = await args.own.tryRows(READ_TIMEOUT_MS);
+  const converged = args.own.assertNoPendingReload({
     rows,
     previous: derivedProcesses(previousConfig),
     isolated: args.stack.services.filter((s) => s.tier === "isolated"),
@@ -3806,7 +3667,7 @@ async function applyReload(args: {
     // the new config, a restart if it was reverted meanwhile.
     args.writeHash(anchor.anchor, anchor.worktreeId, RELOAD_TIMED_OUT_HASH);
   }
-  throw new ConfigDriftError(
+  throw configDriftError(
     `devtrees up: config drift detected for '${anchor.worktreeId}' and the running ` +
       `process-compose could not hot-reload the new config` +
       (reload.message ? ` (${reload.message})` : "") +
@@ -3856,130 +3717,11 @@ async function persistPendingReload(args: {
   writePendingReload(args.anchor.anchor, args.anchor.worktreeId, marker);
 }
 
-type DerivedProcessMap = Readonly<Record<string, Readonly<Record<string, unknown>>>>;
-
-/** The `processes` map of a derived config's YAML, or `undefined` if unreadable. */
-function derivedProcesses(yaml: string | undefined): DerivedProcessMap | undefined {
-  if (yaml === undefined) return undefined;
-  try {
-    const processes = (parseYaml(yaml) as { processes?: unknown } | null)?.processes;
-    return processes !== null && typeof processes === "object"
-      ? (processes as DerivedProcessMap)
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 /**
  * Stored-hash sentinel written when a reload times out (#191). It never
  * equals a real stack hash, so the next `up` always takes the drift path.
  */
 const RELOAD_TIMED_OUT_HASH = "reload-timed-out";
-
-/**
- * Refuse to reload while a previous reload is still pending (#191; see
- * src/reload-pending.ts). The marker is checked whenever there is one.
- * Pure, so `up --dry-run` can raise the same refusal (#210): returns `true`
- * when a successful read shows the reload converged, and the caller (the
- * real `up` only) then clears the marker; a failed read leaves it in place,
- * with only the old PIDs as evidence.
- */
-function assertNoPendingReload(args: {
-  readonly anchor: { readonly anchor: string; readonly worktreeId: string };
-  readonly marker: PendingReload | undefined;
-  readonly rows: ServiceStatus[] | undefined;
-  readonly previous: DerivedProcessMap | undefined;
-  readonly isolated: ReadonlyArray<Pick<ResolvedService, "name" | "namespace">>;
-  readonly requested: ReadonlyArray<string>;
-  readonly isAlive: (pid: number) => boolean;
-  /** Who is refusing (#222): `restart` refuses too, as the update would wait on its new run forever. */
-  readonly command?: "up" | NamedServiceCommand;
-  /** What the remedy says to rerun once the reload is done. Default `devtrees up`. */
-  readonly retry?: string;
-}): boolean {
-  const { anchor, marker, rows } = args;
-  if (marker === undefined) return false;
-  const stuck = stuckFromMarker(marker, rows, args.isAlive);
-  if (stuck !== undefined) {
-    throw reloadPendingError(
-      anchor.worktreeId,
-      stuck,
-      pendingRemedyUp({ ...args, stuck }),
-      args.command,
-      args.retry,
-    );
-  }
-  return rows !== undefined;
-}
-
-/**
- * The `down` + `up` that reboots the instance with the namespaces it runs:
- * the ones this `up` asked for, those the project proves booted (a narrower
- * `-n` must not drop the rest), and the stuck services' own when they have
- * exactly one (they were running before the reload).
- */
-function pendingRemedyUp(args: {
-  readonly rows: ServiceStatus[] | undefined;
-  readonly previous: DerivedProcessMap | undefined;
-  readonly isolated: ReadonlyArray<Pick<ResolvedService, "name" | "namespace">>;
-  readonly requested: ReadonlyArray<string>;
-  readonly stuck: StuckReload;
-}): string {
-  const proven =
-    args.previous !== undefined && args.rows !== undefined
-      ? provenNamespaces(args.previous, args.rows)
-      : [];
-  const stuckOwn = args.isolated
-    .filter((s) => args.stuck.services.includes(s.name))
-    .map((s) => serviceNamespaces(s))
-    .flatMap((ns) => (ns.length === 1 ? ns : []));
-  const namespaces = [...new Set([...args.requested, ...proven, ...stuckOwn])].sort();
-  return `devtrees down && ${formatUpCommand(args.isolated, namespaces)}`;
-}
-
-/**
- * Why a command refuses while a hot-reload is pending (#191). A restart (#222): the update is
- * waiting on the old run, and a run started now is one it does not know
- * about, so it would wait on it forever.
- */
-const PENDING_RELOAD_CONSEQUENCE: Readonly<Record<"up" | NamedServiceCommand, string>> = {
-  up:
-    "Reloading again now would make process-compose start a second, untracked copy, " +
-    "so nothing was reloaded and the instance is unchanged.",
-  restart:
-    "The update is still waiting on the old run, and a run restarted now would be one it " +
-    "does not know about and would wait on forever, so nothing was restarted and the " +
-    "instance is unchanged.",
-};
-
-function reloadPendingError(
-  worktreeId: string,
-  stuck: StuckReload,
-  rebootCommand: string,
-  command: "up" | NamedServiceCommand = "up",
-  retry = "devtrees up",
-): ConfigDriftError {
-  const names = stuck.services.map((s) => `'${s}'`).join(", ");
-  const pids = stuck.pids.join(" ");
-  const [waitingOn, remedy] =
-    stuck.pids.length > 0
-      ? [
-          `its old process (pid ${stuck.pids.join(", ")}) has not exited`,
-          `Kill the old process (\`kill ${pids}\`), then run \`${retry}\` again.`,
-        ]
-      : [
-          `its old process has exited, but process-compose has not brought it back yet`,
-          `Wait a moment for process-compose to start the new one, then run ` +
-            `\`${retry}\` again. If this persists, run \`${rebootCommand}\`.`,
-        ];
-  const consequence = PENDING_RELOAD_CONSEQUENCE[command];
-  return new ConfigDriftError(
-    `devtrees ${command}: a previous hot-reload of '${worktreeId}' is still pending for ` +
-      `${names}: ${waitingOn}. ${consequence} ${remedy}`,
-    { reason: "reload_pending", services: stuck.services, pids: stuck.pids },
-  );
-}
 
 /**
  * Verify an already-running worktree instance against what this `up` asked
@@ -4017,7 +3759,8 @@ function reloadPendingError(
 async function verifyRunning(args: {
   readonly stack: ResolvedStack;
   readonly anchor: { readonly anchor: string; readonly worktreeId: string };
-  readonly socketPath: string;
+  /** This worktree's instance, opened live by `up` under its lifecycle lock (#259). */
+  readonly own: LiveInstance;
   readonly deps: CommandDeps;
   readonly driver: Driver;
   readonly warn: (message: string) => void;
@@ -4026,25 +3769,25 @@ async function verifyRunning(args: {
   readonly droppedNamespaceEdges: ReadonlyArray<DroppedNamespaceEdge>;
   readonly restarted: string[];
 }> {
-  const { stack, anchor, socketPath, deps, driver } = args;
+  const { stack, own, deps, driver } = args;
+  const { socketPath } = own;
   const timeoutMs = deps.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS;
 
   // The boot-time selection only exists in the live project, so `up` needs
   // one successful read before it can say anything; a read that keeps
   // failing is HEALTH_TIMEOUT, never a success over an unknown selection.
-  const rows = await readStatusesWithin(
-    { getServiceStatuses: statusReader(driver) },
-    socketPath,
-    timeoutMs,
-    { notify: args.warn, probe: probeOf(deps) },
-  );
-  const selection = planRunningInstance(stack, anchor.worktreeId, rows, deps.namespaces);
+  const rows = await own.rows(timeoutMs, { notify: args.warn });
+  const selection = own.planUp(stack, rows, deps.namespaces);
   const nsEdges = selection.droppedNamespaceEdges;
   warnDroppedNamespaceEdges(nsEdges, args.warn);
 
   const remedy = `devtrees down && ${formatUpCommand(stack.services, selection.namespaces)}`;
   const { restarted, firstRead } = await restartDeadServices({
-    ...args,
+    stack,
+    anchor: args.anchor,
+    deps,
+    driver,
+    warn: args.warn,
     rows,
     names: selection.services.map((s) => s.name),
     remedy,
@@ -4059,46 +3802,6 @@ async function verifyRunning(args: {
     rows: lastRows,
     droppedNamespaceEdges: nsEdges,
     restarted: restarted.map((r) => r.name),
-  };
-}
-
-/**
- * What `up` does to a running instance, decided from one `process list` read
- * (ADR-0008). Pure: the real `up` (`verifyRunning`) and `up --dry-run`
- * (`previewRunning`, #210) both decide through it, so the preview cannot
- * drift from the command it previews.
- *
- *  - **Selection.** A bare `up` targets the namespaces whose declared
- *    services are all present (the boot-time selection); `-n` is exact, and a
- *    requested namespace whose services are absent throws
- *    `NAMESPACE_NOT_RUNNING` (#170).
- *  - **Dropped edges** (#179) against that effective selection. A target
- *    counts as kept when it is in the project, so a narrower `-n` than the
- *    boot selection does not report edges to services still running.
- *  - **Dead** selected isolated services, in `depends_on` order: the ones
- *    `up` would restart (#178), given the same read.
- */
-function planRunningInstance(
-  stack: ResolvedStack,
-  worktreeId: string,
-  rows: ReadonlyArray<ServiceStatus>,
-  requested: ReadonlyArray<string> | undefined,
-): {
-  readonly namespaces: ReadonlyArray<string>;
-  readonly services: ReadonlyArray<ResolvedService>;
-  readonly droppedNamespaceEdges: ReadonlyArray<DroppedNamespaceEdge>;
-  readonly dead: string[];
-  readonly shared: ReadonlyArray<ResolvedService>;
-} {
-  const selection = selectRunningUp(stack, worktreeId, rows, requested);
-  const names = selection.isolated.map((s) => s.name);
-  const dead = findDeadServices(rows, names).map((d) => d.name);
-  return {
-    namespaces: selection.namespaces,
-    services: selection.isolated,
-    droppedNamespaceEdges: selection.droppedNamespaceEdges,
-    dead: dependencyOrder(stack.services, dead),
-    shared: selection.shared,
   };
 }
 
@@ -4125,7 +3828,6 @@ async function restartDeadServices(args: {
   readonly anchor: { readonly anchor: string; readonly worktreeId: string };
   readonly rows: ServiceStatus[];
   readonly names: ReadonlyArray<string>;
-  readonly socketPath: string;
   readonly deps: CommandDeps;
   readonly driver: Driver;
   readonly remedy: string;
@@ -4136,26 +3838,22 @@ async function restartDeadServices(args: {
   }
   const { lifecycleLock } = resolveLifecycleSeams(args.deps);
   return lifecycleLock(args.anchor.anchor, args.anchor.worktreeId, async () => {
-    // Unknown liveness (#186) fails INSTANCE_UNRESPONSIVE: it is neither
-    // "gone" (INSTANCE_NOT_FOUND) nor safe to `process start` against.
-    const live = await socketIsLive(args.socketPath, resolveProbe(args.deps), {
-      command: "up",
-      instance: args.anchor.worktreeId,
-    });
-    if (!live) {
+    // Re-opened under the lock: unknown liveness (#186) fails
+    // INSTANCE_UNRESPONSIVE, since it is neither "gone" (INSTANCE_NOT_FOUND)
+    // nor safe to `process start` against.
+    const own = await openOwnInstance(args.deps, args.anchor, { command: "up" }, {}, args.driver);
+    if (own === undefined) {
       throw new InstanceGoneError({ worktree_id: args.anchor.worktreeId });
     }
-    const fresh = await readStatusesWithin(
-      { getServiceStatuses: statusReader(args.driver) },
-      args.socketPath,
+    const fresh = await own.rows(
       Math.min(args.deps.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS, RESTART_READ_TIMEOUT_MS),
-      { notify: args.warn },
+      { notify: args.warn, probe: false },
     );
-    const dead = findDeadServices(fresh, args.names).map((d) => d.name);
-    const restarted = await startServices({
-      ...args,
+    const restarted = await own.restartDead({
       rows: fresh,
-      names: dependencyOrder(args.stack.services, dead),
+      names: args.names,
+      order: args.stack.services,
+      remedyFor: () => args.remedy,
     });
     return { restarted, firstRead: fresh };
   });
@@ -4163,44 +3861,6 @@ async function restartDeadServices(args: {
 
 /** Budget for the re-read `restartDeadServices` makes under the lock. */
 const RESTART_READ_TIMEOUT_MS = READ_TIMEOUT_MS;
-
-/**
- * Start `names` over the instance's control socket, in the order given (the
- * caller orders them by `depends_on`: `process start` ignores it). Every
- * service is attempted even if an earlier one is refused; any refusal then
- * fails with `SERVICE_START_FAILED` naming each refused service. A service
- * process-compose reports as already running was started by someone else
- * (another `up`, its restart policy), so it is not in the result. Nothing is
- * stopped.
- */
-async function startServices(args: {
-  readonly anchor: { readonly worktreeId: string };
-  readonly rows: ReadonlyArray<ServiceStatus>;
-  readonly names: ReadonlyArray<string>;
-  readonly socketPath: string;
-  readonly driver: Driver;
-  readonly remedy: string;
-}): Promise<RestartedService[]> {
-  const { restarted, failed } = await startInOrder(args);
-  if (failed.length > 0) {
-    throw serviceStartFailedError(args.anchor.worktreeId, failed, args.remedy);
-  }
-  return restarted;
-}
-
-function serviceStartFailedError(
-  worktreeId: string,
-  failed: ReadonlyArray<{ readonly name: string; readonly message: string }>,
-  remedy: string,
-): ServiceStartFailedError {
-  const reasons = failed.map((f) => `${f.name} (${f.message})`).join(", ");
-  return new ServiceStartFailedError(
-    `devtrees up: could not restart dead service(s) in '${worktreeId}': ${reasons}. ` +
-      `process-compose refused the start request. Run \`${remedy}\` to restart the whole ` +
-      `stack. Nothing was stopped; the worktree instance is still running.`,
-    { worktree_id: worktreeId, services: failed, remedy },
-  );
-}
 
 /** One stderr line per `depends_on` edge the selection drops (ADR-0008, #179). */
 function warnDroppedNamespaceEdges(
@@ -4387,6 +4047,32 @@ function sharedInstanceOf(
       lifecycleWaitMs: deps.lifecycleWaitMs,
     })
   );
+}
+
+/**
+ * Open this worktree's instance through the live instance handle (#259):
+ * `undefined` when it is not running, `INSTANCE_UNRESPONSIVE` when its
+ * liveness stays unknown.
+ */
+async function openOwnInstance(
+  deps: CommandDeps,
+  anchor: { readonly anchor: string; readonly worktreeId: string },
+  context: OpenContext,
+  options: OpenOptions = {},
+  driver: Driver = driverOf(deps),
+): Promise<LiveInstance | undefined> {
+  return await openWorktreeInstance(
+    anchor.anchor,
+    anchor.worktreeId,
+    liveSeams(deps, driver),
+    context,
+    options,
+  );
+}
+
+/** The live instance handle's seams over this command's (#259). */
+function liveSeams(deps: CommandDeps, driver: Driver = driverOf(deps)): LiveInstanceSeams {
+  return { driver, liveness: resolveProbe(deps), probeSocket: probeOf(deps) };
 }
 
 /** The process-compose Driver a command talks to: the injected one, else the real one. */
