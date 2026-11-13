@@ -11,7 +11,8 @@
   // Only consider production source for dead-code/health by default; the audit
   // step scopes to changed files vs the base branch on PRs.
   "entry": ["src/cli.ts"],
-  "ignorePatterns": ["dist/**", "node_modules/**", "**/*.d.ts"],
+  // docs/** holds the README demo (run by vhs, not imported from src).
+  "ignorePatterns": ["dist/**", "node_modules/**", "**/*.d.ts", "docs/**"],
 
   "duplicates": {
     // Duplication percentage above which `fallow dupes --threshold` fails CI.

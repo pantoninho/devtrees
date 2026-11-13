@@ -8,8 +8,8 @@
  *   - `devtrees init --agents` writes `ONBOARDING_BLOCK` into the consuming
  *     repo's `AGENTS.md` / `CLAUDE.md`, fenced by the markers below so re-runs
  *     replace it in place rather than appending.
- *   - the README "Using devtrees from a coding agent" section quotes this exact
- *     text inside a fenced code block; `onboarding.test.ts` pins README↔constant
+ *   - docs/coding-agents.md ("Using devtrees from a coding agent") quotes this
+ *     exact text inside a fenced code block; `onboarding.test.ts` pins doc↔constant
  *     agreement so editing one without the other fails CI.
  *
  * The block is agent-agnostic — plain instructions about the devtrees CLI, valid
@@ -28,9 +28,8 @@ export const MARKER_START = "<!-- devtrees:start -->";
 export const MARKER_END = "<!-- devtrees:end -->";
 
 /**
- * The canonical onboarding text. Quoted verbatim by the README's
- * "Using devtrees from a coding agent" section (pinned by `onboarding.test.ts`)
- * and written between {@link MARKER_START}/{@link MARKER_END} by
+ * The canonical onboarding text. Quoted verbatim by docs/coding-agents.md
+ * (pinned by `onboarding.test.ts`) and written between {@link MARKER_START}/{@link MARKER_END} by
  * `devtrees init --agents`.
  */
 export const ONBOARDING_BLOCK = `## Running the stack with devtrees
@@ -202,7 +201,7 @@ Branch on \`error.code\`:
 | \`CONFIG_INVALID\` / \`INVALID_ARGS\` | The config or your arguments are malformed. Fix the input; don't retry blindly.        |
 
 For the full error enum and the per-command subset each can emit, run
-\`devtrees <cmd> --help\` or see devtrees' README.
+\`devtrees <cmd> --help\` or see [devtrees' error codes](https://github.com/pantoninho/devtrees/blob/main/docs/reference.md#error-codes).
 `;
 
 /**

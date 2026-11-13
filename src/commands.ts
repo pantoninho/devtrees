@@ -5769,9 +5769,9 @@ export interface InitResult {
  * untouched.
  *
  * The block text comes from `ONBOARDING_BLOCK` (src/onboarding.ts), the single
- * source of truth the README also quotes — so the generated file and the README
- * cannot drift (pinned by `onboarding.test.ts`). Pure I/O: no anchor, no lock,
- * no spawn.
+ * source of truth docs/coding-agents.md also quotes — so the generated file
+ * and that doc cannot drift (pinned by `onboarding.test.ts`). Pure I/O: no
+ * anchor, no lock, no spawn.
  */
 export async function runInit(deps: InitDeps = {}): Promise<InitResult> {
   const cwd = deps.cwd ?? process.cwd();

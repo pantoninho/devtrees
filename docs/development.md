@@ -1,0 +1,118 @@
+# Development
+
+devtrees is built with [Vite+](https://viteplus.dev/) (the `vp` CLI), per
+[ADR-0004](adr/0004-nodejs-typescript-with-vite-plus.md).
+
+```bash
+npm install      # install dependencies
+npm test         # run the Vitest suite
+npm run build    # bundle the CLI to dist/cli.mjs
+npm run check    # format, lint, and type-check
+```
+
+Or drive Vite+ directly with the `vp` CLI (what CI runs):
+
+```bash
+vp install       # install dependencies
+vp check         # format + lint + type-check in one pass
+vp lint          # lint only
+vp fmt --check   # verify formatting without writing
+vp test run      # run the test suite once
+vp run build     # bundle the CLI (runs `vp pack`; `vp build` is the app build)
+```
+
+## Smoke testing against real process-compose
+
+Most tests run against the stub `test/stub-process-compose.mjs`. There's also
+a **real-binary smoke suite** (`src/real-pc.smoke.test.ts`, issue #60) that
+drives the built `dist/cli.mjs` against the real `process-compose` binary —
+catching the kind of regressions only the real binary surfaces (probe
+convergence timing, OS `EADDRINUSE`, hot-reload behaviour). It is gated off
+by default so a local `vp test run` is unaffected.
+
+Prerequisites:
+
+- [`process-compose`](https://github.com/F1bonacc1/process-compose) on `PATH`
+  v1.122.0 or newer (run `process-compose version` to confirm). The CI workflow installs a
+  pinned release; see [`.github/workflows/smoke-real-pc.yml`](../.github/workflows/smoke-real-pc.yml).
+
+Run it locally:
+
+```bash
+vp run build                            # the smoke spawns dist/cli.mjs
+DEVTREES_REAL_PC_E2E=1 vp test run real-pc.smoke
+```
+
+When `DEVTREES_REAL_PC_E2E` is unset or `process-compose` is missing, the
+suite skips with a clear marker line.
+
+Golden envelopes live under [`test/fixtures/agent-surface/`](../test/fixtures/agent-surface/).
+The test normalises allocation-dependent fields (port numbers, `block_base`,
+worktree ids) before comparing — see `normaliseEnvelope` in the test file
+for the explicit list. If you intentionally change a `--json` envelope shape,
+update the fixture in the same PR so the smoke catches the change at review
+time.
+
+In CI the smoke runs:
+
+- On PRs touching `src/{commands,driver,deriver,stack,output,allocator,instances}.ts`,
+  the smoke test file itself, or the fixtures. Unrelated PRs skip it.
+- Nightly at 06:00 UTC, so process-compose-side regressions surface within a
+  day even on quiet weeks.
+
+## CI/CD
+
+CI runs on every push to `main` and on every pull request via
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml), in two parts.
+
+### 1. Vite+ pipeline
+
+The [`voidzero-dev/setup-vp`](https://viteplus.dev/guide/ci) action installs
+Vite+, Node 22, and the package manager with dependency caching in a single
+step (replacing `setup-node` + manual cache steps). It then runs each stage of
+the Vite+ pipeline as its own step so a failure points at exactly which gate
+broke: `vp install` → `vp check` (format + lint + **type-check**) → `vp lint` →
+`vp fmt --check` → `vp test run` → `vp run build` (the project's `vp pack`
+library build; plain `vp build` is the frontend-app build and doesn't apply
+to a CLI).
+
+Type-checking is wired into `vp check` via `lint.options.typeCheck` in
+[`vite.config.ts`](../vite.config.ts), so the check stage genuinely fails on type
+errors rather than silently skipping them.
+
+Run the same checks locally with `vp check` and `vp test` (see the top of
+this page).
+
+### 2. fallow code-quality gate
+
+On pull requests, [fallow](https://docs.fallow.tools/) runs as a code-quality
+gate covering dead code, duplication, circular dependencies, and a complexity
+**health** score. It gates on **regressions**, not absolute purity:
+
+- `fallow audit` compares the PR's changed files against committed baselines
+  ([`fallow-baselines/*.json`](../fallow-baselines)) and fails on new issues with
+  `--fail-on-regression --tolerance 2%`.
+- `fallow health --min-score 80` enforces a health-score floor.
+- `fallow dupes --threshold 10` enforces a duplication ceiling (percent).
+
+Results are surfaced on the PR as a markdown comment and in the job summary.
+
+**All thresholds are starting points and tunable.** The tolerance,
+health-score floor, and duplication threshold live in
+[`.fallowrc.jsonc`](../.fallowrc.jsonc) and the workflow; tighten them as the
+codebase matures. Regenerate the baselines on `main` when you intentionally
+pay down or accept debt:
+
+```bash
+npx fallow dead-code --save-baseline fallow-baselines/dead-code.json
+npx fallow health    --save-baseline fallow-baselines/health.json
+npx fallow dupes     --save-baseline fallow-baselines/dupes.json
+```
+
+Run fallow locally before pushing:
+
+```bash
+npx fallow audit            # dead code + dupes + health on changed files
+npx fallow health           # full-tree health score
+npx fallow dupes            # full-tree duplication report
+```

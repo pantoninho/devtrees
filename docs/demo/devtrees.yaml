@@ -1,0 +1,13 @@
+# The stack recorded in docs/demo.gif. `db` is a stand-in for a database every
+# worktree shares; `web` runs once per worktree on its own port.
+# Shared services run from the git common dir, not a worktree, so `db` must not
+# depend on files in the checkout.
+services:
+  db:
+    tier: shared
+    ports: [DB_PORT]
+    command: node -e "require('node:http').createServer((_, res) => res.end('db')).listen(process.env.DB_PORT)"
+  web:
+    tier: isolated
+    ports: [WEB_PORT]
+    command: node server.mjs
