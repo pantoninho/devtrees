@@ -297,59 +297,67 @@ if (cmd === "up") {
   // a child can become observable before discovery can find this instance via
   // its socket on disk, and `runLs` races the bind.
   mkdirSync(dirname(socketPath), { recursive: true });
+  /** JSON answer from the control socket. */
+  const answer = (res, status, body = {}) => {
+    res.writeHead(status, { "content-type": "application/json" });
+    res.end(JSON.stringify(body));
+  };
+  // Hot-reload: persist the re-read config alongside the socket so a
+  // follow-up `process list` reflects the new service set.
+  const reload = () => {
+    const reread = readFileSync(configPath, "utf8");
+    writeFileSync(`${socketPath}.config`, reread);
+    // A process the reload removed is forgotten, its stopped state and its
+    // last run with it (#239): re-added later, it starts as a new process.
+    try {
+      const kept = Object.keys(parseYaml(reread)?.processes ?? {});
+      for (const name of Object.keys(procs)) if (!kept.includes(name)) delete procs[name];
+      writeProcs();
+      const stopped = JSON.parse(readFileSync(`${socketPath}.stopped`, "utf8"));
+      writeFileSync(
+        `${socketPath}.stopped`,
+        JSON.stringify(stopped.filter((n) => kept.includes(n))),
+      );
+    } catch {
+      // nothing stopped
+    }
+  };
+  /** The process's definition in the current (possibly reloaded) config. */
+  const definition = (name) => {
+    try {
+      return parseYaml(readFileSync(`${socketPath}.config`, "utf8"))?.processes?.[name];
+    } catch {
+      return config.processes?.[name];
+    }
+  };
+  // `process stop` / `process start` (#265): the client asks the server,
+  // which owns the processes. A stop SIGTERMs the run's process group; a
+  // start spawns a new run, unless the current run is still alive (or the
+  // process is skipped). Resolves with the HTTP status to answer.
+  const act = (verb, name) => {
+    if (verb === "stop") {
+      if (alive(name)) killChild(procs[name].pid);
+      return 200;
+    }
+    if (alive(name) || skipped.has(name)) return 200;
+    const proc = definition(name);
+    if (proc === undefined) return 400;
+    spawnProc(name, proc);
+    writeFileSync(`${socketPath}.pids`, JSON.stringify(pids));
+    writeProcs();
+    return 200;
+  };
   const server = createServer((req, res) => {
     if (req.method === "POST" && req.url === "/project/configuration") {
-      // Hot-reload: persist the re-read config alongside the socket so a
-      // follow-up `process list` reflects the new service set.
-      const reread = readFileSync(configPath, "utf8");
-      writeFileSync(`${socketPath}.config`, reread);
-      // A process the reload removed is forgotten, its stopped state and its
-      // last run with it (#239): re-added later, it starts as a new process.
-      try {
-        const kept = Object.keys(parseYaml(reread)?.processes ?? {});
-        for (const name of Object.keys(procs)) if (!kept.includes(name)) delete procs[name];
-        writeProcs();
-        const stopped = JSON.parse(readFileSync(`${socketPath}.stopped`, "utf8"));
-        writeFileSync(
-          `${socketPath}.stopped`,
-          JSON.stringify(stopped.filter((n) => kept.includes(n))),
-        );
-      } catch {
-        // nothing stopped
-      }
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end("{}");
+      reload();
+      answer(res, 200);
       return;
     }
-    // `process stop` / `process start` (#265): the client asks the server,
-    // which owns the processes. A stop SIGTERMs the run's process group; a
-    // start spawns a new run from the current (possibly reloaded) config,
-    // unless the current run is still alive.
     const action = /^\/process\/(stop|start)\/(.+)$/.exec(req.url ?? "");
     if (req.method === "POST" && action !== null) {
-      const verb = action[1];
       const name = decodeURIComponent(action[2]);
-      if (verb === "stop") {
-        if (alive(name)) killChild(procs[name].pid);
-      } else if (!alive(name) && !skipped.has(name)) {
-        let current = config;
-        try {
-          current = parseYaml(readFileSync(`${socketPath}.config`, "utf8")) ?? config;
-        } catch {
-          // fall back to the config `up` read
-        }
-        const proc = current?.processes?.[name];
-        if (proc === undefined) {
-          res.writeHead(400, { "content-type": "application/json" });
-          res.end(JSON.stringify({ error: `no such process: ${name}` }));
-          return;
-        }
-        spawnProc(name, proc);
-        writeFileSync(`${socketPath}.pids`, JSON.stringify(pids));
-        writeProcs();
-      }
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end("{}");
+      const status = act(action[1], name);
+      answer(res, status, status === 200 ? {} : { error: `no such process: ${name}` });
       return;
     }
     res.writeHead(404);
@@ -527,18 +535,25 @@ if (cmd === "up") {
       });
       const run = runs[name];
       if (skipped.has(name)) return { ...stopped(1, 0), status: "Skipped" };
-      if (stoppedNames.has(name)) {
-        if (run === undefined) return stopped(-1, 1000);
-        if (run.exitCode === undefined) {
-          return { ...stopped(-1, run.pid), status: "Terminating", is_running: true };
-        }
-        return stopped(-1, run.pid);
-      }
-      if (started.has(name) && diesAgain.has(name)) return stopped(1, 2000);
-      if (!started.has(name) && deadNames.has(name)) return stopped(-1, 1000);
-      if (!started.has(name) && doneNames.has(name)) return stopped(0, 1000);
-      if (run?.exitCode !== undefined) return stopped(run.exitCode, run.pid);
+      if (stoppedNames.has(name)) return stoppedRun(run, stopped);
+      const knob = knobRow(name, stopped);
+      if (knob !== undefined) return knob;
+      return run?.exitCode === undefined ? undefined : stopped(run.exitCode, run.pid);
+    };
+    /** The row the DEAD / DONE / DIES_AGAIN knobs model for `name`, else undefined. */
+    const knobRow = (name, stopped) => {
+      if (started.has(name)) return diesAgain.has(name) ? stopped(1, 2000) : undefined;
+      if (deadNames.has(name)) return stopped(-1, 1000);
+      if (doneNames.has(name)) return stopped(0, 1000);
       return undefined;
+    };
+    /** A stopped process: `Terminating` while its run is still exiting. */
+    const stoppedRun = (run, stopped) => {
+      if (run === undefined) return stopped(-1, 1000);
+      if (run.exitCode === undefined) {
+        return { ...stopped(-1, run.pid), status: "Terminating", is_running: true };
+      }
+      return stopped(-1, run.pid);
     };
     const procs = Object.entries(config.processes ?? {})
       .filter(([, proc]) => selectedByNamespace(proc, namespaces))
