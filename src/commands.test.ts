@@ -5819,6 +5819,26 @@ describe("liveness unknown — retry, then fail without touching the socket (#18
     );
   }
 
+  it("up: an unknown worktree socket fails INSTANCE_UNRESPONSIVE and starts no fresh instance", async () => {
+    const fx = await staged(async () => "unknown");
+    const err = await rejection(runUp(fx.deps));
+    expect(err?.code).toBe("INSTANCE_UNRESPONSIVE");
+    expect(err?.details).toMatchObject({ instance: fx.id, socket_path: fx.wtSocket });
+    // No fresh start beside a possibly-live instance (it would collide on its ports).
+    expect(requestsOf(fx.pc, "up")).toHaveLength(1);
+    expect(fx.sent("up")).toEqual([]);
+    expect(existsSync(fx.wtSocket)).toBe(true);
+  });
+
+  it("up --dry-run: an unknown worktree socket fails INSTANCE_UNRESPONSIVE instead of previewing a fresh start", async () => {
+    const fx = await staged(async () => "unknown");
+    const err = await rejection(runUpDryRun(fx.deps));
+    expect(err?.code).toBe("INSTANCE_UNRESPONSIVE");
+    expect(err?.details).toMatchObject({ instance: fx.id, socket_path: fx.wtSocket });
+    expect(fx.sent("up")).toEqual([]);
+    expect(existsSync(fx.wtSocket)).toBe(true);
+  });
+
   it("down: an unknown socket fails INSTANCE_UNRESPONSIVE — never 'nothing running', never the dead-supervisor reap", async () => {
     const fx = await staged(async () => "unknown");
     const err = await rejection(runDown(fx.deps));

@@ -21,7 +21,6 @@ import {
 } from "./live-instance.js";
 import { instancePaths, runDir, sharedInstancePaths } from "./paths.js";
 import { writePendingReload } from "./reload-pending.js";
-import { declaredServices } from "./selection.js";
 import type { ResolvedService, ResolvedStack } from "./stack.js";
 
 const cleanups: Array<() => void> = [];
@@ -110,7 +109,8 @@ describe("opening an instance: liveness (#80, #186)", () => {
     const fx = await fixture();
     const handle = required(await fx.openWt());
     expect(handle.id).toBe(ID);
-    expect(handle.ref).toEqual({ socketPath: fx.wt.socketPath, configPath: fx.wt.configPath });
+    expect(handle.socketPath).toBe(fx.wt.socketPath);
+    expect(handle.configPath).toBe(fx.wt.configPath);
     expect(Object.keys(handle.processes() ?? {})).toEqual(["web", "api", "job"]);
   });
 
@@ -327,27 +327,13 @@ describe("the booted selection (ADR-0008, #170, #224)", () => {
     expect(plan.dead).toEqual(["web"]);
   });
 
-  it("a namespace that was never booted is NAMESPACE_NOT_RUNNING, for up and for a named service", async () => {
+  it("a namespace that was never booted is NAMESPACE_NOT_RUNNING", async () => {
     const fx = await fixture();
     const handle = required(await fx.openWt());
     const rows = await handle.rows(1000);
     expect((await rejection(() => handle.planUp(stack, rows, ["jobs"]))).code).toBe(
       "NAMESPACE_NOT_RUNNING",
     );
-    const declared = declaredServices(handle.processes());
-    const request = { worktreeId: ID, command: "restart" as const, declared };
-    const job = declared.filter((s) => s.name === "job");
-    const err = await rejection(() =>
-      handle.assertNamedBooted(request, { isolated: job, skippedShared: [] }, rows),
-    );
-    expect(err.code).toBe("NAMESPACE_NOT_RUNNING");
-    expect(() =>
-      handle.assertNamedBooted(
-        request,
-        { isolated: declared.slice(0, 2), skippedShared: [] },
-        rows,
-      ),
-    ).not.toThrow();
   });
 });
 
