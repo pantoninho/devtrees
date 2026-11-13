@@ -13,6 +13,7 @@ import { stateDir } from "./paths.js";
 import {
   assertNotLastRunning,
   assertNotPending,
+  assertNotSkipped,
   clearLegacyStopMarker,
   partitionRunning,
   stopTimeoutMs,
@@ -81,6 +82,89 @@ describe("partitionRunning / assertNotPending (B3)", () => {
         "`devtrees restart api db`.",
     });
     expect(() => assertNotPending([], () => [], "login")).not.toThrow();
+  });
+});
+
+describe("assertNotSkipped (#263)", () => {
+  /** `web` on `api`; `app` on `web`; `docs` on nothing. */
+  const deps: Record<string, string[]> = { web: ["api"], app: ["web"], docs: [] };
+  const dependsOn = (s: string) => deps[s] ?? [];
+
+  it("refuses a Skipped service whose dependency is still dead, naming the dependency", () => {
+    const rows = [row("api", "Completed", 3, false), row("web", "Skipped", 1, false)];
+    const err = thrown(() => assertNotSkipped(rows, ["web"], dependsOn, "login"));
+    expect(err.code).toBe("SERVICE_SKIPPED");
+    const remedy =
+      "Restart api first, and web after it: `devtrees restart api web`. If api fails " +
+      "again, fix it first (`devtrees logs api`).";
+    expect(err.message).toBe(
+      "devtrees restart: web was skipped because a dependency failed, and api (Completed, " +
+        "exit 3) is still failed in 'login', so a start would leave it skipped. Nothing was " +
+        `touched. ${remedy}`,
+    );
+    expect(err.details).toEqual({
+      services: ["web"],
+      failed_dependencies: [{ name: "api", status: "Completed", exit_code: 3 }],
+      remedy,
+    });
+  });
+
+  it("follows a Skipped dependency to the dead one at the root, and restarts the chain", () => {
+    const rows = [
+      row("api", "Error", 1, false),
+      row("web", "Skipped", 1, false),
+      row("app", "Skipped", 1, false),
+    ];
+    const err = thrown(() => assertNotSkipped(rows, ["app"], dependsOn, "login"));
+    expect(err.code).toBe("SERVICE_SKIPPED");
+    expect(err.details).toMatchObject({
+      services: ["app"],
+      failed_dependencies: [{ name: "api", status: "Error", exit_code: 1 }],
+    });
+    expect(String(err.details?.remedy)).toContain("`devtrees restart api web app`");
+  });
+
+  it("names a Skipped dependency as the root when nothing above it is dead", () => {
+    const rows = [row("api", "Running"), row("web", "Skipped", 1, false), row("app", "Skipped")];
+    const err = thrown(() => assertNotSkipped(rows, ["app"], dependsOn, "login"));
+    expect(err.details).toMatchObject({
+      services: ["app"],
+      failed_dependencies: [{ name: "web", status: "Skipped", exit_code: 1 }],
+    });
+  });
+
+  it("refuses the whole request when any named service is blocked", () => {
+    const rows = [
+      row("api", "Completed", -1, false),
+      row("web", "Skipped", 1, false),
+      row("docs", "Running"),
+    ];
+    const err = thrown(() => assertNotSkipped(rows, ["docs", "web"], dependsOn, "login"));
+    expect(err.code).toBe("SERVICE_SKIPPED");
+    expect(err.details).toMatchObject({ services: ["web"] });
+    expect(String(err.details?.remedy)).toContain("`devtrees restart api docs web`");
+  });
+
+  it("lets a Skipped service through once its dependency recovered, or is restarted before it", () => {
+    const skipped = row("web", "Skipped", 1, false);
+    // The dependency is running again (or a finished one-shot): a plain start works.
+    for (const api of [row("api", "Running"), row("api", "Completed", 0, false)]) {
+      expect(() => assertNotSkipped([api, skipped], ["web"], dependsOn, "login")).not.toThrow();
+    }
+    // The dependency is restarted earlier in the same request, and waited on.
+    const dead = row("api", "Completed", 3, false);
+    expect(() => assertNotSkipped([dead, skipped], ["api", "web"], dependsOn, "login")).not.toThrow();
+    // A Disabled service, and a Skipped one with no dependency row, are never refused.
+    const disabled = row("web", "Disabled", 0, false);
+    expect(() => assertNotSkipped([dead, disabled], ["web"], dependsOn, "login")).not.toThrow();
+    expect(() => assertNotSkipped([skipped], ["web"], dependsOn, "login")).not.toThrow();
+  });
+
+  it("survives a depends_on cycle", () => {
+    const cyclic = (s: string) => (s === "a" ? ["b"] : s === "b" ? ["a"] : []);
+    const rows = [row("a", "Skipped", 1, false), row("b", "Skipped", 1, false)];
+    const err = thrown(() => assertNotSkipped(rows, ["a"], cyclic, "login"));
+    expect(err.code).toBe("SERVICE_SKIPPED");
   });
 });
 

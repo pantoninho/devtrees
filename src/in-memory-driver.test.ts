@@ -81,6 +81,37 @@ describe("in-memory process-compose", () => {
     await expect(pc.driver.getServiceStatuses(sock)).rejects.toThrow();
   });
 
+  it("a Skipped or Disabled process holds no run, refuses a stop, and starts on a start (#263)", async () => {
+    const { pc, sock } = await booted({ api: proc(), web: proc(), docs: proc() });
+    pc.idle(sock, "web", "Skipped");
+    pc.idle(sock, "docs", "Disabled");
+    expect(pc.rows(sock).filter((r) => r.name !== "api")).toEqual([
+      {
+        name: "web",
+        status: "Skipped",
+        health: "unknown",
+        exitCode: 1,
+        namespaces: ["default"],
+        running: false,
+      },
+      {
+        name: "docs",
+        status: "Disabled",
+        health: "unknown",
+        exitCode: 0,
+        namespaces: ["default"],
+        running: false,
+      },
+    ]);
+    expect(await pc.driver.stopProcesses(sock, ["web"])).toEqual({
+      ok: false,
+      message: "Failed to stop process web",
+    });
+    expect(await pc.driver.startProcess(sock, "web")).toEqual({ ok: true, alreadyRunning: false });
+    expect(await pc.driver.startProcess(sock, "docs")).toEqual({ ok: true, alreadyRunning: false });
+    expect(pc.rows(sock).map((r) => r.status)).toEqual(["Running", "Running", "Running"]);
+  });
+
   it("a Pending process or one in its restart backoff keeps the instance up", async () => {
     const { pc, sock } = await booted({ api: proc(), mobile: proc(), worker: proc() });
     pc.hold(sock, "mobile");

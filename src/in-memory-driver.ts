@@ -30,12 +30,14 @@
  *  - `down` stops everything and removes the socket.
  *
  * Not modelled: `depends_on` ordering (a dependent starts with everything
- * else; `hold` puts a process in `Pending`), restart policies (`backoff`
- * puts a process in its restart backoff), and probe timing (a probed process
- * is `Ready` at once; `setReady` changes the verdict).
+ * else; `hold` puts a process in `Pending`, and `idle` puts it in `Skipped`
+ * or `Disabled`, which a `process start` then starts, as the binary does
+ * once a skipped process's dependency has recovered, #263), restart policies
+ * (`backoff` puts a process in its restart backoff), and probe timing (a
+ * probed process is `Ready` at once; `setReady` changes the verdict).
  *
  * Tests drive what happens to processes with the event methods (`exit`,
- * `hold`, `backoff`, `setReady`, `crash`, `freeze`, `refuse`, `log`) and
+ * `hold`, `idle`, `backoff`, `setReady`, `crash`, `freeze`, `refuse`, `log`) and
  * assert on state (`rows`, `isUp`), never on argv.
  */
 
@@ -98,6 +100,12 @@ export interface InMemoryProcessCompose {
   exit(socketPath: string, name: string, exitCode: number): void;
   /** The process waits on its dependencies: `Pending`, no pid. */
   hold(socketPath: string, name: string): void;
+  /**
+   * The process holds no run and waits on nothing: `Skipped` (a dependency
+   * failed: exit 1) or `Disabled` (exit 0), no pid, not running, as
+   * process-compose v1.122.0 reports them (#263).
+   */
+  idle(socketPath: string, name: string, status: "Skipped" | "Disabled"): void;
   /** The process died and waits out its restart backoff: `Restarting`, not running, old pid. */
   backoff(socketPath: string, name: string): void;
   /** The probe verdict of a probed process. */
@@ -453,6 +461,15 @@ export function createInMemoryProcessCompose(
       p.status = "Pending";
       p.pid = 0;
       p.running = false;
+    },
+    idle(socketPath, name, status) {
+      const p = proc(socketPath, name);
+      p.status = status;
+      p.exitCode = status === "Skipped" ? 1 : 0;
+      p.pid = 0;
+      p.running = false;
+      const srv = server(socketPath);
+      if (srv !== undefined) exitIfIdle(srv);
     },
     backoff(socketPath, name) {
       const p = proc(socketPath, name);

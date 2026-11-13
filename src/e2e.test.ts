@@ -1942,31 +1942,39 @@ describe("e2e — restart <service...> (#222, #265)", () => {
     expect(await served(stack.env.WEB_PORT)).toBe("web");
   }, 30_000);
 
-  it("a Skipped service (its dependency failed): today the restart fails HEALTH_TIMEOUT and it stays Skipped", async () => {
-    // TODAY'S BEHAVIOUR, pinned on purpose: #263 changes how restart treats a
-    // Skipped/Disabled service, and this test is expected to change with it.
-    // `Skipped` classifies as active, so restart takes the stop-then-start
-    // path: process-compose refuses the stop (nothing runs), answers the
-    // start, and the service stays Skipped (its dependency still failed), so
-    // the health wait times out. The same as process-compose v1.122.0 does
-    // through the built CLI.
+  it("a Skipped service whose dependency is still dead fails SERVICE_SKIPPED at once, naming the dependency; nothing is touched (#263)", async () => {
+    // web was skipped because api failed, and api is still dead (crashed,
+    // exit 3): a start would leave web Skipped (process-compose v1.122.0
+    // answers it OK and starts nothing), so restart refuses before any stop
+    // or start, instead of spending the whole health wait.
     const stack = await bootRestartStack("dt-rs8-", { skipped: "web" });
     const api = await waitForRun(stack.worktree, "api");
+    await fetch(`http://127.0.0.1:${Number(stack.env.API_PORT)}/crash`).catch(() => {});
+    expect(await waitForReaped([api.pid], 4000)).toEqual([]);
+    expect(
+      await waitForRow(stack.socketPath, "api", (r) => r?.status === "Completed"),
+    ).toMatchObject({ status: "Completed", exit_code: 3 });
     expect(listed(stack.socketPath, "web", skippedEnv("web"))).toMatchObject({
       status: "Skipped",
       is_running: false,
     });
 
-    const deps = { ...stack.restartDeps, waitTimeoutMs: 1500 };
-    const err = await restartError(runRestart(deps as never, ["web"]));
+    const startedAt = Date.now();
+    const err = await restartError(runRestart(stack.restartDeps as never, ["web"]));
 
-    expect(err.code).toBe("HEALTH_TIMEOUT");
+    expect(err.code).toBe("SERVICE_SKIPPED");
+    expect(err.details).toMatchObject({
+      services: ["web"],
+      failed_dependencies: [{ name: "api", status: "Completed", exit_code: 3 }],
+    });
+    expect(String(err.details?.remedy)).toContain("`devtrees restart api web`");
+    expect(Date.now() - startedAt).toBeLessThan(5000);
     expect(listed(stack.socketPath, "web", skippedEnv("web"))).toMatchObject({
       status: "Skipped",
     });
     expect(runOf(stack.worktree, "web")).toBeUndefined();
-    expect(await served(stack.env.WEB_PORT)).toBeUndefined();
+    // api was not started again: its row is still the crashed run.
+    expect(listed(stack.socketPath, "api")).toMatchObject({ status: "Completed", exit_code: 3 });
     expect(runOf(stack.worktree, "api")).toEqual(api);
-    expect(pidAlive(api.pid)).toBe(true);
   }, 30_000);
 });
