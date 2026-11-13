@@ -1076,16 +1076,6 @@ export interface CommandDeps {
    * the full window.
    */
   readonly worktreeSocketTimeoutMs?: number;
-  /**
-   * Read the per-service runtime state for the worktree instance after health
-   * is reached, so `runUp` can publish `services[]` in the issue-#30 state
-   * envelope. Default: shells out to the driver's `getServiceStatuses` (same
-   * primitive `ls --json` uses, issue #29). Injected so tests stub it.
-   */
-  readonly getServiceStatuses?: (
-    socketPath: string,
-    opts?: { readonly timeoutMs?: number },
-  ) => Promise<ServiceStatus[]>;
   /** Is a concrete port free to bind? Default: probes a real TCP bind. */
   readonly isPortFree?: (port: number) => boolean | Promise<boolean>;
   /**
@@ -1964,7 +1954,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
       const wait =
         deps.waitForSharedHealth ??
         createWaitForSharedHealth(
-          { getServiceStatuses: statusReader(deps, driver) },
+          { getServiceStatuses: statusReader(driver) },
           { notify: warn, probe: probeOf(deps) },
         );
       await wait({
@@ -2119,7 +2109,7 @@ async function collectIsolatedServices(
 ): Promise<Service[]> {
   let statuses: ServiceStatus[];
   try {
-    statuses = preRead ?? (await statusReader(deps, driver)(socketPath));
+    statuses = preRead ?? (await statusReader(driver)(socketPath));
   } catch {
     return [];
   }
@@ -2351,7 +2341,7 @@ async function previewRunning(
 ): Promise<RunningPreview> {
   const driver = driverOf(deps);
   const rows = await readStatusesWithin(
-    { getServiceStatuses: statusReader(deps, driver) },
+    { getServiceStatuses: statusReader(driver) },
     socketPath,
     deps.waitTimeoutMs ?? DRY_RUN_READ_TIMEOUT_MS,
     { probe: probeOf(deps) },
@@ -2413,7 +2403,7 @@ async function previewSharedRestarts(
   if (state === undefined) return [];
   const plan = planSharedSelection(selected, state.services);
   if (plan.drifted.length > 0 || plan.portConflicts.length > 0) return [];
-  const rows = await statusReader(deps, driverOf(deps))(socketPath, {
+  const rows = await statusReader(driverOf(deps))(socketPath, {
     timeoutMs: deps.waitTimeoutMs ?? DRY_RUN_READ_TIMEOUT_MS,
   }).catch(() => undefined);
   if (rows === undefined) return [];
@@ -2627,10 +2617,7 @@ async function prepareShared(args: {
       socketTimeoutMs: deps.sharedSocketTimeoutMs,
       warn: args.warn,
       readSharedRows: () =>
-        statusReader(
-          deps,
-          driver,
-        )(sharedInstancePaths(anchor.anchor).socketPath).catch(() => undefined),
+        statusReader(driver)(sharedInstancePaths(anchor.anchor).socketPath).catch(() => undefined),
       remedyFor: sharedRemedyFor(stack, args.namespaces, anchor.anchor),
       stepServices: sharedStepServices(
         stack,
@@ -2682,7 +2669,7 @@ async function waitSharedReady(
   const wait =
     deps.waitForSharedReady ??
     createWaitForSharedReady(
-      { getServiceStatuses: statusReader(deps, driver) },
+      { getServiceStatuses: statusReader(driver) },
       { notify: args.warn, probe: probeOf(deps) },
     );
   await wait({
@@ -2733,7 +2720,7 @@ async function runningSharedNamespaces(args: {
   const { stack, anchor, deps } = args;
   if (deps.namespaces !== undefined && deps.namespaces.length > 0) return deps.namespaces;
   if (!hasNamespacedShared(stack)) return [];
-  const rows = await statusReader(deps, driverOf(deps))(args.socketPath).catch(() => undefined);
+  const rows = await statusReader(driverOf(deps))(args.socketPath).catch(() => undefined);
   if (rows === undefined) return [];
   const readHash = deps.readStoredHash ?? defaultReadStoredHash;
   const { configPath } = instancePaths(anchor.anchor, anchor.worktreeId);
@@ -3885,7 +3872,7 @@ async function readSharedRowsOrFail(
   socketPath: string,
   context: LivenessContext,
 ): Promise<ServiceStatus[]> {
-  const read = statusReader(deps, driverOf(deps));
+  const read = statusReader(driverOf(deps));
   try {
     return await readStatusesWithin({ getServiceStatuses: read }, socketPath, READ_TIMEOUT_MS, {
       probe: probeOf(deps),
@@ -3930,7 +3917,7 @@ async function findWorktreeDependants(
   opts: { readonly readOnly: boolean },
 ): Promise<SharedDependant[]> {
   const discover = deps.discover ?? discoverInstances;
-  const read = statusReader(deps, driverOf(deps));
+  const read = statusReader(driverOf(deps));
   const probe = probeOf(deps);
   const instances = await discover(anchor, {
     getServiceStatuses: (socketPath) =>
@@ -4139,7 +4126,7 @@ async function stopSharedTargets(
   const targets = seen.plan.targets;
   const { running } = partitionRunning(seen.rows, targets);
   if (running.length === 0) return { forceKilled: [], instanceGone: false, stopped: false };
-  const read = statusReader(deps, driver);
+  const read = statusReader(driver);
   const outcome = await boundedStopServices(
     {
       socketPath,
@@ -4620,7 +4607,7 @@ async function restartOne(
   survivors: ReadonlyArray<ServiceProcess>;
 }> {
   const before = target.rows.find((r) => r.name === name);
-  const read = statusReader(deps, driver);
+  const read = statusReader(driver);
   const id = target.anchor.worktreeId;
   const gone = () => isGone(probeOf(deps), target.socketPath);
   const outcome = await boundedRestart(
@@ -4735,7 +4722,7 @@ export async function bareRestartRemedy(deps: CommandDeps = {}): Promise<BareRes
     );
     if (!live) return everyNamespace(declared);
     const rows = await readStatusesWithin(
-      { getServiceStatuses: statusReader(deps, driverOf(deps)) },
+      { getServiceStatuses: statusReader(driverOf(deps)) },
       paths.socketPath,
       RESTART_READ_TIMEOUT_MS,
       { notify: () => {}, probe: probeOf(deps) },
@@ -5911,7 +5898,7 @@ async function resolveNamedServices(
   };
   const selection = selectNamedServices(request);
   const rows = await readStatusesWithin(
-    { getServiceStatuses: statusReader(deps, driverOf(deps)) },
+    { getServiceStatuses: statusReader(driverOf(deps)) },
     paths.socketPath,
     Math.min(deps.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS, READ_TIMEOUT_MS),
     { notify: deps.warn ?? defaultWarn, probe: probeOf(deps) },
@@ -6070,7 +6057,7 @@ async function reconcileRunning(args: {
     : undefined;
   // One bounded read; it doubles as the pre-reload snapshot the marker's old
   // PIDs come from. A failed read is `undefined`, not evidence of anything.
-  const rows = await statusReader(args.deps, args.driver)(paths.socketPath, {
+  const rows = await statusReader(args.driver)(paths.socketPath, {
     timeoutMs: READ_TIMEOUT_MS,
   }).catch(() => undefined);
   const converged = assertNoPendingReload({
@@ -6349,7 +6336,7 @@ async function verifyRunning(args: {
   // one successful read before it can say anything; a read that keeps
   // failing is HEALTH_TIMEOUT, never a success over an unknown selection.
   const rows = await readStatusesWithin(
-    { getServiceStatuses: statusReader(deps, driver) },
+    { getServiceStatuses: statusReader(driver) },
     socketPath,
     timeoutMs,
     { notify: args.warn, probe: probeOf(deps) },
@@ -6460,7 +6447,7 @@ async function restartDeadServices(args: {
       throw new InstanceGoneError({ worktree_id: args.anchor.worktreeId });
     }
     const fresh = await readStatusesWithin(
-      { getServiceStatuses: statusReader(args.deps, args.driver) },
+      { getServiceStatuses: statusReader(args.driver) },
       args.socketPath,
       Math.min(args.deps.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS, RESTART_READ_TIMEOUT_MS),
       { notify: args.warn },
@@ -6683,7 +6670,7 @@ async function waitForSelectedHealth(
     readonly timeoutMs?: number;
   },
 ): Promise<ServiceStatus[] | undefined> {
-  const read = statusReader(deps, driver);
+  const read = statusReader(driver);
   let primed = opts.firstRead;
   // The rows the wait last saw — on success, the poll that passed — so the
   // caller can build its envelope without another process-compose round-trip.
@@ -6728,20 +6715,14 @@ function probeOf(deps: CommandDeps): (socketPath: string) => Promise<InstanceSta
   return deps.probeSocket ?? defaultProbeSocket;
 }
 
-/** The per-service status read: the injected seam, else the driver. */
-function statusReader(
-  deps: CommandDeps,
-  driver: {
-    getServiceStatuses(
-      socketPath: string,
-      opts?: { readonly timeoutMs?: number },
-    ): Promise<ServiceStatus[]>;
-  },
-): (socketPath: string, opts?: { readonly timeoutMs?: number }) => Promise<ServiceStatus[]> {
-  return (
-    deps.getServiceStatuses ??
-    ((socketPath, readOpts) => driver.getServiceStatuses(socketPath, readOpts))
-  );
+/** The per-service status read: always the Driver, the one status seam (#256). */
+function statusReader(driver: {
+  getServiceStatuses(
+    socketPath: string,
+    opts?: { readonly timeoutMs?: number },
+  ): Promise<ServiceStatus[]>;
+}): (socketPath: string, opts?: { readonly timeoutMs?: number }) => Promise<ServiceStatus[]> {
+  return (socketPath, readOpts) => driver.getServiceStatuses(socketPath, readOpts);
 }
 
 /**
