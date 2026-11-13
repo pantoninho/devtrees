@@ -50,14 +50,11 @@ import { deriveSharedConfig, deriveWorktreeConfig, type DerivedConfig } from "./
 import type { RegistrySnapshot } from "./allocator.js";
 import {
   parseServiceStatuses,
-  type ControlRequest,
-  type ControlRequester,
   type Driver,
   type InstanceRef,
   type ReloadResult,
   type LogEvent,
   type ServiceStatus,
-  type SpawnedProcess,
 } from "./driver.js";
 import {
   createInMemoryProcessCompose,
@@ -127,51 +124,6 @@ function tmpAnchor(): { anchor: string; worktreeRoot: string } {
 /** A no-op shared lifecycle lock — wraps the callback without any contention. */
 const passThroughSharedLock: WithSharedLock = (_anchor, fn) => fn();
 
-/** Track every `process-compose up` invocation so tests can assert on shared starts. */
-interface UpInvocation {
-  configPath: string;
-  socketPath: string;
-}
-
-interface StubSpawn {
-  invocations: UpInvocation[];
-  /**
-   * When true, the next stub-spawn marks the socket file as existing so a
-   * subsequent `existsSync(socketPath)` in `ensureSharedStarted` sees the
-   * shared instance as running.
-   */
-  touchSocket: boolean;
-}
-
-/**
- * SpawnedProcess that pretends to be a real `process-compose` child: fires
- * `exit(0)` on the next tick so `driver.down`/`attach` (which await an exit
- * event) resolve cleanly, and ignores `error` listeners.
- */
-function spawnedOk(): SpawnedProcess {
-  const exitHandlers: Array<(code: number | null) => void> = [];
-  queueMicrotask(() => {
-    for (const h of exitHandlers) h(0);
-  });
-  return {
-    on(event: "error" | "exit", cb: (arg: never) => void): void {
-      if (event === "exit") exitHandlers.push(cb as (code: number | null) => void);
-    },
-    unref: () => {},
-  };
-}
-
-/**
- * A stub for process-compose's REST API (the hot-reload goes over it, #194):
- * answers every request with `status`, recording each one in `seen`.
- */
-function reloadAnswering(status: number, seen: ControlRequest[] = []): ControlRequester {
-  return (request) => {
-    seen.push(request);
-    return Promise.resolve({ status, body: status === 200 ? "{}" : "" });
-  };
-}
-
 /** Allocate a temp anchor + worktree-root + registry ref for a multi-worktree test. */
 function multiWorktreeFixture(prefix: string): {
   sharedAnchor: string;
@@ -184,23 +136,6 @@ function multiWorktreeFixture(prefix: string): {
     sharedAnchor: join(root, ".git"),
     wtRoot: join(root, "wt"),
     registryRef: { snapshot: {} as RegistrySnapshot },
-  };
-}
-
-function makeStubSpawner(track: StubSpawn) {
-  return (_binary: string, args: ReadonlyArray<string>, _options: unknown): SpawnedProcess => {
-    const ai = args.indexOf("-f");
-    const si = args.indexOf("-u");
-    if (ai >= 0 && si >= 0 && args[0] === "up") {
-      const configPath = args[ai + 1] ?? "";
-      const socketPath = args[si + 1] ?? "";
-      track.invocations.push({ configPath, socketPath });
-      if (track.touchSocket) {
-        // Mimic process-compose creating the control socket as a liveness marker.
-        writeFileSync(socketPath, "");
-      }
-    }
-    return spawnedOk();
   };
 }
 
@@ -226,11 +161,6 @@ function stubDeps(opts: {
   initialRegistry?: RegistrySnapshot;
   isPortFree?: (port: number) => boolean | Promise<boolean>;
   warn?: (m: string) => void;
-  /**
-   * Tracker for `process-compose up` invocations + a flag to make the stub
-   * spawner touch the socket file (so the shared lazy-start sees it as running).
-   */
-  track?: StubSpawn;
   anchorOverride?: string;
   worktreeRootOverride?: string;
   registryRef?: { snapshot: RegistrySnapshot };
@@ -258,8 +188,6 @@ function stubDeps(opts: {
     if (flag === "--is-bare-repository") return "false";
     throw new Error(`unexpected git invocation: ${args.join(" ")}`);
   };
-
-  const track = opts.track ?? { invocations: [], touchSocket: false };
 
   return {
     expectedWorktreeId,
@@ -299,16 +227,6 @@ function stubDeps(opts: {
     // real post-spawn socket poll (#91) would burn its full timeout in most
     // tests. Tests that care about the socket-wait override this field.
     waitForSocketFile: () => Promise.resolve(),
-    // The version probe (#173) would run through the stub spawner, which
-    // prints nothing; the check itself is covered in its own describe block.
-    assertProcessComposeVersion: () => Promise.resolve(),
-    // Driver that records every spawn but doesn't actually run anything; a
-    // hot-reload (#194) is accepted without touching any socket.
-    driver: {
-      exists: () => Promise.resolve(true),
-      spawner: makeStubSpawner(track),
-      controlRequest: reloadAnswering(200),
-    },
   };
 }
 
@@ -332,17 +250,16 @@ function inMemoryPcDeps(pc: InMemoryProcessCompose) {
   } satisfies CommandDeps;
 }
 
-/** `deps` with its spawner-backed driver swapped for a fresh in-memory process-compose. */
+/** `deps` on a fresh in-memory process-compose. */
 function onInMemoryPc<D extends CommandDeps>(
   deps: D,
   opts: InMemoryProcessComposeOptions = {},
 ): { deps: D; pc: InMemoryProcessCompose } {
   const pc = createInMemoryProcessCompose(opts);
-  const { driver: _spawnerDriver, ...rest } = deps;
   const pcDeps = inMemoryPcDeps(pc);
   return {
     pc,
-    deps: { ...rest, ...pcDeps, stop: { ...pcDeps.stop, ...deps.stop } } as D,
+    deps: { ...deps, ...pcDeps, stop: { ...pcDeps.stop, ...deps.stop } } as D,
   };
 }
 
@@ -361,7 +278,7 @@ const requestsOf = (pc: InMemoryProcessCompose, op: PcRequest["op"]) =>
 
 /**
  * `stubDeps` with process-compose as the in-memory adapter
- * (src/in-memory-driver.ts) instead of an argv-parsing spawner: `up` boots a
+ * (src/in-memory-driver.ts): `up` boots a
  * process table from the derived config, binds the control socket and
  * answers `process list` from that table. Tests make things happen to its
  * processes and assert on its state (`pc.isUp`, `pc.rows`), never on argv.
@@ -381,7 +298,7 @@ type PcDeps = StubbedDeps & {
 };
 
 function pcDeps(
-  opts: Omit<Parameters<typeof stubDeps>[0], "track"> & {
+  opts: Parameters<typeof stubDeps>[0] & {
     pc?: InMemoryProcessCompose;
     /**
      * Runs right after process-compose boots an instance, before `up` sees
@@ -393,11 +310,10 @@ function pcDeps(
 ): PcDeps {
   const pc = opts.pc ?? createInMemoryProcessCompose();
   const { onBoot } = opts;
-  const {
-    driver: _argvDriver,
-    assertProcessComposeVersion: _versionStub,
-    ...base
-  } = stubDeps({ ...opts, probeSocket: opts.probeSocket ?? ((path) => pc.probeSocket(path)) });
+  const base = stubDeps({
+    ...opts,
+    probeSocket: opts.probeSocket ?? ((path) => pc.probeSocket(path)),
+  });
   const anchor = base.git!(["rev-parse", "--git-common-dir"]);
   const onPc = inMemoryPcDeps(pc);
   return {
@@ -6600,7 +6516,7 @@ describe("bounded down — force-kill and DOWN_TIMEOUT (#190)", () => {
   /** A worktree `up` on a stuck in-memory process-compose. */
   async function upStuck(stack: ResolvedStack) {
     const stuck = stuckPc();
-    const { driver: _spawnerDriver, ...base } = stubDeps({ stack });
+    const base = stubDeps({ stack });
     const deps = { ...base, ...stuck.pcDeps };
     await runUp(deps);
     return { ...stuck, deps };
