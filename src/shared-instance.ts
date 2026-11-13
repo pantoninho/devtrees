@@ -104,11 +104,6 @@ export interface SharedInstanceDeps {
   readonly sharedLock: WithSharedLock;
   /** The control-socket liveness probe (#80, #186). */
   readonly liveness: LivenessProbe;
-  /** One `process list` read of an instance. */
-  readonly readStatuses: (
-    socketPath: string,
-    opts?: { readonly timeoutMs?: number },
-  ) => Promise<ServiceStatus[]>;
   /** The control-socket probe the health waits use after a failed read (#205). */
   readonly probeSocket: (socketPath: string) => Promise<InstanceStatus>;
   readonly warn: (message: string) => void;
@@ -350,7 +345,9 @@ async function prepareShared(
       socketTimeoutMs: deps.socketTimeoutMs,
       warn: deps.warn,
       readSharedRows: () =>
-        deps.readStatuses(sharedInstancePaths(anchor).socketPath).catch(() => undefined),
+        deps.driver
+          .getServiceStatuses(sharedInstancePaths(anchor).socketPath)
+          .catch(() => undefined),
       remedyFor: sharedRemedyFor(stack, request.namespaces, anchor),
       stepServices: sharedStepServices(
         stack,
@@ -395,10 +392,7 @@ async function waitSharedReady(
   }
   const wait =
     deps.waitForSharedReady ??
-    createWaitForSharedReady(
-      { getServiceStatuses: deps.readStatuses },
-      { notify: deps.warn, probe: deps.probeSocket },
-    );
+    createWaitForSharedReady(deps.driver, { notify: deps.warn, probe: deps.probeSocket });
   await wait({
     socketPath: paths.socketPath,
     serviceNames: selected.map((s) => s.name),
@@ -433,10 +427,7 @@ async function waitForDependencies(
   deps.warn(formatHealthWaitNotice(names));
   const wait =
     deps.waitForSharedHealth ??
-    createWaitForSharedHealth(
-      { getServiceStatuses: deps.readStatuses },
-      { notify: deps.warn, probe: deps.probeSocket },
-    );
+    createWaitForSharedHealth(deps.driver, { notify: deps.warn, probe: deps.probeSocket });
   await wait({
     anchor: deps.anchor,
     socketPath: sharedInstancePaths(deps.anchor).socketPath,
@@ -469,8 +460,8 @@ async function previewSharedRestarts(
   if (state === undefined) return [];
   const plan = planSharedSelection(selected, state.services);
   if (plan.drifted.length > 0 || plan.portConflicts.length > 0) return [];
-  const rows = await deps
-    .readStatuses(socketPath, { timeoutMs: deps.previewReadTimeoutMs })
+  const rows = await deps.driver
+    .getServiceStatuses(socketPath, { timeoutMs: deps.previewReadTimeoutMs })
     .catch(() => undefined);
   if (rows === undefined) return [];
   const added = new Set(servicesToAdd(selected, plan, state, rows).map((s) => s.name));

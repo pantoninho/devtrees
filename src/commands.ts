@@ -5326,7 +5326,6 @@ function sharedInstanceOf(
       driver,
       sharedLock: deps.withSharedLock ?? defaultWithSharedLock,
       liveness: resolveProbe(deps),
-      readStatuses: statusReader(driver),
       probeSocket: probeOf(deps),
       warn: deps.warn ?? defaultWarn,
       waitTimeoutMs: deps.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS,
