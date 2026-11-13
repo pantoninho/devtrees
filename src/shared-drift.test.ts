@@ -1,20 +1,18 @@
 /**
- * Shared-service selection tests (#236, ADR-0010): which shared services an
- * `up` selects, what a running shared instance must add or reports as
- * drifted, and how a pre-#236 shared state is attributed. Shared port
- * resolution is `shared-ports.test.ts` (#238).
+ * Shared-service drift tests (#236, ADR-0010): what a running shared instance
+ * must add or reports as drifted, and how a pre-#236 shared state is
+ * attributed. Which shared services an `up` selects is `selection.test.ts`;
+ * shared port resolution is `shared-ports.test.ts` (#238).
  */
 
 import { describe, expect, it } from "vite-plus/test";
 import { sharedServiceHash, sharedStackHash } from "./hash.js";
 import {
   UNKNOWN_REVISION,
-  hasNamespacedShared,
   planSharedSelection,
-  selectSharedServices,
   sharedRecords,
   withServiceRecords,
-} from "./shared-selection.js";
+} from "./shared-drift.js";
 import type { ResolvedService, ResolvedStack } from "./stack.js";
 
 function svc(
@@ -39,34 +37,6 @@ const cache = svc("cache", "shared", { ports: ["CACHE_PORT"], namespace: ["cache
 const api = svc("api", "isolated", { ports: ["API_PORT"], namespace: "app" });
 const stack: ResolvedStack = { services: [pg, sb, cache, api] };
 const names = (services: ReadonlyArray<ResolvedService>) => services.map((s) => s.name);
-
-describe("selectSharedServices", () => {
-  it("always selects the shared services with no namespace", () => {
-    expect(names(selectSharedServices(stack, []))).toEqual(["pg"]);
-    expect(names(selectSharedServices(stack, ["app"]))).toEqual(["pg"]);
-  });
-
-  it("selects a namespaced shared service when any of its namespaces is selected", () => {
-    expect(names(selectSharedServices(stack, ["db-shared"]))).toEqual(["pg", "sb", "cache"]);
-    expect(names(selectSharedServices(stack, ["cache"]))).toEqual(["pg", "cache"]);
-  });
-
-  it("selects a selected shared service's shared dependencies, transitively", () => {
-    const a = svc("a", "shared", { namespace: "a", dependsOn: [{ name: "b" }] });
-    const b = svc("b", "shared", { namespace: "b", dependsOn: [{ name: "c" }] });
-    const c = svc("c", "shared", { namespace: "c" });
-    expect(names(selectSharedServices({ services: [c, b, a] }, ["a"]))).toEqual(["c", "b", "a"]);
-  });
-
-  it("never selects isolated services", () => {
-    expect(names(selectSharedServices(stack, ["app"]))).not.toContain("api");
-  });
-
-  it("hasNamespacedShared is false for a stack whose shared services have no namespace", () => {
-    expect(hasNamespacedShared({ services: [pg, api] })).toBe(false);
-    expect(hasNamespacedShared(stack)).toBe(true);
-  });
-});
 
 describe("planSharedSelection", () => {
   it("reports a selected service the instance does not run as missing, and nothing drifted", () => {

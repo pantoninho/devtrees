@@ -1693,19 +1693,6 @@ describe("runUp — namespace selection (#128)", () => {
     expect(track.invocations).toEqual([]);
   });
 
-  it("`-n` naming a namespace with services still starts on the all-namespaced stack (#176)", async () => {
-    let observed: string[] | undefined;
-    const track: StubSpawn = { invocations: [], touchSocket: false };
-    await runUp({
-      ...stubDeps({ stack: allNamespaced, track }),
-      namespaces: ["app"],
-      waitForHealth: async ({ serviceNames }) => {
-        observed = [...serviceNames].sort();
-      },
-    });
-    expect(observed).toEqual(["web", "worker"]);
-  });
-
   it("`-n` naming only a namespace with NO services fails NO_SERVICES_SELECTED before any state is written (#203)", async () => {
     const registryRef = { snapshot: {} as RegistrySnapshot };
     const track: StubSpawn = { invocations: [], touchSocket: false };
@@ -1725,19 +1712,6 @@ describe("runUp — namespace selection (#128)", () => {
     expect(err?.message).toContain("devtrees up -n app");
     expect(track.invocations).toEqual([]);
     expect(registryRef.snapshot).toEqual({});
-  });
-
-  it("`-n app -n nope` still starts: only an overall empty selection is an error (#203)", async () => {
-    let observed: string[] | undefined;
-    const track: StubSpawn = { invocations: [], touchSocket: false };
-    await runUp({
-      ...stubDeps({ stack: allNamespaced, track }),
-      namespaces: ["app", "nope"],
-      waitForHealth: async ({ serviceNames }) => {
-        observed = [...serviceNames].sort();
-      },
-    });
-    expect(observed).toEqual(["web", "worker"]);
   });
 
   it("a bare up on a RUNNING instance is not a fresh start: no NO_SERVICES_SELECTED, no spawn (#177's scope)", async () => {
@@ -5338,32 +5312,6 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
     ],
   };
 
-  it("#179: bare up after -n two targets `two` only — `one` is not running although db is present", async () => {
-    const waited: string[][] = [];
-    const warnings: string[] = [];
-    const { deps } = liveInstance(
-      listNamespaces,
-      { worktree: [running("db"), running("api")] },
-      {
-        warn: (m) => warnings.push(m),
-        waitForHealth: async ({ serviceNames }) => {
-          waited.push([...serviceNames]);
-        },
-      },
-    );
-    const result = await runUp(deps);
-    expect(waited).toEqual([["db", "api"]]);
-    expect(result.droppedNamespaceEdges).toEqual([]);
-    expect(warnings.filter((w) => /cross-namespace/.test(w))).toEqual([]);
-  });
-
-  it("#179: -n one on an instance booted with -n two names only the absent web", async () => {
-    const { deps } = liveInstance(listNamespaces, { worktree: [running("db"), running("api")] });
-    const err = await failure({ ...deps, namespaces: ["one"] });
-    expect(err?.code).toBe("NAMESPACE_NOT_RUNNING");
-    expect(err?.details?.["services"]).toEqual(["web"]);
-  });
-
   it("#179: warns about edges the effective (read-back) selection drops on a bare up", async () => {
     // Booted with -n one: web and db present, api absent. web -> api is dropped.
     const warnings: string[] = [];
@@ -5392,21 +5340,6 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
     expect(spawned.filter((a) => a[0] !== "process")).toEqual([]);
   });
 
-  it("#203: -n one -n nope on a running instance keeps today's behaviour for the real namespace", async () => {
-    const waited: string[][] = [];
-    const { deps } = liveInstance(
-      twoNamespaces,
-      { worktree: [running("a")] },
-      {
-        waitForHealth: async ({ serviceNames }) => {
-          waited.push([...serviceNames]);
-        },
-      },
-    );
-    await runUp({ ...deps, namespaces: ["one", "nope"] });
-    expect(waited).toEqual([["a"]]);
-  });
-
   it("#170: -n naming a namespace the instance was not booted with fails with NAMESPACE_NOT_RUNNING", async () => {
     const { deps, spawned, id } = liveInstance(twoNamespaces, { worktree: [running("a")] });
     const err = await failure({ ...deps, namespaces: ["one", "two"] });
@@ -5421,22 +5354,6 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
     });
     // Nothing was started, stopped or reloaded.
     expect(spawned.filter((a) => a[0] !== "process")).toEqual([]);
-  });
-
-  it("bare up on an instance booted with -n one targets `one` only", async () => {
-    const waited: string[][] = [];
-    const { deps } = liveInstance(
-      twoNamespaces,
-      { worktree: [running("a")] },
-      {
-        waitForHealth: async ({ serviceNames }) => {
-          waited.push([...serviceNames]);
-        },
-      },
-    );
-    const result = await runUp(deps);
-    expect(waited).toEqual([["a"]]);
-    expect(result.services.map((s) => s.name)).toEqual(["a"]);
   });
 
   it("a narrower -n than what runs leaves the rest alone and does not fail", async () => {

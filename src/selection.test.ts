@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vite-plus/test";
 import {
   assertExplicitSelectionNotEmpty,
+  hasNamespacedShared,
+  selectSharedServices,
   assertNamedTargetsBooted,
   bootedNamespaces,
   declaredNamespaces,
@@ -563,6 +565,18 @@ describe("selectNamedServices / assertNamedTargetsBooted (ADR-0009)", () => {
     expect(() => assertNamedTargetsBooted(req, sel, on("app", "api", "web"))).not.toThrow();
   });
 
+  it("a list-valued target the instance did not boot names every namespace it declares", () => {
+    const req = request(["api"]);
+    const sel = selectNamedServices(req);
+    const err = selectionError(() => assertNamedTargetsBooted(req, sel, on("web")));
+    expect(err.details).toEqual({
+      worktree_id: "wt-1",
+      namespaces: ["backend", "mobile"],
+      services: ["api"],
+      remedy: "devtrees down && devtrees up -n default -n backend -n mobile",
+    });
+  });
+
   it("a target the instance did not boot is NAMESPACE_NOT_RUNNING; the remedy keeps the booted namespaces", () => {
     const req = request(["app", "web"]);
     const sel = selectNamedServices(req);
@@ -625,5 +639,74 @@ describe("selectSharedDown (ADR-0012)", () => {
 
   it("with no shared derived config every named namespace is inactive", () => {
     expect(selectSharedDown(undefined, ["a"])).toEqual({ targets: [], inactiveNamespaces: ["a"] });
+  });
+});
+
+// --- the shared closure (moved from shared-selection.test.ts) ---------------
+
+describe("selectSharedServices (#236, ADR-0010)", () => {
+  const pg = service("pg", "shared", { ports: ["PG_PORT"] });
+  const sb = service("sb", "shared", { ports: ["SB_PORT"], namespace: "db-shared" });
+  const cache = service("cache", "shared", {
+    ports: ["CACHE_PORT"],
+    namespace: ["cache", "db-shared"],
+  });
+  const api = service("api", "isolated", { ports: ["API_PORT"], namespace: "app" });
+  const sharedStack: ResolvedStack = { services: [pg, sb, cache, api] };
+  const sharedNames = (services: ReadonlyArray<ResolvedService>) => services.map((s) => s.name);
+
+  it("always selects the shared services with no namespace", () => {
+    expect(sharedNames(selectSharedServices(sharedStack, []))).toEqual(["pg"]);
+    expect(sharedNames(selectSharedServices(sharedStack, ["app"]))).toEqual(["pg"]);
+  });
+
+  it("selects a namespaced shared service when any of its namespaces is selected", () => {
+    expect(sharedNames(selectSharedServices(sharedStack, ["db-shared"]))).toEqual([
+      "pg",
+      "sb",
+      "cache",
+    ]);
+    expect(sharedNames(selectSharedServices(sharedStack, ["cache"]))).toEqual(["pg", "cache"]);
+  });
+
+  it("selects a selected shared service's shared dependencies, transitively", () => {
+    const a = service("a", "shared", { namespace: "a", dependsOn: [{ name: "b" }] });
+    const b = service("b", "shared", { namespace: "b", dependsOn: [{ name: "c" }] });
+    const c = service("c", "shared", { namespace: "c" });
+    expect(sharedNames(selectSharedServices({ services: [c, b, a] }, ["a"]))).toEqual([
+      "c",
+      "b",
+      "a",
+    ]);
+  });
+
+  it("never selects isolated services", () => {
+    expect(sharedNames(selectSharedServices(sharedStack, ["app"]))).not.toContain("api");
+  });
+
+  it("hasNamespacedShared is false for a stack whose shared services have no namespace", () => {
+    expect(hasNamespacedShared({ services: [pg, api] })).toBe(false);
+    expect(hasNamespacedShared(sharedStack)).toBe(true);
+  });
+});
+
+describe("declaredServices", () => {
+  it("reads each process's name, namespaces and depends_on from the derived config", () => {
+    expect(
+      declaredServices({
+        app: {
+          command: "a",
+          namespace: "mobile",
+          depends_on: { api: { condition: "process_healthy" } },
+        },
+        api: { command: "b", namespace: ["backend", "mobile"] },
+        web: { command: "c" },
+      }),
+    ).toEqual([
+      { name: "app", namespace: "mobile", dependsOn: [{ name: "api" }] },
+      { name: "api", namespace: ["backend", "mobile"], dependsOn: [] },
+      { name: "web", dependsOn: [] },
+    ]);
+    expect(declaredServices(undefined)).toEqual([]);
   });
 });
