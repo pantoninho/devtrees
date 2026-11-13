@@ -1714,6 +1714,19 @@ describe("runUp — namespace selection (#128)", () => {
     expect(registryRef.snapshot).toEqual({});
   });
 
+  it("`-n app -n nope` still starts: only an overall empty selection is an error (#203)", async () => {
+    let observed: string[] | undefined;
+    const track: StubSpawn = { invocations: [], touchSocket: false };
+    await runUp({
+      ...stubDeps({ stack: allNamespaced, track }),
+      namespaces: ["app", "nope"],
+      waitForHealth: async ({ serviceNames }) => {
+        observed = [...serviceNames].sort();
+      },
+    });
+    expect(observed).toEqual(["web", "worker"]);
+  });
+
   it("a bare up on a RUNNING instance is not a fresh start: no NO_SERVICES_SELECTED, no spawn (#177's scope)", async () => {
     const track: StubSpawn = { invocations: [], touchSocket: true };
     const baseDeps = stubDeps({ stack: allNamespaced, track });
@@ -5338,6 +5351,21 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
       namespaces: ["one", "two"],
     });
     expect(spawned.filter((a) => a[0] !== "process")).toEqual([]);
+  });
+
+  it("#203: -n one -n nope on a running instance keeps today's behaviour for the real namespace", async () => {
+    const waited: string[][] = [];
+    const { deps } = liveInstance(
+      twoNamespaces,
+      { worktree: [running("a")] },
+      {
+        waitForHealth: async ({ serviceNames }) => {
+          waited.push([...serviceNames]);
+        },
+      },
+    );
+    await runUp({ ...deps, namespaces: ["one", "nope"] });
+    expect(waited).toEqual([["a"]]);
   });
 
   it("#170: -n naming a namespace the instance was not booted with fails with NAMESPACE_NOT_RUNNING", async () => {

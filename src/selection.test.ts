@@ -565,6 +565,63 @@ describe("selectNamedServices / assertNamedTargetsBooted (ADR-0009)", () => {
     expect(() => assertNamedTargetsBooted(req, sel, on("app", "api", "web"))).not.toThrow();
   });
 
+  it("duplicate -n values collapse, in the expansion and in NO_SERVICES_SELECTED", () => {
+    const sel = selectNamedServices(request([], ["mobile", "mobile"]));
+    expect(namesOf(sel.isolated)).toEqual(["api", "app"]);
+    expect(sel.skippedShared).toEqual(["queue"]);
+    const err = selectionError(() => selectNamedServices(request([], ["nope", "nope"])));
+    expect(err.code).toBe("NO_SERVICES_SELECTED");
+    expect(err.message).toContain("`-n nope` names no namespace");
+    expect((err.details as { selected_namespaces: string[] }).selected_namespaces).toEqual([
+      "nope",
+    ]);
+  });
+
+  it("skippedShared keeps the repo's order and names each shared service once", () => {
+    const sel = selectNamedServices({
+      ...request([], ["edge", "mobile"]),
+      // `devtrees.yaml` then the shared derived config: the same service can appear twice.
+      repoShared: [
+        { name: "queue", namespace: "mobile" },
+        { name: "pg" },
+        { name: "bus", namespace: ["mobile", "edge"] },
+        { name: "queue", namespace: "mobile" },
+        { name: "cache", namespace: "edge" },
+      ],
+    });
+    expect(namesOf(sel.isolated)).toEqual(["api", "app", "cache"]);
+    expect(sel.skippedShared).toEqual(["queue", "bus"]);
+  });
+
+  it("of several unknown names, SERVICE_NOT_FOUND names the first", () => {
+    const err = selectionError(() => selectNamedServices(request(["nope", "web", "zzz"])));
+    expect(err.code).toBe("SERVICE_NOT_FOUND");
+    expect(err.details).toEqual({
+      service: "nope",
+      valid_services: ["app", "api", "web", "cache"],
+    });
+  });
+
+  it("several missing services are grouped under each namespace they declare", () => {
+    for (const req of [request(["app", "api"]), request([], ["mobile"])]) {
+      const sel = selectNamedServices(req);
+      expect(selectionError(() => assertNamedTargetsBooted(req, sel, on("web")))).toEqual({
+        code: "NAMESPACE_NOT_RUNNING",
+        message:
+          "devtrees restart: namespaces 'backend', 'mobile' are not running in 'wt-1' (not " +
+          "started: api, app). A running instance keeps the namespaces it was booted with and " +
+          "cannot add more. Run `devtrees down && devtrees up -n default -n backend -n mobile` " +
+          "to boot with them. Nothing was started or stopped.",
+        details: {
+          worktree_id: "wt-1",
+          namespaces: ["backend", "mobile"],
+          services: ["api", "app"],
+          remedy: "devtrees down && devtrees up -n default -n backend -n mobile",
+        },
+      });
+    }
+  });
+
   it("a list-valued target the instance did not boot names every namespace it declares", () => {
     const req = request(["api"]);
     const sel = selectNamedServices(req);
