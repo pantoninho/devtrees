@@ -38,8 +38,8 @@ import {
   type DerivedShared,
 } from "./deriver.js";
 import { stopInstance, type ForceKilled, type StopDriver, type StopSeams } from "./bounded-down.js";
-import { boundedStopServices, StopRefusedError, warnSurvivors } from "./bounded-stop.js";
-import { daemonHooksSkipped, unsignalledServices } from "./down-survivors.js";
+import { StopRefusedError, warnSurvivors } from "./bounded-stop.js";
+import { daemonHooksSkipped } from "./down-survivors.js";
 import {
   READ_TIMEOUT_MS,
   reloadTimeoutMs,
@@ -51,11 +51,9 @@ import { sharedExtendedFields, sharedStackHash } from "./hash.js";
 import {
   createWaitForSharedHealth,
   createWaitForSharedReady,
-  isGone,
   probedNames,
   readStatusesWithin,
   sharedServiceDeadError,
-  startInOrder,
   type RestartedService,
   type WaitForSharedHealth,
   type WaitForSharedReady,
@@ -68,15 +66,14 @@ import {
   type InstanceInfo,
   type InstanceStatus,
 } from "./instances.js";
+import { SOCKET_WAIT_TIMEOUT_MS, pollForSocket, type LivenessProbe } from "./liveness.js";
 import {
-  SOCKET_WAIT_TIMEOUT_MS,
-  instanceUnresponsiveError,
-  pollForSocket,
-  socketIsLive,
-  unresponsiveRemedy,
-  type LivenessContext,
-  type LivenessProbe,
-} from "./liveness.js";
+  openSharedLiveInstance,
+  type LiveInstance,
+  type LiveInstanceSeams,
+  type OpenContext,
+  type OpenOptions,
+} from "./live-instance.js";
 import { formatSharedFieldChangeWarning } from "./output.js";
 import {
   SHARED_INSTANCE_ID,
@@ -153,7 +150,7 @@ import {
   type SharedState,
 } from "./shared-state.js";
 import { loadStack, type ResolvedService, type ResolvedStack } from "./stack.js";
-import { partitionRunning, stopTimeoutMs } from "./stop-services.js";
+import { partitionRunning } from "./stop-services.js";
 
 /** What the shared instance module needs from its caller: the anchor and the I/O seams. */
 export interface SharedInstanceDeps {
@@ -481,13 +478,9 @@ async function prepareShared(
     lockOf(deps),
     {
       driver: deps.driver,
-      probe: deps.liveness,
+      seams: liveSeams(deps),
       socketTimeoutMs: deps.socketTimeoutMs,
       warn: deps.warn,
-      readSharedRows: () =>
-        deps.driver
-          .getServiceStatuses(sharedInstancePaths(anchor).socketPath)
-          .catch(() => undefined),
       remedyFor: sharedRemedyFor(stack, request.namespaces, anchor),
       stepServices: sharedStepServices(
         stack,
@@ -594,15 +587,13 @@ async function previewSharedRestarts(
 ): Promise<string[]> {
   if (selected.length === 0) return [];
   const { anchor } = deps;
-  const { socketPath } = sharedInstancePaths(anchor);
-  if (!(await sharedSocketLive(deps))) return [];
+  const shared = await openSharedReadOnly(deps);
+  if (shared === undefined) return [];
   const state = readRecordedSharedState(anchor, stack);
   if (state === undefined) return [];
   const plan = planSharedSelection(selected, state.services);
   if (plan.drifted.length > 0 || plan.portConflicts.length > 0) return [];
-  const rows = await deps.driver
-    .getServiceStatuses(socketPath, { timeoutMs: deps.previewReadTimeoutMs })
-    .catch(() => undefined);
+  const rows = await shared.tryRows(deps.previewReadTimeoutMs);
   if (rows === undefined) return [];
   const added = new Set(servicesToAdd(selected, plan, state, rows).map((s) => s.name));
   const names = selected.map((s) => s.name).filter((name) => !added.has(name));
@@ -614,12 +605,26 @@ async function previewSharedRestarts(
 
 /** A read-only liveness probe of the shared socket: unlinks nothing, and unknown reads as down. */
 async function sharedSocketLive(deps: SharedInstanceDeps): Promise<boolean> {
-  return await socketIsLive(
-    sharedInstancePaths(deps.anchor).socketPath,
-    deps.liveness,
-    { command: "up", instance: SHARED_INSTANCE_ID },
-    { readOnly: true },
-  ).catch(() => false);
+  return (await openSharedReadOnly(deps)) !== undefined;
+}
+
+/** The shared instance opened read-only (#259): a stale file is kept, and unknown reads as down. */
+async function openSharedReadOnly(deps: SharedInstanceDeps): Promise<LiveInstance | undefined> {
+  return await openShared(deps, { command: "up" }, { readOnly: true }).catch(() => undefined);
+}
+
+/** Open the shared instance through the live instance handle (#259). */
+async function openShared(
+  deps: SharedInstanceDeps,
+  context: OpenContext,
+  options: OpenOptions = {},
+): Promise<LiveInstance | undefined> {
+  return await openSharedLiveInstance(deps.anchor, liveSeams(deps), context, options);
+}
+
+/** The live instance handle's seams over the shared instance module's. */
+function liveSeams(deps: SharedInstanceDeps): LiveInstanceSeams {
+  return { driver: deps.driver, liveness: deps.liveness, probeSocket: deps.probeSocket };
 }
 
 /**
@@ -685,17 +690,12 @@ export interface SharedPortSeed {
 /** What `ensureSharedStarted` needs besides the stack and the selection. */
 interface EnsureSharedDeps {
   readonly driver: Driver;
-  readonly probe: LivenessProbe;
+  /** The live instance handle's seams (#259), for the shared instance's liveness and reads. */
+  readonly seams: LiveInstanceSeams;
   /** Socket-bind wait window for the lazy start (issue #92). Default: 3s. */
   readonly socketTimeoutMs?: number;
   /** Sink for the shared-field-change warnings (#185). */
   readonly warn: (message: string) => void;
-  /**
-   * One `process list` read of the running shared instance; `undefined` when
-   * it cannot be read. Lets a retried `up` see a service a timed-out add
-   * recorded but process-compose never started (#236).
-   */
-  readonly readSharedRows: () => Promise<ServiceStatus[] | undefined>;
   /** The remedy for broken or drifted selected shared services (#239). */
   readonly remedyFor?: (services: ReadonlyArray<string>) => string;
   /**
@@ -745,13 +745,10 @@ async function ensureSharedStarted(
   deps: EnsureSharedDeps,
 ): Promise<EnsuredShared> {
   return await sharedLock(anchor, async () => {
-    const paths = sharedInstancePaths(anchor);
     // Unknown liveness (#186) fails INSTANCE_UNRESPONSIVE rather than
     // lazy-starting a second shared instance onto the same ports.
-    const live = await socketIsLive(paths.socketPath, deps.probe, {
-      command: "up",
-      instance: SHARED_INSTANCE_ID,
-    });
+    const shared = await openSharedLiveInstance(anchor, deps.seams, { command: "up" });
+    const live = shared !== undefined;
     // The stable shared port map (#238): read and reconciled under the shared
     // lock, so two `up`s from different branches cannot both assign a name.
     const portPlan = readSharedPortPlan(anchor, stack, seed, live, deps.warn);
@@ -767,7 +764,7 @@ async function ensureSharedStarted(
       ports: portNamesOf(sharedServicesOf(stack)),
     });
     const step = { anchor, stack, selected, portPlan, deps };
-    if (live) return await reconcileLiveShared({ ...step, worktreeId });
+    if (shared !== undefined) return await reconcileLiveShared({ ...step, worktreeId, shared });
     // A fresh start binds every selected service's ports.
     assertSharedPortsClean({ command: "up", ...step, binding: selected, warn: deps.warn });
     recordSharedPorts(anchor, portPlan);
@@ -799,9 +796,9 @@ interface SharedStep {
  * what it runs, then add the selected ones it lacks (#236).
  */
 async function reconcileLiveShared(
-  step: SharedStep & { readonly worktreeId: string },
+  step: SharedStep & { readonly worktreeId: string; readonly shared: LiveInstance },
 ): Promise<EnsuredShared> {
-  const { anchor, stack, selected, portPlan, deps } = step;
+  const { anchor, stack, selected, portPlan, deps, shared } = step;
   const ports = portPlan.ports;
   const state = readRecordedSharedState(anchor, stack);
   // Legacy fallback: a pre-#83 shared instance left no persisted state. Its
@@ -809,7 +806,7 @@ async function reconcileLiveShared(
   // long as nothing has to be added: what that instance runs cannot be known.
   if (state === undefined) {
     assertSharedPortsClean({ command: "up", ...step, binding: [], warn: deps.warn });
-    const legacy = await legacySharedInstance(selected, anchor, deps);
+    const legacy = await legacySharedInstance(selected, anchor, shared);
     recordSharedPorts(anchor, portPlan);
     return { ...legacy, ports };
   }
@@ -829,7 +826,10 @@ async function reconcileLiveShared(
   // One read, under the shared lock, decides both what to add and what to
   // restart: a concurrent `up` from another worktree waits for this one and
   // then reads the services it restarted as running.
-  const rows = await readSelectedSharedRows(selected, plan, state, deps);
+  // One `process list` read; `undefined` when it cannot be read. Lets a
+  // retried `up` see a service a timed-out add recorded but process-compose
+  // never started (#236).
+  const rows = await readSelectedSharedRows(selected, plan, state, shared);
   const toAdd = servicesToAdd(selected, plan, state, rows);
   // Port conflicts after drift and before anything changes (#238): an added
   // service binds its recorded ports, which must not be another name's or
@@ -838,12 +838,17 @@ async function reconcileLiveShared(
   assertSharedPortsClean({ command: "up", ...step, binding: toAdd, warn: deps.warn });
   recordSharedPorts(anchor, portPlan);
   // Restart before adding: a service being added may `depends_on` a dead one.
-  const restarted = await restartDeadShared({
-    stack,
+  // Only the dead selected services the instance already runs (#240,
+  // ADR-0008), with rows read under the shared lock, so two worktrees racing
+  // start each one once: the second reads the first's restart as running.
+  // Dead versus done is `classifyService`'s (an exit-0 one-shot is never
+  // rerun, a `Restarting` one is left to process-compose), and a running
+  // shared service is never stopped, restarted or reloaded: other worktrees
+  // use it. A refused start is `SHARED_SERVICE_DEAD` `start_refused`.
+  const restarted = await shared.restartDead({
     rows: rows ?? [],
     names: selectedNames.filter((name) => !toAdd.some((s) => s.name === name)),
-    socketPath: sharedInstancePaths(anchor).socketPath,
-    driver: deps.driver,
+    order: stack.services,
     remedyFor: deps.remedyFor,
   });
   if (toAdd.length === 0) {
@@ -851,7 +856,7 @@ async function reconcileLiveShared(
   }
   // Read before the add: a process the instance already lists is one a
   // removal (`down --shared -n`, #239) stopped but whose reload never landed.
-  const before = rows ?? (await deps.readSharedRows());
+  const before = rows ?? (await shared.tryRows());
   await activateShared({ ...step, state, missing: toAdd, ports });
   const revived = await reviveReAdded(step, toAdd, before ?? []);
   return {
@@ -871,17 +876,15 @@ async function reconcileLiveShared(
  * dead shared service (#240), and waited on with them.
  */
 async function reviveReAdded(
-  step: SharedStep,
+  step: SharedStep & { readonly shared: LiveInstance },
   added: ReadonlyArray<ResolvedService>,
   before: ReadonlyArray<ServiceStatus>,
 ): Promise<RestartedService[]> {
   const listed = new Set(before.map((r) => r.name));
-  return await restartDeadShared({
-    stack: step.stack,
+  return await step.shared.restartDead({
     rows: before,
     names: added.map((s) => s.name).filter((name) => listed.has(name)),
-    socketPath: sharedInstancePaths(step.anchor).socketPath,
-    driver: step.deps.driver,
+    order: step.stack.services,
     remedyFor: step.deps.remedyFor,
   });
 }
@@ -895,11 +898,11 @@ async function readSelectedSharedRows(
   selected: ReadonlyArray<ResolvedService>,
   plan: SharedPlan,
   state: RecordedSharedState,
-  deps: EnsureSharedDeps,
+  shared: LiveInstance,
 ): Promise<ServiceStatus[] | undefined> {
   const missing = new Set(plan.missing.map((s) => s.name));
   const recorded = selected.some((s) => !missing.has(s.name) && state.services[s.name]);
-  return recorded ? await deps.readSharedRows() : undefined;
+  return recorded ? await shared.tryRows() : undefined;
 }
 
 /**
@@ -927,53 +930,6 @@ function servicesToAdd(
 }
 
 /**
- * Restart the dead services among `names` — the selected shared services the
- * running shared instance already runs — over its control socket (#240,
- * ADR-0008). Called under the shared lifecycle lock, after the drift check,
- * with rows read under that lock, so two worktrees racing start each dead
- * service once: the second reads the first's restart as running.
- *
- * Dead versus done is `classifyService`'s: a crash, a kill or a non-zero
- * exit is dead; an exit-0 one-shot is done and never rerun, and a service
- * process-compose is already `Restarting` is left to it. Started in
- * `depends_on` order, since `process start` ignores it. A running shared
- * service is never stopped, restarted or reloaded: other worktrees use it.
- *
- * A start process-compose refuses fails `SHARED_SERVICE_DEAD` with
- * `reason: "start_refused"` (the services it did start keep running); one it
- * answers with "already running" was started by someone else and is not
- * reported. Returns the services started, each with the pid of the run that
- * died, for the health wait (`createWaitForSharedReady`).
- */
-async function restartDeadShared(args: {
-  readonly stack: ResolvedStack;
-  readonly rows: ReadonlyArray<ServiceStatus>;
-  readonly names: ReadonlyArray<string>;
-  readonly socketPath: string;
-  readonly driver: Driver;
-  readonly remedyFor?: ((services: ReadonlyArray<string>) => string) | undefined;
-}): Promise<RestartedService[]> {
-  const dead = findDeadServices(args.rows, args.names);
-  if (dead.length === 0) return [];
-  const { restarted, failed } = await startInOrder({
-    ...args,
-    names: dependencyOrder(
-      args.stack.services,
-      dead.map((d) => d.name),
-    ),
-  });
-  if (failed.length > 0) {
-    const refused = dead.filter((d) => failed.some((f) => f.name === d.name));
-    throw sharedServiceDeadError(refused, {
-      reason: "start_refused",
-      startFailures: failed,
-      remedy: args.remedyFor?.(refused.map((d) => d.name)),
-    });
-  }
-  return restarted;
-}
-
-/**
  * A running shared instance started by a devtrees older than #83 left no
  * state, so what it runs is unknown. Always-on shared services keep the old
  * positional fallback; a selected namespaced one cannot be added safely and
@@ -985,7 +941,7 @@ async function restartDeadShared(args: {
 async function legacySharedInstance(
   selected: ReadonlyArray<ResolvedService>,
   anchor: string,
-  deps: EnsureSharedDeps,
+  shared: LiveInstance,
 ): Promise<EnsuredShared> {
   const namespaced = selected.filter((s) => !isAlwaysOnShared(s)).map((s) => s.name);
   if (namespaced.length > 0) {
@@ -1002,7 +958,7 @@ async function legacySharedInstance(
       },
     );
   }
-  const rows = selected.length > 0 ? await deps.readSharedRows() : undefined;
+  const rows = selected.length > 0 ? await shared.tryRows() : undefined;
   const dead = findDeadServices(
     rows ?? [],
     selected.map((s) => s.name),
@@ -1470,10 +1426,7 @@ export interface SharedDownResult {
 async function down(deps: SharedInstanceDeps): Promise<SharedDownResult> {
   const paths = sharedInstancePaths(deps.anchor);
   return await lockOf(deps)(deps.anchor, async () => {
-    const live = await socketIsLive(paths.socketPath, deps.liveness, {
-      command: "down",
-      instance: SHARED_INSTANCE_ID,
-    });
+    const live = (await openShared(deps, { command: "down" })) !== undefined;
     const forceKilled = live
       ? (await stopInstance(deps.driver, paths, SHARED_INSTANCE_ID, "down", deps.stop)).forceKilled
       : [];
@@ -1531,7 +1484,8 @@ export interface SharedNamespaceDownPreview {
 
 /** What a namespaced shared teardown found, under the shared lock or (dry run) without it. */
 interface SharedDownInspection {
-  readonly live: boolean;
+  /** The shared instance, opened live (#259); `undefined` when it is not running. */
+  readonly instance: LiveInstance | undefined;
   readonly config: DerivedConfig | undefined;
   readonly rows: ReadonlyArray<ServiceStatus>;
   readonly plan: SharedDownPlan;
@@ -1644,7 +1598,8 @@ async function sharedNamespaceDownAttempt(
       forceKilled: [] as ForceKilled[],
       removed: [] as string[],
     };
-    if (!seen.live || (seen.plan.targets.length === 0 && seen.leftovers.length === 0)) {
+    const { instance } = seen;
+    if (instance === undefined || (seen.plan.targets.length === 0 && seen.leftovers.length === 0)) {
       return { ...result, stopped: false, instanceStopped: false };
     }
     const removed = [...seen.plan.targets, ...seen.leftovers];
@@ -1659,7 +1614,7 @@ async function sharedNamespaceDownAttempt(
       const forceKilled = await stopWholeShared(driver, anchor, deps);
       return { ...result, ...overridden, stopped: true, instanceStopped: true, forceKilled };
     }
-    const stop = await stopSharedTargets(deps, driver, anchor, seen);
+    const stop = await stopSharedTargets(deps, instance, anchor, seen);
     const { forceKilled } = stop;
     if (stop.instanceGone) {
       rmSync(sharedInstancePaths(anchor).configPath, { force: true });
@@ -1683,7 +1638,7 @@ async function previewDownNamespaces(
   const seen = await inspectSharedDown(deps, deps.anchor, options, { readOnly: true });
   return {
     namespaces: [...options.namespaces],
-    running: seen.live,
+    running: seen.instance !== undefined,
     services: seen.plan.targets,
     inactiveNamespaces: seen.plan.inactiveNamespaces,
     wouldStopInstance: seen.last,
@@ -1701,12 +1656,16 @@ async function inspectSharedDown(
 ): Promise<SharedDownInspection> {
   const paths = sharedInstancePaths(anchor);
   const retry = sharedDownCommand(options.namespaces, options.force);
-  const context = { command: "down" as const, instance: SHARED_INSTANCE_ID, retry };
-  const live = await socketIsLive(paths.socketPath, deps.liveness, context, opts);
-  if (!live) {
+  const instance = await openSharedLiveInstance(
+    anchor,
+    liveSeams(deps),
+    { command: "down", retry },
+    opts,
+  );
+  if (instance === undefined) {
     const plan = planSharedDown(undefined, options.namespaces);
     return {
-      live,
+      instance,
       config: undefined,
       rows: [],
       plan,
@@ -1717,7 +1676,8 @@ async function inspectSharedDown(
     };
   }
   const config = readDerivedConfig(paths.configPath);
-  const rows = await readSharedRowsOrFail(deps, paths.socketPath, context);
+  // One bounded `process list`; one that never answers is `INSTANCE_UNRESPONSIVE`.
+  const rows = await instance.rows(READ_TIMEOUT_MS, { unresponsive: true });
   const plan = planSharedDown(config, options.namespaces);
   const leftovers = rows.map((r) => r.name).filter((name) => !(name in (config?.processes ?? {})));
   const dependants =
@@ -1728,28 +1688,7 @@ async function inspectSharedDown(
           ...(await findWorktreeDependants(deps, anchor, plan.targets, opts)),
         ];
   const last = plan.targets.length > 0 && removesLastRunning(rows, plan.remaining);
-  return { live, config, rows, plan, leftovers, dependants, last, retry };
-}
-
-/** One bounded `process list` of the shared instance; one that never answers is `INSTANCE_UNRESPONSIVE`. */
-async function readSharedRowsOrFail(
-  deps: SharedInstanceDeps,
-  socketPath: string,
-  context: LivenessContext,
-): Promise<ServiceStatus[]> {
-  try {
-    return await readStatusesWithin(deps.driver, socketPath, READ_TIMEOUT_MS, {
-      probe: deps.probeSocket,
-    });
-  } catch (err) {
-    if ((err as { code?: unknown }).code !== "HEALTH_TIMEOUT") throw err;
-    throw instanceUnresponsiveError("down", {
-      instance: SHARED_INSTANCE_ID,
-      socket_path: socketPath,
-      attempts: 1,
-      remedy: unresponsiveRemedy(socketPath, context),
-    });
-  }
+  return { instance, config, rows, plan, leftovers, dependants, last, retry };
 }
 
 /**
@@ -1978,7 +1917,7 @@ async function stopWholeShared(
  */
 async function stopSharedTargets(
   deps: SharedInstanceDeps,
-  driver: Driver,
+  instance: LiveInstance,
   anchor: string,
   seen: SharedDownInspection,
 ): Promise<{
@@ -1987,26 +1926,16 @@ async function stopSharedTargets(
   /** Some target was running, and was stopped. */
   readonly stopped: boolean;
 }> {
-  const { socketPath, configPath } = sharedInstancePaths(anchor);
+  const { configPath } = sharedInstancePaths(anchor);
   const targets = seen.plan.targets;
   const { running } = partitionRunning(seen.rows, targets);
   if (running.length === 0) return { forceKilled: [], instanceGone: false, stopped: false };
-  const outcome = await boundedStopServices(
-    {
-      socketPath,
-      services: running,
-      statuses: seen.rows,
-      timeoutMs: stopTimeoutMs(seen.config, running, deps.stop?.baseTimeoutMs),
-      unsignalled: unsignalledServices(seen.config),
-      instance: SHARED_INSTANCE_ID,
-      instanceGone: () => isGone(deps.probeSocket, socketPath),
-    },
-    {
-      stopProcesses: (socket, services) => driver.stopProcesses(socket, services),
-      getServiceStatuses: (socket) => driver.getServiceStatuses(socket),
-    },
-    deps.stop,
-  ).catch((err: unknown) => {
+  const stopping = instance.stop(running, {
+    rows: seen.rows,
+    config: seen.config,
+    seams: deps.stop,
+  });
+  const outcome = await stopping.catch((err: unknown) => {
     if ((err as { code?: unknown }).code === "INSTANCE_NOT_FOUND") return undefined;
     if (!(err instanceof StopRefusedError)) throw err;
     throw removalFailed(targets, "stop_refused", configPath, err.reason, seen.retry);
