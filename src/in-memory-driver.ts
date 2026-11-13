@@ -145,6 +145,15 @@ interface Server {
 
 const BINARY = "process-compose";
 
+/** Resolves once `signal` aborts; never, when there is no signal. */
+function whenAborted(signal: AbortSignal | undefined): Promise<void> {
+  if (signal === undefined) return new Promise<void>(() => {});
+  if (signal.aborted) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    signal.addEventListener("abort", () => resolve(), { once: true });
+  });
+}
+
 export function createInMemoryProcessCompose(
   opts: InMemoryProcessComposeOptions = {},
 ): InMemoryProcessCompose {
@@ -426,26 +435,19 @@ export function createInMemoryProcessCompose(
   ): AsyncGenerator<LogEvent> {
     const { srv, p } = logSource(socketPath, logOpts.service);
     let next = Math.max(0, p.logs.length - (logOpts.tail ?? p.logs.length));
-    const { signal } = logOpts;
-    const aborted =
-      signal === undefined
-        ? undefined
-        : new Promise<void>((resolve) => {
-            if (signal.aborted) resolve();
-            else signal.addEventListener("abort", () => resolve(), { once: true });
-          });
+    const aborted = whenAborted(logOpts.signal);
     // A function, not an inline read: the abort lands while this generator is
     // suspended, which flow narrowing does not see.
-    const isAborted = (): boolean => signal?.aborted === true;
+    const isAborted = (): boolean => logOpts.signal?.aborted === true;
+    const keepFollowing = (): boolean =>
+      logOpts.follow === true && servers.get(socketPath) === srv && !isAborted();
     for (;;) {
-      if (isAborted()) return;
-      while (next < p.logs.length) {
+      while (next < p.logs.length && !isAborted()) {
         const line = p.logs[next++] ?? "";
         yield { ts: new Date().toISOString(), service: logOpts.service, stream: "stdout", line };
-        if (isAborted()) return;
       }
-      if (logOpts.follow !== true || servers.get(socketPath) !== srv) return;
-      await (aborted === undefined ? nextEvent(srv) : Promise.race([nextEvent(srv), aborted]));
+      if (!keepFollowing()) return;
+      await Promise.race([nextEvent(srv), aborted]);
     }
   }
 
