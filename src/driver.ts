@@ -34,12 +34,12 @@ export class MissingProcessComposeError extends Error {
  * that accepts a list-valued `namespace` (issue #173), which namespace
  * selection builds on.
  */
-export const MIN_PROCESS_COMPOSE_VERSION = "1.122.0";
+const MIN_PROCESS_COMPOSE_VERSION = "1.122.0";
 
 const PROCESS_COMPOSE_UPGRADE_URL = "https://f1bonacc1.github.io/process-compose/installation/";
 
 /** Raised when the installed process-compose is older than the supported minimum. */
-export class ProcessComposeTooOldError extends Error {
+class ProcessComposeTooOldError extends Error {
   readonly code = "PROCESS_COMPOSE_TOO_OLD" as const;
   readonly details: {
     readonly installed_version: string | null;
@@ -80,6 +80,19 @@ export function isAtLeastVersion(version: string, minimum: string): boolean {
     if ((a[i] ?? 0) !== (b[i] ?? 0)) return (a[i] ?? 0) > (b[i] ?? 0);
   }
   return true;
+}
+
+/**
+ * Fail with `ProcessComposeTooOldError` unless `output` (what
+ * `process-compose version --short` printed) names at least
+ * `MIN_PROCESS_COMPOSE_VERSION` (#173). Unparseable output is an unknown
+ * version, so it fails too. Shared by both Driver adapters.
+ */
+export function assertSupportedVersionOutput(output: string): void {
+  const installed = parseProcessComposeVersion(output);
+  if (installed === null || !isAtLeastVersion(installed, MIN_PROCESS_COMPOSE_VERSION)) {
+    throw new ProcessComposeTooOldError(installed);
+  }
 }
 
 /**
@@ -663,10 +676,7 @@ export function createDriver(deps: DriverDeps = {}): Driver {
         // is reported as an unknown version rather than a crash.
         child.on("exit", () => resolve(out));
       });
-      const installed = parseProcessComposeVersion(stdout);
-      if (installed === null || !isAtLeastVersion(installed, MIN_PROCESS_COMPOSE_VERSION)) {
-        throw new ProcessComposeTooOldError(installed);
-      }
+      assertSupportedVersionOutput(stdout);
     },
     /**
      * Stop the running instance, bounded by `timeoutMs` (default

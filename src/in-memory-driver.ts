@@ -44,11 +44,8 @@ import { dirname } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { parse as parseYaml } from "yaml";
 import {
-  isAtLeastVersion,
-  MIN_PROCESS_COMPOSE_VERSION,
-  parseProcessComposeVersion,
+  assertSupportedVersionOutput,
   parseServiceStatuses,
-  ProcessComposeTooOldError,
   type DownOutcome,
   type Driver,
   type InstanceRef,
@@ -261,10 +258,7 @@ export function createInMemoryProcessCompose(
     },
 
     async assertSupportedVersion() {
-      const installed = parseProcessComposeVersion(opts.version ?? "v1.122.0");
-      if (installed === null || !isAtLeastVersion(installed, MIN_PROCESS_COMPOSE_VERSION)) {
-        throw new ProcessComposeTooOldError(installed);
-      }
+      assertSupportedVersionOutput(opts.version ?? "v1.122.0");
     },
 
     async down(inst): Promise<DownOutcome> {
@@ -370,50 +364,67 @@ export function createInMemoryProcessCompose(
           message: `process-compose config reload answered HTTP 400: ${(err as Error).message}`,
         };
       }
-      for (const name of srv.procs.keys()) {
-        const definition = config[name];
-        if (definition === undefined || !selected(definition, srv.namespaces)) {
-          srv.procs.delete(name);
-        }
-      }
-      for (const [name, definition] of Object.entries(config)) {
-        if (!selected(definition, srv.namespaces)) continue;
-        const p = srv.procs.get(name);
-        if (p === undefined) srv.procs.set(name, newProc(name, definition));
-        else if (!isDeepStrictEqual(p.definition, definition)) {
-          p.definition = definition;
-          startRun(p);
-        }
-      }
+      applyConfig(srv, config);
       exitIfIdle(srv);
       return { ok: true };
     },
   };
 
+  /**
+   * Apply a re-read config the way process-compose's reload does: drop what
+   * is gone or no longer selected, start what is new, restart what changed,
+   * and leave everything else as it is (stopped ones too, #239).
+   */
+  function applyConfig(srv: Server, config: Record<string, Record<string, unknown>>): void {
+    for (const name of srv.procs.keys()) {
+      const definition = config[name];
+      if (definition === undefined || !selected(definition, srv.namespaces)) srv.procs.delete(name);
+    }
+    for (const [name, definition] of Object.entries(config)) {
+      if (!selected(definition, srv.namespaces)) continue;
+      const p = srv.procs.get(name);
+      if (p === undefined) srv.procs.set(name, newProc(name, definition));
+      else if (!isDeepStrictEqual(p.definition, definition)) {
+        p.definition = definition;
+        startRun(p);
+      }
+    }
+  }
+
+  /** The server and process `process logs` reads from; throws as the client exits 1 otherwise. */
+  function logSource(socketPath: string, service: string): { srv: Server; p: Proc } {
+    const srv = answering(socketPath);
+    const p = srv === undefined || srv === "frozen" ? undefined : srv.procs.get(service);
+    if (srv === undefined || srv === "frozen" || p === undefined) {
+      throw new Error(`${BINARY} process logs exited with code 1`);
+    }
+    return { srv, p };
+  }
+
+  /** Resolves when the server logs a line or goes away. */
+  function nextEvent(srv: Server): Promise<void> {
+    return new Promise<void>((resolve) => {
+      const wake = () => {
+        srv.listeners.delete(wake);
+        resolve();
+      };
+      srv.listeners.add(wake);
+    });
+  }
+
   async function* streamLogs(
     socketPath: string,
     logOpts: StreamLogsOptions,
   ): AsyncGenerator<LogEvent> {
-    const srv = answering(socketPath);
-    const p = srv === undefined || srv === "frozen" ? undefined : srv.procs.get(logOpts.service);
-    if (srv === undefined || srv === "frozen" || p === undefined) {
-      throw new Error(`${BINARY} process logs exited with code 1`);
-    }
-    const tail = logOpts.tail;
-    let next = tail === undefined ? 0 : Math.max(0, p.logs.length - tail);
+    const { srv, p } = logSource(socketPath, logOpts.service);
+    let next = Math.max(0, p.logs.length - (logOpts.tail ?? p.logs.length));
     for (;;) {
       while (next < p.logs.length) {
         const line = p.logs[next++] ?? "";
         yield { ts: new Date().toISOString(), service: logOpts.service, stream: "stdout", line };
       }
       if (logOpts.follow !== true || servers.get(socketPath) !== srv) return;
-      await new Promise<void>((resolve) => {
-        const wake = () => {
-          srv.listeners.delete(wake);
-          resolve();
-        };
-        srv.listeners.add(wake);
-      });
+      await nextEvent(srv);
     }
   }
 
