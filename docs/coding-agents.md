@@ -142,7 +142,9 @@ are. It never stops anything, and never attaches the TUI.
   `HEALTH_TIMEOUT` leaves the stack running (`devtrees restart <service>`
   tries again), `SERVICE_START_FAILED` means process-compose refused. It
   refuses a shared service (`SHARED_SERVICE_REFUSED`), a service still
-  waiting on its dependencies (`SERVICE_PENDING`), and the stack's last
+  waiting on its dependencies (`SERVICE_PENDING`), a skipped service whose
+  dependency is still failed (`SERVICE_SKIPPED`: restart that dependency
+  with it, the command is in `details.remedy`), and the stack's last
   running process (`LAST_SERVICES_RUNNING`: use `details.remedy`, a `down` +
   `up`). To restart the whole stack, use that `down` + `up` too: a bare
   `devtrees restart` fails `INVALID_ARGS` and prints it.
@@ -181,6 +183,7 @@ Branch on `error.code`:
 | `SHARED_SERVICE_REFUSED`    | You asked `restart` for a shared service. Nothing was touched; a worktree never restarts what other worktrees share. Leave it, or restart the shared instance with `details.remedy` (`devtrees down --shared && devtrees up`). |
 | `LAST_SERVICES_RUNNING`     | `restart` would have to stop the last running process, and process-compose would then exit and take the whole stack down. Nothing was touched. To restart the stack, run `details.remedy` (`devtrees down && devtrees up …`). |
 | `SERVICE_PENDING`           | You asked `restart` for a service still waiting on its dependencies: it has not started, so nothing was touched. Wait until it starts, or restart what it waits on (`details.waiting_on`, the command is in `details.remedy`). |
+| `SERVICE_SKIPPED`           | You asked `restart` for a service process-compose skipped because a dependency failed, and that dependency is still failed, so a start would leave it skipped. Nothing was touched. Restart the dependency with it (`details.failed_dependencies`; the command is in `details.remedy`); if the dependency fails again, fix it first (`devtrees logs <dependency>`). |
 | `PROCESS_COMPOSE_NOT_FOUND` | The `process-compose` binary is missing. **Surface this to the human** — it's an environment setup gap you can't fix.   |
 | `PROCESS_COMPOSE_TOO_OLD`   | The installed `process-compose` is below the minimum (v1.122.0). **Surface this to the human** — they need to upgrade it. |
 | `CONFIG_INVALID` / `INVALID_ARGS` | The config or your arguments are malformed. Fix the input; don't retry blindly.        |

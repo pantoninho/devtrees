@@ -126,6 +126,7 @@ import {
 import {
   assertNotLastRunning,
   assertNotPending,
+  assertNotSkipped,
   clearLegacyStopMarker,
   instanceExitedError,
   instanceNotRunningError,
@@ -212,7 +213,7 @@ import {
   type PendingReload,
   type StuckReload,
 } from "./reload-pending.js";
-import { dependencyOrder, findDeadServices, isActiveOrIdle } from "./service-state.js";
+import { dependencyOrder, findDeadServices, idleState, isActiveOrIdle } from "./service-state.js";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -4446,7 +4447,9 @@ export interface RestartResult {
  * isolated services of this worktree's running instance in place, one at a
  * time in `depends_on` order. The instance, its ports and every other
  * service keep running; dependents of a named service are not restarted. A
- * stopped or dead service is simply started.
+ * stopped, dead or idle (`Skipped`, `Disabled`) service is simply started;
+ * a `Skipped` one whose dependency is still failed is refused
+ * (`SERVICE_SKIPPED`, #263).
  *
  * For each service in turn:
  *
@@ -4503,6 +4506,9 @@ export async function runRestart(
       // Before anything is touched, and again before each later service: a
       // one-shot that finished meanwhile may have left it the last one.
       const ahead = order.slice(i);
+      // A `Skipped` service whose dependency is still failed would stay
+      // Skipped after its start (#263).
+      assertNotSkipped(target.rows, ahead, waitingOn(target), anchor.worktreeId);
       // A service still `Pending` has not started: `process stop` would leave
       // it `Terminating` with no process for good (#223).
       const { pending } = partitionRunning(target.rows, ahead);
@@ -4594,7 +4600,7 @@ function assertRestartKeepsInstance(
 ): void {
   for (const name of pending) {
     const row = target.rows.find((r) => r.name === name);
-    if (row === undefined || !isActiveOrIdle(row)) continue;
+    if (row === undefined || !isActiveOrIdle(row) || idleState(row) !== undefined) continue;
     assertNotLastRunning(target.rows, [name], target.anchor.worktreeId, {
       remedy: restartRemedy(target),
       done,
