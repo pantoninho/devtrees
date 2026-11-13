@@ -2503,6 +2503,69 @@ describe.skipIf(!ENABLED)("real-pc smoke — stop removed, restart's stop refusa
     expect(devtrees(wt, ["down", "--json"]).code).toBe(0);
   }, 120_000);
 
+  it("scenario 140: restarting a Skipped service whose dependency is still failed fails SERVICE_SKIPPED at once; once the dependency is fixed, the remedy restarts both (#263)", async () => {
+    // `migrate` is a one-shot that fails until `fixed` exists; `app` needs it
+    // to complete successfully, so process-compose skips app. `keep` keeps
+    // the instance alive. A start of app while migrate is still failed is
+    // answered OK and starts nothing, so restart refuses it up front.
+    const { wt, root, socketPath } = stopRepo("dt-rpc140-", (r) => {
+      const migrate = join(r, "migrate.py");
+      writeFileSync(
+        migrate,
+        `import os, sys\nsys.exit(0 if os.path.exists(${JSON.stringify(join(r, "fixed"))}) else 1)\n`,
+      );
+      return [
+        "  migrate:",
+        "    tier: isolated",
+        `    command: "python3 ${migrate}"`,
+        "  app:",
+        "    tier: isolated",
+        `    command: "python3 ${sleeper(r, "app")}"`,
+        "    depends_on:",
+        "      migrate:",
+        "        condition: process_completed_successfully",
+        "  keep:",
+        "    tier: isolated",
+        `    command: "python3 ${sleeper(r, "keep")}"`,
+      ];
+    });
+    devtrees(wt, ["up", "--json", "--wait-timeout", "10"]);
+    expect(existsSync(socketPath), "the instance should be running").toBe(true);
+    const statusOf = (name: string) =>
+      (devtrees(wt, ["ls", "--json"]).doc as LsDoc).ls.instances
+        .find((i) => i.id === wtId(wt))
+        ?.services.find((s) => s.name === name)?.status;
+    const deadline = Date.now() + 15_000;
+    while (statusOf("app") !== "Skipped" && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    expect(statusOf("app")).toBe("Skipped");
+
+    const restartStarted = Date.now();
+    const restart = devtrees(wt, ["restart", "app", "--json"]);
+    expect(Date.now() - restartStarted, "refused up front").toBeLessThan(10_000);
+    expect(restart.code, restart.stdout).toBe(1);
+    const restartError = (restart.doc as ErrorDoc).error;
+    expect(restartError.code).toBe("SERVICE_SKIPPED");
+    expect(restartError.details).toMatchObject({
+      services: ["app"],
+      failed_dependencies: [{ name: "migrate", status: "Completed", exit_code: 1 }],
+    });
+    expect(statusOf("app")).toBe("Skipped");
+    expect(pidsMatching(join(root, "app.py"))).toEqual([]);
+
+    // Fixed: the remedy's command, run literally, restarts migrate and then app.
+    writeFileSync(join(root, "fixed"), "");
+    const remedy = String(restartError.details?.remedy);
+    const command = /`devtrees ([^`]+)`/.exec(remedy)?.[1];
+    expect(command).toBe("restart migrate app");
+    const fixed = devtrees(wt, [...(command ?? "").split(" "), "--json"]);
+    expect(fixed.code, fixed.stdout + fixed.stderr).toBe(0);
+    expect(await waitForPid(join(root, "app.py"), 20_000), "app should start").toBe(true);
+    expect(statusOf("app")).toBe("Running");
+    expect(devtrees(wt, ["down", "--json"]).code).toBe(0);
+  }, 120_000);
+
   it("scenario 112: restarting the only running service is refused LAST_SERVICES_RUNNING when its dependent is Pending (B1)", async () => {
     // `app` waits for `api` to be healthy, which it never is: process-compose
     // shows `app` Pending (is_running false). Restarting `api` stops it first,

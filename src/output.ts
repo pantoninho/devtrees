@@ -47,6 +47,7 @@ export const ERROR_CODES = [
   "SHARED_SERVICE_REFUSED",
   "LAST_SERVICES_RUNNING",
   "SERVICE_PENDING",
+  "SERVICE_SKIPPED",
   "CONFIG_DRIFT",
   "SHARED_DRIFT",
   "SHARED_START_FAILED",
@@ -104,6 +105,8 @@ export const ERROR_CODE_DESCRIPTIONS: Readonly<Record<ErrorCode, string>> = {
     "`restart` would have to stop the instance's last running process (a `Pending` service does not count), and process-compose would then exit and take the instance down; nothing was touched. `details.services` names them, `details.remedy` is the `down` + `up` that restarts the instance.",
   SERVICE_PENDING:
     "`restart` named a service still waiting on its dependencies (`Pending`): it has not started, so there is nothing to restart, and nothing was touched. `details` has `{services, waiting_on, remedy}`: wait until it starts, or restart what it waits on.",
+  SERVICE_SKIPPED:
+    "`restart` named a service process-compose skipped (`Skipped`) because a dependency failed, and that dependency is still failed (dead, or itself skipped), so a start would leave it skipped; nothing was touched. `details` has `{services, failed_dependencies, remedy}`: `failed_dependencies` names the root failed dependency of each (`{name, status, exit_code?}`), and `remedy` restarts it together with the service (fix it first if it fails again).",
   CONFIG_DRIFT:
     "Running config differs from devtrees.yaml and hot-reload failed, or an earlier reload is still pending; `details.reason` is `timeout`, `not_supported`, `error`, or `reload_pending` (nothing was reloaded: kill `details.pids`, then retry; empty `pids` means the old process is gone and process-compose is still starting the new one, so retry shortly).",
   SHARED_DRIFT:

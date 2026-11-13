@@ -12,7 +12,16 @@ import { join } from "node:path";
 import type { DerivedConfig } from "./deriver.js";
 import { downTimeoutMs, type ServiceStatus } from "./driver.js";
 import { stateDir } from "./paths.js";
-import { isPending, isRunning, keepsInstanceAlive } from "./service-state.js";
+import {
+  deadServicesDetails,
+  describeDeadServices,
+  idleState,
+  isDead,
+  isPending,
+  isRunning,
+  keepsInstanceAlive,
+  type DeadService,
+} from "./service-state.js";
 
 /** An error tagged with a stable `code` and `details` for the `--json` envelope. */
 function codedError(code: string, message: string, details: Record<string, unknown>): Error {
@@ -128,6 +137,83 @@ export function assertNotPending(
       `${one ? "has" : "have"} not started, so there is nothing to restart. Nothing was ` +
       `touched. ${remedy}`,
     { services: [...pending], waiting_on: deps, remedy },
+  );
+}
+
+/**
+ * Refuse to restart a `Skipped` service while a dependency it needs is still
+ * failed (#263). process-compose skipped it because a dependency failed, and
+ * v1.122.0 answers its `process start` OK yet leaves it `Skipped` until that
+ * dependency has recovered, so the restart would only spend the whole health
+ * wait. A dependency counts as failed when it is dead (ADR-0008) or is itself
+ * `Skipped`, followed transitively over `dependsOn` to the root: the dead
+ * one, or the topmost `Skipped` one when nothing above it is dead. A
+ * dependency restarted earlier in this same request (before it in `names`,
+ * which is in `depends_on` order) does not count: it is restarted and waited
+ * on first. Every named service is checked, so a request that mixes a
+ * refused service with restartable ones is refused whole, touching nothing.
+ * The remedy restarts the failed chain together with `names`. A `Disabled`
+ * service is never refused: a start starts it.
+ */
+export function assertNotSkipped(
+  rows: ReadonlyArray<ServiceStatus>,
+  names: ReadonlyArray<string>,
+  dependsOn: (service: string) => ReadonlyArray<string>,
+  worktreeId: string,
+): void {
+  const byName = new Map(rows.map((r) => [r.name, r]));
+  const blocked: string[] = [];
+  const roots = new Set<string>();
+  const chain = new Set<string>();
+  names.forEach((name, i) => {
+    const row = byName.get(name);
+    if (row === undefined || idleState(row) !== "skipped") return;
+    const restartedBefore = new Set(names.slice(0, i));
+    const seen = new Set<string>([name]);
+    /** Whether `service` has a failed dependency; records the roots and the chain. */
+    const walk = (service: string): boolean => {
+      let found = false;
+      for (const dep of dependsOn(service)) {
+        const depRow = byName.get(dep);
+        if (depRow === undefined || restartedBefore.has(dep)) continue;
+        if (isDead(depRow)) {
+          roots.add(dep);
+          chain.add(dep);
+          found = true;
+        } else if (idleState(depRow) === "skipped") {
+          found = true;
+          if (seen.has(dep)) continue;
+          seen.add(dep);
+          if (!walk(dep)) roots.add(dep);
+          chain.add(dep);
+        }
+      }
+      return found;
+    };
+    if (walk(name)) blocked.push(name);
+  });
+  if (blocked.length === 0) return;
+  const failed = [...roots].map((name): DeadService => {
+    const row = byName.get(name) as ServiceStatus;
+    return row.exitCode === undefined
+      ? { name, status: row.status }
+      : { name, status: row.status, exitCode: row.exitCode };
+  });
+  const oneService = blocked.length === 1;
+  const oneRoot = failed.length === 1;
+  const rootList = [...roots].join(", ");
+  const command = `devtrees restart ${[...new Set([...chain, ...names])].join(" ")}`;
+  const remedy =
+    `Restart ${rootList} first, and ${blocked.join(", ")} after ${oneRoot ? "it" : "them"}: ` +
+    `\`${command}\`. If ${rootList} ${oneRoot ? "fails" : "fail"} again, fix ` +
+    `${oneRoot ? "it" : "them"} first (\`devtrees logs ${oneRoot ? rootList : "<service>"}\`).`;
+  throw codedError(
+    "SERVICE_SKIPPED",
+    `devtrees restart: ${blocked.join(", ")} ${oneService ? "was" : "were"} skipped because a ` +
+      `dependency failed, and ${describeDeadServices(failed)} ${oneRoot ? "is" : "are"} still ` +
+      `failed in '${worktreeId}', so a start would leave ${oneService ? "it" : "them"} ` +
+      `skipped. Nothing was touched. ${remedy}`,
+    { services: blocked, failed_dependencies: deadServicesDetails(failed), remedy },
   );
 }
 

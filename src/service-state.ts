@@ -58,9 +58,9 @@ export function isDead(row: Pick<ServiceStatus, "status" | "exitCode">): boolean
 
 /**
  * Is the row neither dead nor done? Unlike `isRunning`, this also counts an
- * idle service (`Disabled`, `Skipped`), which holds no process. It is the
- * rule `restart` reads a service's state by today, so restarting an idle
- * service takes the stop-then-start path (a known bug, #263).
+ * idle service (`Disabled`, `Skipped`), which holds no process. `restart`
+ * asks `idleState` first, so an idle service is simply started, never
+ * stopped (#263).
  */
 export function isActiveOrIdle(row: Pick<ServiceStatus, "status" | "exitCode">): boolean {
   return classifyService(row) === "active";
@@ -71,6 +71,16 @@ export function isActiveOrIdle(row: Pick<ServiceStatus, "status" | "exitCode">):
  * process, and one skipped because a dependency failed.
  */
 const IDLE_STATES = new Set(["disabled", "skipped"]);
+
+/**
+ * Is the service idle: holding no process and waiting on nothing? `skipped`
+ * when process-compose skipped it because a dependency failed, `disabled`
+ * when it is disabled; otherwise `undefined`. Case-insensitive.
+ */
+export function idleState(row: Pick<ServiceStatus, "status">): "skipped" | "disabled" | undefined {
+  const status = row.status.toLowerCase();
+  return IDLE_STATES.has(status) ? (status as "skipped" | "disabled") : undefined;
+}
 
 /**
  * Is the service running, or on its way up or down (`Running`, `Pending`,
