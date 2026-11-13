@@ -2,16 +2,15 @@
  * `runSharedNamespaceDown` orchestration (#239, ADR-0012): `down --shared
  * -n` stops and removes only the named namespaces' shared services, under
  * the shared lock, refuses while something depends on them, and turns into a
- * full shared teardown when nothing else would be left running. Every
- * collaborator is a stub; the real-binary behaviour is in the smoke suite
- * (scenarios 124-126).
+ * full shared teardown when nothing else would be left running.
+ * process-compose is the in-memory adapter (src/in-memory-driver.ts); the
+ * other collaborators are stubs. The real-binary behaviour is in the smoke
+ * suite (scenarios 124-126).
  */
 import { afterEach, describe, expect, it } from "vite-plus/test";
-import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Readable } from "node:stream";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { deriveWorktreeId } from "./anchor.js";
 import {
@@ -20,7 +19,7 @@ import {
   type CommandDeps,
 } from "./commands.js";
 import { DEVTREES_METADATA_KEY } from "./deriver.js";
-import type { ServiceStatus, SpawnedProcess } from "./driver.js";
+import { createInMemoryProcessCompose } from "./in-memory-driver.js";
 import type { InstanceInfo } from "./instances.js";
 import { classifyError } from "./output.js";
 import { instancePaths, runDir, sharedInstancePaths } from "./paths.js";
@@ -48,24 +47,6 @@ const sharedProcesses = {
   sb: proc({ namespace: "b" }),
 };
 
-const running = (name: string, pid: number): ServiceStatus => ({
-  name,
-  status: "Running",
-  health: "unknown",
-  pid,
-  running: true,
-});
-
-function child(code: number, stderr = ""): SpawnedProcess {
-  const emitter = new EventEmitter() as EventEmitter & SpawnedProcess;
-  Object.assign(emitter, {
-    stdout: Readable.from([]),
-    stderr: Readable.from(stderr === "" ? [] : [stderr]),
-  });
-  setTimeout(() => emitter.emit("exit", code), 2);
-  return emitter;
-}
-
 function svc(name: string, tier: "isolated" | "shared", deps: string[] = []): ResolvedService {
   return {
     name,
@@ -78,11 +59,18 @@ function svc(name: string, tier: "isolated" | "shared", deps: string[] = []): Re
 }
 
 interface Opts {
+  /** The shared config on disk. Default: `sharedProcesses`. */
   readonly processes?: Record<string, ReturnType<typeof proc>>;
-  readonly rows?: ServiceStatus[];
-  /** HTTP status the reload answers with. */
-  readonly reloadStatus?: number;
-  /** `process stop` exits 1 with this complaint. */
+  /**
+   * What the running server booted with, when it differs from `processes`
+   * (a reload that timed out left the old processes listed). Default: `processes`.
+   */
+  readonly booted?: Record<string, ReturnType<typeof proc>>;
+  /** Processes that exited on their own before the command, with their exit codes. */
+  readonly exited?: Record<string, number>;
+  /** process-compose rejects the config it re-reads on a reload. */
+  readonly rejectReload?: boolean;
+  /** process-compose refuses `process stop sa` with this complaint. */
   readonly refuseStop?: string;
   readonly worktrees?: ReadonlyArray<{
     readonly id: string;
@@ -95,11 +83,12 @@ interface Opts {
 }
 
 /**
- * A live shared instance. `process stop` flips a row to `Completed`; a
- * reload drops every row its config no longer holds; `down` removes the
- * socket. Records every process-compose call and the shared lock window.
+ * A live shared instance, running on the in-memory process-compose
+ * (src/in-memory-driver.ts) booted from its derived config. Records the
+ * shared lock window and every process stop, reload and down
+ * process-compose received.
  */
-function sharedInstance(opts: Opts = {}) {
+async function sharedInstance(opts: Opts = {}) {
   const root = mkdtempSync(join(tmpdir(), "dt-pr239-"));
   cleanups.push(() => rmSync(root, { recursive: true, force: true }));
   const anchor = join(root, ".git");
@@ -109,18 +98,43 @@ function sharedInstance(opts: Opts = {}) {
   cleanups.push(() => rmSync(runDir(anchor), { recursive: true, force: true }));
   const paths = sharedInstancePaths(anchor);
   const processes = opts.processes ?? sharedProcesses;
-  writeFileSync(
-    paths.configPath,
-    stringifyYaml({
-      processes,
-      [DEVTREES_METADATA_KEY]: {
-        ports_by_service: Object.fromEntries(
-          Object.keys(processes).map((n) => [n, { [`${n.toUpperCase()}_PORT`]: 1 }]),
-        ),
-      },
-    }),
-  );
-  if (opts.live !== false) writeFileSync(paths.socketPath, "");
+  const writeConfig = (procs: Record<string, unknown>) =>
+    writeFileSync(
+      paths.configPath,
+      stringifyYaml({
+        processes: procs,
+        [DEVTREES_METADATA_KEY]: {
+          ports_by_service: Object.fromEntries(
+            Object.keys(procs).map((n) => [n, { [`${n.toUpperCase()}_PORT`]: 1 }]),
+          ),
+        },
+      }),
+    );
+  const log: string[] = [];
+  const pc = createInMemoryProcessCompose({
+    firstPid: 10,
+    onRequest: (r) => {
+      if (r.op === "start" || r.op === "stop") {
+        log.push(`process ${r.op} ${(r.services ?? []).join(" ")}`);
+      } else if (r.op === "reload" || r.op === "down") {
+        log.push(r.op);
+      }
+      // process-compose re-reads a config it cannot parse: it answers HTTP 400.
+      if (r.op === "reload" && opts.rejectReload === true) {
+        writeFileSync(paths.configPath, "processes: [unparseable\n");
+      }
+    },
+  });
+  if (opts.refuseStop !== undefined) pc.refuse("stop", "sa", opts.refuseStop);
+  if (opts.live !== false) {
+    writeConfig(opts.booted ?? processes);
+    await pc.driver.up(paths);
+    for (const [name, code] of Object.entries(opts.exited ?? {})) {
+      pc.exit(paths.socketPath, name, code);
+    }
+    log.length = 0;
+  }
+  writeConfig(processes);
   writeSharedState(anchor, {
     hash: "whole",
     ports: Object.fromEntries(Object.keys(processes).map((n, i) => [`${n.toUpperCase()}_PORT`, i])),
@@ -132,9 +146,6 @@ function sharedInstance(opts: Opts = {}) {
       ]),
     ),
   });
-  const state = new Map(
-    (opts.rows ?? Object.keys(processes).map((n, i) => running(n, 10 + i))).map((r) => [r.name, r]),
-  );
   const worktrees: InstanceInfo[] = (opts.worktrees ?? []).map((w) => {
     const wp = instancePaths(anchor, w.id);
     writeFileSync(
@@ -167,7 +178,6 @@ function sharedInstance(opts: Opts = {}) {
       servicesRead: "ok",
     };
   });
-  const log: string[] = [];
   const deps: CommandDeps = {
     cwd: top,
     git: (args) => {
@@ -176,9 +186,9 @@ function sharedInstance(opts: Opts = {}) {
       return "false";
     },
     readStack: () => opts.stack ?? { services: [] },
-    probeSocket: async (socketPath) => (existsSync(socketPath) ? "running" : "stale"),
+    processCompose: pc.driver,
+    probeSocket: (socketPath) => pc.probeSocket(socketPath),
     probeRetryDelaysMs: [],
-    getServiceStatuses: async () => [...state.values()],
     discover: async () => [
       ...worktrees,
       {
@@ -202,48 +212,25 @@ function sharedInstance(opts: Opts = {}) {
         log.push("unlock");
       }
     },
-    stop: { readProcessTable: async () => [], pollMs: 1, treeGraceMs: 1, graceMs: 1 },
+    stop: {
+      readProcessTable: async () => [],
+      isAlive: () => false,
+      kill: () => {},
+      pollMs: 1,
+      treeGraceMs: 1,
+      graceMs: 1,
+    },
     warn: () => {},
     reap: async () => ({ ranCount: 0, failures: [] }),
-    driver: {
-      exists: async () => true,
-      spawner: (_bin, args) => {
-        if (args[0] === "down") {
-          log.push("down");
-          rmSync(paths.socketPath, { force: true });
-          return child(0);
-        }
-        const end = args.indexOf("-U");
-        const names = args.slice(2, end < 0 ? undefined : end);
-        log.push(`process ${args[1]} ${names.join(" ")}`);
-        if (args[1] === "stop" && opts.refuseStop !== undefined) {
-          return child(1, opts.refuseStop);
-        }
-        for (const name of names) {
-          const row = state.get(name);
-          if (row !== undefined && args[1] === "stop") {
-            state.set(name, { ...row, status: "Completed", exitCode: -1, running: false });
-          }
-        }
-        return child(0);
-      },
-      controlRequest: async (request) => {
-        log.push(`reload ${request.path}`);
-        const status = opts.reloadStatus ?? 200;
-        if (status === 200) {
-          const kept = Object.keys(configProcesses());
-          for (const name of state.keys()) if (!kept.includes(name)) state.delete(name);
-        }
-        return { status, body: status === 200 ? "{}" : "refused" };
-      },
-    },
   };
   function configProcesses(): Record<string, unknown> {
     if (!existsSync(paths.configPath)) return {};
     const doc = parseYaml(readFileSync(paths.configPath, "utf8")) as { processes?: object };
     return (doc.processes ?? {}) as Record<string, unknown>;
   }
-  return { deps, log, state, anchor, paths, configProcesses, top };
+  /** The shared instance's rows as process-compose lists them now. */
+  const rows = () => pc.rows(paths.socketPath);
+  return { deps, log, pc, rows, anchor, paths, configProcesses, top };
 }
 
 async function failure(p: Promise<unknown>) {
@@ -257,7 +244,7 @@ async function failure(p: Promise<unknown>) {
 
 describe("runSharedNamespaceDown (#239)", () => {
   it("stops and removes only the named namespace's shared services, under the shared lock", async () => {
-    const s = sharedInstance();
+    const s = await sharedInstance();
     const result = await runSharedNamespaceDown(s.deps, { namespaces: ["a"] });
     expect(result).toMatchObject({
       shared: true,
@@ -268,15 +255,15 @@ describe("runSharedNamespaceDown (#239)", () => {
       instanceStopped: false,
       dependants: [],
     });
-    expect(s.log).toEqual(["lock", "process stop sa", "reload /project/configuration", "unlock"]);
+    expect(s.log).toEqual(["lock", "process stop sa", "reload", "unlock"]);
     expect(Object.keys(s.configProcesses())).toEqual(["pg", "sb"]);
-    expect([...s.state.keys()]).toEqual(["pg", "sb"]);
-    expect(s.state.get("sb")?.status).toBe("Running");
+    expect(s.rows().map((r) => r.name)).toEqual(["pg", "sb"]);
+    expect(s.rows().find((r) => r.name === "sb")?.status).toBe("Running");
     expect(existsSync(s.paths.socketPath)).toBe(true);
   });
 
   it("drops the removed services' revision records and bound ports", async () => {
-    const s = sharedInstance();
+    const s = await sharedInstance();
     await runSharedNamespaceDown(s.deps, { namespaces: ["a"] });
     const after = readSharedState(s.anchor);
     expect(Object.keys(after?.services ?? {})).toEqual(["pg", "sb"]);
@@ -286,27 +273,27 @@ describe("runSharedNamespaceDown (#239)", () => {
   });
 
   it("is a no-op, listing the namespace as inactive, when no shared service of it runs", async () => {
-    const s = sharedInstance();
+    const s = await sharedInstance();
     const result = await runSharedNamespaceDown(s.deps, { namespaces: ["nope"] });
     expect(result).toMatchObject({ stopped: false, services: [], inactiveNamespaces: ["nope"] });
     expect(s.log).toEqual(["lock", "unlock"]);
   });
 
   it("names an inactive namespace beside an active one, and stops the active one", async () => {
-    const s = sharedInstance();
+    const s = await sharedInstance();
     const result = await runSharedNamespaceDown(s.deps, { namespaces: ["b", "nope"] });
     expect(result).toMatchObject({ stopped: true, services: ["sb"], inactiveNamespaces: ["nope"] });
   });
 
   it("is a no-op when the shared instance is not running", async () => {
-    const s = sharedInstance({ live: false });
+    const s = await sharedInstance({ live: false });
     const result = await runSharedNamespaceDown(s.deps, { namespaces: ["a"] });
     expect(result).toMatchObject({ stopped: false, services: [], inactiveNamespaces: ["a"] });
     expect(s.log).toEqual(["lock", "unlock"]);
   });
 
   it("refuses SHARED_IN_USE while a live worktree's booted service depends on a target, touching nothing", async () => {
-    const s = sharedInstance({
+    const s = await sharedInstance({
       worktrees: [{ id: "login-1", sharedDependsOn: { worker: ["sa", "pg"] } }],
     });
     const err = await failure(runSharedNamespaceDown(s.deps, { namespaces: ["a"] }));
@@ -326,7 +313,7 @@ describe("runSharedNamespaceDown (#239)", () => {
   });
 
   it("a dependant in a namespace the worktree did not boot does not block", async () => {
-    const s = sharedInstance({
+    const s = await sharedInstance({
       worktrees: [{ id: "login-1", booted: ["web"], sharedDependsOn: { worker: ["sa"] } }],
     });
     const result = await runSharedNamespaceDown(s.deps, { namespaces: ["a"] });
@@ -334,7 +321,7 @@ describe("runSharedNamespaceDown (#239)", () => {
   });
 
   it("counts a service a pending hot-reload is applying as booted, though process-compose does not list it", async () => {
-    const s = sharedInstance({
+    const s = await sharedInstance({
       worktrees: [{ id: "login-1", booted: ["web"], sharedDependsOn: { worker: ["sa"] } }],
     });
     writePendingReload(s.anchor, "login-1", {
@@ -349,7 +336,7 @@ describe("runSharedNamespaceDown (#239)", () => {
   });
 
   it("a lifecycle command still in flight after the wait refuses with a plain retry, never --force", async () => {
-    const s = sharedInstance();
+    const s = await sharedInstance();
     const id = deriveWorktreeId("/x/billing");
     writeFileSync(join(s.anchor, "devtrees", `${id}.lock`), `${process.pid}\n`);
     const err = await failure(runSharedNamespaceDown(s.deps, { namespaces: ["a"] }));
@@ -373,7 +360,7 @@ describe("runSharedNamespaceDown (#239)", () => {
   });
 
   it("waits for an in-flight command OUTSIDE the shared lock, then goes ahead once it is gone", async () => {
-    const s = sharedInstance();
+    const s = await sharedInstance();
     const lock = join(s.anchor, "devtrees", `${deriveWorktreeId("/x/billing")}.lock`);
     writeFileSync(lock, `${process.pid}\n`);
     setTimeout(() => rmSync(lock, { force: true }), 150);
@@ -391,7 +378,7 @@ describe("runSharedNamespaceDown (#239)", () => {
     const id = "billing-0a1b2c3d";
 
     it("does not wait for an in-flight `up` whose marker names no target", async () => {
-      const s = sharedInstance();
+      const s = await sharedInstance();
       const result = await withLifecycleLock(s.anchor, id, async () => {
         writeSharedStepMarker(s.anchor, id, { services: ["pg", "sb"], ports: [] });
         return await runSharedNamespaceDown(
@@ -401,11 +388,11 @@ describe("runSharedNamespaceDown (#239)", () => {
       });
       expect(result).toMatchObject({ stopped: true, services: ["sa"], dependants: [] });
       // One attempt: no release-and-wait.
-      expect(s.log).toEqual(["lock", "process stop sa", "reload /project/configuration", "unlock"]);
+      expect(s.log).toEqual(["lock", "process stop sa", "reload", "unlock"]);
     });
 
     it("does not wait for a worktree `down` (its marker names no shared service)", async () => {
-      const s = sharedInstance();
+      const s = await sharedInstance();
       const result = await withLifecycleLock(s.anchor, id, async () => {
         writeSharedStepMarker(s.anchor, id, { services: [] });
         return await runSharedNamespaceDown(s.deps, { namespaces: ["a"] });
@@ -414,7 +401,7 @@ describe("runSharedNamespaceDown (#239)", () => {
     });
 
     it("waits for an in-flight `up` whose marker names a target, and lists the targets it uses", async () => {
-      const s = sharedInstance();
+      const s = await sharedInstance();
       const err = await withLifecycleLock(s.anchor, id, async () => {
         writeSharedStepMarker(s.anchor, id, { services: ["pg", "sa"], ports: [] });
         return await failure(runSharedNamespaceDown(s.deps, { namespaces: ["a"] }));
@@ -432,7 +419,7 @@ describe("runSharedNamespaceDown (#239)", () => {
     });
 
     it("goes ahead once an `up` without a marker gets past its shared step, without waiting for its lock", async () => {
-      const s = sharedInstance();
+      const s = await sharedInstance();
       const lock = join(s.anchor, "devtrees", `${id}.lock`);
       writeFileSync(lock, `${process.pid}\n`);
       cleanups.push(() => rmSync(lock, { force: true }));
@@ -449,7 +436,7 @@ describe("runSharedNamespaceDown (#239)", () => {
     });
 
     it("treats a marker that is not the current hold's as none (conservative), and removes it", async () => {
-      const s = sharedInstance();
+      const s = await sharedInstance();
       writeFileSync(join(s.anchor, "devtrees", `${id}.lock`), `${process.pid}\n`);
       const marker = sharedStepMarkerFile(s.anchor, id);
       // Left by a crashed holder whose lock this live process has since taken.
@@ -468,7 +455,7 @@ describe("runSharedNamespaceDown (#239)", () => {
     });
 
     it("the dry run applies the same scoping, and removes nothing", async () => {
-      const s = sharedInstance();
+      const s = await sharedInstance();
       const orphan = sharedStepMarkerFile(s.anchor, "gone-0a1b2c3d");
       writeFileSync(orphan, JSON.stringify({ version: 1, pid: 1, lock_ino: 1, services: [] }));
       const preview = await withLifecycleLock(s.anchor, id, async () => {
@@ -481,7 +468,7 @@ describe("runSharedNamespaceDown (#239)", () => {
   });
 
   it("a shared dependant fails at once, without waiting for an in-flight command", async () => {
-    const s = sharedInstance({
+    const s = await sharedInstance({
       processes: {
         pg: proc(),
         sa: proc({ namespace: "a" }),
@@ -503,7 +490,7 @@ describe("runSharedNamespaceDown (#239)", () => {
   });
 
   it("ignores a lifecycle lock whose holder is dead, and the registry, shared and hashes locks", async () => {
-    const s = sharedInstance();
+    const s = await sharedInstance();
     const dir = join(s.anchor, "devtrees");
     writeFileSync(join(dir, `${deriveWorktreeId("/x/gone")}.lock`), `${2 ** 22 + 12345}\n`);
     for (const name of ["registry.lock", "shared.lock", "hashes.lock"]) {
@@ -514,7 +501,7 @@ describe("runSharedNamespaceDown (#239)", () => {
   });
 
   it("lists both a worktree's edges and its in-flight command, and remedies with a retry, not --force", async () => {
-    const s = sharedInstance({
+    const s = await sharedInstance({
       worktrees: [{ id: "login-1aaaaaaa", sharedDependsOn: { worker: ["sa"] } }],
     });
     writeFileSync(join(s.anchor, "devtrees", "login-1aaaaaaa.lock"), `${process.pid}\n`);
@@ -537,7 +524,9 @@ describe("runSharedNamespaceDown (#239)", () => {
   });
 
   it("remedies a real worktree dependant alone with --force", async () => {
-    const s = sharedInstance({ worktrees: [{ id: "w", sharedDependsOn: { worker: ["sa"] } }] });
+    const s = await sharedInstance({
+      worktrees: [{ id: "w", sharedDependsOn: { worker: ["sa"] } }],
+    });
     const err = await failure(runSharedNamespaceDown(s.deps, { namespaces: ["a"] }));
     expect(err.details).toMatchObject({
       forceable: true,
@@ -546,34 +535,28 @@ describe("runSharedNamespaceDown (#239)", () => {
   });
 
   it("removing only already-stopped services reports stopped: false, and lists them as removed", async () => {
-    const s = sharedInstance({
-      rows: [
-        running("pg", 10),
-        { name: "sa", status: "Completed", health: "unknown", exitCode: -1, running: false },
-        running("sb", 12),
-      ],
-    });
+    const s = await sharedInstance({ exited: { sa: -1 } });
     const result = await runSharedNamespaceDown(s.deps, { namespaces: ["a"] });
     expect(result).toMatchObject({ stopped: false, services: ["sa"], removed: ["sa"] });
-    expect(s.log).toEqual(["lock", "reload /project/configuration", "unlock"]);
+    expect(s.rows().map((r) => r.name)).toEqual(["pg", "sb"]);
+    expect(s.log).toEqual(["lock", "reload", "unlock"]);
   });
 
   it("re-sends the removal for a leftover a timed-out reload left listed, and reports it removed", async () => {
-    const s = sharedInstance({
+    // The config on disk no longer holds sa, but the server still lists it, stopped.
+    const s = await sharedInstance({
       processes: { pg: proc(), sb: proc({ namespace: "b" }) },
-      rows: [
-        running("pg", 10),
-        { name: "sa", status: "Completed", health: "unknown", exitCode: -1, running: false },
-        running("sb", 12),
-      ],
+      booted: sharedProcesses,
+      exited: { sa: -1 },
     });
+    expect(s.rows().map((r) => r.name)).toEqual(["pg", "sa", "sb"]);
     const result = await runSharedNamespaceDown(s.deps, { namespaces: ["a"] });
     expect(result).toMatchObject({ stopped: false, services: [], removed: ["sa"] });
-    expect([...s.state.keys()]).toEqual(["pg", "sb"]);
+    expect(s.rows().map((r) => r.name)).toEqual(["pg", "sb"]);
   });
 
   it("--force removes the services anyway and reports the dependants it overrode", async () => {
-    const s = sharedInstance({
+    const s = await sharedInstance({
       worktrees: [{ id: "login-1", sharedDependsOn: { worker: ["sa"] } }],
     });
     const result = await runSharedNamespaceDown(s.deps, { namespaces: ["a"], force: true });
@@ -586,7 +569,7 @@ describe("runSharedNamespaceDown (#239)", () => {
   });
 
   it("reads a pre-#239 worktree's edges from its devtrees.yaml", async () => {
-    const s = sharedInstance({
+    const s = await sharedInstance({
       worktrees: [{ id: "login-1" }],
       stack: { services: [svc("sa", "shared"), svc("worker", "isolated", ["sa"])] },
     });
@@ -598,7 +581,7 @@ describe("runSharedNamespaceDown (#239)", () => {
   });
 
   it("counts a worktree whose dependencies cannot be read as a dependant", async () => {
-    const s = sharedInstance({ worktrees: [{ id: "login-1" }] });
+    const s = await sharedInstance({ worktrees: [{ id: "login-1" }] });
     const deps: CommandDeps = {
       ...s.deps,
       readStack: () => {
@@ -613,7 +596,7 @@ describe("runSharedNamespaceDown (#239)", () => {
   });
 
   it("refuses a shared dependant even with --force, naming its namespace in the remedy", async () => {
-    const s = sharedInstance({
+    const s = await sharedInstance({
       processes: {
         pg: proc(),
         sa: proc({ namespace: "a" }),
@@ -631,23 +614,18 @@ describe("runSharedNamespaceDown (#239)", () => {
   });
 
   it("stops the whole shared instance when nothing else would be left running", async () => {
-    const s = sharedInstance({
-      rows: [
-        { name: "pg", status: "Completed", health: "unknown", exitCode: 0, running: false },
-        running("sa", 11),
-        running("sb", 12),
-      ],
-    });
+    const s = await sharedInstance({ exited: { pg: 0 } });
     const result = await runSharedNamespaceDown(s.deps, { namespaces: ["a", "b"] });
     expect(result).toMatchObject({ stopped: true, services: ["sa", "sb"], instanceStopped: true });
     expect(s.log).toContain("down");
-    expect(s.log).not.toContain("reload /project/configuration");
+    expect(s.pc.isUp(s.paths.socketPath)).toBe(false);
+    expect(s.log).not.toContain("reload");
     expect(existsSync(s.paths.socketPath)).toBe(false);
     expect(existsSync(s.paths.configPath)).toBe(false);
   });
 
   it("a refused reload fails SHARED_REMOVAL_FAILED, restores the config and keeps the records", async () => {
-    const s = sharedInstance({ reloadStatus: 500 });
+    const s = await sharedInstance({ rejectReload: true });
     const err = await failure(runSharedNamespaceDown(s.deps, { namespaces: ["a"] }));
     expect(err.code).toBe("SHARED_REMOVAL_FAILED");
     expect(err.details).toMatchObject({
@@ -657,21 +635,28 @@ describe("runSharedNamespaceDown (#239)", () => {
     });
     expect(Object.keys(s.configProcesses())).toEqual(["pg", "sa", "sb"]);
     expect(Object.keys(readSharedState(s.anchor)?.services ?? {})).toEqual(["pg", "sa", "sb"]);
+    // The reload was refused: sa (already stopped) is still listed, the rest run.
+    expect(s.rows().map((r) => [r.name, r.status])).toEqual([
+      ["pg", "Running"],
+      ["sa", "Completed"],
+      ["sb", "Running"],
+    ]);
   });
 
   it("a refused stop fails SHARED_REMOVAL_FAILED with nothing removed", async () => {
-    const s = sharedInstance({ refuseStop: "FTL failed to stop process sa" });
+    const s = await sharedInstance({ refuseStop: "FTL failed to stop process sa" });
     const err = await failure(runSharedNamespaceDown(s.deps, { namespaces: ["a"] }));
     expect(err.code).toBe("SHARED_REMOVAL_FAILED");
     expect(err.details).toMatchObject({ reason: "stop_refused", services: ["sa"] });
-    expect(s.log).not.toContain("reload /project/configuration");
+    expect(s.log).not.toContain("reload");
     expect(Object.keys(s.configProcesses())).toEqual(["pg", "sa", "sb"]);
+    expect(s.rows().find((r) => r.name === "sa")?.status).toBe("Running");
   });
 });
 
 describe("runSharedNamespaceDownDryRun (#239)", () => {
   it("previews what would stop and what blocks it, with no lock, stop or reload", async () => {
-    const s = sharedInstance({
+    const s = await sharedInstance({
       worktrees: [{ id: deriveWorktreeId("/x/login"), sharedDependsOn: { worker: ["sa"] } }],
     });
     const preview = await runSharedNamespaceDownDryRun(s.deps, { namespaces: ["a", "nope"] });
@@ -689,17 +674,19 @@ describe("runSharedNamespaceDownDryRun (#239)", () => {
   });
 
   it("with --force a worktree dependant no longer blocks", async () => {
-    const s = sharedInstance({ worktrees: [{ id: "w", sharedDependsOn: { worker: ["sa"] } }] });
+    const s = await sharedInstance({
+      worktrees: [{ id: "w", sharedDependsOn: { worker: ["sa"] } }],
+    });
     const preview = await runSharedNamespaceDownDryRun(s.deps, { namespaces: ["a"], force: true });
     expect(preview.blocked).toBe(false);
     expect(preview.dependants).toHaveLength(1);
   });
 
   it("leaves a stale shared socket file in place and reports nothing running", async () => {
-    const s = sharedInstance({ live: false });
+    // A socket file with no server behind it: the probe reads it stale.
+    const s = await sharedInstance({ live: false });
     writeFileSync(s.paths.socketPath, "");
-    const deps: CommandDeps = { ...s.deps, probeSocket: async () => "stale" };
-    const preview = await runSharedNamespaceDownDryRun(deps, { namespaces: ["a"] });
+    const preview = await runSharedNamespaceDownDryRun(s.deps, { namespaces: ["a"] });
     expect(preview).toMatchObject({ running: false, services: [], wouldStopInstance: false });
     expect(existsSync(s.paths.socketPath)).toBe(true);
   });

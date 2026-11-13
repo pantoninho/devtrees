@@ -23,7 +23,6 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Readable } from "node:stream";
-import type { SpawnOptions } from "node:child_process";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import {
   filterLogEventsSince,
@@ -53,10 +52,17 @@ import type { RegistrySnapshot } from "./allocator.js";
 import type {
   ControlRequest,
   ControlRequester,
+  Driver,
   LogEvent,
   ServiceStatus,
   SpawnedProcess,
 } from "./driver.js";
+import {
+  createInMemoryProcessCompose,
+  type InMemoryProcessCompose,
+  type InMemoryProcessComposeOptions,
+  type PcRequest,
+} from "./in-memory-driver.js";
 import type { InstanceInfo, InstanceStatus } from "./instances.js";
 import { classifyError } from "./output.js";
 import {
@@ -1873,6 +1879,53 @@ describe("runUp — state envelope on success (#30)", () => {
   });
 });
 
+/**
+ * The command deps that put a command on the in-memory process-compose
+ * (src/in-memory-driver.ts, #255): the Driver and the liveness probe answer
+ * from the model, and the bounded stop's process-table seams see no OS
+ * processes, so the model's pids never reach a real `ps` or `kill`.
+ */
+function inMemoryPcDeps(pc: InMemoryProcessCompose) {
+  return {
+    processCompose: pc.driver,
+    probeSocket: (socketPath: string) => pc.probeSocket(socketPath),
+    stop: {
+      readProcessTable: async () => [],
+      isAlive: () => false,
+      kill: () => {},
+      pollMs: 1,
+      treeGraceMs: 1,
+    },
+  } satisfies CommandDeps;
+}
+
+/** `deps` with its spawner-backed driver swapped for a fresh in-memory process-compose. */
+function onInMemoryPc<D extends CommandDeps>(
+  deps: D,
+  opts: InMemoryProcessComposeOptions = {},
+): { deps: D; pc: InMemoryProcessCompose } {
+  const pc = createInMemoryProcessCompose(opts);
+  const { driver: _spawnerDriver, ...rest } = deps;
+  const pcDeps = inMemoryPcDeps(pc);
+  return {
+    pc,
+    deps: { ...rest, ...pcDeps, stop: { ...pcDeps.stop, ...deps.stop } } as D,
+  };
+}
+
+/** The worktree and shared instance sockets of a stub-deps worktree. */
+function socketsOf(deps: StubbedDeps): { worktree: string; shared: string } {
+  const anchor = (deps.git!(["rev-parse", "--git-common-dir"]) as string).trim();
+  return {
+    worktree: instancePaths(anchor, deps.expectedWorktreeId).socketPath,
+    shared: sharedInstancePaths(anchor).socketPath,
+  };
+}
+
+/** The `op` requests process-compose received, oldest first. */
+const requestsOf = (pc: InMemoryProcessCompose, op: PcRequest["op"]) =>
+  pc.requests.filter((r) => r.op === op);
+
 describe("runDown — shared lifecycle is decoupled from worktree lifecycle", () => {
   const mixedStack: ResolvedStack = {
     services: [
@@ -1882,15 +1935,20 @@ describe("runDown — shared lifecycle is decoupled from worktree lifecycle", ()
   };
 
   it("plain runDown stops the worktree instance only — shared socket survives", async () => {
-    const track: StubSpawn = { invocations: [], touchSocket: true };
-    const deps = stubDeps({ stack: mixedStack, track });
+    const { deps, pc } = onInMemoryPc(stubDeps({ stack: mixedStack }));
     await runUp(deps);
-    const sharedSpawn = findSharedSpawn(track);
+    const sockets = socketsOf(deps);
+    expect(pc.isUp(sockets.shared)).toBe(true);
+    expect(pc.isUp(sockets.worktree)).toBe(true);
 
-    // shared.sock was created by the stub spawner; runDown without --shared must leave it.
-    expect(existsSync(sharedSpawn.socketPath)).toBe(true);
     await runDown(deps);
-    expect(existsSync(sharedSpawn.socketPath)).toBe(true);
+    expect(pc.isUp(sockets.worktree)).toBe(false);
+    // runDown without --shared leaves the shared instance and its postgres running.
+    expect(pc.isUp(sockets.shared)).toBe(true);
+    expect(existsSync(sockets.shared)).toBe(true);
+    expect(pc.rows(sockets.shared).map((r) => [r.name, r.status])).toEqual([
+      ["postgres", "Running"],
+    ]);
   });
 
   it("runDown(--shared) tears down the shared instance but preserves its registry entry (#51)", async () => {
@@ -1898,35 +1956,18 @@ describe("runDown — shared lifecycle is decoupled from worktree lifecycle", ()
     // so agents that record `DB_PORT` once can reuse it. Liveness in `ls --json`
     // is driven by socket presence, not registry presence (instances.ts), so
     // dropping the entry was tidy theatre at the cost of port stability.
-    const track: StubSpawn = { invocations: [], touchSocket: true };
     const registryRef = { snapshot: {} as RegistrySnapshot };
-    const deps = stubDeps({ stack: mixedStack, track, registryRef });
+    const { deps, pc } = onInMemoryPc(stubDeps({ stack: mixedStack, registryRef }));
     await runUp(deps);
+    const sockets = socketsOf(deps);
 
     expect(registryRef.snapshot[SHARED_REGISTRY_KEY]).toBeDefined();
     const priorSharedBase = registryRef.snapshot[SHARED_REGISTRY_KEY];
-    const sharedSpawn = findSharedSpawn(track);
-    expect(existsSync(sharedSpawn.socketPath)).toBe(true);
+    expect(existsSync(sockets.shared)).toBe(true);
 
-    // Simulate the real driver: down() removes the socket. The stub driver in
-    // commands' spawner just records — we drop the socket here to mimic it.
-    const downDeps: CommandDeps = {
-      ...deps,
-      driver: {
-        exists: () => Promise.resolve(true),
-        spawner: (_b, args, _o): SpawnedProcess => {
-          const si = args.indexOf("-u");
-          if (args[0] === "down" && si >= 0) {
-            const socketPath = args[si + 1];
-            if (socketPath) rmSync(socketPath, { force: true });
-          }
-          return spawnedOk();
-        },
-      },
-    };
-
-    await runDown(downDeps, { shared: true });
-    expect(existsSync(sharedSpawn.socketPath)).toBe(false);
+    await runDown(deps, { shared: true });
+    expect(pc.isUp(sockets.shared)).toBe(false);
+    expect(existsSync(sockets.shared)).toBe(false);
     // The shared registry entry survives — liveness flows from the socket
     // (which *is* gone), and the next `up` reuses the same block.
     expect(registryRef.snapshot[SHARED_REGISTRY_KEY]).toBe(priorSharedBase);
@@ -1939,53 +1980,39 @@ describe("runDown — shared lifecycle is decoupled from worktree lifecycle", ()
     // without the registry entry, even a probe that always passes still hashes
     // from `__shared__` fresh, but the assertion that matters is the *whole
     // workflow* round-trips identically.
-    const track: StubSpawn = { invocations: [], touchSocket: true };
     const registryRef = { snapshot: {} as RegistrySnapshot };
-    const deps = stubDeps({ stack: mixedStack, track, registryRef });
+    const { deps, pc } = onInMemoryPc(stubDeps({ stack: mixedStack, registryRef }));
     const firstUp = await runUp(deps);
     const firstSharedBase = registryRef.snapshot[SHARED_REGISTRY_KEY];
     expect(firstSharedBase).toBeDefined();
+    const sockets = socketsOf(deps);
 
-    // Mimic the real driver: down() removes the socket so the next `up` will
-    // observe socket absence and lazy-start.
-    const downDeps: CommandDeps = {
-      ...deps,
-      driver: {
-        exists: () => Promise.resolve(true),
-        spawner: (_b, args, _o): SpawnedProcess => {
-          const si = args.indexOf("-u");
-          if (args[0] === "down" && si >= 0) {
-            const socketPath = args[si + 1];
-            if (socketPath) rmSync(socketPath, { force: true });
-          }
-          return spawnedOk();
-        },
-      },
-    };
     // Tear the worktree down too so the second `up` takes the full lazy-start
     // path (the idempotency branch in `runUp` short-circuits before it would
     // re-check the shared socket).
-    await runDown(downDeps);
-    await runDown(downDeps, { shared: true });
+    await runDown(deps);
+    await runDown(deps, { shared: true });
 
     // The shared registry entry survived the teardown.
     expect(registryRef.snapshot[SHARED_REGISTRY_KEY]).toBe(firstSharedBase);
 
-    // Re-`up`: shared lazy-starts again (socket was removed) on the same block.
-    expect(existsSync(findSharedSpawn(track).socketPath)).toBe(false);
+    // Re-`up`: shared lazy-starts again (its socket was removed) on the same block.
+    expect(existsSync(sockets.shared)).toBe(false);
     const secondUp = await runUp(deps);
     expect(registryRef.snapshot[SHARED_REGISTRY_KEY]).toBe(firstSharedBase);
     expect(secondUp.env.DB_PORT).toBe(firstUp.env.DB_PORT);
     expect(secondUp.sharedStarted).toBe(true);
-    // Socket re-appeared: lazy-start ran.
-    expect(existsSync(findSharedSpawn(track).socketPath)).toBe(true);
+    // The shared instance runs again: lazy-start ran.
+    expect(pc.isUp(sockets.shared)).toBe(true);
+    expect(requestsOf(pc, "up").filter((r) => r.socketPath === sockets.shared)).toHaveLength(2);
   });
 
   it("runDown(--shared) is a tidy no-op when the shared instance is not running", async () => {
-    const deps = stubDeps({ stack: mixedStack });
+    const { deps, pc } = onInMemoryPc(stubDeps({ stack: mixedStack }));
     // No prior `up` — the socket doesn't exist.
     await runDown(deps, { shared: true });
-    // Nothing thrown; registry still has no shared entry.
+    // Nothing thrown, and nothing asked of process-compose.
+    expect(pc.requests).toEqual([]);
   });
 
   it("up → down --shared → up lazy-restarts shared even though the worktree socket is still present (#56)", async () => {
@@ -1994,51 +2021,30 @@ describe("runDown — shared lifecycle is decoupled from worktree lifecycle", ()
     // tier but the worktree's own instance is still up, the next `up` must
     // still recover shared (and the envelope must report `shared_started:
     // true` so an agent can tell shared was just brought back).
-    const track: StubSpawn = { invocations: [], touchSocket: true };
     const registryRef = { snapshot: {} as RegistrySnapshot };
-    const deps = stubDeps({ stack: mixedStack, track, registryRef });
+    const { deps, pc } = onInMemoryPc(stubDeps({ stack: mixedStack, registryRef }));
     const first = await runUp(deps);
     expect(first.sharedStarted).toBe(true);
-    const sharedSpawn = findSharedSpawn(track);
-    expect(existsSync(sharedSpawn.socketPath)).toBe(true);
+    const sockets = socketsOf(deps);
+    expect(pc.isUp(sockets.shared)).toBe(true);
 
-    // Mimic the real driver: down() removes the socket so the next `up`
-    // observes shared as gone. Note we DO NOT call `runDown` for the worktree
-    // — its socket stays present so the second `up` hits the idempotency
-    // branch.
-    const downDeps: CommandDeps = {
-      ...deps,
-      driver: {
-        exists: () => Promise.resolve(true),
-        spawner: (_b, args, _o): SpawnedProcess => {
-          const si = args.indexOf("-u");
-          if (args[0] === "down" && si >= 0) {
-            const socketPath = args[si + 1];
-            if (socketPath) rmSync(socketPath, { force: true });
-          }
-          return spawnedOk();
-        },
-      },
-    };
-    await runDown(downDeps, { shared: true });
-    expect(existsSync(sharedSpawn.socketPath)).toBe(false);
+    // Note we DO NOT call `runDown` for the worktree — its instance stays up
+    // so the second `up` hits the idempotency branch.
+    await runDown(deps, { shared: true });
+    expect(pc.isUp(sockets.shared)).toBe(false);
+    expect(existsSync(sockets.shared)).toBe(false);
+    expect(pc.isUp(sockets.worktree)).toBe(true);
 
     // Second `up` from the same (still-running) worktree must lazy-restart
     // shared — the idempotency branch can no longer skip the shared check.
     const second = await runUp(deps);
     expect(second.sharedStarted).toBe(true);
-    expect(existsSync(findSharedSpawn(track).socketPath)).toBe(true);
+    expect(pc.isUp(sockets.shared)).toBe(true);
     // Shared block stayed the same (registry entry survived the down).
     expect(second.env.DB_PORT).toBe(first.env.DB_PORT);
   });
 });
 
-/**
- * Issue #48 — `devtrees down --json` is operation-output only. `runDown`
- * returns an identity-only `DownResult`: exactly one of `{shared: true}` or
- * `{shared: false, worktreeId: "<id>"}` (discriminated union). Pre- and
- * post-teardown state belongs to `ls --json`, not this envelope.
- */
 /**
  * The worktree `down` runs under the per-worktree lifecycle lock (#178), so
  * an `up` restarting dead services cannot `process start` on a supervisor
@@ -2048,12 +2054,12 @@ describe("runDown — worktree teardown holds the lifecycle lock (#178)", () => 
   const stack: ResolvedStack = { services: [isolated("web", "node server.js", ["WEB_PORT"])] };
 
   it("probes and stops the instance inside the worktree's lifecycle lock", async () => {
-    const track: StubSpawn = { invocations: [], touchSocket: true };
-    const deps = stubDeps({ stack, track });
-    await runUp(deps);
     const events: string[] = [];
-    const spawner = deps.driver?.spawner;
-    if (spawner === undefined) throw new Error("expected spawner");
+    const { deps, pc } = onInMemoryPc(stubDeps({ stack }), {
+      onRequest: (r) => events.push(r.op),
+    });
+    await runUp(deps);
+    events.length = 0;
     const result = await runDown({
       ...deps,
       withLifecycleLock: async (_a, instanceId, fn) => {
@@ -2062,27 +2068,17 @@ describe("runDown — worktree teardown holds the lifecycle lock (#178)", () => 
         events.push("unlock");
         return out;
       },
-      driver: {
-        ...deps.driver,
-        spawner: (b, args, o) => {
-          events.push(args[0] ?? "");
-          return spawner(b, args, o);
-        },
-      },
     });
     expect(result.stopped).toBe(true);
+    expect(pc.isUp(socketsOf(deps).worktree)).toBe(false);
     // The pre-stop snapshot (`process list`, #190) also runs under the lock.
-    expect(events).toEqual([`lock ${deps.expectedWorktreeId}`, "process", "down", "unlock"]);
+    expect(events).toEqual([`lock ${deps.expectedWorktreeId}`, "list", "down", "unlock"]);
   });
 
   it("a lock held by a concurrent up fails LOCK_CONTENTION and stops nothing", async () => {
-    const track: StubSpawn = { invocations: [], touchSocket: true };
-    const deps = stubDeps({ stack, track });
+    const { deps, pc } = onInMemoryPc(stubDeps({ stack }));
     await runUp(deps);
     const anchor = (deps.git!(["rev-parse", "--git-common-dir"]) as string).trim();
-    const downs: string[][] = [];
-    const spawner = deps.driver?.spawner;
-    if (spawner === undefined) throw new Error("expected spawner");
     let release: () => void = () => {};
     const held = new Promise<void>((r) => (release = r));
     let acquired: () => void = () => {};
@@ -2096,13 +2092,6 @@ describe("runDown — worktree teardown holds the lifecycle lock (#178)", () => 
       ...deps,
       withLifecycleLock: (a, i, fn) =>
         withLifecycleLock(a, i, fn, { retries: 3, retryDelayMs: 10 }),
-      driver: {
-        ...deps.driver,
-        spawner: (b, args, o) => {
-          if (args[0] === "down") downs.push([...args]);
-          return spawner(b, args, o);
-        },
-      },
     }).then(
       () => undefined,
       (e: unknown) => e as Error & { code?: string },
@@ -2110,10 +2099,17 @@ describe("runDown — worktree teardown holds the lifecycle lock (#178)", () => 
     release();
     await holder;
     expect(err?.code).toBe("LOCK_CONTENTION");
-    expect(downs).toEqual([]);
+    expect(requestsOf(pc, "down")).toEqual([]);
+    expect(pc.isUp(socketsOf(deps).worktree)).toBe(true);
   });
 });
 
+/**
+ * Issue #48 — `devtrees down --json` is operation-output only. `runDown`
+ * returns an identity-only `DownResult`: exactly one of `{shared: true}` or
+ * `{shared: false, worktreeId: "<id>"}` (discriminated union). Pre- and
+ * post-teardown state belongs to `ls --json`, not this envelope.
+ */
 describe("runDown — operation-output result (#48)", () => {
   const mixedStack: ResolvedStack = {
     services: [
@@ -2123,8 +2119,7 @@ describe("runDown — operation-output result (#48)", () => {
   };
 
   it("worktree teardown returns {shared: false, worktreeId}", async () => {
-    const track: StubSpawn = { invocations: [], touchSocket: true };
-    const deps = stubDeps({ stack: mixedStack, track });
+    const { deps } = onInMemoryPc(stubDeps({ stack: mixedStack }));
     await runUp(deps);
     const result = await runDown(deps);
     expect(result.shared).toBe(false);
@@ -2132,57 +2127,29 @@ describe("runDown — operation-output result (#48)", () => {
   });
 
   it("shared teardown returns {shared: true} and no worktreeId", async () => {
-    const track: StubSpawn = { invocations: [], touchSocket: true };
-    const registryRef = { snapshot: {} as RegistrySnapshot };
-    const baseDeps = stubDeps({ stack: mixedStack, track, registryRef });
-    await runUp(baseDeps);
+    const { deps } = onInMemoryPc(stubDeps({ stack: mixedStack }));
+    await runUp(deps);
 
-    const downDeps: CommandDeps = {
-      ...baseDeps,
-      driver: {
-        exists: () => Promise.resolve(true),
-        spawner: (_b, args, _o): SpawnedProcess => {
-          const si = args.indexOf("-u");
-          if (args[0] === "down" && si >= 0) {
-            const socketPath = args[si + 1];
-            if (socketPath) rmSync(socketPath, { force: true });
-          }
-          return spawnedOk();
-        },
-      },
-    };
-
-    const result = await runDown(downDeps, { shared: true });
+    const result = await runDown(deps, { shared: true });
     expect(result.shared).toBe(true);
     expect(result.worktreeId).toBeUndefined();
   });
 
   it("runDown(--shared) on an already-stopped shared instance is a tidy no-op that still returns {shared: true}", async () => {
-    const deps = stubDeps({ stack: mixedStack });
+    const { deps } = onInMemoryPc(stubDeps({ stack: mixedStack }));
     const result = await runDown(deps, { shared: true });
     expect(result.shared).toBe(true);
     expect(result.worktreeId).toBeUndefined();
   });
 
   it("still calls driver.down so the lifecycle contract (#1 plain runDown stops the worktree instance) holds", async () => {
-    const track: StubSpawn = { invocations: [], touchSocket: true };
-    const deps = stubDeps({ stack: mixedStack, track });
+    const { deps, pc } = onInMemoryPc(stubDeps({ stack: mixedStack }));
     await runUp(deps);
-    track.invocations.length = 0;
+    const sockets = socketsOf(deps);
 
-    const downCalls: ReadonlyArray<string>[] = [];
-    const observed: CommandDeps = {
-      ...deps,
-      driver: {
-        exists: () => Promise.resolve(true),
-        spawner: (_b, args, _o): SpawnedProcess => {
-          if (args[0] === "down") downCalls.push(args);
-          return spawnedOk();
-        },
-      },
-    };
-    await runDown(observed);
-    expect(downCalls).toHaveLength(1);
+    await runDown(deps);
+    expect(requestsOf(pc, "down").map((r) => r.socketPath)).toEqual([sockets.worktree]);
+    expect(pc.isUp(sockets.worktree)).toBe(false);
   });
 });
 
@@ -2200,85 +2167,57 @@ describe("runDown — idempotent no-op when nothing is running (#92)", () => {
     ],
   };
 
-  /** Wrap deps with a spawner that records `down` invocations. */
-  function recordingDownDeps(deps: CommandDeps): {
-    deps: CommandDeps;
-    downCalls: ReadonlyArray<string>[];
-  } {
-    const downCalls: ReadonlyArray<string>[] = [];
-    return {
-      downCalls,
-      deps: {
-        ...deps,
-        driver: {
-          exists: () => Promise.resolve(true),
-          spawner: (_b, args, _o): SpawnedProcess => {
-            if (args[0] === "down") downCalls.push(args);
-            return spawnedOk();
-          },
-        },
-      },
-    };
-  }
-
   it("worktree down with no instance running skips the driver and returns stopped: false", async () => {
     // No prior `up` — the worktree's control socket does not exist.
-    const { deps, downCalls } = recordingDownDeps(stubDeps({ stack: mixedStack }));
+    const { deps, pc } = onInMemoryPc(stubDeps({ stack: mixedStack }));
     const result = await runDown(deps);
-    expect(downCalls).toHaveLength(0);
+    expect(requestsOf(pc, "down")).toHaveLength(0);
     expect(result.shared).toBe(false);
     expect(result.stopped).toBe(false);
   });
 
   it("worktree down against a live instance calls the driver and returns stopped: true", async () => {
-    const track: StubSpawn = { invocations: [], touchSocket: true };
-    const baseDeps = stubDeps({ stack: mixedStack, track });
-    await runUp(baseDeps);
-    const { deps, downCalls } = recordingDownDeps(baseDeps);
+    const { deps, pc } = onInMemoryPc(stubDeps({ stack: mixedStack }));
+    await runUp(deps);
     const result = await runDown(deps);
-    expect(downCalls).toHaveLength(1);
+    expect(requestsOf(pc, "down")).toHaveLength(1);
+    expect(pc.isUp(socketsOf(deps).worktree)).toBe(false);
     expect(result.stopped).toBe(true);
-    expect(result.worktreeId).toBe(baseDeps.expectedWorktreeId);
+    expect(result.worktreeId).toBe(deps.expectedWorktreeId);
   });
 
   it("worktree down against a stale socket file (dead listener) is a no-op that unlinks the orphan", async () => {
-    // Mimic a SIGKILLed instance: the socket *file* survives in anchor state
-    // but no listener answers (#80). `down` must not shell out against the
-    // dead UDS — that's the raw "exited with code N" UNKNOWN the issue fixes.
-    const track: StubSpawn = { invocations: [], touchSocket: true };
-    const baseDeps = stubDeps({
-      stack: mixedStack,
-      track,
-      probeSocket: async () => "stale" as const,
-    });
-    await runUp({ ...baseDeps, probeSocket: async () => "running" as const });
-    const worktreeSpawn = track.invocations.find((i) => !i.socketPath.endsWith("/shared.sock"));
-    if (worktreeSpawn === undefined) throw new Error("expected a worktree spawn");
-    expect(existsSync(worktreeSpawn.socketPath)).toBe(true);
+    // A SIGKILLed instance: the socket *file* survives in anchor state but no
+    // listener answers (#80). `down` must not shell out against the dead UDS
+    // — that's the raw "exited with code N" UNKNOWN the issue fixes.
+    const { deps, pc } = onInMemoryPc(stubDeps({ stack: mixedStack }));
+    await runUp(deps);
+    const { worktree } = socketsOf(deps);
+    pc.crash(worktree);
+    expect(existsSync(worktree)).toBe(true);
 
-    const { deps, downCalls } = recordingDownDeps(baseDeps);
     const result = await runDown(deps);
-    expect(downCalls).toHaveLength(0);
+    expect(requestsOf(pc, "down")).toHaveLength(0);
     expect(result.stopped).toBe(false);
     // The probe gate unlinked the orphaned socket file on the way through.
-    expect(existsSync(worktreeSpawn.socketPath)).toBe(false);
+    expect(existsSync(worktree)).toBe(false);
   });
 
   it("shared down reports stopped: true when it actually tore the instance down", async () => {
-    const track: StubSpawn = { invocations: [], touchSocket: true };
-    const baseDeps = stubDeps({ stack: mixedStack, track });
-    await runUp(baseDeps);
-    const { deps, downCalls } = recordingDownDeps(baseDeps);
+    const { deps, pc } = onInMemoryPc(stubDeps({ stack: mixedStack }));
+    await runUp(deps);
+    const { shared: sharedSocket } = socketsOf(deps);
     const result = await runDown(deps, { shared: true });
-    expect(downCalls).toHaveLength(1);
+    expect(requestsOf(pc, "down").map((r) => r.socketPath)).toEqual([sharedSocket]);
+    expect(pc.isUp(sharedSocket)).toBe(false);
     expect(result.shared).toBe(true);
     expect(result.stopped).toBe(true);
   });
 
   it("shared down no-op reports stopped: false", async () => {
-    const { deps, downCalls } = recordingDownDeps(stubDeps({ stack: mixedStack }));
+    const { deps, pc } = onInMemoryPc(stubDeps({ stack: mixedStack }));
     const result = await runDown(deps, { shared: true });
-    expect(downCalls).toHaveLength(0);
+    expect(requestsOf(pc, "down")).toHaveLength(0);
     expect(result.shared).toBe(true);
     expect(result.stopped).toBe(false);
   });
@@ -2327,7 +2266,8 @@ describe("runDown — dead-supervisor reap of out-of-band resources (#148)", () 
   }
 
   it("runs the shutdown hook directly from the anchor when the supervisor socket is stale (SIGKILLed)", async () => {
-    const deps = stubDeps({ stack: hookStack, probeSocket: async () => "stale" as const });
+    // The staged socket file has no server behind it: the probe reads it stale.
+    const { deps, pc } = onInMemoryPc(stubDeps({ stack: hookStack }));
     const staged = stageWorktreeInstance(deps);
     const reapCalls: Array<{ cwd: string; config: DerivedConfig }> = [];
 
@@ -2348,24 +2288,22 @@ describe("runDown — dead-supervisor reap of out-of-band resources (#148)", () 
       command: "reap-stack.sh",
       timeout_seconds: 8,
     });
+    // Nothing was asked of the dead supervisor.
+    expect(requestsOf(pc, "down")).toHaveLength(0);
     // The stale socket file is reclaimed; result is the worktree teardown.
+    expect(existsSync(staged.socketPath)).toBe(false);
     expect(result.shared).toBe(false);
     expect(result.stopped).toBe(false);
   });
 
   it("does NOT run the direct reap when the supervisor is live (graceful down fires the hook) — no regression on acceptance 4", async () => {
-    const track: StubSpawn = { invocations: [], touchSocket: true };
-    const baseDeps = stubDeps({
-      stack: hookStack,
-      track,
-      probeSocket: async () => "running" as const,
-    });
-    stageWorktreeInstance(baseDeps);
+    const { deps, pc } = onInMemoryPc(stubDeps({ stack: hookStack }));
+    const staged = stageWorktreeInstance(deps);
+    await pc.driver.up({ configPath: staged.configPath, socketPath: staged.socketPath });
     const reapCalls: unknown[] = [];
 
     const result = await runDown({
-      ...baseDeps,
-      driver: { exists: () => Promise.resolve(true), spawner: () => spawnedOk() },
+      ...deps,
       reap: async (config, rdeps) => {
         reapCalls.push({ config, cwd: rdeps.cwd });
         return { ranCount: 0, failures: [] };
@@ -2375,11 +2313,12 @@ describe("runDown — dead-supervisor reap of out-of-band resources (#148)", () 
     // Live supervisor: the graceful `process-compose down` fires the hook from
     // the (present) worktree, so devtrees must NOT also run it directly.
     expect(reapCalls).toHaveLength(0);
+    expect(pc.isUp(staged.socketPath)).toBe(false);
     expect(result.stopped).toBe(true);
   });
 
   it("reflects a failed dead-supervisor reap in DownResult.warning (acceptance 5)", async () => {
-    const deps = stubDeps({ stack: hookStack, probeSocket: async () => "stale" as const });
+    const { deps } = onInMemoryPc(stubDeps({ stack: hookStack }));
     stageWorktreeInstance(deps);
 
     const result = await runDown({
@@ -3124,23 +3063,29 @@ describe("runLs — instance enumeration", () => {
       if (flag === "--is-bare-repository") return "false";
       throw new Error("unexpected");
     };
-    // Driver injection is the same one up/down use — exists+spawner. The
-    // spawner here is never reached because runLs's getServiceStatuses goes
-    // through the driver and the discoverer below sees the function only.
-    let receivedFetch: unknown;
+    // The process-compose Driver is the same one up/down use; the discoverer
+    // is handed a read that reaches it.
+    const pc = createInMemoryProcessCompose();
+    const inst = instancePaths(tmp.anchor, "login");
+    mkdirSync(inst.runDir, { recursive: true });
+    writeFileSync(inst.configPath, stringifyYaml({ processes: { web: { command: "sleep 300" } } }));
+    await pc.driver.up(inst);
+    let received: ServiceStatus[] | undefined;
     const { runLs } = await import("./commands.js");
     await runLs({
       cwd: join(tmp.worktreeRoot, "login"),
       git,
-      driver: { exists: () => Promise.resolve(true) },
+      processCompose: pc.driver,
+      probeSocket: (path) => pc.probeSocket(path),
       discover: async (_anchor, deps) => {
-        receivedFetch = deps.getServiceStatuses;
+        received = await deps.getServiceStatuses?.(inst.socketPath);
         return [];
       },
     });
-    // The discoverer must have been handed a callable — the wiring exists,
-    // even when no instance ends up exercising it.
-    expect(typeof receivedFetch).toBe("function");
+    // The read the discoverer was handed answers with the instance's rows.
+    expect(received?.map((r) => [r.name, r.status, r.pid])).toEqual([
+      ["web", "Running", pc.pidOf(inst.socketPath, "web")],
+    ]);
   });
 
   it("bounds each instance's service read: a wedged instance fails within the budget, in parallel with the rest (#226)", async () => {
@@ -3152,39 +3097,35 @@ describe("runLs — instance enumeration", () => {
       if (flag === "--is-bare-repository") return "false";
       throw new Error("unexpected");
     };
-    const killed: string[] = [];
-    // `process list` against `wedged.sock` never answers, like a SIGSTOPped
-    // process-compose; against any other socket it answers at once.
-    const spawner: NonNullable<CommandDeps["driver"]>["spawner"] = (_binary, args) => {
-      const socket = String(args[args.indexOf("-u") + 1]);
-      const emitter = new EventEmitter() as EventEmitter & {
-        stdout: Readable;
-        kill: () => boolean;
-      };
-      emitter.kill = () => {
-        killed.push(socket);
-        return true;
-      };
-      if (socket.endsWith("wedged.sock")) {
-        emitter.stdout = new Readable({ read() {} });
-        return emitter as unknown as SpawnedProcess;
-      }
-      emitter.stdout = Readable.from([JSON.stringify([{ name: "web", status: "Running" }])]);
-      emitter.stdout.on("end", () => queueMicrotask(() => emitter.emit("exit", 0)));
-      return emitter as unknown as SpawnedProcess;
-    };
+    // `wedged` stops answering, like a SIGSTOPped process-compose: it still
+    // accepts connections (the probe reads it running), so the read retries
+    // until its budget runs out. `login` answers at once. Killing a hung
+    // `process list` client at the cap is the real driver's, covered in
+    // driver.test.ts ("kills a `process list` that never answers ...").
+    const pc = createInMemoryProcessCompose();
+    const login = instancePaths(tmp.anchor, "login");
+    const wedged = instancePaths(tmp.anchor, "wedged");
+    mkdirSync(login.runDir, { recursive: true });
+    for (const inst of [login, wedged]) {
+      writeFileSync(
+        inst.configPath,
+        stringifyYaml({ processes: { web: { command: "sleep 300" } } }),
+      );
+      await pc.driver.up(inst);
+    }
+    pc.freeze(wedged.socketPath);
     const reads: Array<{ socket: string; ms: number; ok: boolean }> = [];
     const { runLs } = await import("./commands.js");
     const started = Date.now();
     await runLs({
       cwd: join(tmp.worktreeRoot, "login"),
       git,
-      driver: { exists: () => Promise.resolve(true), spawner },
+      processCompose: pc.driver,
       readTimeoutMs: 300,
-      probeSocket: async () => "running",
+      probeSocket: (path) => pc.probeSocket(path),
       discover: async (_anchor, deps) => {
         await Promise.all(
-          ["/x/wedged.sock", "/x/login.sock"].map(async (socket) => {
+          [wedged.socketPath, login.socketPath].map(async (socket) => {
             const t0 = Date.now();
             const ok = await deps.getServiceStatuses!(socket).then(
               () => true,
@@ -3196,18 +3137,18 @@ describe("runLs — instance enumeration", () => {
         return [];
       },
     });
-    const wedged = reads.find((r) => r.socket === "/x/wedged.sock");
-    expect(reads.find((r) => r.socket === "/x/login.sock")?.ok).toBe(true);
-    expect(wedged?.ok).toBe(false);
-    // Retried within the budget, every hung client killed, never waited on past it.
-    expect(wedged?.ms).toBeLessThan(2_000);
-    expect(killed.length).toBeGreaterThan(0);
-    expect(killed.every((s) => s === "/x/wedged.sock")).toBe(true);
+    const wedgedRead = reads.find((r) => r.socket === wedged.socketPath);
+    expect(reads.find((r) => r.socket === login.socketPath)?.ok).toBe(true);
+    expect(wedgedRead?.ok).toBe(false);
+    // Retried for the whole budget, never waited on past it.
+    expect(wedgedRead?.ms).toBeGreaterThanOrEqual(290);
+    expect(wedgedRead?.ms).toBeLessThan(2_000);
     expect(Date.now() - started).toBeLessThan(2_000);
   });
 });
 
 /**
+
  * Tracker for `process-compose attach` invocations — the spawner records the
  * args so the test can assert which socket path was attached against.
  */
@@ -3434,10 +3375,10 @@ describe("runPrune — reconcile instances against git worktree list", () => {
     mkdirSync(runDir(tmp.anchor), { recursive: true });
     const orphanSocket = instancePaths(tmp.anchor, "removed").socketPath;
     const orphanConfig = join(tmp.anchor, "devtrees", "removed.yaml");
-    writeFileSync(orphanSocket, "");
-    writeFileSync(orphanConfig, "processes: {}\n");
-
-    const downCalls: Array<{ configPath: string; socketPath: string }> = [];
+    writeFileSync(orphanConfig, stringifyYaml({ processes: { web: { command: "sleep 300" } } }));
+    // The orphan's process-compose still runs.
+    const pc = createInMemoryProcessCompose();
+    await pc.driver.up({ configPath: orphanConfig, socketPath: orphanSocket });
 
     const git = pruneGit({
       anchor: tmp.anchor,
@@ -3467,25 +3408,14 @@ describe("runPrune — reconcile instances against git worktree list", () => {
         registryRef.snapshot = after;
         return after;
       },
-      driver: {
-        exists: () => Promise.resolve(true),
-        spawner: (_binary, args) => {
-          // The driver invokes `down -U -u <socket>`.
-          const verb = args[0];
-          const si = args.indexOf("-u");
-          if (verb === "down" && si >= 0) {
-            const socketPath = args[si + 1] ?? "";
-            downCalls.push({ configPath: "", socketPath });
-          }
-          return spawnedOk();
-        },
-      },
+      ...inMemoryPcDeps(pc),
     });
 
     // Acceptance: orphan is reported in the result.
     expect(result.pruned.map((p) => p.id)).toEqual(["removed"]);
-    // Acceptance: driver.down was called for the orphan only.
-    expect(downCalls.map((c) => c.socketPath)).toEqual([orphanSocket]);
+    // Acceptance: driver.down was called for the orphan only, and stopped it.
+    expect(requestsOf(pc, "down").map((r) => r.socketPath)).toEqual([orphanSocket]);
+    expect(pc.isUp(orphanSocket)).toBe(false);
     // Acceptance: anchor state for the orphan is gone.
     expect(existsSync(orphanSocket)).toBe(false);
     expect(existsSync(orphanConfig)).toBe(false);
@@ -3501,9 +3431,15 @@ describe("runPrune — reconcile instances against git worktree list", () => {
     // driver is the only way it doesn't outlive the sweep.
     const tmp = tmpAnchor();
     mkdirSync(runDir(tmp.anchor), { recursive: true });
-    const orphanSocket = instancePaths(tmp.anchor, "removed").socketPath;
-    writeFileSync(orphanSocket, "");
-    const downSockets: string[] = [];
+    const orphan = instancePaths(tmp.anchor, "removed");
+    const orphanSocket = orphan.socketPath;
+    writeFileSync(
+      orphan.configPath,
+      stringifyYaml({ processes: { web: { command: "sleep 300" } } }),
+    );
+    // It is a live process-compose that was merely slow to answer.
+    const pc = createInMemoryProcessCompose();
+    await pc.driver.up(orphan);
     const { runPrune } = await import("./commands.js");
     const result = await runPrune({
       cwd: join(tmp.worktreeRoot, "login"),
@@ -3515,16 +3451,11 @@ describe("runPrune — reconcile instances against git worktree list", () => {
       }),
       discover: async () => [instance("removed", { status: "unknown", socketPath: orphanSocket })],
       withRegistryLock: async (_anchor, mutate) => mutate({}),
-      driver: {
-        exists: () => Promise.resolve(true),
-        spawner: (_binary, args) => {
-          if (args[0] === "down") downSockets.push(args[args.indexOf("-u") + 1] ?? "");
-          return spawnedOk();
-        },
-      },
+      ...inMemoryPcDeps(pc),
     });
     expect(result.pruned.map((p) => p.id)).toEqual(["removed"]);
-    expect(downSockets).toEqual([orphanSocket]);
+    expect(requestsOf(pc, "down").map((r) => r.socketPath)).toEqual([orphanSocket]);
+    expect(pc.isUp(orphanSocket)).toBe(false);
     expect(result.unreclaimed).toEqual([]);
     expect(existsSync(orphanSocket)).toBe(false);
   });
@@ -3557,11 +3488,8 @@ describe("runPrune — reconcile instances against git worktree list", () => {
         registryRef.snapshot = await mutate(registryRef.snapshot);
         return registryRef.snapshot;
       },
-      driver: {
-        exists: () => Promise.resolve(true),
-        spawner: (_binary, args) =>
-          args[0] === "down" ? refusedStart("connection refused") : spawnedOk(),
-      },
+      // No server answers on the orphan's socket, so its `down` fails.
+      ...inMemoryPcDeps(createInMemoryProcessCompose()),
     });
     expect(result.pruned).toEqual([]);
     expect(result.unreclaimed).toEqual([
@@ -3578,6 +3506,7 @@ describe("runPrune — reconcile instances against git worktree list", () => {
     mkdirSync(runDir(tmp.anchor), { recursive: true });
     const orphanSocket = instancePaths(tmp.anchor, "removed").socketPath;
     writeFileSync(orphanSocket, "");
+    const pc = createInMemoryProcessCompose();
     const { runPrune } = await import("./commands.js");
     const result = await runPrune({
       cwd: join(tmp.worktreeRoot, "login"),
@@ -3589,11 +3518,10 @@ describe("runPrune — reconcile instances against git worktree list", () => {
       }),
       discover: async () => [instance("removed", { status: "running", socketPath: orphanSocket })],
       withRegistryLock: async (_anchor, mutate) => mutate({}),
-      driver: {
-        exists: () => Promise.resolve(true),
-        spawner: (_binary, args) => (args[0] === "down" ? refusedStart("boom") : spawnedOk()),
-      },
+      // No server answers on the orphan's socket, so its `down` fails.
+      ...inMemoryPcDeps(pc),
     });
+    expect(requestsOf(pc, "down").map((r) => r.socketPath)).toEqual([orphanSocket]);
     expect(result.pruned.map((p) => p.id)).toEqual(["removed"]);
     expect(result.unreclaimed).toEqual([]);
     expect(existsSync(orphanSocket)).toBe(false);
@@ -3609,7 +3537,7 @@ describe("runPrune — reconcile instances against git worktree list", () => {
     writeFileSync(orphanSocket, "");
     writeFileSync(orphanConfig, "processes: {}\n");
 
-    const downCalls: string[] = [];
+    const pc = createInMemoryProcessCompose();
     const git = pruneGit({
       anchor: tmp.anchor,
       worktreeRoot: tmp.worktreeRoot,
@@ -3628,18 +3556,12 @@ describe("runPrune — reconcile instances against git worktree list", () => {
         registryRef.snapshot = after;
         return after;
       },
-      driver: {
-        exists: () => Promise.resolve(true),
-        spawner: (_binary, args) => {
-          downCalls.push(args[0] ?? "");
-          return spawnedOk();
-        },
-      },
+      ...inMemoryPcDeps(pc),
     });
 
     expect(result.pruned.map((p) => p.id)).toEqual(["removed"]);
     // Acceptance: no driver.down for a stale instance — nothing is listening.
-    expect(downCalls).toEqual([]);
+    expect(pc.requests).toEqual([]);
     expect(existsSync(orphanSocket)).toBe(false);
     expect(existsSync(orphanConfig)).toBe(false);
     expect("removed" in registryRef.snapshot).toBe(false);
@@ -3672,12 +3594,18 @@ describe("runPrune — reconcile instances against git worktree list", () => {
     // on. The whole point of prune is to reclaim stale state.
     const tmp = tmpAnchor();
     mkdirSync(runDir(tmp.anchor), { recursive: true });
-    const a = instancePaths(tmp.anchor, "alpha").socketPath;
-    const b = instancePaths(tmp.anchor, "beta").socketPath;
-    writeFileSync(a, "");
-    writeFileSync(b, "");
-    writeFileSync(join(tmp.anchor, "devtrees", "alpha.yaml"), "");
-    writeFileSync(join(tmp.anchor, "devtrees", "beta.yaml"), "");
+    const alpha = instancePaths(tmp.anchor, "alpha");
+    const beta = instancePaths(tmp.anchor, "beta");
+    const a = alpha.socketPath;
+    const b = beta.socketPath;
+    writeFileSync(alpha.configPath, stringifyYaml({ processes: { web: { command: "sleep 1" } } }));
+    writeFileSync(beta.configPath, stringifyYaml({ processes: { web: { command: "sleep 1" } } }));
+    // alpha's process-compose has died, leaving its socket file: its `down`
+    // fails. beta's still runs.
+    const pc = createInMemoryProcessCompose();
+    await pc.driver.up(alpha);
+    await pc.driver.up(beta);
+    pc.crash(a);
 
     const git = pruneGit({
       anchor: tmp.anchor,
@@ -3686,7 +3614,6 @@ describe("runPrune — reconcile instances against git worktree list", () => {
       porcelain: [`worktree ${join(tmp.worktreeRoot, "live")}`, "HEAD x", ""].join("\n"),
     });
     const registryRef = { snapshot: { alpha: 20000, beta: 20032 } as RegistrySnapshot };
-    let firstDown = true;
     const { runPrune } = await import("./commands.js");
     const result = await runPrune({
       cwd: join(tmp.worktreeRoot, "live"),
@@ -3700,25 +3627,17 @@ describe("runPrune — reconcile instances against git worktree list", () => {
         registryRef.snapshot = after;
         return after;
       },
-      driver: {
-        exists: () => Promise.resolve(true),
-        spawner: (_binary, _args) => {
-          if (firstDown) {
-            firstDown = false;
-            // Simulate process-compose down failing — emit exit(1).
-            return {
-              on(event: "error" | "exit", cb: (arg: never) => void): void {
-                if (event === "exit") queueMicrotask(() => (cb as (c: number) => void)(1));
-              },
-              unref: () => {},
-            };
-          }
-          return spawnedOk();
-        },
-      },
+      ...inMemoryPcDeps(pc),
     });
 
     expect(result.pruned.map((p) => p.id).sort()).toEqual(["alpha", "beta"]);
+    // alpha's down failed; beta's still ran and stopped it.
+    expect(
+      requestsOf(pc, "down")
+        .map((r) => r.socketPath)
+        .sort(),
+    ).toEqual([a, b]);
+    expect(pc.isUp(b)).toBe(false);
     // Both orphans had their anchor state cleared regardless of down outcome.
     expect(existsSync(a)).toBe(false);
     expect(existsSync(b)).toBe(false);
@@ -3822,12 +3741,18 @@ describe("runPrune — reconcile instances against git worktree list", () => {
       porcelain: [`worktree ${join(tmp.worktreeRoot, "live")}`, "HEAD x", ""].join("\n"),
     });
     const registryRef = { snapshot: { removed: 20000 } as RegistrySnapshot };
-    return { tmp, orphanSocket, orphanConfig, goneWorktree, git, registryRef, status };
+    // A running supervisor still serves the orphan's socket; a stale one left
+    // only the file behind.
+    const pc = createInMemoryProcessCompose();
+    return { tmp, orphanSocket, orphanConfig, goneWorktree, git, registryRef, status, pc };
   }
 
   for (const status of ["running", "stale"] as const) {
     it(`runs each orphan's shutdown.command from the anchor (not the deleted working_dir) — ${status} supervisor (#148)`, async () => {
       const fx = reapFixture(status);
+      if (status === "running") {
+        await fx.pc.driver.up({ configPath: fx.orphanConfig, socketPath: fx.orphanSocket });
+      }
       const reapCalls: Array<{ cwd: string; config: DerivedConfig }> = [];
 
       const { runPrune } = await import("./commands.js");
@@ -3839,7 +3764,7 @@ describe("runPrune — reconcile instances against git worktree list", () => {
           fx.registryRef.snapshot = await mutate(fx.registryRef.snapshot);
           return fx.registryRef.snapshot;
         },
-        driver: { exists: () => Promise.resolve(true), spawner: () => spawnedOk() },
+        ...inMemoryPcDeps(fx.pc),
         reap: async (config, deps) => {
           reapCalls.push({ cwd: deps.cwd, config });
           return { ranCount: 1, failures: [] };
@@ -3860,11 +3785,15 @@ describe("runPrune — reconcile instances against git worktree list", () => {
       // read before deletion, then removed afterwards.
       expect(existsSync(fx.orphanConfig)).toBe(false);
       expect(existsSync(fx.orphanSocket)).toBe(false);
+      // A running supervisor is also stopped gracefully; a stale one is not asked.
+      expect(requestsOf(fx.pc, "down")).toHaveLength(status === "running" ? 1 : 0);
+      expect(fx.pc.isUp(fx.orphanSocket)).toBe(false);
     });
   }
 
   it("reflects a failed orphan reap in PruneResult.warnings — NOT a silent clean teardown (#148 acceptance 5)", async () => {
     const fx = reapFixture("running");
+    await fx.pc.driver.up({ configPath: fx.orphanConfig, socketPath: fx.orphanSocket });
 
     const { runPrune } = await import("./commands.js");
     const result = await runPrune({
@@ -3877,7 +3806,7 @@ describe("runPrune — reconcile instances against git worktree list", () => {
         fx.registryRef.snapshot = await mutate(fx.registryRef.snapshot);
         return fx.registryRef.snapshot;
       },
-      driver: { exists: () => Promise.resolve(true), spawner: () => spawnedOk() },
+      ...inMemoryPcDeps(fx.pc),
       reap: async () => ({
         ranCount: 1,
         failures: [
@@ -3952,15 +3881,15 @@ describe("runEnv — pure read of injected env", () => {
   });
 
   it("does not spawn process-compose (pure read; no driver interaction)", async () => {
-    const track: StubSpawn = { invocations: [], touchSocket: false };
     const stack: ResolvedStack = {
       services: [
         isolated("web", "node x.js", ["WEB_PORT"]),
         shared("postgres", "postgres", ["DB_PORT"]),
       ],
     };
-    await runEnv(stubDeps({ stack, track }));
-    expect(track.invocations).toEqual([]);
+    const { deps, pc } = onInMemoryPc(stubDeps({ stack }));
+    await runEnv(deps);
+    expect(pc.requests).toEqual([]);
   });
 
   it("does not acquire the allocation-registry lock and does not persist anything", async () => {
@@ -6280,61 +6209,49 @@ describe("runDown — crash recovery: stale shared socket (#80)", () => {
     ],
   };
 
-  it("cleans up the stale socket file and no-ops instead of signalling a dead instance", async () => {
+  /** The shared instance on the in-memory process-compose, booted with `postgres`. */
+  async function sharedRunning() {
     const tmp = tmpAnchor();
     const sharedPaths = sharedInstancePaths(tmp.anchor);
     mkdirSync(sharedPaths.runDir, { recursive: true });
-    writeFileSync(sharedPaths.socketPath, "");
+    writeFileSync(
+      sharedPaths.configPath,
+      stringifyYaml({ processes: { postgres: { command: "postgres" } } }),
+    );
+    const { deps, pc } = onInMemoryPc(
+      stubDeps({
+        stack: mixedStack,
+        anchorOverride: tmp.anchor,
+        worktreeRootOverride: tmp.worktreeRoot,
+      }),
+    );
+    await pc.driver.up(sharedPaths);
+    return { deps, pc, sharedPaths };
+  }
 
-    const downSpawns: string[] = [];
-    const base = stubDeps({
-      stack: mixedStack,
-      anchorOverride: tmp.anchor,
-      worktreeRootOverride: tmp.worktreeRoot,
-      probeSocket: async () => "stale",
-    });
-    const innerSpawner = base.driver?.spawner;
-    if (innerSpawner === undefined) throw new Error("expected stub spawner");
-    const spawner = (binary: string, args: ReadonlyArray<string>, options: SpawnOptions) => {
-      if (args[0] === "down") downSpawns.push(args.join(" "));
-      return innerSpawner(binary, args, options);
-    };
-    const deps: CommandDeps = { ...base, driver: { ...base.driver, spawner } };
+  it("cleans up the stale socket file and no-ops instead of signalling a dead instance", async () => {
+    // A SIGKILLed shared instance: its socket file stays, nothing answers.
+    const { deps, pc, sharedPaths } = await sharedRunning();
+    pc.crash(sharedPaths.socketPath);
+    const before = pc.requests.length;
 
     const result = await runDown(deps, { shared: true });
 
     // Idempotent no-op result, no `process-compose down` against the dead UDS.
     expect(result).toEqual({ shared: true, stopped: false, forceKilled: [] });
-    expect(downSpawns).toHaveLength(0);
+    expect(pc.requests.slice(before)).toEqual([]);
     // The orphaned socket file was unlinked, so the next up lazy-starts fresh.
     expect(existsSync(sharedPaths.socketPath)).toBe(false);
   });
 
   it("still signals a live shared instance through the driver", async () => {
-    const tmp = tmpAnchor();
-    const sharedPaths = sharedInstancePaths(tmp.anchor);
-    mkdirSync(sharedPaths.runDir, { recursive: true });
-    writeFileSync(sharedPaths.socketPath, "");
-
-    const downSpawns: string[] = [];
-    const base = stubDeps({
-      stack: mixedStack,
-      anchorOverride: tmp.anchor,
-      worktreeRootOverride: tmp.worktreeRoot,
-      probeSocket: async () => "running",
-    });
-    const innerSpawner = base.driver?.spawner;
-    if (innerSpawner === undefined) throw new Error("expected stub spawner");
-    const spawner = (binary: string, args: ReadonlyArray<string>, options: SpawnOptions) => {
-      if (args[0] === "down") downSpawns.push(args.join(" "));
-      return innerSpawner(binary, args, options);
-    };
-    const deps: CommandDeps = { ...base, driver: { ...base.driver, spawner } };
+    const { deps, pc, sharedPaths } = await sharedRunning();
 
     const result = await runDown(deps, { shared: true });
 
     expect(result).toEqual({ shared: true, stopped: true, forceKilled: [] });
-    expect(downSpawns).toHaveLength(1);
+    expect(requestsOf(pc, "down").map((r) => r.socketPath)).toEqual([sharedPaths.socketPath]);
+    expect(pc.isUp(sharedPaths.socketPath)).toBe(false);
   });
 });
 
@@ -6369,50 +6286,49 @@ describe("liveness unknown — retry, then fail without touching the socket (#18
   };
 
   /**
-   * A worktree instance whose socket file is on disk (unchanged config, `web`
-   * running, so a live verdict takes the quiet already-running path), with
-   * every spawn and reap recorded.
+   * A worktree instance running `web` on the in-memory process-compose
+   * (unchanged config, so a live verdict takes the quiet already-running
+   * path), with every reap recorded. The liveness probe is `probeSocket`, so
+   * a test can make it answer `unknown`.
    */
-  function staged(
+  async function staged(
     probeSocket: (socketPath: string) => Promise<InstanceStatus>,
     stack: ResolvedStack = isolatedStack,
   ) {
     const tmp = tmpAnchor();
-    const track: StubSpawn = { invocations: [], touchSocket: true };
-    const base = stubDeps({
-      stack,
-      track,
-      anchorOverride: tmp.anchor,
-      worktreeRootOverride: tmp.worktreeRoot,
-      probeSocket,
-    });
-    const wtSocket = instancePaths(tmp.anchor, base.expectedWorktreeId).socketPath;
+    const onPc = onInMemoryPc(
+      stubDeps({
+        stack,
+        anchorOverride: tmp.anchor,
+        worktreeRootOverride: tmp.worktreeRoot,
+      }),
+    );
+    const { pc } = onPc;
+    const wt = instancePaths(tmp.anchor, onPc.deps.expectedWorktreeId);
+    const wtSocket = wt.socketPath;
     const sharedSocket = sharedInstancePaths(tmp.anchor).socketPath;
     mkdirSync(runDir(tmp.anchor), { recursive: true });
-    writeFileSync(wtSocket, "");
-    const spawned: string[][] = [];
+    writeFileSync(
+      wt.configPath,
+      stringifyYaml({ processes: { web: { command: "node server.js" } } }),
+    );
+    await pc.driver.up(wt);
+    const booted = pc.requests.length;
     const reaped: string[] = [];
-    const inner = base.driver?.spawner;
-    if (inner === undefined) throw new Error("expected stub spawner");
     const deps: CommandDeps = {
-      ...base,
+      ...onPc.deps,
+      probeSocket,
       probeRetryDelaysMs: [0, 0, 0],
       readStoredHash: () => stackHash(stack),
       writeStoredHash: () => {},
-      getServiceStatuses: async () => [{ name: "web", status: "Running", health: "unknown" }],
       reap: async () => {
         reaped.push("reap");
         return { ranCount: 0, failures: [] };
       },
-      driver: {
-        ...base.driver,
-        spawner: (binary, args, options) => {
-          spawned.push([...args]);
-          return inner(binary, args, options);
-        },
-      },
     };
-    return { deps, track, spawned, reaped, wtSocket, sharedSocket, id: base.expectedWorktreeId };
+    /** The `op` requests process-compose received since the instance was staged. */
+    const sent = (op: PcRequest["op"]) => pc.requests.slice(booted).filter((r) => r.op === op);
+    return { deps, pc, sent, reaped, wtSocket, sharedSocket, id: onPc.deps.expectedWorktreeId };
   }
 
   async function rejection(p: Promise<unknown>) {
@@ -6424,7 +6340,7 @@ describe("liveness unknown — retry, then fail without touching the socket (#18
 
   it("up: an unknown worktree socket is re-probed, then fails INSTANCE_UNRESPONSIVE without a fresh start", async () => {
     const probed: string[] = [];
-    const fx = staged(async (p) => {
+    const fx = await staged(async (p) => {
       probed.push(p);
       return "unknown";
     });
@@ -6435,70 +6351,79 @@ describe("liveness unknown — retry, then fail without touching the socket (#18
     // One probe plus one per backoff step, all against the worktree socket.
     expect(probed).toEqual([fx.wtSocket, fx.wtSocket, fx.wtSocket, fx.wtSocket]);
     // No fresh start beside a possibly-live instance (it would collide on ports).
-    expect(fx.track.invocations).toEqual([]);
+    expect(fx.sent("up")).toEqual([]);
     expect(existsSync(fx.wtSocket)).toBe(true);
+    expect(fx.pc.isUp(fx.wtSocket)).toBe(true);
   });
 
   it("up: a probe that answers on a retry takes the already-running path", async () => {
     let probes = 0;
-    const fx = staged(async () => (++probes < 3 ? "unknown" : "running"));
+    const fx = await staged(async () => (++probes < 3 ? "unknown" : "running"));
+    const webPid = fx.pc.pidOf(fx.wtSocket, "web");
     const result = await runUp(fx.deps);
     expect(result.worktreeId).toBe(fx.id);
     expect(probes).toBe(3);
-    expect(fx.track.invocations).toEqual([]);
+    expect(fx.sent("up")).toEqual([]);
     expect(existsSync(fx.wtSocket)).toBe(true);
+    // The running instance was left as it was.
+    expect(fx.pc.pidOf(fx.wtSocket, "web")).toBe(webPid);
   });
 
   it("up: a definitive stale after an unknown still unlinks and starts fresh", async () => {
     let probes = 0;
-    const fx = staged(async () => (++probes === 1 ? "unknown" : "stale"));
+    const fx = await staged(async () => (++probes === 1 ? "unknown" : "stale"));
+    // The instance died, leaving its socket file behind.
+    fx.pc.crash(fx.wtSocket);
     await runUp(fx.deps);
-    expect(fx.track.invocations.map((i) => i.socketPath)).toEqual([fx.wtSocket]);
+    expect(fx.sent("up").map((r) => r.socketPath)).toEqual([fx.wtSocket]);
+    expect(fx.pc.isUp(fx.wtSocket)).toBe(true);
   });
 
   it("up: an unknown shared socket fails INSTANCE_UNRESPONSIVE instead of lazy-starting a second shared instance", async () => {
-    const fx = staged(async () => "unknown", mixedStack);
-    rmSync(fx.wtSocket);
+    const fx = await staged(async () => "unknown", mixedStack);
+    await fx.pc.driver.down({ configPath: "", socketPath: fx.wtSocket });
     writeFileSync(fx.sharedSocket, "");
     const err = await rejection(runUp(fx.deps));
     expect(err?.code).toBe("INSTANCE_UNRESPONSIVE");
     expect(err?.details).toMatchObject({ instance: "shared", socket_path: fx.sharedSocket });
-    expect(fx.track.invocations.some((i) => i.socketPath === fx.sharedSocket)).toBe(false);
+    expect(fx.sent("up").some((r) => r.socketPath === fx.sharedSocket)).toBe(false);
     expect(existsSync(fx.sharedSocket)).toBe(true);
   });
 
   it("down: an unknown socket fails INSTANCE_UNRESPONSIVE — never 'nothing running', never the dead-supervisor reap", async () => {
-    const fx = staged(async () => "unknown");
+    const fx = await staged(async () => "unknown");
     const err = await rejection(runDown(fx.deps));
     expect(err?.code).toBe("INSTANCE_UNRESPONSIVE");
     expect(err?.message).toContain("socket was kept");
     expect(String(err?.details?.remedy)).toContain("devtrees down");
-    expect(fx.spawned.filter((a) => a[0] === "down")).toEqual([]);
+    expect(fx.sent("down")).toEqual([]);
     expect(fx.reaped).toEqual([]);
     expect(existsSync(fx.wtSocket)).toBe(true);
+    expect(fx.pc.isUp(fx.wtSocket)).toBe(true);
   });
 
   it("down: a probe that answers on a retry stops the instance through the driver", async () => {
     let probes = 0;
-    const fx = staged(async () => (++probes === 1 ? "unknown" : "running"));
+    const fx = await staged(async () => (++probes === 1 ? "unknown" : "running"));
     const result = await runDown(fx.deps);
     expect(result.stopped).toBe(true);
-    expect(fx.spawned.filter((a) => a[0] === "down")).toHaveLength(1);
+    expect(fx.sent("down")).toHaveLength(1);
+    expect(fx.pc.isUp(fx.wtSocket)).toBe(false);
   });
 
   it("down --shared: an unknown shared socket fails INSTANCE_UNRESPONSIVE and keeps the socket", async () => {
-    const fx = staged(async () => "unknown", mixedStack);
+    const fx = await staged(async () => "unknown", mixedStack);
     writeFileSync(fx.sharedSocket, "");
     const err = await rejection(runDown(fx.deps, { shared: true }));
     expect(err?.code).toBe("INSTANCE_UNRESPONSIVE");
     expect(err?.details).toMatchObject({ instance: "shared" });
     expect(String(err?.details?.remedy)).toContain("devtrees down --shared");
-    expect(fx.spawned.filter((a) => a[0] === "down")).toEqual([]);
+    expect(fx.sent("down")).toEqual([]);
     expect(existsSync(fx.sharedSocket)).toBe(true);
   });
 
   it("the envelope classifies as INSTANCE_UNRESPONSIVE with its details", async () => {
-    const fx = staged(async () => "unknown");
+    const fx = await staged(async () => "unknown");
     const err = await rejection(runDown(fx.deps));
     if (err === undefined) throw new Error("expected runDown to reject");
     const payload = classifyError(err);
@@ -7014,57 +6939,49 @@ describe("bounded down — force-kill and DOWN_TIMEOUT (#190)", () => {
   const PC_PID = 100;
   const WEB_PID = 201;
 
-  /** A `process-compose down` client that never returns until killed. */
-  function hangingDown(): SpawnedProcess {
-    const emitter = new EventEmitter();
-    (emitter as unknown as SpawnedProcess).kill = () => {
-      queueMicrotask(() => emitter.emit("exit", null));
-      return true;
-    };
-    return emitter as unknown as SpawnedProcess;
-  }
-
-  /** A `process list -o json` child reporting `web` running as WEB_PID. */
-  function listing(): SpawnedProcess {
-    const emitter = new EventEmitter() as EventEmitter & { stdout: Readable };
-    const rows = [
-      { name: "web", status: "Running", is_ready: "-", pid: WEB_PID, is_running: true },
-    ];
-    emitter.stdout = Readable.from([JSON.stringify(rows)]);
-    emitter.stdout.on("end", () => queueMicrotask(() => emitter.emit("exit", 0)));
-    return emitter as unknown as SpawnedProcess;
-  }
-
-  /** A driver whose `down` hangs on a stuck `web`. */
-  function stuckDriver(): CommandDeps["driver"] {
-    return {
-      exists: () => Promise.resolve(true),
-      spawner: (_binary, args) => {
-        if (args[0] === "down") return hangingDown();
-        if (args[0] === "process") return listing();
-        return spawnedOk();
+  /**
+   * The in-memory process-compose (its first process runs as WEB_PID), as
+   * seen through a Driver whose `down` never finishes within its budget: a
+   * service ignores SIGTERM. The adapter does not model a stuck service, so
+   * only `down` is replaced: it waits out the budget and reports the timeout,
+   * as the real driver does once it kills the hung client. Every other
+   * operation, and every status read, is the model's.
+   */
+  function stuckPc() {
+    const pc = createInMemoryProcessCompose({ firstPid: WEB_PID });
+    const downs: string[] = [];
+    const driver: Driver = {
+      ...pc.driver,
+      down: async (inst, opts = {}) => {
+        downs.push(inst.socketPath);
+        await new Promise((r) => setTimeout(r, opts.timeoutMs ?? 0));
+        return { stopped: false, reason: "timeout" };
       },
     };
+    return { pc, downs, pcDeps: { ...inMemoryPcDeps(pc), processCompose: driver } };
   }
 
   /**
    * Stop seams over a fake process table: process-compose (PC_PID) bound to
-   * `socketPath`, `web` its child, plus `extra` children (alive until
-   * killed). `pcExits` decides whether process-compose exits once `web` is
-   * killed; `pcExitsOnKill` makes it exit once that pid is killed instead.
+   * `socketPath`, the stuck service (`servicePid`, default WEB_PID) its
+   * child, plus `extra` children (alive until killed). `pcExits` decides
+   * whether process-compose exits once the stuck service is killed;
+   * `pcExitsOnKill` makes it exit once that pid is killed instead.
    */
   function stopSeams(
     socketPath: string,
     opts: {
       pcExits: boolean;
       pcExitsOnKill?: number;
+      servicePid?: number;
       extra?: ReadonlyArray<{ pid: number; ppid: number; pgid: number; command: string }>;
     },
   ) {
+    const servicePid = opts.servicePid ?? WEB_PID;
     const kills: Array<[number, string]> = [];
     const killed = new Set<number>();
     const pcGone = (): boolean =>
-      (opts.pcExits && killed.has(WEB_PID)) ||
+      (opts.pcExits && killed.has(servicePid)) ||
       (opts.pcExitsOnKill !== undefined && killed.has(opts.pcExitsOnKill));
     const seams: NonNullable<CommandDeps["stop"]> = {
       readProcessTable: async () => [
@@ -7074,7 +6991,7 @@ describe("bounded down — force-kill and DOWN_TIMEOUT (#190)", () => {
           pgid: PC_PID,
           command: `process-compose up -f x.yaml -U -u ${socketPath} -t=false`,
         },
-        { pid: WEB_PID, ppid: PC_PID, pgid: WEB_PID, command: "bash -c tail -f hold" },
+        { pid: servicePid, ppid: PC_PID, pgid: servicePid, command: "bash -c tail -f hold" },
         ...(opts.extra ?? []).filter((row) => !killed.has(row.pid)),
       ],
       kill: (target, signal) => {
@@ -7107,18 +7024,27 @@ describe("bounded down — force-kill and DOWN_TIMEOUT (#190)", () => {
     return (deps.git!(["rev-parse", "--git-common-dir"]) as string).trim();
   }
 
+  /** A worktree `up` on a stuck in-memory process-compose. */
+  async function upStuck(stack: ResolvedStack) {
+    const stuck = stuckPc();
+    const { driver: _spawnerDriver, ...base } = stubDeps({ stack });
+    const deps = { ...base, ...stuck.pcDeps };
+    await runUp(deps);
+    return { ...stuck, deps };
+  }
+
   type Failure = Error & { code?: string; details?: Record<string, unknown> };
 
   const PENDING: PendingReload = { services: ["web"], oldRuns: [{ name: "web", pid: 99 }] };
 
   it("worktree down force-kills only the stuck service and reports it", async () => {
-    const deps = stubDeps({ stack: isolatedStack, track: { invocations: [], touchSocket: true } });
-    await runUp(deps);
+    const { deps, pc } = await upStuck(isolatedStack);
     const paths = instancePaths(anchorOf(deps), deps.expectedWorktreeId);
+    expect(pc.pidOf(paths.socketPath, "web")).toBe(WEB_PID);
     const { seams, kills } = stopSeams(paths.socketPath, { pcExits: true });
     // A successful bounded stop clears any pending reload (#191).
     writePendingReload(anchorOf(deps), deps.expectedWorktreeId, PENDING);
-    const result = await runDown({ ...deps, driver: stuckDriver(), stop: seams });
+    const result = await runDown({ ...deps, stop: seams });
     expect(result).toMatchObject({ shared: false, stopped: true });
     expect(result.forceKilled).toEqual([{ service: "web", pid: WEB_PID }]);
     // The service's process group, never process-compose itself.
@@ -7127,8 +7053,7 @@ describe("bounded down — force-kill and DOWN_TIMEOUT (#190)", () => {
   });
 
   it("worktree down force-kills a pending reload's unlisted old run before stopping, then clears the marker (#206)", async () => {
-    const deps = stubDeps({ stack: isolatedStack, track: { invocations: [], touchSocket: true } });
-    await runUp(deps);
+    const { deps } = await upStuck(isolatedStack);
     const paths = instancePaths(anchorOf(deps), deps.expectedWorktreeId);
     // process-compose no longer lists the old `api` run; only the marker knows it.
     const old = { pid: 77, ppid: PC_PID, pgid: 77, command: "bash -c sleep 300" };
@@ -7139,7 +7064,7 @@ describe("bounded down — force-kill and DOWN_TIMEOUT (#190)", () => {
         { name: "api", pid: 77, identity: { ppid: PC_PID, pgid: 77, command: old.command } },
       ],
     });
-    const result = await runDown({ ...deps, driver: stuckDriver(), stop: seams });
+    const result = await runDown({ ...deps, stop: seams });
     expect(result.forceKilled).toEqual([
       { service: "api", pid: 77 },
       { service: "web", pid: WEB_PID },
@@ -7155,8 +7080,7 @@ describe("bounded down — force-kill and DOWN_TIMEOUT (#190)", () => {
   it("worktree down succeeds when process-compose exits on its own while the pending reload settles (#206)", async () => {
     // The update's new copy failed to start and nothing else ran:
     // process-compose (no --keep-project) exits once the old run is killed.
-    const deps = stubDeps({ stack: isolatedStack, track: { invocations: [], touchSocket: true } });
-    await runUp(deps);
+    const { deps, downs } = await upStuck(isolatedStack);
     const paths = instancePaths(anchorOf(deps), deps.expectedWorktreeId);
     const old = { pid: 77, ppid: PC_PID, pgid: 77, command: "bash -c sleep 300" };
     const { seams, kills } = stopSeams(paths.socketPath, {
@@ -7170,19 +7094,9 @@ describe("bounded down — force-kill and DOWN_TIMEOUT (#190)", () => {
         { name: "api", pid: 77, identity: { ppid: PC_PID, pgid: 77, command: old.command } },
       ],
     });
-    const downs: string[][] = [];
-    const base = stuckDriver();
-    const driver: CommandDeps["driver"] = {
-      ...base,
-      spawner: (binary, args, options) => {
-        if (args[0] === "down") downs.push([...args]);
-        return base!.spawner!(binary, args, options);
-      },
-    };
     const reaps: unknown[] = [];
     const result = await runDown({
       ...deps,
-      driver,
       stop: seams,
       reap: async (config) => {
         reaps.push(config);
@@ -7201,8 +7115,7 @@ describe("bounded down — force-kill and DOWN_TIMEOUT (#190)", () => {
   });
 
   it("a pending-reload DOWN_TIMEOUT's remedy leads with killing the old run, not process-compose (#206)", async () => {
-    const deps = stubDeps({ stack: isolatedStack, track: { invocations: [], touchSocket: true } });
-    await runUp(deps);
+    const { deps } = await upStuck(isolatedStack);
     const paths = instancePaths(anchorOf(deps), deps.expectedWorktreeId);
     const old = { pid: 77, ppid: PC_PID, pgid: 77, command: "bash -c sleep 300" };
     const { seams, kills } = stopSeams(paths.socketPath, { pcExits: false, extra: [old] });
@@ -7213,7 +7126,6 @@ describe("bounded down — force-kill and DOWN_TIMEOUT (#190)", () => {
     });
     const err = (await runDown({
       ...deps,
-      driver: stuckDriver(),
       stop: { ...seams, settleMs: 20 },
     }).catch((e: unknown) => e)) as Failure;
     expect(err.code).toBe("DOWN_TIMEOUT");
@@ -7227,15 +7139,12 @@ describe("bounded down — force-kill and DOWN_TIMEOUT (#190)", () => {
   });
 
   it("worktree down fails DOWN_TIMEOUT and keeps the socket and config when process-compose never exits", async () => {
-    const deps = stubDeps({ stack: isolatedStack, track: { invocations: [], touchSocket: true } });
-    await runUp(deps);
+    const { deps, pc } = await upStuck(isolatedStack);
     const paths = instancePaths(anchorOf(deps), deps.expectedWorktreeId);
     const { seams, kills } = stopSeams(paths.socketPath, { pcExits: false });
     // A pending reload (#191) must survive a DOWN_TIMEOUT: the instance is still up.
     writePendingReload(anchorOf(deps), deps.expectedWorktreeId, PENDING);
-    const err = (await runDown({ ...deps, driver: stuckDriver(), stop: seams }).catch(
-      (e: unknown) => e,
-    )) as Failure;
+    const err = (await runDown({ ...deps, stop: seams }).catch((e: unknown) => e)) as Failure;
     expect(err.code).toBe("DOWN_TIMEOUT");
     expect(err.details).toMatchObject({
       instance: deps.expectedWorktreeId,
@@ -7250,47 +7159,43 @@ describe("bounded down — force-kill and DOWN_TIMEOUT (#190)", () => {
     expect(kills).toEqual([[-WEB_PID, "SIGKILL"]]);
     expect(existsSync(paths.socketPath)).toBe(true);
     expect(existsSync(paths.configPath)).toBe(true);
+    expect(pc.isUp(paths.socketPath)).toBe(true);
     expect(readPendingReload(anchorOf(deps), deps.expectedWorktreeId)).toEqual(PENDING);
   });
 
   it("the down budget is the base plus the derived config's shutdown.timeout_seconds", async () => {
-    const deps = stubDeps({ stack: isolatedStack, track: { invocations: [], touchSocket: true } });
-    await runUp(deps);
+    const { deps } = await upStuck(isolatedStack);
     const paths = instancePaths(anchorOf(deps), deps.expectedWorktreeId);
     writeFileSync(
       paths.configPath,
       stringifyYaml({ processes: { web: { command: "x", shutdown: { timeout_seconds: 1 } } } }),
     );
     const { seams } = stopSeams(paths.socketPath, { pcExits: false });
-    const err = (await runDown({ ...deps, driver: stuckDriver(), stop: seams }).catch(
-      (e: unknown) => e,
-    )) as Failure;
+    const err = (await runDown({ ...deps, stop: seams }).catch((e: unknown) => e)) as Failure;
     expect(err.details?.timeout_ms).toBe(1020);
   });
 
   it("down --shared reports force-killed services", async () => {
-    const deps = stubDeps({ stack: mixedStack, track: { invocations: [], touchSocket: true } });
-    await runUp(deps);
+    const { deps, pc } = await upStuck(mixedStack);
     const paths = sharedInstancePaths(anchorOf(deps));
-    const { seams } = stopSeams(paths.socketPath, { pcExits: true });
-    const result = await runDown({ ...deps, driver: stuckDriver(), stop: seams }, { shared: true });
+    const postgresPid = pc.pidOf(paths.socketPath, "postgres");
+    const { seams } = stopSeams(paths.socketPath, { pcExits: true, servicePid: postgresPid });
+    const result = await runDown({ ...deps, stop: seams }, { shared: true });
     expect(result).toEqual({
       shared: true,
       stopped: true,
-      forceKilled: [{ service: "web", pid: WEB_PID }],
+      forceKilled: [{ service: "postgres", pid: postgresPid }],
     });
     expect(existsSync(paths.configPath)).toBe(false);
   });
 
   it("down --shared fails DOWN_TIMEOUT and keeps the shared config", async () => {
-    const deps = stubDeps({ stack: mixedStack, track: { invocations: [], touchSocket: true } });
-    await runUp(deps);
+    const { deps } = await upStuck(mixedStack);
     const paths = sharedInstancePaths(anchorOf(deps));
     const { seams } = stopSeams(paths.socketPath, { pcExits: false });
-    const err = (await runDown(
-      { ...deps, driver: stuckDriver(), stop: seams },
-      { shared: true },
-    ).catch((e: unknown) => e)) as Failure;
+    const err = (await runDown({ ...deps, stop: seams }, { shared: true }).catch(
+      (e: unknown) => e,
+    )) as Failure;
     expect(err.code).toBe("DOWN_TIMEOUT");
     expect(err.details?.instance).toBe("shared");
     expect(String(err.details?.remedy)).toContain("`devtrees down --shared`");
@@ -7298,9 +7203,20 @@ describe("bounded down — force-kill and DOWN_TIMEOUT (#190)", () => {
     expect(existsSync(paths.socketPath)).toBe(true);
   });
 
-  /** Prune inputs with only `login` live, so `removed` is an orphan. */
-  function pruneInputs(tmp: { anchor: string; worktreeRoot: string }, socketPath: string) {
-    return {
+  /**
+   * Prune inputs with only `login` live, so `removed` is an orphan, running
+   * `web` (as WEB_PID) on a stuck in-memory process-compose.
+   */
+  async function pruneInputs(tmp: { anchor: string; worktreeRoot: string }) {
+    mkdirSync(runDir(tmp.anchor), { recursive: true });
+    const orphan = instancePaths(tmp.anchor, "removed");
+    writeFileSync(
+      orphan.configPath,
+      stringifyYaml({ processes: { web: { command: "tail -f hold" } } }),
+    );
+    const { pc, pcDeps } = stuckPc();
+    await pc.driver.up(orphan);
+    const inputs = {
       cwd: join(tmp.worktreeRoot, "login"),
       git: (args: ReadonlyArray<string>): string => {
         if (args[1] === "--git-common-dir") return tmp.anchor;
@@ -7314,25 +7230,24 @@ describe("bounded down — force-kill and DOWN_TIMEOUT (#190)", () => {
           id: "removed",
           kind: "worktree" as const,
           status: "running" as const,
-          socketPath,
+          socketPath: orphan.socketPath,
           ports: {},
           blockBase: undefined,
           services: [],
         },
       ],
-      driver: stuckDriver(),
+      ...pcDeps,
     };
+    return { orphan, inputs };
   }
 
   it("prune reports a force-killed orphan stop on its pruned row", async () => {
     const tmp = tmpAnchor();
-    mkdirSync(runDir(tmp.anchor), { recursive: true });
-    const orphan = instancePaths(tmp.anchor, "removed");
-    writeFileSync(orphan.socketPath, "");
+    const { orphan, inputs } = await pruneInputs(tmp);
     const { seams } = stopSeams(orphan.socketPath, { pcExits: true });
     const { runPrune } = await import("./commands.js");
     const result = await runPrune({
-      ...pruneInputs(tmp, orphan.socketPath),
+      ...inputs,
       readRegistry: () => ({}),
       withRegistryLock: async (_anchor, mutate) => mutate({}),
       stop: seams,
@@ -7345,9 +7260,7 @@ describe("bounded down — force-kill and DOWN_TIMEOUT (#190)", () => {
 
   it("prune forwards an orphan's pending-reload marker to its stop (#206)", async () => {
     const tmp = tmpAnchor();
-    mkdirSync(runDir(tmp.anchor), { recursive: true });
-    const orphan = instancePaths(tmp.anchor, "removed");
-    writeFileSync(orphan.socketPath, "");
+    const { orphan, inputs } = await pruneInputs(tmp);
     const old = { pid: 77, ppid: PC_PID, pgid: 77, command: "bash -c sleep 300" };
     const { seams, kills } = stopSeams(orphan.socketPath, { pcExits: true, extra: [old] });
     writePendingReload(tmp.anchor, "removed", {
@@ -7358,7 +7271,7 @@ describe("bounded down — force-kill and DOWN_TIMEOUT (#190)", () => {
     });
     const { runPrune } = await import("./commands.js");
     const result = await runPrune({
-      ...pruneInputs(tmp, orphan.socketPath),
+      ...inputs,
       readRegistry: () => ({}),
       withRegistryLock: async (_anchor, mutate) => mutate({}),
       stop: seams,
@@ -7380,10 +7293,7 @@ describe("bounded down — force-kill and DOWN_TIMEOUT (#190)", () => {
     // The orphan's worktree is gone, so the update's new copy cannot start
     // and process-compose exits once the old run is killed.
     const tmp = tmpAnchor();
-    mkdirSync(runDir(tmp.anchor), { recursive: true });
-    const orphan = instancePaths(tmp.anchor, "removed");
-    writeFileSync(orphan.socketPath, "");
-    writeFileSync(orphan.configPath, "processes: {}\n");
+    const { orphan, inputs } = await pruneInputs(tmp);
     const old = { pid: 77, ppid: PC_PID, pgid: 77, command: "bash -c sleep 300" };
     const { seams } = stopSeams(orphan.socketPath, {
       pcExits: false,
@@ -7398,7 +7308,7 @@ describe("bounded down — force-kill and DOWN_TIMEOUT (#190)", () => {
     });
     const { runPrune } = await import("./commands.js");
     const result = await runPrune({
-      ...pruneInputs(tmp, orphan.socketPath),
+      ...inputs,
       readRegistry: () => ({}),
       withRegistryLock: async (_anchor, mutate) => mutate({}),
       stop: seams,
@@ -7416,15 +7326,12 @@ describe("bounded down — force-kill and DOWN_TIMEOUT (#190)", () => {
     // Unlike an ordinary failed `down`, a DOWN_TIMEOUT proves process-compose
     // is still running: unlinking its socket would hide a live supervisor.
     const tmp = tmpAnchor();
-    mkdirSync(runDir(tmp.anchor), { recursive: true });
-    const orphan = instancePaths(tmp.anchor, "removed");
-    writeFileSync(orphan.socketPath, "");
-    writeFileSync(orphan.configPath, "processes: {}\n");
+    const { orphan, inputs } = await pruneInputs(tmp);
     const registryRef = { snapshot: { removed: 20032 } as RegistrySnapshot };
     const { seams } = stopSeams(orphan.socketPath, { pcExits: false });
     const { runPrune } = await import("./commands.js");
     const result = await runPrune({
-      ...pruneInputs(tmp, orphan.socketPath),
+      ...inputs,
       readRegistry: () => registryRef.snapshot,
       withRegistryLock: async (_anchor, mutate) => {
         registryRef.snapshot = await mutate(registryRef.snapshot);
@@ -7472,7 +7379,11 @@ describe("runDown after process-compose stops (#155)", () => {
     ),
   };
 
-  /** A live instance whose `process list` reads `rows`. */
+  /**
+   * A live instance whose `process list` reads `rows`, through a spawner
+   * fake. Only for the statuses the in-memory process-compose does not model
+   * (a daemon's `Launched`, `Error`); everything else uses `pcInstance`.
+   */
   async function liveInstance(
     rows: ReadonlyArray<{ name: string; status: string; exit_code?: number }>,
     declared: ResolvedStack = stack,
@@ -7499,6 +7410,26 @@ describe("runDown after process-compose stops (#155)", () => {
     return { deps: { ...deps, driver: { ...base, spawner }, reap }, reaped, port };
   }
 
+  /**
+   * A live instance of `declared` on the in-memory process-compose, booted
+   * with `namespaces` (default: all), every reap recorded. Tests make things
+   * happen to its processes (`pc.exit`) before the `down`.
+   */
+  async function pcInstance(declared: ResolvedStack = stack, namespaces?: string[]) {
+    const onPc = onInMemoryPc(stubDeps({ stack: declared }));
+    const { pc } = onPc;
+    const base = namespaces === undefined ? onPc.deps : { ...onPc.deps, namespaces };
+    const up = await runUp(base);
+    const socket = socketsOf(onPc.deps).worktree;
+    const reaped: string[][] = [];
+    const reap: CommandDeps["reap"] = async (config) => {
+      reaped.push(Object.keys(config.processes));
+      return { ranCount: Object.keys(config.processes).length, failures: [] };
+    };
+    const port = (name: string): number => Number(up.env[name]);
+    return { deps: { ...base, reap }, pc, socket, reaped, port };
+  }
+
   it("runs the shutdown hook of a daemon whose launch had failed, and only that one", async () => {
     const { deps, reaped } = await liveInstance([
       { name: "db", status: "Completed", exit_code: 1 },
@@ -7521,21 +7452,18 @@ describe("runDown after process-compose stops (#155)", () => {
   });
 
   it("never re-runs the hook of a daemon stopped earlier (Completed, exit 0: its hook already ran)", async () => {
-    const { deps, reaped } = await liveInstance([
-      { name: "db", status: "Completed", exit_code: 0 },
-      { name: "cache", status: "Completed" },
-      { name: "web", status: "Running" },
-    ]);
+    const { deps, pc, socket, reaped } = await pcInstance();
+    pc.exit(socket, "db", 0);
+    pc.exit(socket, "cache", 0);
     await runDown(deps);
     expect(reaped).toEqual([]);
+    expect(pc.isUp(socket)).toBe(false);
   });
 
   it("never runs a hook for a failed service that is not a daemon", async () => {
     // `web` has a hook and failed: only the is_daemon filter keeps it out.
-    const { deps, reaped } = await liveInstance(
-      [{ name: "web", status: "Completed", exit_code: 1 }],
-      hooked,
-    );
+    const { deps, pc, socket, reaped } = await pcInstance(hooked);
+    pc.exit(socket, "web", 1);
     await runDown(deps);
     expect(reaped).toEqual([]);
   });
@@ -7550,10 +7478,8 @@ describe("runDown after process-compose stops (#155)", () => {
   });
 
   it("fails DOWN_INCOMPLETE naming a booted service's port that still accepts connections", async () => {
-    const { deps, port } = await liveInstance([
-      { name: "db", status: "Completed" },
-      { name: "web", status: "Running" },
-    ]);
+    const { deps, pc, socket, port } = await pcInstance();
+    pc.exit(socket, "db", 0);
     const dbPort = port("DB_PORT");
     const err = (await runDown({
       ...deps,
@@ -7579,10 +7505,8 @@ describe("runDown after process-compose stops (#155)", () => {
   });
 
   it("a second down re-checks the ports and fails again while the listener survives, then converges", async () => {
-    const { deps, port } = await liveInstance([
-      { name: "db", status: "Completed", exit_code: 1 },
-      { name: "web", status: "Running" },
-    ]);
+    const { deps, pc, socket, port } = await pcInstance();
+    pc.exit(socket, "db", 1);
     const dbPort = port("DB_PORT");
     let listening = true;
     const seams = {
@@ -7593,7 +7517,8 @@ describe("runDown after process-compose stops (#155)", () => {
     const first = (await runDown(seams).catch((e: unknown) => e)) as { code?: string };
     expect(first.code).toBe("DOWN_INCOMPLETE");
     // process-compose is gone now: the next `down` takes the dead-supervisor path.
-    const dead = { ...seams, probeSocket: async () => "stale" as const };
+    expect(pc.isUp(socket)).toBe(false);
+    const dead = seams;
     const second = (await runDown(dead).catch((e: unknown) => e)) as {
       code?: string;
       details?: { survivors?: unknown[] };
@@ -7608,7 +7533,7 @@ describe("runDown after process-compose stops (#155)", () => {
   });
 
   it("waits for a port that closes shortly after the stop instead of reporting it", async () => {
-    const { deps, port } = await liveInstance([{ name: "web", status: "Running" }]);
+    const { deps, port } = await pcInstance();
     let checks = 0;
     const result = await runDown({
       ...deps,
@@ -7621,7 +7546,16 @@ describe("runDown after process-compose stops (#155)", () => {
   });
 
   it("never checks the ports of a service the instance did not boot", async () => {
-    const { deps, port } = await liveInstance([{ name: "web", status: "Running" }]);
+    // db and cache are in a namespace this up does not select: never booted.
+    const { deps, pc, socket, port } = await pcInstance(
+      {
+        services: stack.services.map((svc) =>
+          svc.name === "web" ? svc : { ...svc, namespace: "data" },
+        ),
+      },
+      ["default"],
+    );
+    expect(pc.rows(socket).map((r) => r.name)).toEqual(["web"]);
     const probed: number[] = [];
     await runDown({
       ...deps,
