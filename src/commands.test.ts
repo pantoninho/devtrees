@@ -121,9 +121,6 @@ function tmpAnchor(): { anchor: string; worktreeRoot: string } {
   return { anchor, worktreeRoot: join(root, "wt") };
 }
 
-/** A no-op shared lifecycle lock — wraps the callback without any contention. */
-const passThroughSharedLock: WithSharedLock = (_anchor, fn) => fn();
-
 /** Allocate a temp anchor + worktree-root + registry ref for a multi-worktree test. */
 function multiWorktreeFixture(prefix: string): {
   sharedAnchor: string;
@@ -154,7 +151,12 @@ function idFor(root: string, basename: string): string {
  */
 type StubbedDeps = CommandDeps & { readonly expectedWorktreeId: string };
 
-/** Build a `CommandDeps` whose every collaborator is a deterministic stub. */
+/**
+ * The neutral `CommandDeps`: a fake git, a stack, an in-memory registry, and
+ * stubs for the seams that would touch real ports, a TTY or a health poll.
+ * It wires no process-compose: tests that drive one put the in-memory Driver
+ * in with `onInMemoryPc` or `pcDeps`.
+ */
 function stubDeps(opts: {
   stack: ResolvedStack;
   worktreeId?: string;
@@ -164,12 +166,6 @@ function stubDeps(opts: {
   anchorOverride?: string;
   worktreeRootOverride?: string;
   registryRef?: { snapshot: RegistrySnapshot };
-  /**
-   * Liveness verdict for an existing socket file (#80). Default: "running" —
-   * mirrors the pre-#80 "file present ⇒ live" fiction the older tests fake
-   * instances with (a plain file would probe stale against a real UDS connect).
-   */
-  probeSocket?: (socketPath: string) => Promise<InstanceStatus>;
 }): StubbedDeps {
   const tmp = tmpAnchor();
   const anchor = opts.anchorOverride ?? tmp.anchor;
@@ -200,7 +196,6 @@ function stubDeps(opts: {
       return after;
     },
     readRegistry: () => snapshotRef.snapshot,
-    withSharedLock: passThroughSharedLock,
     isPortFree: opts.isPortFree ?? (() => true),
     // Default port-holder stub mirrors isPortFree's "everything free" default:
     // the real default (`defaultPortHolder`) does a real TCP bind, which
@@ -217,16 +212,6 @@ function stubDeps(opts: {
     // stub — the default polls a real `process-compose` over the UDS, which
     // would hang the unit test. Tests that *do* care override this field.
     waitForHealth: () => Promise.resolve(),
-    // Same for the wait on an already-running shared instance's services
-    // (#240); the tests that care use the real one.
-    waitForSharedReady: () => Promise.resolve(),
-    // Default verdict "running" preserves the pre-#80 semantics existing
-    // tests fake liveness with (touching a plain file at the socket path).
-    probeSocket: opts.probeSocket ?? (async () => "running" as const),
-    // The stub spawner with touchSocket: false never binds a socket, so the
-    // real post-spawn socket poll (#91) would burn its full timeout in most
-    // tests. Tests that care about the socket-wait override this field.
-    waitForSocketFile: () => Promise.resolve(),
   };
 }
 
@@ -300,6 +285,8 @@ type PcDeps = StubbedDeps & {
 function pcDeps(
   opts: Parameters<typeof stubDeps>[0] & {
     pc?: InMemoryProcessCompose;
+    /** Liveness verdict for a control socket (#80). Default: the adapter's own. */
+    probeSocket?: (socketPath: string) => Promise<InstanceStatus>;
     /**
      * Runs right after process-compose boots an instance, before `up` sees
      * it: e.g. a process exits at once (`pc.exit`), so the server exits and
@@ -310,14 +297,12 @@ function pcDeps(
 ): PcDeps {
   const pc = opts.pc ?? createInMemoryProcessCompose();
   const { onBoot } = opts;
-  const base = stubDeps({
-    ...opts,
-    probeSocket: opts.probeSocket ?? ((path) => pc.probeSocket(path)),
-  });
+  const base = stubDeps(opts);
   const anchor = base.git!(["rev-parse", "--git-common-dir"]);
   const onPc = inMemoryPcDeps(pc);
   return {
     ...base,
+    probeSocket: opts.probeSocket ?? onPc.probeSocket,
     stop: { ...onPc.stop, ...base.stop },
     processCompose:
       onBoot === undefined
@@ -841,14 +826,9 @@ describe("runUp — worktree instance dies before binding its socket (#157)", ()
     ],
   };
 
-  /**
-   * `stubDeps` no-ops the socket wait so ordinary tests don't pay its
-   * timeout; these tests want the real one, so drop the override and shorten
-   * the deadline instead.
-   */
+  /** The real socket wait, with a deadline short enough for a unit test. */
   function withRealSocketWait<D extends CommandDeps>(base: D): D {
-    const { waitForSocketFile: _stubbed, ...rest } = base;
-    return { ...rest, worktreeSocketTimeoutMs: 50 } as D;
+    return { ...base, worktreeSocketTimeoutMs: 50 };
   }
 
   it("attributes the failure to the worktree instance on a stack with no shared tier", async () => {
