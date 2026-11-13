@@ -1,70 +1,22 @@
 /**
- * Shared-service selection (#236, ADR-0010).
+ * Shared-service drift (#236, ADR-0010).
  *
- * Which shared services an `up` uses, and what the running shared instance
- * must do about them. A shared service with no `namespace:` is **always on**:
- * every `up` selects it, as before #236. A shared service with a `namespace:`
- * is selected only when the `up` selects one of its namespaces; it then joins
- * the one shared instance (ADR-0001) the first time some worktree selects it,
- * and stays there until `devtrees down --shared`.
- *
- * Drift is scoped the same way: a shared service whose definition differs
- * from the revision the running instance runs is `SHARED_DRIFT` only for an
- * `up` that selects it.
+ * What the running shared instance must do about the shared services an
+ * `up` selects (the selection itself is `selectSharedServices` in
+ * src/selection.ts): which it runs at another revision (`SHARED_DRIFT`),
+ * which it does not run yet and must add, and how a pre-#236 shared state is
+ * attributed. Drift is scoped to the selection: a shared service whose
+ * definition differs from the revision the running instance runs is
+ * `SHARED_DRIFT` only for an `up` that selects it.
  *
  * Pure: no I/O. The caller hands in the stack, the selection and the
  * persisted shared state.
  */
 
 import { sharedServiceHash, sharedStackHash } from "./hash.js";
-import { namespaceSelected } from "./selection.js";
+import { sharedServicesOf } from "./selection.js";
 import type { SharedServiceRecord, SharedState } from "./shared-state.js";
 import type { ResolvedService, ResolvedStack } from "./stack.js";
-
-/** A shared service with no `namespace:` runs on every `up` (pre-#236 behaviour). */
-export function isAlwaysOnShared(service: Pick<ResolvedService, "namespace">): boolean {
-  return service.namespace === undefined;
-}
-
-/** The stack's shared services, in declaration order. */
-export function sharedServicesOf(stack: ResolvedStack): ResolvedService[] {
-  return stack.services.filter((s) => s.tier === "shared");
-}
-
-/** Does any shared service declare a namespace? Only then does selection matter. */
-export function hasNamespacedShared(stack: ResolvedStack): boolean {
-  return sharedServicesOf(stack).some((s) => !isAlwaysOnShared(s));
-}
-
-/**
- * The shared services an `up` selecting `namespaces` uses, in declaration
- * order: every always-on shared service, every namespaced one whose
- * namespaces intersect the selection, and — transitively — every shared
- * service those `depends_on`. A selected shared service's shared dependency
- * runs with it even when its own namespace is not selected: the shared
- * instance is repo-wide, so there is no "unselected" copy to fall back to,
- * and dropping the edge would start the dependent ungated.
- */
-export function selectSharedServices(
-  stack: ResolvedStack,
-  namespaces: ReadonlyArray<string>,
-): ResolvedService[] {
-  const shared = sharedServicesOf(stack);
-  const byName = new Map(shared.map((s) => [s.name, s]));
-  const selected = new Set<string>();
-  const visit = (service: ResolvedService): void => {
-    if (selected.has(service.name)) return;
-    selected.add(service.name);
-    for (const dep of service.dependsOn) {
-      const target = byName.get(dep.name);
-      if (target !== undefined) visit(target);
-    }
-  };
-  for (const service of shared) {
-    if (isAlwaysOnShared(service) || namespaceSelected(service, namespaces)) visit(service);
-  }
-  return shared.filter((s) => selected.has(s.name));
-}
 
 /** Per-service records for services this worktree defines (revision + owned ports). */
 export function sharedRecords(

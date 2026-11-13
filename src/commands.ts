@@ -133,16 +133,6 @@ import {
   stopTimeoutMs,
 } from "./stop-services.js";
 import {
-  declaredServices,
-  expandNamespaces,
-  notBootedNamespaces,
-  orderedTargets,
-  sharedAmong,
-  unbootedServices,
-  unknownService,
-  type DeclaredService,
-} from "./service-targets.js";
-import {
   readStoredHash as defaultReadStoredHash,
   writeStoredHash as defaultWriteStoredHash,
 } from "./hashes.js";
@@ -156,15 +146,11 @@ import {
 } from "./shared-state.js";
 import {
   UNKNOWN_REVISION,
-  hasNamespacedShared,
-  isAlwaysOnShared,
   planSharedSelection,
-  selectSharedServices,
   sharedRecords,
-  sharedServicesOf,
   withServiceRecords,
   type SharedPlan,
-} from "./shared-selection.js";
+} from "./shared-drift.js";
 import {
   blockingPortConflicts,
   liveSharedPortsOf,
@@ -195,25 +181,33 @@ import {
   type WaitForSharedHealth,
 } from "./health.js";
 import {
-  DEFAULT_NAMESPACE,
-  declaredNamespaces,
-  droppedNamespaceEdges,
+  assertExplicitSelectionNotEmpty,
+  assertNamedTargetsBooted,
+  bootedNamespaces,
+  declaredServices,
   formatUpCommand,
+  hasNamespacedShared,
+  isAlwaysOnShared,
+  namespaceOf,
   namespaceSelected,
-  resolveRunningSelection,
+  provenNamespaces,
+  selectFreshUp,
+  selectNamedServices,
+  selectRunningUp,
+  selectSharedServices,
   serviceNamespaces,
+  serviceNotFoundError,
+  sharedServicesOf,
   type DroppedNamespaceEdge,
-  type NamespaceNotRunning,
+  type NamedServiceCommand,
 } from "./selection.js";
 import {
   clearPendingReload,
   identifyOldRuns,
   isProcessAlive,
-  namespaceOf,
   planPendingReload,
   readPendingReload,
   stuckFromMarker,
-  provenNamespaces,
   writePendingReload,
   type PendingReload,
   type StuckReload,
@@ -479,76 +473,6 @@ class WorktreeStartFailedError extends Error {
 }
 
 /**
- * Thrown when an `up` selects zero isolated services (issues #176, #203,
- * ADR-0008): a bare fresh `up` whose implicit `default` namespace is empty,
- * or an explicit `-n` naming only namespaces with no services. Starting an
- * empty instance and reporting it healthy would be a lie, and process-compose
- * exits after hot-reloading an empty project (#203). `details.namespaces`
- * lists the namespaces the stack declares so an agent can retry with `-n`
- * without a second round-trip; `selected_namespaces` is what was asked for.
- */
-class NoServicesSelectedError extends Error {
-  readonly code = "NO_SERVICES_SELECTED" as const;
-  readonly details: {
-    readonly worktree_id: string;
-    readonly selected_namespaces: ReadonlyArray<string>;
-    readonly namespaces: ReadonlyArray<string>;
-  };
-  constructor(
-    worktreeId: string,
-    available: ReadonlyArray<string>,
-    selected: ReadonlyArray<string> = [DEFAULT_NAMESPACE],
-    explicit = false,
-    command: "up" | NamedServiceCommand = "up",
-  ) {
-    const example = available[0] ?? "<ns>";
-    const why = explicit
-      ? `\`-n ${selected.join(", ")}\` names no namespace with ${command === "up" ? "services in this stack" : "isolated services in this instance"}.`
-      : `A bare \`devtrees up\` starts only the \`${DEFAULT_NAMESPACE}\` namespace ` +
-        `(services with no \`namespace:\`), and this stack has none.`;
-    // A per-service verb (#224) touched nothing; `up` says how to select.
-    const next =
-      command === "up"
-        ? `Name the ones to start with -n, e.g. \`devtrees up -n ${example}\` ` +
-          `(repeat -n for several).`
-        : `Nothing was touched.`;
-    super(
-      `devtrees ${command}: no services selected (NO_SERVICES_SELECTED) for '${worktreeId}'. ${why} ` +
-        `Available namespaces: ${available.join(", ")}. ${next}`,
-    );
-    this.name = "NoServicesSelectedError";
-    this.details = {
-      worktree_id: worktreeId,
-      selected_namespaces: selected,
-      namespaces: available,
-    };
-  }
-}
-
-/**
- * Thrown when `up -n` on a running instance names a namespace the instance
- * was not booted with (ADR-0008, issue #170). process-compose omits
- * `-n`-excluded services from the project and cannot add them at runtime, so
- * the only honest answer is to fail, name what is missing, and say how to
- * boot with it. Nothing is started or stopped; the instance keeps running.
- */
-class NamespaceNotRunningError extends Error {
-  readonly code = "NAMESPACE_NOT_RUNNING" as const;
-  constructor(
-    message: string,
-    readonly details: {
-      readonly worktree_id: string;
-      readonly namespaces: ReadonlyArray<string>;
-      readonly services: ReadonlyArray<string>;
-      readonly remedy: string;
-    },
-  ) {
-    super(message);
-    this.name = "NamespaceNotRunningError";
-  }
-}
-
-/**
  * Thrown when `up` asks process-compose to restart a dead selected service
  * on a running instance and the start request itself fails (ADR-0008, issue
  * #178): process-compose refused or errored. Distinct from `HEALTH_TIMEOUT`,
@@ -621,56 +545,6 @@ class InstanceUnresponsiveError extends Error {
     );
     this.name = "InstanceUnresponsiveError";
   }
-}
-
-/**
- * The namespace selection a **fresh** start applies (issue #176, ADR-0008).
- * Namespaces are opt-in: with no `-n`, only the implicit `default` namespace
- * starts; `-n` is exact and forwarded verbatim (it never implies `default`).
- * The returned `namespaces` is never empty, so the worktree up-spawn always
- * passes `-n` and process-compose never falls back to "every namespace".
- *
- * Throws `NoServicesSelectedError` when the selection resolves to zero
- * isolated services — bare or explicit `-n` (#203: an empty instance is
- * useless, and process-compose exits after reloading one). Only isolated
- * services are counted: the worktree instance holds only those, and one with
- * nothing selected is useless even when the selection includes namespaced
- * shared services (#236). A stack with no isolated services at all keeps
- * starting (shared only).
- *
- * Not used on the running-instance path: what a bare `up` targets there is
- * #177's to define; `assertExplicitSelectionNotEmpty` covers explicit `-n`.
- */
-function resolveFreshSelection(
-  stack: ResolvedStack,
-  worktreeId: string,
-  requested: ReadonlyArray<string> | undefined,
-): { readonly namespaces: ReadonlyArray<string>; readonly services: ResolvedService[] } {
-  const bare = requested === undefined || requested.length === 0;
-  const namespaces = bare ? [DEFAULT_NAMESPACE] : requested;
-  const isolated = stack.services.filter((s) => s.tier === "isolated");
-  const services = isolated.filter((s) => namespaceSelected(s, namespaces));
-  if (services.length === 0 && isolated.length > 0) {
-    throw new NoServicesSelectedError(worktreeId, declaredNamespaces(isolated), namespaces, !bare);
-  }
-  return { namespaces, services };
-}
-
-/**
- * Pure pre-check for an explicit `-n` (#203): fail `NO_SERVICES_SELECTED` when
- * the namespaces select no isolated service in the stack, on a fresh and a
- * running instance alike, before any port allocation or state write. On a
- * running instance nothing is "missing" from such a selection, so this is
- * not `NAMESPACE_NOT_RUNNING`. A bare `up` is not checked here: its target
- * depends on whether the instance is running.
- */
-function assertExplicitSelectionNotEmpty(
-  stack: ResolvedStack,
-  worktreeId: string,
-  requested: ReadonlyArray<string> | undefined,
-): void {
-  if (requested === undefined || requested.length === 0) return;
-  resolveFreshSelection(stack, worktreeId, requested);
 }
 
 /** Remedy for drift in the shared instance: restart it from this worktree's config. */
@@ -1937,7 +1811,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     // whose bare-`up` target is #177's to define.
     const freshSelection = ownInstanceLive
       ? undefined
-      : resolveFreshSelection(stack, anchor.worktreeId, deps.namespaces);
+      : selectFreshUp(stack, anchor.worktreeId, deps.namespaces);
 
     // Pre-flight stale-port-block check (issue #58). Self-gates on the
     // own-instance-live flag so the idempotent re-up path skips the probe
@@ -1996,7 +1870,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
       // The isolated services this `up` boots, for its shared-step marker:
       // a fresh start's selection; on the running path a hot-reload may start
       // any of them (`undefined`: all).
-      booted: freshSelection?.services.map((s) => s.name),
+      booted: freshSelection?.isolated.map((s) => s.name),
     });
     const { started: sharedStarted, fieldChanges: sharedChanges } = shared;
 
@@ -2054,7 +1928,8 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     // Warned before the spawn, so the line is on screen before any attach and
     // survives a later HEALTH_TIMEOUT. The running path warns in
     // `verifyRunning`, against the selection it reads back.
-    const nsEdges = warnDroppedNamespaceEdges(stack, freshSelection.services, warn);
+    const nsEdges = freshSelection.droppedNamespaceEdges;
+    warnDroppedNamespaceEdges(nsEdges, warn);
 
     // The run dir now lives outside the git dir (issue #156), so the anchor
     // state dir the derived config goes in has to be created on its own —
@@ -2129,7 +2004,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
       sharedActivated: shared.activated,
       sharedRestarted: shared.restarted,
       sharedChanges,
-      selected: freshSelection.services,
+      selected: freshSelection.isolated,
       namespaces: freshSelection.namespaces,
       droppedNamespaceEdges: nsEdges,
     } as const;
@@ -2433,12 +2308,12 @@ function previewFresh(
   worktreeId: string,
   requested: ReadonlyArray<string> | undefined,
 ): DryRunPlan {
-  const selection = resolveFreshSelection(stack, worktreeId, requested);
+  const selection = selectFreshUp(stack, worktreeId, requested);
   return {
     instance: "fresh",
     namespaces: selection.namespaces,
-    selectedServices: selection.services.map((s) => s.name),
-    droppedNamespaceEdges: droppedNamespaceEdges(stack.services, selection.services),
+    selectedServices: selection.isolated.map((s) => s.name),
+    droppedNamespaceEdges: selection.droppedNamespaceEdges,
     wouldReload: false,
     wouldRestart: [],
   };
@@ -2595,7 +2470,7 @@ function rowsAfterReload(
     ...namespaceOf(previous[name]),
   }));
   const present = new Set(rows.map((r) => r.name));
-  const booted = resolveRunningSelection(before, present, undefined).namespaces;
+  const booted = bootedNamespaces(before, present);
   const byName = new Map(rows.map((r) => [r.name, r]));
   return stack.services
     .filter((s) => s.tier === "isolated" && namespaceSelected(s, booted))
@@ -2869,8 +2744,7 @@ async function runningSharedNamespaces(args: {
     previous !== undefined && readHash(anchor.anchor, anchor.worktreeId) !== stackHash(stack);
   const projected = reload ? rowsAfterReload(stack, previous, rows) : rows;
   const isolated = stack.services.filter((s) => s.tier === "isolated");
-  return resolveRunningSelection(isolated, new Set(projected.map((r) => r.name)), undefined)
-    .namespaces;
+  return bootedNamespaces(isolated, new Set(projected.map((r) => r.name)));
 }
 
 /**
@@ -4809,7 +4683,7 @@ function declaredOf(target: NamedServices) {
 function restartRemedy(target: NamedServices): string {
   const declared = declaredOf(target);
   const present = new Set(target.rows.map((r) => r.name));
-  const booted = resolveRunningSelection(declared, present, undefined).namespaces;
+  const booted = bootedNamespaces(declared, present);
   return `devtrees down && ${formatUpCommand(declared, booted)}`;
 }
 
@@ -4867,7 +4741,7 @@ export async function bareRestartRemedy(deps: CommandDeps = {}): Promise<BareRes
       { notify: () => {}, probe: probeOf(deps) },
     );
     const present = new Set(rows.map((r) => r.name));
-    const booted = resolveRunningSelection(fromConfig, present, undefined).namespaces;
+    const booted = bootedNamespaces(fromConfig, present);
     if (booted.length === 0) return everyNamespace(declared);
     return {
       remedy: `devtrees down && ${formatUpCommand(fromConfig, booted)}`,
@@ -5958,38 +5832,6 @@ export async function* filterLogEventsSince(
   }
 }
 
-/**
- * Build the documented `SERVICE_NOT_FOUND` error (#109): tagged with the
- * stable code so `classifyError` routes it into the JSON envelope, and
- * carrying `{service, valid_services}` details so an agent can correct the
- * name without a second round-trip. Mirrors the `invalidArgsError` /
- * `StalePortBlockError` tagging convention.
- */
-function serviceNotFoundError(
-  service: string,
-  validServices: ReadonlyArray<string>,
-  shared: boolean,
-  /** The per-service verb raising it (#223); `logs` keeps its historical text. */
-  command?: NamedServiceCommand,
-): Error {
-  const where = shared ? "the shared instance" : "this worktree's instance";
-  const valid =
-    validServices.length > 0
-      ? `Valid services: ${validServices.join(", ")}.`
-      : "Its derived config lists no services.";
-  const prefix = command === undefined ? "" : `devtrees ${command}: `;
-  const err = new Error(`${prefix}unknown service '${service}' in ${where}. ${valid}`) as Error & {
-    code?: string;
-    details?: Readonly<Record<string, unknown>>;
-  };
-  err.code = "SERVICE_NOT_FOUND";
-  err.details = { service, valid_services: [...validServices] };
-  return err;
-}
-
-/** The verbs that act on named services of this worktree's instance (ADR-0009). */
-type NamedServiceCommand = "restart";
-
 /** What `resolveNamedServices` hands a per-service verb. */
 interface NamedServices {
   readonly anchor: { readonly anchor: string; readonly worktreeId: string };
@@ -6028,10 +5870,12 @@ interface NamedServices {
  *     `details: {worktree_id, namespaces, services, remedy}`.
  *
  * `namespaces` (`-n`, #224) adds every isolated service of each namespace to
- * `names` (`expandNamespaces`, against the derived config); every check above
- * then applies to the union. Between checks 4 and 5, a namespace with no
- * isolated service fails `NO_SERVICES_SELECTED`. Shared services in the
- * namespaces are not added: they are returned in `skippedShared`.
+ * `names` (against the derived config); every check above then applies to
+ * the union. Between checks 4 and 5, a namespace with no isolated service
+ * fails `NO_SERVICES_SELECTED`. Shared services in the namespaces are not
+ * added: they are returned in `skippedShared`. Checks 3, 4, the expansion and
+ * 6 are the selection module's (`selectNamedServices`,
+ * `assertNamedTargetsBooted`, src/selection.ts).
  *
  * Returns the named services in `depends_on` order, with the rows. Takes no
  * lock: the caller holds this worktree's lifecycle lock around it and the
@@ -6057,13 +5901,15 @@ async function resolveNamedServices(
     : undefined;
   const processes = derivedProcesses(configText);
   const declared = declaredServices(processes);
-  const { names, skippedShared } = checkedSelection(
-    deps,
-    anchor,
-    declared,
-    { named, namespaces },
+  const request = {
+    worktreeId: anchor.worktreeId,
     command,
-  );
+    declared,
+    repoShared: sharedServices(deps, anchor),
+    named,
+    namespaces,
+  };
+  const selection = selectNamedServices(request);
   const rows = await readStatusesWithin(
     { getServiceStatuses: statusReader(deps, driverOf(deps)) },
     paths.socketPath,
@@ -6081,74 +5927,15 @@ async function resolveNamedServices(
     command,
     retry,
   });
-  const targets = orderedTargets(declared, names);
-  const present = new Set(rows.map((r) => r.name));
-  const missing = unbootedServices(targets, present);
-  if (missing.length > 0) {
-    const booted = resolveRunningSelection(declared, present, undefined).namespaces;
-    const notRunning = notBootedNamespaces(missing);
-    throw namespaceNotRunningError(
-      anchor.worktreeId,
-      notRunning,
-      [...booted, ...notRunning.map((n) => n.namespace)],
-      command,
-      declared,
-    );
-  }
+  assertNamedTargetsBooted(request, selection, rows);
   return {
     anchor: { anchor: anchor.anchor, worktreeId: anchor.worktreeId },
     socketPath: paths.socketPath,
     configPath: paths.configPath,
     config: readDerivedConfig(paths.configPath),
-    services: targets.map((s) => s.name),
+    services: selection.isolated.map((s) => s.name),
     rows,
-    skippedShared,
-  };
-}
-
-/**
- * Checks 3 and 4 of `resolveNamedServices` on the named services, then the
- * `-n` expansion (#224): a namespace with no isolated service fails
- * `NO_SERVICES_SELECTED`. Returns the union of the names and the expansion,
- * each once, and the shared services the expansion skipped.
- */
-function checkedSelection(
-  deps: CommandDeps,
-  anchor: { readonly anchor: string; readonly worktreeId: string; readonly worktreeRoot: string },
-  declared: ReadonlyArray<DeclaredService>,
-  selection: { readonly named: ReadonlyArray<string>; readonly namespaces: ReadonlyArray<string> },
-  command: NamedServiceCommand,
-): { names: string[]; skippedShared: ReadonlyArray<string> } {
-  const { named, namespaces } = selection;
-  const repoShared = sharedServices(deps, anchor);
-  const shared = sharedAmong(
-    repoShared.map((s) => s.name),
-    declared,
-    named,
-  );
-  if (shared.length > 0) throw sharedServiceRefusedError(shared, command);
-  const unknown = unknownService(declared, named);
-  if (unknown !== undefined) {
-    throw serviceNotFoundError(
-      unknown,
-      declared.map((s) => s.name),
-      false,
-      command,
-    );
-  }
-  const expansion = expandNamespaces(declared, repoShared, namespaces);
-  if (expansion.empty.length > 0) {
-    throw new NoServicesSelectedError(
-      anchor.worktreeId,
-      declaredNamespaces(declared),
-      expansion.empty,
-      true,
-      command,
-    );
-  }
-  return {
-    names: [...new Set([...named, ...expansion.services])],
-    skippedShared: expansion.skippedShared,
+    skippedShared: selection.skippedShared,
   };
 }
 
@@ -6186,43 +5973,6 @@ function sharedServices(
     // The shared derived config still names them.
   }
   return [...fromStack, ...fromConfig];
-}
-
-/**
- * Thrown when a per-service verb names a shared service (ADR-0009). The
- * shared instance serves every worktree, so a worktree's command never stops
- * or restarts one of its processes (ADR-0001, ADR-0008). Nothing is touched;
- * `details.remedy` is the repo-wide way to bounce it, which affects every
- * worktree.
- */
-class SharedServiceRefusedError extends Error {
-  readonly code = "SHARED_SERVICE_REFUSED" as const;
-  constructor(
-    message: string,
-    readonly details: {
-      readonly services: ReadonlyArray<string>;
-      readonly remedy: string;
-    },
-  ) {
-    super(message);
-    this.name = "SharedServiceRefusedError";
-  }
-}
-
-function sharedServiceRefusedError(
-  services: ReadonlyArray<string>,
-  command: NamedServiceCommand,
-): SharedServiceRefusedError {
-  const remedy = "devtrees down --shared && devtrees up";
-  const quoted = services.map((s) => `'${s}'`).join(", ");
-  const one = services.length === 1;
-  return new SharedServiceRefusedError(
-    `devtrees ${command}: ${quoted} ${one ? "is a shared service" : "are shared services"}. ` +
-      `The shared instance serves every worktree, so devtrees does not ${command} its ` +
-      `services from a worktree. Nothing was touched. \`${remedy}\` restarts the shared ` +
-      `instance, for every worktree.`,
-    { services, remedy },
-  );
 }
 
 /**
@@ -6606,7 +6356,7 @@ async function verifyRunning(args: {
   );
   const selection = planRunningInstance(stack, anchor.worktreeId, rows, deps.namespaces);
   const nsEdges = selection.droppedNamespaceEdges;
-  for (const edge of nsEdges) args.warn(formatDroppedNamespaceEdgeWarning(edge));
+  warnDroppedNamespaceEdges(nsEdges, args.warn);
 
   const remedy = `devtrees down && ${formatUpCommand(stack.services, selection.namespaces)}`;
   const { restarted, firstRead } = await restartDeadServices({
@@ -6652,21 +6402,16 @@ function planRunningInstance(
 ): {
   readonly namespaces: ReadonlyArray<string>;
   readonly services: ReadonlyArray<ResolvedService>;
-  readonly droppedNamespaceEdges: DroppedNamespaceEdge[];
+  readonly droppedNamespaceEdges: ReadonlyArray<DroppedNamespaceEdge>;
   readonly dead: string[];
 } {
-  const isolated = stack.services.filter((s) => s.tier === "isolated");
-  const present = new Set(rows.map((r) => r.name));
-  const selection = resolveRunningSelection(isolated, present, requested);
-  if (selection.notRunning.length > 0) {
-    throw namespaceNotRunningError(worktreeId, selection.notRunning, requested ?? []);
-  }
-  const names = selection.services.map((s) => s.name);
+  const selection = selectRunningUp(stack, worktreeId, rows, requested);
+  const names = selection.isolated.map((s) => s.name);
   const dead = findDeadServices(rows, names).map((d) => d.name);
   return {
     namespaces: selection.namespaces,
-    services: selection.services,
-    droppedNamespaceEdges: droppedNamespaceEdges(stack.services, selection.services, present),
+    services: selection.isolated,
+    droppedNamespaceEdges: selection.droppedNamespaceEdges,
     dead: dependencyOrder(stack.services, dead),
   };
 }
@@ -6804,21 +6549,12 @@ function serviceStartFailedError(
   );
 }
 
-/**
- * Compute the `depends_on` edges `selected` leaves dangling (ADR-0008, #179)
- * and warn once per edge; returns them for the `up --json` envelope. `kept`
- * is forwarded to `droppedNamespaceEdges` (the project's services on a
- * running instance; omitted on a fresh start).
- */
+/** One stderr line per `depends_on` edge the selection drops (ADR-0008, #179). */
 function warnDroppedNamespaceEdges(
-  stack: ResolvedStack,
-  selected: ReadonlyArray<ResolvedService>,
+  edges: ReadonlyArray<DroppedNamespaceEdge>,
   warn: (message: string) => void,
-  kept?: ReadonlySet<string>,
-): DroppedNamespaceEdge[] {
-  const edges = droppedNamespaceEdges(stack.services, selected, kept);
+): void {
   for (const edge of edges) warn(formatDroppedNamespaceEdgeWarning(edge));
-  return edges;
 }
 
 /** One stderr line per braced injected variable (#200). */
@@ -6827,33 +6563,6 @@ function warnBracedEnvVars(
   warn: (message: string) => void,
 ): void {
   for (const v of vars) warn(formatBracedEnvVarWarning(v));
-}
-
-function namespaceNotRunningError(
-  worktreeId: string,
-  notRunning: ReadonlyArray<NamespaceNotRunning>,
-  requested: ReadonlyArray<string>,
-  command: "up" | NamedServiceCommand = "up",
-  declared?: ReadonlyArray<Pick<ResolvedService, "namespace">>,
-): NamespaceNotRunningError {
-  const namespaces = notRunning.map((n) => n.namespace);
-  const services = [...new Set(notRunning.flatMap((n) => n.missingServices))];
-  const flags = [...new Set(requested)].map((ns) => `-n ${ns}`).join(" ");
-  // A per-service verb (#223) spells the boot with `formatUpCommand`, as the
-  // other remedies do; `up` keeps its own `-n` list.
-  const remedy =
-    declared === undefined
-      ? `devtrees down && devtrees up ${flags}`
-      : `devtrees down && ${formatUpCommand(declared, requested)}`;
-  const quoted = namespaces.map((ns) => `'${ns}'`).join(", ");
-  const one = namespaces.length === 1;
-  return new NamespaceNotRunningError(
-    `devtrees ${command}: namespace${one ? "" : "s"} ${quoted} ${one ? "is" : "are"} not running in ` +
-      `'${worktreeId}' (not started: ${services.join(", ")}). A running instance keeps the ` +
-      `namespaces it was booted with and cannot add more. Run \`${remedy}\` to boot with ` +
-      `them. Nothing was started or stopped.`,
-    { worktree_id: worktreeId, namespaces, services, remedy },
-  );
 }
 
 // --- default I/O implementations -------------------------------------------
@@ -6930,7 +6639,7 @@ async function waitForWorktreeHealth(
   },
   warn: (message: string) => void,
 ): Promise<void> {
-  // `isolated` is the fresh selection (`resolveFreshSelection`): the isolated
+  // `isolated` is the fresh selection (`selectFreshUp`): the isolated
   // tier intersected with the selected namespaces (issue #128) — `default`
   // alone on a bare `up` (#176).
   await waitForSelectedHealth(fresh.selected, socketPath, deps, driver, {

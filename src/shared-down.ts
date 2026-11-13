@@ -15,12 +15,14 @@ import type { ServiceStatus } from "./driver.js";
 import {
   DEFAULT_NAMESPACE,
   formatUpCommand,
+  isAlwaysOnShared,
   namespaceSelected,
+  selectSharedDown,
   serviceNamespaces,
+  sharedServicesOf,
 } from "./selection.js";
 import { keepsInstanceAlive } from "./service-state.js";
 import type { SharedState } from "./shared-state.js";
-import { isAlwaysOnShared, sharedServicesOf } from "./shared-selection.js";
 import type { ResolvedService, ResolvedStack } from "./stack.js";
 
 /**
@@ -64,25 +66,17 @@ export interface SharedDownPlan {
 }
 
 /**
- * Pick the shared services `down --shared -n` removes: every process of the
- * shared derived config that declares a `namespace:` and has one of
- * `namespaces` among them (a list-valued one counts if any matches, as for
- * `up`). An always-on shared service (no `namespace:`) is in no namespace, so
- * it is never a target, not even of `-n default`: only a full
- * `down --shared` stops it.
+ * Plan `down --shared -n`: its targets are `selectSharedDown`'s (ADR-0012),
+ * picked from the shared derived config; the rest is what the teardown keeps
+ * and which kept shared services `depends_on` a target.
  */
 export function planSharedDown(
   config: Pick<DerivedConfig, "processes"> | undefined,
   namespaces: ReadonlyArray<string>,
 ): SharedDownPlan {
   const processes = Object.entries(config?.processes ?? {});
-  const targets = processes
-    .filter(([, proc]) => proc.namespace !== undefined && namespaceSelected(proc, namespaces))
-    .map(([name]) => name);
+  const { targets, inactiveNamespaces } = selectSharedDown(config?.processes, namespaces);
   const targeted = new Set(targets);
-  const active = new Set(
-    processes.filter(([name]) => targeted.has(name)).flatMap(([, proc]) => serviceNamespaces(proc)),
-  );
   const sharedDependants = processes.flatMap(([name, proc]) => {
     if (targeted.has(name)) return [];
     const on = Object.keys(proc.depends_on ?? {}).filter((dep) => targeted.has(dep));
@@ -92,7 +86,7 @@ export function planSharedDown(
   });
   return {
     targets,
-    inactiveNamespaces: [...new Set(namespaces)].filter((ns) => !active.has(ns)),
+    inactiveNamespaces,
     remaining: processes.map(([name]) => name).filter((name) => !targeted.has(name)),
     sharedDependants,
   };
