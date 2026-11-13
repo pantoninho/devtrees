@@ -27,7 +27,8 @@
  * process-compose exits once nothing runs, so its stop would end the
  * instance (`LAST_SERVICES_RUNNING`, ADR-0009).
  *
- * A service that is not running (stopped, crashed, a finished one-shot) has
+ * A service that is not running (stopped, crashed, a finished one-shot, or
+ * idle: `Skipped` or `Disabled`, #263) has
  * no old run: it is simply started.
  */
 
@@ -39,7 +40,7 @@ import {
   type ServiceStopTarget,
 } from "./bounded-stop.js";
 import type { ServiceStatus, StartResult } from "./driver.js";
-import { isActiveOrIdle } from "./service-state.js";
+import { idleState, isActiveOrIdle } from "./service-state.js";
 
 /** The slice of the driver `boundedRestart` uses. */
 export interface RestartDriver extends ServiceStopDriver {
@@ -77,7 +78,7 @@ export async function boundedRestart(
   seams: StopSeams = {},
 ): Promise<RestartOutcome> {
   const before = target.statuses.find((r) => r.name === target.service);
-  if (before === undefined || !isActiveOrIdle(before)) {
+  if (before === undefined || !isActiveOrIdle(before) || idleState(before) !== undefined) {
     const started = await startChecked(target, driver);
     return started.ok ? { ok: true, forceKilled: [], survivors: [] } : started;
   }

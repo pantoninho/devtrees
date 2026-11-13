@@ -789,7 +789,8 @@ class RestartCommand extends DevtreesCommand {
     // service → SHARED_SERVICE_REFUSED; an unknown name → SERVICE_NOT_FOUND; a
     // pending hot-reload → CONFIG_DRIFT (reload_pending); a service whose
     // namespace was not booted → NAMESPACE_NOT_RUNNING; a service still Pending →
-    // SERVICE_PENDING; the instance's last running
+    // SERVICE_PENDING; a Skipped service whose dependency is still failed →
+    // SERVICE_SKIPPED (#263); the instance's last running
     // process → LAST_SERVICES_RUNNING. process-compose refusing
     // the stop or start → SERVICE_START_FAILED; a restarted service that never
     // becomes healthy, or dies → HEALTH_TIMEOUT. No names → INVALID_ARGS
@@ -801,7 +802,9 @@ class RestartCommand extends DevtreesCommand {
       "process to exit, starts it, and waits for it to be healthy before restarting the " +
       "services that depend on it. The instance, its ports and every other service keep " +
       "running, and services that depend on a named one are not restarted (name them too). " +
-      "A stopped service is simply started. The instance's last running process is refused " +
+      "A stopped, crashed, `Skipped` or `Disabled` service is simply started; a `Skipped` " +
+      "one whose dependency is still failed is refused (`SERVICE_SKIPPED`): restart the " +
+      "dependency with it. The instance's last running process is refused " +
       "(`LAST_SERVICES_RUNNING`): stopping it would make process-compose exit. Each service's " +
       "`shutdown.command` is honoured; " +
       "an old process that does not exit within its grace is force-killed, as `down` does, " +
@@ -823,6 +826,7 @@ class RestartCommand extends DevtreesCommand {
           "NAMESPACE_NOT_RUNNING",
           "LAST_SERVICES_RUNNING",
           "SERVICE_PENDING",
+          "SERVICE_SKIPPED",
           "CONFIG_DRIFT",
           "INSTANCE_NOT_FOUND",
           "INSTANCE_UNRESPONSIVE",

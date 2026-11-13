@@ -6,6 +6,7 @@ import {
   findDeadServices,
   isActiveOrIdle,
   isDead,
+  idleState,
   isHealthyForWait,
   isPending,
   isRunning,
@@ -100,6 +101,21 @@ describe("findDeadServices", () => {
         { name: "api", status: "Error" },
       ]),
     ).toBe("toy (Completed, exit -1), api (Error)");
+  });
+});
+
+describe("idleState — a row that holds no process and waits on nothing (#263)", () => {
+  it.each([
+    ["Skipped", 1, "skipped"],
+    ["skipped", undefined, "skipped"],
+    ["Disabled", 0, "disabled"],
+    ["DISABLED", undefined, "disabled"],
+    ["Running", 0, undefined],
+    ["Pending", undefined, undefined],
+    ["Completed", -1, undefined],
+    ["Error", 1, undefined],
+  ] as const)("%s (exit %s) is %s", (status, exitCode, expected) => {
+    expect(idleState(row("x", status, exitCode))).toBe(expected);
   });
 });
 

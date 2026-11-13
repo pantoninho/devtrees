@@ -202,6 +202,72 @@ describe("runRestart (#222)", () => {
     expect(touched(log)).toEqual([]);
   });
 
+  it("a Skipped service whose dependency is still dead is refused with SERVICE_SKIPPED: nothing touched (#263)", async () => {
+    // mobile was skipped because api (its process_healthy dependency) died;
+    // api has not recovered, so a start would leave mobile Skipped.
+    const { deps, log, id, pc, socketPath, row } = await instance();
+    pc.exit(socketPath, "api", 3);
+    pc.idle(socketPath, "mobile", "Skipped");
+    const err = await failure(runRestart(deps, ["worker", "mobile"]));
+    const remedy =
+      "Restart api first, and mobile after it: `devtrees restart api worker mobile`. If api " +
+      "fails again, fix it first (`devtrees logs api`).";
+    expect(err).toEqual({
+      code: "SERVICE_SKIPPED",
+      message:
+        "devtrees restart: mobile was skipped because a dependency failed, and api " +
+        `(Completed, exit 3) is still failed in '${id}', so a start would leave it skipped. ` +
+        `Nothing was touched. ${remedy}`,
+      details: {
+        services: ["mobile"],
+        failed_dependencies: [{ name: "api", status: "Completed", exit_code: 3 }],
+        remedy,
+      },
+    });
+    expect(touched(log)).toEqual([]);
+    expect(row("mobile")).toMatchObject({ status: "Skipped", running: false });
+  });
+
+  it("a Skipped service is restarted together with its dead dependency: api first, then mobile (#263)", async () => {
+    const { deps, log, id, pc, socketPath, row } = await instance();
+    pc.exit(socketPath, "api", 3);
+    pc.idle(socketPath, "mobile", "Skipped");
+    const result = await runRestart(deps, ["mobile", "api"]);
+    expect(result).toMatchObject({ restarted: ["api", "mobile"] });
+    expect(log).toEqual([
+      `lock ${id}`,
+      "process start api",
+      "unlock",
+      "wait api",
+      `lock ${id}`,
+      "process start mobile",
+      "unlock",
+      "wait mobile",
+    ]);
+    expect(row("mobile")).toMatchObject({ status: "Running", running: true });
+  });
+
+  it.each(["Skipped", "Disabled"] as const)(
+    "a %s service with no failed dependency is simply started: no stop (#263)",
+    async (state) => {
+      const { deps, log, id, pc, socketPath, row } = await instance();
+      pc.idle(socketPath, "mobile", state);
+      const result = await runRestart(deps, ["mobile"]);
+      expect(result).toMatchObject({ restarted: ["mobile"] });
+      expect(log).toEqual([`lock ${id}`, "process start mobile", "unlock", "wait mobile"]);
+      expect(row("mobile")).toMatchObject({ status: "Running", running: true });
+    },
+  );
+
+  it("an idle service never counts as the last running process (#263)", async () => {
+    // api is the only running process; restarting the idle mobile stops nothing.
+    const { deps, log, pc, socketPath } = await instance();
+    pc.exit(socketPath, "worker", 0);
+    pc.idle(socketPath, "mobile", "Disabled");
+    await runRestart(deps, ["mobile"]);
+    expect(touched(log)).toEqual(["process start mobile"]);
+  });
+
   it("re-checks the last running process before each later service: a one-shot may have finished", async () => {
     // worker is kept alive by `seed`, a one-shot, until mobile's step is done;
     // then seed finishes and mobile dies, leaving worker the last one.
