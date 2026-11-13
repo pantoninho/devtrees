@@ -13,7 +13,7 @@
  * the event loop.
  */
 
-import { READ_TIMEOUT_MS, type ServiceStatus } from "./driver.js";
+import { READ_TIMEOUT_MS, type Driver, type ServiceStatus } from "./driver.js";
 import { probeSocket, type InstanceStatus } from "./instances.js";
 import {
   deadServicesDetails,
@@ -790,4 +790,37 @@ function deadServicesError(
       `\`${remedy}\` restarts the whole stack. The worktree instance is still running.`,
     { dead_services: deadServicesDetails(dead), remedy },
   );
+}
+
+/**
+ * `process start` each of `names` on `socketPath`, in the order given, every
+ * one attempted even if an earlier one is refused. A service process-compose
+ * reports as already running was started by someone else and is left out of
+ * `restarted`; each started one carries the pid its dead row had (`rows`),
+ * for the health wait's stale-row rule. Shared by the isolated (#178) and
+ * shared (#240) restarts, which differ only in how a refusal is reported.
+ */
+export async function startInOrder(args: {
+  readonly rows: ReadonlyArray<ServiceStatus>;
+  readonly names: ReadonlyArray<string>;
+  readonly socketPath: string;
+  readonly driver: Pick<Driver, "startProcess">;
+}): Promise<{
+  readonly restarted: RestartedService[];
+  readonly failed: Array<{ name: string; message: string }>;
+}> {
+  const pids = new Map(args.rows.map((r) => [r.name, r.pid]));
+  const restarted: RestartedService[] = [];
+  const failed: Array<{ name: string; message: string }> = [];
+  for (const name of args.names) {
+    const outcome = await args.driver.startProcess(args.socketPath, name);
+    if (!outcome.ok) {
+      failed.push({ name, message: outcome.message });
+      continue;
+    }
+    if (outcome.alreadyRunning) continue;
+    const stalePid = pids.get(name);
+    restarted.push(stalePid === undefined ? { name } : { name, stalePid });
+  }
+  return { restarted, failed };
 }

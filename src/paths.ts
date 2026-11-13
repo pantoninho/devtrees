@@ -30,7 +30,8 @@
 
 import { createHash } from "node:crypto";
 import { mkdirSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import type { ResolvedStack, Tier } from "./stack.js";
 
 /** Well-known registry key for the shared instance's port block. */
 export const SHARED_REGISTRY_KEY = "__shared__";
@@ -240,4 +241,22 @@ export function logsDir(anchor: string, instanceId: string): string {
  */
 export function sharedInstancePaths(anchor: string): InstancePaths {
   return instancePaths(anchor, SHARED_INSTANCE_ID);
+}
+
+/**
+ * Create the directories every authored `log_location` file needs (issue #136)
+ * so process-compose can open the file — it opens but does not `mkdir -p` the
+ * path itself. Created lazily: a stack where no service authored a
+ * `log_location` makes no dir at all, so a plain stack never sprouts an empty
+ * `devtrees/logs/<instanceId>/` (acceptance: "no empty logs dir surprise"). For
+ * a nested location (e.g. `sub/api.log`) the file's *parent* dir is created, so
+ * `<logsBase>/sub/` exists before launch. `logsBase` is the per-instance logs
+ * dir (`logsDir(anchor, instanceId)`); the authored values are already validated
+ * to be relative and non-escaping, so the join stays under it.
+ */
+export function ensureLogsDir(stack: ResolvedStack, logsBase: string, tier: Tier): void {
+  for (const svc of stack.services) {
+    if (svc.tier !== tier || svc.logLocation === undefined) continue;
+    mkdirSync(dirname(join(logsBase, svc.logLocation)), { recursive: true });
+  }
 }

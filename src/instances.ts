@@ -26,7 +26,7 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { connect } from "node:net";
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
-import { DEVTREES_METADATA_KEY } from "./deriver.js";
+import { DEVTREES_METADATA_KEY, type DerivedConfig } from "./deriver.js";
 import type { ServiceStatus } from "./driver.js";
 import { readRegistry } from "./registry.js";
 import { readPendingReload } from "./reload-pending.js";
@@ -413,8 +413,28 @@ interface DerivedConfigDoc {
   readonly [DEVTREES_METADATA_KEY]?: { ports_by_service?: unknown };
 }
 
+/**
+ * Read and parse an orphan's full derived process-compose config from disk
+ * (issue #148). Returns `undefined` when the file is missing or unparsable —
+ * an orphan with no on-disk config has no `shutdown.command` to run, so the
+ * reaper has nothing to do. Best-effort, like `readWorktreePath`: a malformed
+ * config must not abort the sweep.
+ */
+export function readDerivedConfig(configPath: string): DerivedConfig | undefined {
+  if (!existsSync(configPath)) return undefined;
+  try {
+    const doc = parseYaml(readFileSync(configPath, "utf8")) as DerivedConfig | null;
+    if (doc === null || typeof doc !== "object" || typeof doc.processes !== "object") {
+      return undefined;
+    }
+    return doc;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Parse a derived config from disk, or `{}` when it isn't there / is empty. */
-function readDerivedConfig(configPath: string): DerivedConfigDoc {
+function readDerivedDoc(configPath: string): DerivedConfigDoc {
   if (!existsSync(configPath)) return {};
   return (parseYaml(readFileSync(configPath, "utf8")) ?? {}) as DerivedConfigDoc;
 }
@@ -446,7 +466,7 @@ function readPortsByService(
  */
 export function readDeclaredPorts(configPath: string): Record<string, Record<string, number>> {
   try {
-    return readPortsByService(readDerivedConfig(configPath)) ?? {};
+    return readPortsByService(readDerivedDoc(configPath)) ?? {};
   } catch {
     return {};
   }
@@ -620,7 +640,7 @@ export async function discoverInstances(
         deps.probeRetryDelaysMs,
       );
       const blockBase = registry[registryKeyFor(stem)];
-      const configDoc = readDerivedConfig(paths.configPath);
+      const configDoc = readDerivedDoc(paths.configPath);
       // Read-only, like the rest of discovery: `up` and `down` clear it.
       const pending = readPendingReload(anchor, stem);
       const view = await readServicesView(stem, socketPath, status, {

@@ -29,8 +29,8 @@ import {
   PROBE_RETRY_DELAYS_MS,
   type DiscoverDeps,
   probeSocket as defaultProbeSocket,
-  probeUntilDefinitive,
   readDeclaredPorts,
+  readDerivedConfig,
   type InstanceInfo,
   type InstanceStatus,
   type Service,
@@ -39,6 +39,7 @@ import {
   SHARED_INSTANCE_ID,
   SHARED_REGISTRY_KEY,
   assertSocketPathFits,
+  ensureLogsDir,
   ensureRunDir,
   instancePaths,
   logsDir,
@@ -53,7 +54,7 @@ import {
 } from "./output.js";
 import { findDeadReservations, findOrphans, parseWorktreeIds } from "./prune.js";
 import { reapShutdownHooks, type ReapDeps, type ReapOutcome } from "./reaper.js";
-import { loadStack, type ResolvedService, type ResolvedStack, type Tier } from "./stack.js";
+import { loadStack, type ResolvedService, type ResolvedStack } from "./stack.js";
 import {
   boundedDown,
   DownTimeoutError,
@@ -93,6 +94,13 @@ import {
   type PortHolderReport,
 } from "./port-probe.js";
 import { acceptsConnections, forwarderLabel, isPortForwarder } from "./port-connect.js";
+import {
+  InstanceUnresponsiveError,
+  socketIsLive,
+  unresponsiveRemedy,
+  type LivenessContext,
+  type LivenessProbe,
+} from "./liveness.js";
 import {
   clearDownIncomplete,
   daemonHooksSkipped,
@@ -175,6 +183,7 @@ import {
   isGone,
   readStatusesWithin,
   sharedServiceDeadError,
+  startInOrder,
   type RestartedService,
   type WaitForHealth,
   type WaitingCommand,
@@ -513,38 +522,6 @@ class InstanceGoneError extends Error {
         `\`devtrees up\` to start it again.`,
     );
     this.name = "InstanceGoneError";
-  }
-}
-
-/**
- * Thrown when a control socket still exists but repeated probes could not
- * tell whether process-compose behind it is alive (issue #186): every connect
- * timed out, or was refused while a process still held the socket. `up` and
- * `down` refuse to guess. Treating the instance as gone would unlink its
- * socket and orphan a possibly live process-compose and its services, which
- * keep their ports, so a fresh `up` would then collide on them. The socket is
- * kept and nothing is started or stopped. `details.instance` is the worktree
- * id, or `shared` for the shared instance.
- */
-class InstanceUnresponsiveError extends Error {
-  readonly code = "INSTANCE_UNRESPONSIVE" as const;
-  constructor(
-    command: string,
-    readonly details: {
-      readonly instance: string;
-      readonly socket_path: string;
-      readonly attempts: number;
-      readonly remedy: string;
-    },
-  ) {
-    super(
-      `devtrees ${command}: the ${details.instance === SHARED_INSTANCE_ID ? "shared" : `'${details.instance}'`} ` +
-        `instance's control socket did not answer after ${details.attempts} ` +
-        `probe${details.attempts === 1 ? "" : "s"} ` +
-        `(${details.socket_path}); process-compose may be busy or frozen. Nothing was ` +
-        `started or stopped and the socket was kept. ${details.remedy}`,
-    );
-    this.name = "InstanceUnresponsiveError";
   }
 }
 
@@ -1445,24 +1422,6 @@ function hasTier(stack: ResolvedStack, tier: "isolated" | "shared"): boolean {
   return stack.services.some((s) => s.tier === tier);
 }
 
-/**
- * Create the directories every authored `log_location` file needs (issue #136)
- * so process-compose can open the file — it opens but does not `mkdir -p` the
- * path itself. Created lazily: a stack where no service authored a
- * `log_location` makes no dir at all, so a plain stack never sprouts an empty
- * `devtrees/logs/<instanceId>/` (acceptance: "no empty logs dir surprise"). For
- * a nested location (e.g. `sub/api.log`) the file's *parent* dir is created, so
- * `<logsBase>/sub/` exists before launch. `logsBase` is the per-instance logs
- * dir (`logsDir(anchor, instanceId)`); the authored values are already validated
- * to be relative and non-escaping, so the join stays under it.
- */
-function ensureLogsDir(stack: ResolvedStack, logsBase: string, tier: Tier): void {
-  for (const svc of stack.services) {
-    if (svc.tier !== tier || svc.logLocation === undefined) continue;
-    mkdirSync(dirname(join(logsBase, svc.logLocation)), { recursive: true });
-  }
-}
-
 interface AllocatedPortMaps {
   readonly blockBase: number;
   readonly sharedBase?: number;
@@ -1589,12 +1548,6 @@ function resolveLifecycleSeams(deps: CommandDeps) {
   } as const;
 }
 
-/** A socket-liveness probe plus its retry backoff for `unknown` (#80, #186). */
-interface LivenessProbe {
-  readonly probe: (socketPath: string) => Promise<InstanceStatus>;
-  readonly retryDelaysMs: ReadonlyArray<number>;
-}
-
 /**
  * Resolve the #80 socket-liveness probe seam — needed by both `runUp` (via
  * `resolveUpSeams`) and `runDown`, which doesn't share the up-seam bundle.
@@ -1604,65 +1557,6 @@ function resolveProbe(deps: CommandDeps): LivenessProbe {
     probe: deps.probeSocket ?? defaultProbeSocket,
     retryDelaysMs: deps.probeRetryDelaysMs ?? PROBE_RETRY_DELAYS_MS,
   };
-}
-
-/** Which command is asking, and about which instance — for the #186 envelope. */
-interface LivenessContext {
-  readonly command: "up" | "down" | NamedServiceCommand;
-  /** The exact command to retry, when it is more than the verb (`devtrees restart web`). */
-  readonly retry?: string;
-  /** Worktree id, or `SHARED_INSTANCE_ID` for the shared instance. */
-  readonly instance: string;
-}
-
-/**
- * Liveness gate for the write paths (issue #80). A control-socket *file* is
- * not proof of a live instance — it lives in anchor state, which survives
- * `kill -9` and reboots, so after a crash the file points at nothing. Probe
- * the UDS (retrying while the answer is `unknown`):
- *
- *  - a listener means live (`true`);
- *  - a definitive "nothing listening" means the file is an orphan, so unlink
- *    it and report "not live" (`false`) — the caller then falls through to
- *    its fresh-start (or idempotent no-op) path;
- *  - still `unknown` after the retries (#186) throws `INSTANCE_UNRESPONSIVE`
- *    and keeps the socket. Every caller is about to start or stop processes,
- *    and guessing either way is worse than failing: "not live" would orphan
- *    a live process-compose (and a fresh start would collide on its ports),
- *    "live" would hand the driver a socket that does not answer.
- */
-async function socketIsLive(
-  socketPath: string,
-  liveness: LivenessProbe,
-  context: LivenessContext,
-  /** `up --dry-run` (#210): answer the same question, but leave a stale file. */
-  opts: { readonly readOnly?: boolean } = {},
-): Promise<boolean> {
-  if (!existsSync(socketPath)) return false;
-  const status = await probeUntilDefinitive(socketPath, liveness.probe, liveness.retryDelaysMs);
-  if (status === "running") return true;
-  if (status === "stale") {
-    if (opts.readOnly !== true) rmSync(socketPath, { force: true });
-    return false;
-  }
-  throw new InstanceUnresponsiveError(context.command, {
-    instance: context.instance,
-    socket_path: socketPath,
-    attempts: liveness.retryDelaysMs.length + 1,
-    remedy: unresponsiveRemedy(socketPath, context),
-  });
-}
-
-/** The `details.remedy` an `INSTANCE_UNRESPONSIVE` envelope carries (#186). */
-function unresponsiveRemedy(socketPath: string, context: LivenessContext): string {
-  const down = context.instance === SHARED_INSTANCE_ID ? "devtrees down --shared" : "devtrees down";
-  const retry =
-    context.retry ?? (context.command === "down" ? down : `devtrees ${context.command}`);
-  return (
-    `Retry \`${retry}\` in a moment. If it keeps failing, find the process-compose ` +
-    `holding the socket with \`lsof -U -a ${socketPath}\`: resume it if it is stopped ` +
-    `(\`kill -CONT <pid>\`), or kill it, then run \`${down}\` to clean up.`
-  );
 }
 
 /**
@@ -5476,26 +5370,6 @@ async function reapDerivedConfig(
 }
 
 /**
- * Read and parse an orphan's full derived process-compose config from disk
- * (issue #148). Returns `undefined` when the file is missing or unparsable —
- * an orphan with no on-disk config has no `shutdown.command` to run, so the
- * reaper has nothing to do. Best-effort, like `readWorktreePath`: a malformed
- * config must not abort the sweep.
- */
-function readDerivedConfig(configPath: string): DerivedConfig | undefined {
-  if (!existsSync(configPath)) return undefined;
-  try {
-    const doc = parseYaml(readFileSync(configPath, "utf8")) as DerivedConfig | null;
-    if (doc === null || typeof doc !== "object" || typeof doc.processes !== "object") {
-      return undefined;
-    }
-    return doc;
-  } catch {
-    return undefined;
-  }
-}
-
-/**
  * Recover the `working_dir` of the first process in a derived process-compose
  * config — devtrees always pins this to the worktree root at `up` time, so
  * the path is the orphan's last-known anchor location. Returns "" when the
@@ -6493,39 +6367,6 @@ async function startServices(args: {
     throw serviceStartFailedError(args.anchor.worktreeId, failed, args.remedy);
   }
   return restarted;
-}
-
-/**
- * `process start` each of `names` on `socketPath`, in the order given, every
- * one attempted even if an earlier one is refused. A service process-compose
- * reports as already running was started by someone else and is left out of
- * `restarted`; each started one carries the pid its dead row had (`rows`),
- * for the health wait's stale-row rule. Shared by the isolated (#178) and
- * shared (#240) restarts, which differ only in how a refusal is reported.
- */
-async function startInOrder(args: {
-  readonly rows: ReadonlyArray<ServiceStatus>;
-  readonly names: ReadonlyArray<string>;
-  readonly socketPath: string;
-  readonly driver: Driver;
-}): Promise<{
-  readonly restarted: RestartedService[];
-  readonly failed: Array<{ name: string; message: string }>;
-}> {
-  const pids = new Map(args.rows.map((r) => [r.name, r.pid]));
-  const restarted: RestartedService[] = [];
-  const failed: Array<{ name: string; message: string }> = [];
-  for (const name of args.names) {
-    const outcome = await args.driver.startProcess(args.socketPath, name);
-    if (!outcome.ok) {
-      failed.push({ name, message: outcome.message });
-      continue;
-    }
-    if (outcome.alreadyRunning) continue;
-    const stalePid = pids.get(name);
-    restarted.push(stalePid === undefined ? { name } : { name, stalePid });
-  }
-  return { restarted, failed };
 }
 
 function serviceStartFailedError(
