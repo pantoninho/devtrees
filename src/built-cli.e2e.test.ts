@@ -26,8 +26,8 @@
  * step runs before its build step) the suite builds it once in `beforeAll`
  * via the project's own `vp run build`. An existing bundle is reused as-is.
  */
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vite-plus/test";
-import { execFileSync, spawnSync } from "node:child_process";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vite-plus/test";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -39,6 +39,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { constants as osConstants } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
@@ -125,6 +126,23 @@ interface CliResult {
   readonly stderr: string;
   /** Parsed stdout when `--json` was passed and stdout is one JSON document. */
   readonly doc?: unknown;
+}
+
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function killQuietly(pid: number): void {
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {
+    // already gone
+  }
 }
 
 /** Spawn the built CLI with the shim directory prepended to PATH. */
@@ -747,6 +765,51 @@ describe("built CLI e2e — argv→commands wiring over the stub process-compose
     expect(human.code, `logs failed: ${human.stderr}`).toBe(0);
     expect(human.stdout).toBe("four\nfive\n");
   }, 60_000);
+
+  for (const signal of ["SIGTERM", "SIGHUP"] as const) {
+    it(`logs -f streams lines as they arrive, and ${signal} stops its process-compose child (#282)`, async () => {
+      const { wt, sock } = setupScenario(`dt-bc8${signal === "SIGTERM" ? "t" : "h"}-`);
+
+      const up = devtrees(wt, ["up", "--json", "--wait-timeout", "30"]);
+      expect(up.code, `up failed: ${up.stderr}`).toBe(0);
+      writeFileSync(`${sock}.web.log`, ["one", "two"].join("\n"));
+      const pidFile = `${sock}.web.log.follower-pid`;
+
+      const child = spawn(process.execPath, [CLI, "logs", "web", "-f"], {
+        cwd: wt,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, PATH: `${shimDir}:${process.env.PATH ?? ""}` },
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (chunk: Buffer) => {
+        stdout += chunk.toString("utf8");
+      });
+      child.stderr.on("data", (chunk: Buffer) => {
+        stderr += chunk.toString("utf8");
+      });
+      const exited = new Promise<number | null>((resolve) => {
+        child.on("exit", (code) => resolve(code));
+      });
+      cleanups.push(() => {
+        child.kill("SIGKILL");
+        if (existsSync(pidFile)) killQuietly(Number(readFileSync(pidFile, "utf8")));
+      });
+
+      // The command is still following, yet its output has already arrived.
+      await vi.waitFor(() => expect(stdout, `stderr: ${stderr}`).toBe("one\ntwo\n"), {
+        timeout: 15_000,
+      });
+      expect(child.exitCode).toBe(null);
+      await vi.waitFor(() => expect(existsSync(pidFile)).toBe(true));
+      const follower = Number(readFileSync(pidFile, "utf8"));
+      expect(isAlive(follower)).toBe(true);
+
+      child.kill(signal);
+      expect(await exited).toBe(128 + (osConstants.signals[signal] ?? 0));
+      await vi.waitFor(() => expect(isAlive(follower)).toBe(false), { timeout: 5_000 });
+    }, 60_000);
+  }
 
   it("logs with an unknown service fails fast with SERVICE_NOT_FOUND — no hang (#109)", () => {
     const { wt } = setupScenario("dt-bc5-");

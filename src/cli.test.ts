@@ -2,8 +2,10 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { Writable } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
-import { COMMANDS, execute, isEntrypoint, run } from "./cli.js";
+import { COMMANDS, execute, executeStreaming, isEntrypoint, run } from "./cli.js";
+import type { LogEvent } from "./driver.js";
 import { withRegistryLock } from "./registry.js";
 import { parseStack } from "./stack.js";
 
@@ -1078,6 +1080,65 @@ describe("devtrees CLI — logs (#33)", () => {
     expect(logsAll).toHaveBeenCalledWith(
       expect.objectContaining({ service: undefined, all: true, shared: true, follow: true }),
     );
+  });
+
+  it("executeStreaming writes each log line as it arrives, before the command returns (#282)", async () => {
+    let release = (): void => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    async function* follow(): AsyncIterable<LogEvent> {
+      yield { ts: "T1", service: "web", stream: "stdout", line: "alpha" };
+      await gate; // a follow that has nothing more to say yet
+    }
+    const logs = vi.fn().mockResolvedValue({ services: ["web"], events: follow() });
+    let written = "";
+    const stdout = new Writable({
+      write(chunk: Buffer | string, _enc, cb) {
+        written += chunk.toString();
+        cb();
+      },
+    });
+    const stderr = new Writable({ write: (_c, _e, cb) => cb() });
+    let finished = false;
+    const done = executeStreaming(
+      ["logs", "web", "-f"],
+      { up: vi.fn(), down: vi.fn(), logs },
+      {
+        stdout,
+        stderr,
+      },
+    ).then((code) => {
+      finished = true;
+      return code;
+    });
+    await vi.waitFor(() => expect(written).toBe("alpha\n"));
+    expect(finished).toBe(false);
+    release();
+    expect(await done).toBe(0);
+  });
+
+  it("executeStreaming writes the unknown-command diagnostic to stderr", async () => {
+    let err = "";
+    const sink = (onChunk: (s: string) => void) =>
+      new Writable({
+        write(chunk: Buffer | string, _enc, cb) {
+          onChunk(chunk.toString());
+          cb();
+        },
+      });
+    const code = await executeStreaming(
+      ["nope"],
+      { up: vi.fn(), down: vi.fn() },
+      {
+        stdout: sink(() => {}),
+        stderr: sink((s) => {
+          err += s;
+        }),
+      },
+    );
+    expect(code).toBe(1);
+    expect(err).toBe("devtrees: unknown command 'nope'\nRun 'devtrees --help' for usage.\n");
   });
 
   it("routes `logs <service>` to deps.logs and writes lines verbatim in human mode", async () => {

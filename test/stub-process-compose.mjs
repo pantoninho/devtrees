@@ -428,7 +428,12 @@ if (cmd === "up") {
       if (Number.isFinite(n) && n >= 0) lines.splice(0, Math.max(0, lines.length - n));
     }
     for (const line of lines) process.stdout.write(`${line}\n`);
-    process.exit(0);
+    if (!process.argv.includes("-f")) process.exit(0);
+    // Follow: stay alive like the real binary, and record our pid so a test
+    // can tell whether devtrees left us running (#282).
+    writeFileSync(`${logPath}.follower-pid`, String(process.pid));
+    setInterval(() => {}, 60_000);
+    await new Promise(() => {});
   }
   if (sub === "list") {
     // `process list -U -u <socket> -o json` — devtrees driver reads each

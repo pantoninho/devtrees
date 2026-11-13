@@ -448,6 +448,11 @@ export interface LogsFlags {
 export interface StreamLogsOptions extends LogsFlags {
   /** Name of the service to stream. One subprocess per service; `--all` is handled by the caller. */
   readonly service: string;
+  /**
+   * Ends the stream when aborted (#282): the child is killed at once, so a
+   * caller that is about to exit on a signal does not leave it running.
+   */
+  readonly signal?: AbortSignal;
 }
 
 /**
@@ -1059,6 +1064,15 @@ async function* streamLogsImpl(
   // Surface a spawn error even if no one awaits exitPromise.
   exitPromise.catch(() => {});
 
+  // An abort kills the child synchronously, not when the iterator is next
+  // resumed: a pending `next()` on a quiet follow stream may never settle, so
+  // a `return()` alone would not reach the `finally` below (#282).
+  const kill = (): void => {
+    child.kill?.();
+  };
+  if (opts.signal?.aborted === true) kill();
+  opts.signal?.addEventListener("abort", kill, { once: true });
+
   try {
     const reader = createInterface({ input: stdout, crlfDelay: Number.POSITIVE_INFINITY });
     for await (const line of reader) {
@@ -1069,8 +1083,10 @@ async function* streamLogsImpl(
         line,
       };
     }
+    if (opts.signal?.aborted === true) return;
     await exitPromise;
   } finally {
+    opts.signal?.removeEventListener("abort", kill);
     child.kill?.();
   }
 }

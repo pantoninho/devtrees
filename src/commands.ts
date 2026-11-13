@@ -3410,6 +3410,8 @@ export interface LogsOptions {
    * Must be a finite, non-negative number of milliseconds.
    */
   readonly sinceMs?: number;
+  /** Ends every stream and kills its process-compose child when aborted (#282). */
+  readonly signal?: AbortSignal;
 }
 
 export interface LogsResult {
@@ -3465,6 +3467,7 @@ export async function runLogs(
       service,
       follow: options.follow,
       tail: options.tail,
+      ...(options.signal !== undefined ? { signal: options.signal } : {}),
     };
     return driver.streamLogs(paths.socketPath, driverOpts);
   });

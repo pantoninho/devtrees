@@ -16,6 +16,7 @@
  */
 
 import { realpathSync, readFileSync } from "node:fs";
+import { constants as osConstants } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Writable } from "node:stream";
 import { Cli, Command, Option, Builtins, type BaseContext } from "clipanion";
@@ -1263,8 +1264,8 @@ function buildCli(): Cli<DevtreesContext> {
 
 /**
  * Buffered stdio so `execute`/`run` can return a `RunResult` instead of writing
- * straight to the process. Tests need byte-exact captures and the entrypoint
- * shell needs to flush in order — both go through this.
+ * straight to the process. Tests need byte-exact captures; the entrypoint
+ * writes to the process's stdio directly (`executeStreaming`, #282).
  */
 function bufferedStream(): { write: Writable; readonly text: () => string } {
   let buf = "";
@@ -1330,24 +1331,36 @@ function unknownCommandStderr(argv: ReadonlyArray<string>): string {
   return `devtrees: unknown command '${name}'\nRun 'devtrees --help' for usage.\n`;
 }
 
+/** Where a dispatch writes: the process's stdio at the entrypoint, buffers in tests. */
+export interface CliIo {
+  readonly stdout: Writable;
+  readonly stderr: Writable;
+}
+
 /**
- * Resolve an argv list through clipanion into a `RunResult`. The single
- * entrypoint every other surface in this file (and the test suite) calls.
+ * Resolve an argv list through clipanion, writing to `io` as the command runs,
+ * and return the exit code. The single dispatch every other surface in this
+ * file (and the test suite) goes through.
  *
- * `deps` is optional so help/version paths can run without wiring the
- * effectful commands; subcommands that need a missing dep dispatch to a
- * no-op `return 0` (preserving the pre-clipanion behaviour where a
- * test-stub omitting `ls` from `ExecuteDeps` returned the "not implemented"
- * stub output).
+ * Output is written as it is produced, never held until the command returns:
+ * `logs -f` never returns, so held output would never be printed (#282).
+ * Nothing here reads back what a command wrote; the error envelopes and
+ * `--json` documents are complete when written.
+ *
+ * Subcommands whose dep is missing from `deps` dispatch to a no-op `return 0`
+ * (preserving the pre-clipanion behaviour where a test-stub omitting `ls`
+ * from `ExecuteDeps` returned the "not implemented" stub output).
  */
-async function dispatchCli(argv: ReadonlyArray<string>, deps: ExecuteDeps): Promise<RunResult> {
+async function dispatchTo(
+  argv: ReadonlyArray<string>,
+  deps: ExecuteDeps,
+  io: CliIo,
+): Promise<number> {
   const cli = buildCli();
-  const stdout = bufferedStream();
-  const stderr = bufferedStream();
   const context = {
     stdin: process.stdin,
-    stdout: stdout.write,
-    stderr: stderr.write,
+    stdout: io.stdout,
+    stderr: io.stderr,
     env: process.env,
     colorDepth: 1,
     deps,
@@ -1363,16 +1376,28 @@ async function dispatchCli(argv: ReadonlyArray<string>, deps: ExecuteDeps): Prom
     if (isUnknownCommandError(error)) {
       // Reshape clipanion's "Command not found" to devtrees' historical
       // error surface (#62: behavior preserved exactly across the migration).
-      return { code: 1, stdout: "", stderr: unknownCommandStderr(argv) };
+      io.stderr.write(unknownCommandStderr(argv));
+      return 1;
     }
     // Any other syntax error (bad flag, missing value, ambiguity) renders
     // exactly as `cli.run([...argv])` always rendered it: clipanion's own
     // formatting on stdout, exit 1.
-    stdout.write.write(cli.error(error, { colored: false }));
-    return { code: 1, stdout: stdout.text(), stderr: stderr.text() };
+    io.stdout.write(cli.error(error, { colored: false }));
+    return 1;
   }
 
-  const code = await cli.run(command, context);
+  return cli.run(command, context);
+}
+
+/**
+ * `dispatchTo` into in-memory buffers, returned as a `RunResult` once the
+ * command finishes. Tests need byte-exact captures; only a command that
+ * returns can be captured this way.
+ */
+async function dispatchCli(argv: ReadonlyArray<string>, deps: ExecuteDeps): Promise<RunResult> {
+  const stdout = bufferedStream();
+  const stderr = bufferedStream();
+  const code = await dispatchTo(argv, deps, { stdout: stdout.write, stderr: stderr.write });
   return { code, stdout: stdout.text(), stderr: stderr.text() };
 }
 
@@ -1404,6 +1429,19 @@ export function run(argv: ReadonlyArray<string>): Promise<RunResult> {
  */
 export function execute(argv: ReadonlyArray<string>, deps: ExecuteDeps): Promise<RunResult> {
   return dispatchCli(argv, deps);
+}
+
+/**
+ * Resolve a command line, performing effects for the commands in `deps` and
+ * writing to `io` as output is produced (#282). What the entrypoint runs;
+ * `execute` is the same dispatch into buffers.
+ */
+export function executeStreaming(
+  argv: ReadonlyArray<string>,
+  deps: ExecuteDeps,
+  io: CliIo,
+): Promise<number> {
+  return dispatchTo(argv, deps, io);
 }
 
 // --- entrypoint -------------------------------------------------------------
@@ -1451,6 +1489,41 @@ function stopSeamsFromEnv(): { baseTimeoutMs?: number } {
   const raw = process.env.DEVTREES_DOWN_BASE_TIMEOUT_MS;
   const ms = raw === undefined ? Number.NaN : Number(raw);
   return Number.isInteger(ms) && ms > 0 ? { baseTimeoutMs: ms } : {};
+}
+
+/**
+ * Wait until everything written to stdout and stderr has been handed to the
+ * OS. Pipes are asynchronous on macOS, and `process.exit` drops what is still
+ * queued.
+ */
+function flushStdio(): Promise<void> {
+  const flush = (stream: NodeJS.WriteStream) =>
+    new Promise<void>((resolve) => {
+      stream.write("", () => resolve());
+    });
+  return Promise.all([flush(process.stdout), flush(process.stderr)]).then(() => undefined);
+}
+
+/**
+ * An AbortSignal that fires on SIGINT, SIGTERM or SIGHUP, after which the
+ * process exits with 128 + the signal number (#282).
+ *
+ * `logs` streams through process-compose children that Node's default signal
+ * action would leave running: SIGTERM or SIGHUP sent to devtrees alone (a
+ * terminal emulator closing a tab, a supervisor) kills devtrees and orphans
+ * them. Ctrl-C only looked fine because the terminal signals the whole
+ * foreground process group, children included. Aborting kills the children
+ * synchronously (`streamLogs`), so exiting right after leaves none behind.
+ */
+function abortOnTerminationSignals(): AbortSignal {
+  const controller = new AbortController();
+  for (const name of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+    process.once(name, () => {
+      controller.abort();
+      process.exit(128 + osConstants.signals[name]);
+    });
+  }
+  return controller.signal;
 }
 
 if (isEntrypoint(import.meta.url, process.argv[1])) {
@@ -1508,6 +1581,7 @@ if (isEntrypoint(import.meta.url, process.argv[1])) {
           follow: opts.follow,
           tail: opts.tail,
           sinceMs: opts.sinceMs,
+          signal: abortOnTerminationSignals(),
         },
       ),
     init: () => runInit(),
@@ -1519,8 +1593,10 @@ if (isEntrypoint(import.meta.url, process.argv[1])) {
     // are never TTYs) can exercise the human-context silence path.
     initHint: () => maybeInitHint({ cwd: process.cwd(), isTTY: entrypointIsTTY() }),
   };
-  const result = await dispatchCli(process.argv.slice(2), deps);
-  if (result.stdout) process.stdout.write(result.stdout);
-  if (result.stderr) process.stderr.write(result.stderr);
-  process.exit(result.code);
+  const code = await executeStreaming(process.argv.slice(2), deps, {
+    stdout: process.stdout,
+    stderr: process.stderr,
+  });
+  await flushStdio();
+  process.exit(code);
 }
