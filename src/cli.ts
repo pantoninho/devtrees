@@ -21,6 +21,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { Writable } from "node:stream";
 import { Cli, Command, Option, Builtins, type BaseContext } from "clipanion";
 import type {
+  LogsOptions,
+  UpOptions,
   bareRestartRemedy,
   runAttach,
   runDown,
@@ -120,32 +122,20 @@ export interface RunResult {
 }
 
 /**
- * Options the `up` handler threads from CLI flags into the underlying `runUp`.
- * Optional everywhere: when omitted, runUp's own defaults apply (TTY detection
- * for `attach`, 120s for `waitTimeoutMs`).
+ * A command as the CLI calls it: its signature from `commands.ts` minus the
+ * leading `CommandEnv`, which the entrypoint supplies. The options and the
+ * result are the command's own, so the CLI's view cannot drift from them.
  */
-export interface UpOptions {
-  /** Force-attach (`--attach`) or force-skip (`--no-attach`). */
-  readonly attach?: boolean;
-  /** Health-wait window in ms (`--wait-timeout=<seconds>`). */
-  readonly waitTimeoutMs?: number;
-  /**
-   * process-compose namespaces to start (`-n/--namespace`, issue #128),
-   * repeatable and forwarded verbatim. Omitted when no `-n` flag is given, so
-   * `runUp`'s default applies (a fresh start selects only `default`, #176).
-   */
-  readonly namespaces?: ReadonlyArray<string>;
-}
+type Invocation<F> = F extends (env: never, ...options: infer A) => infer R
+  ? (...options: A) => R
+  : never;
 
-/**
- * The result a command resolves to, derived from its signature in
- * `commands.ts` so the CLI's view cannot drift from what the command returns.
- */
-type ResultOf<F extends (...args: never[]) => Promise<unknown>> = ReturnType<F>;
+/** What a command's invocation resolves to. */
+type ResultOf<F> = Awaited<ReturnType<Invocation<F>>>;
 
 /** The effectful commands, injected so dispatch stays unit-testable. */
 export interface ExecuteDeps {
-  up: (options?: UpOptions) => ResultOf<typeof runUp>;
+  up: Invocation<typeof runUp>;
   /**
    * Dry-run derivation (#124): runs the full pipeline `up` would run and
    * returns the derived config(s) + the resolved env, with no side effects.
@@ -154,43 +144,27 @@ export interface ExecuteDeps {
    * carries the allocated worktree ports (and injected shared ports) a sibling
    * reads off the `--json` envelope (#125).
    */
-  upDryRun?: (options?: {
-    readonly namespaces?: ReadonlyArray<string>;
-    /** Caps the running instance's status read (#210); default 5s. */
-    readonly waitTimeoutMs?: number;
-  }) => ResultOf<typeof runUpDryRun>;
-  down: (options: { shared: boolean }) => ResultOf<typeof runDown>;
+  upDryRun?: Invocation<typeof runUpDryRun>;
+  down: Invocation<typeof runDown>;
   /** `down --shared -n <namespace>...` (#239). Optional, like the other non-core commands. */
-  downSharedNamespaces?: (options: {
-    readonly namespaces: ReadonlyArray<string>;
-    readonly force: boolean;
-  }) => ResultOf<typeof runSharedNamespaceDown>;
+  downSharedNamespaces?: Invocation<typeof runSharedNamespaceDown>;
   /** `down --shared -n <namespace>... --dry-run` (#239): read-only preview. */
-  downSharedNamespacesDryRun?: (options: {
-    readonly namespaces: ReadonlyArray<string>;
-    readonly force: boolean;
-  }) => ResultOf<typeof runSharedNamespaceDownDryRun>;
+  downSharedNamespacesDryRun?: Invocation<typeof runSharedNamespaceDownDryRun>;
   /** `restart <service...>` (ADR-0009, #222). Optional, like the other non-core commands. */
-  restart?: (options: {
-    readonly services: ReadonlyArray<string>;
-    /** `-n` namespaces, expanded to their isolated services (#224). */
-    readonly namespaces?: ReadonlyArray<string>;
-    /** Health-wait window in ms (`--wait-timeout=<seconds>`). */
-    readonly waitTimeoutMs?: number;
-  }) => ResultOf<typeof runRestart>;
+  restart?: Invocation<typeof runRestart>;
   /**
    * The remedy a bare `restart` points to (#225): the `down` + `up` that keeps
    * the booted namespaces. Best-effort; never throws.
    */
-  bareRestartRemedy?: () => ResultOf<typeof bareRestartRemedy>;
-  ls?: () => ResultOf<typeof runLs>;
-  attach?: (options: { shared: boolean }) => ResultOf<typeof runAttach>;
+  bareRestartRemedy?: Invocation<typeof bareRestartRemedy>;
+  ls?: Invocation<typeof runLs>;
+  attach?: Invocation<typeof runAttach>;
   /** `prune --shared-ports` (#238): drop shared port map names no instance holds. */
-  pruneSharedPorts?: (options: { dryRun: boolean }) => ResultOf<typeof runPruneSharedPorts>;
-  prune?: () => ResultOf<typeof runPrune>;
-  env?: () => ResultOf<typeof runEnv>;
-  logs?: (options: LogsCliOptions) => ResultOf<typeof runLogs>;
-  init?: () => ResultOf<typeof runInit>;
+  pruneSharedPorts?: Invocation<typeof runPruneSharedPorts>;
+  prune?: Invocation<typeof runPrune>;
+  env?: Invocation<typeof runEnv>;
+  logs?: Invocation<typeof runLogs>;
+  init?: Invocation<typeof runInit>;
   /**
    * The agent-onboarding hint `up` surfaces on stderr (issue #119): a one-line,
    * non-fatal pointer at `devtrees init --agents`, returned only when the
@@ -201,17 +175,6 @@ export interface ExecuteDeps {
    * Optional so dispatch paths that don't wire it simply never hint.
    */
   initHint?: () => string | undefined;
-}
-
-/** Parsed `devtrees logs` options threaded into `deps.logs`. */
-export interface LogsCliOptions {
-  readonly service?: string;
-  readonly all: boolean;
-  readonly shared: boolean;
-  readonly follow: boolean;
-  readonly tail?: number;
-  /** `--since` window, already coerced from a duration string (e.g. `5m`) to ms. */
-  readonly sinceMs?: number;
 }
 
 // --- error-code footers for per-command --help -----------------------------
@@ -495,7 +458,7 @@ class UpCommand extends DevtreesCommand {
   }
 }
 
-type DryRunResultView = Awaited<ResultOf<typeof runUpDryRun>>;
+type DryRunResultView = ResultOf<typeof runUpDryRun>;
 
 /** Map the injected `upDryRun` result onto the formatter's payload. */
 function dryRunPayload(result: DryRunResultView): UpDryRunPayload {
@@ -969,7 +932,7 @@ class LogsCommand extends DevtreesCommand {
   override async execute(): Promise<number> {
     return this.dispatch(async () => {
       if (!this.context.deps.logs) return 0;
-      const opts: LogsCliOptions = {
+      const opts: LogsOptions = {
         service: this.service,
         all: this.all,
         shared: this.shared,
@@ -1058,7 +1021,7 @@ function invalidArgsError(message: string, details?: Readonly<Record<string, unk
 function bareRestartMessage({
   remedy,
   namespacesRead,
-}: Awaited<ResultOf<typeof bareRestartRemedy>>): string {
+}: ResultOf<typeof bareRestartRemedy>): string {
   const unread = namespacesRead
     ? ""
     : " devtrees could not read which namespaces the instance runs, so that command boots " +
@@ -1444,47 +1407,23 @@ if (isEntrypoint(import.meta.url, process.argv[1])) {
     runLogs,
     runInit,
   } = await import("./commands.js");
+  // Each command gets its options as the CLI parsed them, and the real seams;
+  // only the stops read their budgets from the environment (#190).
   const deps: ExecuteDeps = {
-    up: (options) =>
-      runUp({
-        ...(options?.attach !== undefined ? { attach: options.attach } : {}),
-        ...(options?.waitTimeoutMs !== undefined ? { waitTimeoutMs: options.waitTimeoutMs } : {}),
-        ...(options?.namespaces !== undefined ? { namespaces: options.namespaces } : {}),
-      }),
-    upDryRun: (options) =>
-      runUpDryRun({
-        ...(options?.namespaces !== undefined ? { namespaces: options.namespaces } : {}),
-        ...(options?.waitTimeoutMs !== undefined ? { waitTimeoutMs: options.waitTimeoutMs } : {}),
-      }),
-    down: ({ shared }) => runDown({ stop: stopSeamsFromEnv() }, { shared }),
+    up: (options) => runUp({}, options),
+    upDryRun: (options) => runUpDryRun({}, options),
+    down: (options) => runDown({ stop: stopSeamsFromEnv() }, options),
     downSharedNamespaces: (options) =>
       runSharedNamespaceDown({ stop: stopSeamsFromEnv() }, options),
     downSharedNamespacesDryRun: (options) => runSharedNamespaceDownDryRun({}, options),
-    restart: ({ services, namespaces, waitTimeoutMs }) =>
-      runRestart(
-        { stop: stopSeamsFromEnv(), ...(waitTimeoutMs !== undefined ? { waitTimeoutMs } : {}) },
-        services,
-        namespaces,
-      ),
+    restart: (options) => runRestart({ stop: stopSeamsFromEnv() }, options),
     bareRestartRemedy: () => bareRestartRemedy(),
     ls: () => runLs(),
-    attach: ({ shared }) => runAttach({}, { shared }),
+    attach: (options) => runAttach({}, options),
     prune: () => runPrune({ stop: stopSeamsFromEnv() }),
     pruneSharedPorts: (options) => runPruneSharedPorts({}, options),
     env: () => runEnv(),
-    logs: (opts) =>
-      runLogs(
-        {},
-        {
-          service: opts.service,
-          all: opts.all,
-          shared: opts.shared,
-          follow: opts.follow,
-          tail: opts.tail,
-          sinceMs: opts.sinceMs,
-          signal: abortOnTerminationSignals(),
-        },
-      ),
+    logs: (options) => runLogs({}, { ...options, signal: abortOnTerminationSignals() }),
     init: () => runInit(),
     // Issue #119: the agent-onboarding hint `up` may surface on stderr. The
     // gate is "agent context" (neither stdout nor stderr a TTY — the same

@@ -177,7 +177,7 @@ import {
 } from "./shared-instance.js";
 
 // The shared instance's contracts live in its module (#257, #258);
-// re-exported here so `CommandDeps` callers keep a single import site.
+// re-exported here so `CommandEnv` callers keep a single import site.
 export type {
   PruneSharedPortsResult,
   SharedInstance,
@@ -188,7 +188,7 @@ export type {
 } from "./shared-instance.js";
 
 // The health-gate contracts (and their driver-backed defaults) live in the
-// health module (issue #87); re-exported here so `CommandDeps` callers keep a
+// health module (issue #87); re-exported here so `CommandEnv` callers keep a
 // single import site.
 export type { WaitForHealth, WaitForSharedHealth } from "./health.js";
 
@@ -449,10 +449,50 @@ async function collectPortCollisions(
 /** Default health-wait window for the worktree instance — overridable per call. */
 const DEFAULT_WAIT_TIMEOUT_MS = 120_000;
 
-export interface CommandDeps {
+/**
+ * What every command's options carry: where it runs. A command's options are
+ * the per-invocation choices (the CLI's flags); its `CommandEnv` holds the
+ * seams it reaches the world through, and is the same for every call.
+ */
+export interface CommandOptions {
   /** Working directory to resolve the worktree from. Default: process.cwd(). */
   readonly cwd?: string;
-  /** Inject git. Default: runs the real `git` in `cwd`. */
+}
+
+/** Options of `runUp`: the `up` flags. */
+export interface UpOptions extends CommandOptions {
+  /**
+   * Attach the TUI after a successful up (`--attach` / `--no-attach`).
+   * Default: only when both stdout and stderr are TTYs (ADR-0005 — agent
+   * invocations shouldn't be hijacked by the TUI), as `CommandEnv.isTTY`
+   * reports. Setting this explicitly overrides the auto-detect.
+   */
+  readonly attach?: boolean;
+  /** Health-wait window for the worktree instance (`--wait-timeout`). Default: 120s. */
+  readonly waitTimeoutMs?: number;
+  /**
+   * process-compose namespaces to start (issue #128) — the `-n/--namespace`
+   * selection. Forwarded verbatim to the worktree up-spawn AND used to narrow
+   * the worktree health-wait's expected set, so `up -n default` neither spawns
+   * nor waits on a probed service in an excluded namespace. Exact: `-n app`
+   * does not imply `default`. Empty / omitted on a fresh start selects only
+   * the `default` namespace (namespaces are opt-in, issue #176 / ADR-0008),
+   * and fails with `NO_SERVICES_SELECTED` if that selects nothing.
+   */
+  readonly namespaces?: ReadonlyArray<string>;
+}
+
+/** Options of `runUpDryRun`: the `up --dry-run` flags. */
+export interface UpDryRunOptions extends CommandOptions {
+  /** The `-n` selection to preview; see `UpOptions.namespaces`. */
+  readonly namespaces?: ReadonlyArray<string>;
+  /** Caps the running instance's status read (#210). Default: 5s. */
+  readonly waitTimeoutMs?: number;
+}
+
+/** The seams every command reaches the world through, each with a real default. */
+export interface CommandEnv {
+  /** Inject git. Default: runs the real `git` in the command's `cwd`. */
   readonly git?: GitProbe;
   /** Read the stack from a directory. Default: reads `devtrees.yaml` from disk. */
   readonly readStack?: (dir: string) => ReturnType<typeof loadStack>;
@@ -519,8 +559,6 @@ export interface CommandDeps {
    * over the worktree instance's UDS (issue #87); injected so tests stub it.
    */
   readonly waitForHealth?: WaitForHealth;
-  /** Health-wait window for the worktree instance. Default: 120s. */
-  readonly waitTimeoutMs?: number;
   /**
    * How long the shared lazy-start waits for the spawned instance to bind its
    * control socket before failing with `SHARED_START_FAILED` (issue #92).
@@ -617,29 +655,13 @@ export interface CommandDeps {
    */
   readonly writeStoredHash?: (anchor: string, worktreeId: string, hash: string) => void;
   /**
-   * Attach the TUI after a successful up. Default: only when both stdout and
-   * stderr are TTYs (ADR-0005 — agent invocations shouldn't be hijacked by
-   * the TUI). Setting this explicitly overrides the auto-detect.
-   */
-  readonly attach?: boolean;
-  /**
    * Inject the TTY check so unit tests can prove the auto-detect logic
    * without touching `process.stdout.isTTY`. Default: returns true only when
-   * both stdout and stderr are TTYs. Ignored when `attach` is set explicitly.
+   * both stdout and stderr are TTYs. Ignored when `UpOptions.attach` is set.
    */
   readonly isTTY?: () => boolean;
   /** Sink for non-fatal warnings (e.g. unmanaged port detection). Default: stderr. */
   readonly warn?: (message: string) => void;
-  /**
-   * process-compose namespaces to start (issue #128) — the `-n/--namespace`
-   * selection. Forwarded verbatim to the worktree up-spawn AND used to narrow
-   * the worktree health-wait's expected set, so `up -n default` neither spawns
-   * nor waits on a probed service in an excluded namespace. Exact: `-n app`
-   * does not imply `default`. Empty / omitted on a fresh start selects only
-   * the `default` namespace (namespaces are opt-in, issue #176 / ADR-0008),
-   * and fails with `NO_SERVICES_SELECTED` if that selects nothing.
-   */
-  readonly namespaces?: ReadonlyArray<string>;
   /**
    * Run a torn-down instance's derived `shutdown.command`(s) directly —
    * socket-free, from the anchor — to reap out-of-band resources when the
@@ -842,7 +864,7 @@ export interface DryRunResult {
   readonly bracedEnvVars: ReadonlyArray<BracedEnvVar>;
 }
 
-export interface DownOptions {
+export interface DownOptions extends CommandOptions {
   /**
    * When true, tears down the shared instance (CONTEXT.md "Shared instance":
    * lifecycle is decoupled from any single worktree's `down`). Defaults to
@@ -852,8 +874,9 @@ export interface DownOptions {
   readonly shared?: boolean;
 }
 
-function resolve(deps: CommandDeps) {
-  const cwd = deps.cwd ?? process.cwd();
+/** Resolve the worktree a command runs in, from its `cwd` through its git seam. */
+function resolve(deps: { readonly git?: GitProbe }, options: CommandOptions) {
+  const cwd = options.cwd ?? process.cwd();
   const git = deps.git ?? defaultGit(cwd);
   const anchor = resolveAnchor(cwd, git);
   return { cwd, anchor };
@@ -992,7 +1015,7 @@ async function allocateAndBuildPortMaps(args: {
  * dropped-edge wait, attach-after-up) rather than counting one extra
  * decision per nullish-coalesce.
  */
-function resolveUpSeams(deps: CommandDeps) {
+function resolveUpSeams(deps: CommandEnv) {
   return {
     readStack: deps.readStack ?? loadStack,
     lock: deps.withRegistryLock ?? defaultWithRegistryLock,
@@ -1006,7 +1029,7 @@ function resolveUpSeams(deps: CommandDeps) {
 }
 
 /** The pre-flight's port seams (#58, #155): who holds a port, and does it serve it. */
-function resolvePortSeams(deps: CommandDeps) {
+function resolvePortSeams(deps: CommandEnv) {
   return {
     portHolder: deps.portHolder ?? defaultPortHolder,
     portAccepts: deps.portAccepts ?? acceptsConnections,
@@ -1019,7 +1042,7 @@ function resolvePortSeams(deps: CommandDeps) {
  * default-bundle whose per-`??` cyclomatic count never creeps toward the
  * audit gate's complexity threshold.
  */
-function resolveLifecycleSeams(deps: CommandDeps) {
+function resolveLifecycleSeams(deps: CommandEnv) {
   return {
     lifecycleLock: deps.withLifecycleLock ?? defaultWithLifecycleLock,
     waitForSocketFile:
@@ -1033,7 +1056,7 @@ function resolveLifecycleSeams(deps: CommandDeps) {
  * Resolve the #80 socket-liveness probe seam — needed by both `runUp` (via
  * `resolveUpSeams`) and `runDown`, which doesn't share the up-seam bundle.
  */
-function resolveProbe(deps: CommandDeps): LivenessProbe {
+function resolveProbe(deps: CommandEnv): LivenessProbe {
   return {
     probe: deps.probeSocket ?? defaultProbeSocket,
     retryDelaysMs: deps.probeRetryDelaysMs ?? PROBE_RETRY_DELAYS_MS,
@@ -1093,8 +1116,8 @@ function resolveProbe(deps: CommandDeps): LivenessProbe {
  * threaded into the returned envelope reflects whether THIS call brought
  * shared up (`true`) or found it already running (`false`).
  */
-export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
-  const { anchor } = resolve(deps);
+export async function runUp(deps: CommandEnv = {}, options: UpOptions = {}): Promise<UpResult> {
+  const { anchor } = resolve(deps, options);
   const seams = resolveUpSeams(deps);
   const { readStack, lock, isPortFree, portHolder, portAccepts, warn } = seams;
   const { readHash, writeHash } = seams;
@@ -1103,13 +1126,13 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
 
   // An explicit `-n` that selects nothing is an error whether or not the
   // instance is running (#203); checked before any version probe or state.
-  assertExplicitSelectionNotEmpty(stack, anchor.worktreeId, deps.namespaces);
+  assertExplicitSelectionNotEmpty(stack, anchor.worktreeId, options.namespaces);
 
   // Refuse an unsupported process-compose before allocating ports or touching
   // any state (issue #173): one cheap subprocess, and nothing to roll back.
   await (deps.assertProcessComposeVersion ?? (() => driverOf(deps).assertSupportedVersion()))();
 
-  const options = resolveAllocatorOptions(stack, deps.allocator ?? DEFAULT_ALLOCATOR);
+  const allocator = resolveAllocatorOptions(stack, deps.allocator ?? DEFAULT_ALLOCATOR);
 
   // Lock-guarded read-modify-write: allocate (or look up) both the worktree's
   // own block and — if the stack has shared services — the repo-wide shared
@@ -1122,14 +1145,14 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     anchor: anchor.anchor,
     worktreeId: anchor.worktreeId,
     stack,
-    options,
+    options: allocator,
     lock,
     isPortFree,
   });
 
   // Warn for any port literal in a service command that is outside this
   // worktree's block — a hardcoded number devtrees did not allocate (PRD US-24).
-  for (const warning of findUnmanagedPortBinds(stack, blockBase, options.blockSize)) {
+  for (const warning of findUnmanagedPortBinds(stack, blockBase, allocator.blockSize)) {
     warn(warning);
   }
 
@@ -1141,7 +1164,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
   // written for a start that cannot succeed.
   assertSocketPathFits(paths.socketPath);
   const driver = driverOf(deps);
-  const sharedInstance = sharedInstanceOf(deps, anchor.anchor, driver);
+  const sharedInstance = sharedInstanceOf(deps, anchor.anchor, driver, options.waitTimeoutMs);
   const inst = { configPath: paths.configPath, socketPath: paths.socketPath };
 
   // Per-worktree lifecycle lock (issue #91): the liveness-check →
@@ -1175,7 +1198,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     // whose bare-`up` target is #177's to define.
     const gate =
       own === undefined
-        ? { own, fresh: selectFreshUp(stack, anchor.worktreeId, deps.namespaces) }
+        ? { own, fresh: selectFreshUp(stack, anchor.worktreeId, options.namespaces) }
         : { own, fresh: undefined };
     const freshSelection = gate.fresh;
 
@@ -1221,13 +1244,13 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     const sharedNamespaces =
       gate.own === undefined
         ? gate.fresh.namespaces
-        : await runningSharedNamespaces({ stack, anchor, own: gate.own, deps });
+        : await runningSharedNamespaces({ stack, anchor, own: gate.own, deps, options });
     const shared = await sharedInstance.ensure({
       stack,
       worktreeId: anchor.worktreeId,
       selected: freshSelection?.shared ?? selectSharedServices(stack, sharedNamespaces),
       namespaces: sharedNamespaces,
-      seed: { positional: sharedPortFor, block: sharedBlockOf(sharedBase, options) },
+      seed: { positional: sharedPortFor, block: sharedBlockOf(sharedBase, allocator) },
       // The fresh path waits for the shared services here, inside the lock and
       // before the worktree spawns (ADR-0003); the running path waits after the
       // lock is released, with the rest of its verification (#240).
@@ -1275,6 +1298,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
         inst,
         driver,
         deps,
+        namespaces: options.namespaces,
         readHash,
         writeHash,
       });
@@ -1382,6 +1406,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
       anchor,
       own: outcome.own,
       deps,
+      options,
       driver,
       warn,
     });
@@ -1401,7 +1426,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
     };
   }
 
-  if (shouldAttachAfterUp(deps)) {
+  if (shouldAttachAfterUp(deps, options)) {
     // Attach path (#132): the server is already started detached, and
     // `process-compose attach` renders each service transitioning starting ->
     // ready live. Attach NOW — before any health-wait — so the human watches
@@ -1426,7 +1451,7 @@ export async function runUp(deps: CommandDeps = {}): Promise<UpResult> {
   // Headless paths (`--json` / `--no-attach`): no TUI to render progress, so the
   // silent health-wait is what turns "up returned" into "the stack is serving
   // traffic" (PRD #26, ADR-0005), and HEALTH_TIMEOUT surfaces a stuck start.
-  await waitForWorktreeHealth(stack, outcome, paths.socketPath, deps, driver, warn);
+  await waitForWorktreeHealth(stack, outcome, paths.socketPath, deps, options, driver, warn);
 
   // After the health-wait, snapshot the per-service runtime rows so the
   // issue-#30 `up --json` envelope can publish them without a follow-up
@@ -1459,7 +1484,7 @@ async function collectIsolatedServices(
   stack: ResolvedStack,
   socketPath: string,
   portFor: (name: string) => number | undefined,
-  deps: CommandDeps,
+  deps: CommandEnv,
   driver: Driver,
   /** Rows the caller already read from this instance; skips the re-read. */
   preRead?: ServiceStatus[],
@@ -1529,15 +1554,18 @@ async function collectIsolatedServices(
  * in-memory for the caller to print to stdout — the "preview the derived
  * config" use case, served with no disk write (#125).
  */
-export async function runUpDryRun(deps: CommandDeps = {}): Promise<DryRunResult> {
-  const { anchor } = resolve(deps);
+export async function runUpDryRun(
+  deps: CommandEnv = {},
+  options: UpDryRunOptions = {},
+): Promise<DryRunResult> {
+  const { anchor } = resolve(deps, options);
   const readStack = deps.readStack ?? loadStack;
   const lock = deps.withRegistryLock ?? defaultWithRegistryLock;
   const isPortFree = deps.isPortFree ?? defaultIsPortFree;
 
   const stack = readStack(anchor.worktreeRoot);
   // The same explicit-`-n` check the real `up` makes first (#203).
-  assertExplicitSelectionNotEmpty(stack, anchor.worktreeId, deps.namespaces);
+  assertExplicitSelectionNotEmpty(stack, anchor.worktreeId, options.namespaces);
   // Preview the path the real `up` would take (#210): the running-instance
   // one when this worktree's instance is live, else a fresh start (#176). Both
   // raise the errors the real `up` would, and both run before the registry is
@@ -1545,15 +1573,15 @@ export async function runUpDryRun(deps: CommandDeps = {}): Promise<DryRunResult>
   const own = await openOwnInstance(deps, anchor, { command: "up" }, { readOnly: true });
   const preview: RunningPreview =
     own === undefined
-      ? previewFresh(stack, anchor.worktreeId, deps.namespaces)
-      : await previewRunning(stack, anchor, own, deps);
-  const options = resolveAllocatorOptions(stack, deps.allocator ?? DEFAULT_ALLOCATOR);
+      ? previewFresh(stack, anchor.worktreeId, options.namespaces)
+      : await previewRunning(stack, anchor, own, deps, options);
+  const allocator = resolveAllocatorOptions(stack, deps.allocator ?? DEFAULT_ALLOCATOR);
 
   const allocated = await allocateAndBuildPortMaps({
     anchor: anchor.anchor,
     worktreeId: anchor.worktreeId,
     stack,
-    options,
+    options: allocator,
     lock,
     isPortFree,
   });
@@ -1564,14 +1592,19 @@ export async function runUpDryRun(deps: CommandDeps = {}): Promise<DryRunResult>
   // previewed `up` selects are its selection's (`UpSelection.shared`): the
   // always-on ones plus the namespaced ones in the effective selection, as
   // the real `up` decides them.
-  const shared = await sharedInstanceOf(deps, anchor.anchor).preview({
+  const shared = await sharedInstanceOf(
+    deps,
+    anchor.anchor,
+    undefined,
+    options.waitTimeoutMs,
+  ).preview({
     stack,
     worktreeId: anchor.worktreeId,
     selected: preview.shared,
     namespaces: preview.plan.namespaces,
     seed: {
       positional: allocated.sharedPortFor,
-      block: sharedBlockOf(allocated.sharedBase, options),
+      block: sharedBlockOf(allocated.sharedBase, allocator),
     },
   });
 
@@ -1673,9 +1706,10 @@ async function previewRunning(
   stack: ResolvedStack,
   anchor: { readonly anchor: string; readonly worktreeId: string },
   own: LiveInstance,
-  deps: CommandDeps,
+  deps: CommandEnv,
+  options: UpDryRunOptions,
 ): Promise<RunningPreview> {
-  const rows = await own.rows(deps.waitTimeoutMs ?? DRY_RUN_READ_TIMEOUT_MS);
+  const rows = await own.rows(options.waitTimeoutMs ?? DRY_RUN_READ_TIMEOUT_MS);
   const readHash = deps.readStoredHash ?? defaultReadStoredHash;
   const wouldReload = readHash(anchor.anchor, anchor.worktreeId) !== stackHash(stack);
   const previous = own.processes();
@@ -1683,12 +1717,12 @@ async function previewRunning(
     rows,
     previous,
     isolated: stack.services.filter((s) => s.tier === "isolated"),
-    requested: deps.namespaces ?? [],
+    requested: options.namespaces ?? [],
     isAlive: deps.isProcessAlive ?? isProcessAlive,
   });
   const reload = wouldReload && previous !== undefined;
   const projected = reload ? rowsAfterReload(stack, previous, rows) : rows;
-  const plan = own.planUp(stack, projected, deps.namespaces);
+  const plan = own.planUp(stack, projected, options.namespaces);
   return {
     plan: {
       instance: "running",
@@ -1770,7 +1804,7 @@ function withoutReloadRestarted(running: RunningPreview, next: DerivedConfig): D
  * Options for `runAttach`. Default is to attach this worktree's instance;
  * `{ shared: true }` attaches the shared instance instead.
  */
-export interface AttachOptions {
+export interface AttachOptions extends CommandOptions {
   readonly shared?: boolean;
 }
 
@@ -1786,11 +1820,8 @@ export interface AttachOptions {
  * driver's `attach` foreground so the TUI inherits the user's terminal,
  * then return when the user detaches and the child exits.
  */
-export async function runAttach(
-  deps: CommandDeps = {},
-  options: AttachOptions = {},
-): Promise<void> {
-  const { anchor } = resolve(deps);
+export async function runAttach(deps: CommandEnv = {}, options: AttachOptions = {}): Promise<void> {
+  const { anchor } = resolve(deps, options);
   const driver = driverOf(deps);
 
   if (options.shared) {
@@ -1842,10 +1873,11 @@ async function runningSharedNamespaces(args: {
   readonly stack: ResolvedStack;
   readonly anchor: { readonly anchor: string; readonly worktreeId: string };
   readonly own: LiveInstance;
-  readonly deps: CommandDeps;
+  readonly deps: CommandEnv;
+  readonly options: UpOptions;
 }): Promise<ReadonlyArray<string>> {
-  const { stack, anchor, own, deps } = args;
-  if (deps.namespaces !== undefined && deps.namespaces.length > 0) return deps.namespaces;
+  const { stack, anchor, own, deps, options } = args;
+  if (options.namespaces !== undefined && options.namespaces.length > 0) return options.namespaces;
   if (!hasNamespacedShared(stack)) return [];
   const rows = await own.tryRows();
   if (rows === undefined) return [];
@@ -2003,10 +2035,10 @@ export type DownResult =
  * pre- or post-teardown state should call `ls --json` before/after `down`.
  */
 export async function runDown(
-  deps: CommandDeps = {},
+  deps: CommandEnv = {},
   options: DownOptions = {},
 ): Promise<DownResult> {
-  const { anchor } = resolve(deps);
+  const { anchor } = resolve(deps, options);
   const driver = driverOf(deps);
 
   if (options.shared) {
@@ -2145,7 +2177,7 @@ async function checkAfterStop(
   stopped: StopResult,
   configPath: string,
   anchor: { readonly anchor: string; readonly worktreeId: string },
-  deps: CommandDeps,
+  deps: CommandEnv,
 ): Promise<{ warning?: ReapWarning; survivors?: DownSurvivor[] }> {
   const config = readDerivedConfig(configPath);
   const processes = (stopped.survivors ?? []).map(processSurvivor);
@@ -2180,7 +2212,7 @@ function bootedServices(stopped: StopResult): string[] {
 async function recheckDownIncomplete(
   configPath: string,
   anchor: { readonly anchor: string; readonly worktreeId: string },
-  deps: CommandDeps,
+  deps: CommandEnv,
   warning: ReapWarning | undefined,
 ): Promise<void> {
   const services = readDownIncomplete(anchor.anchor, anchor.worktreeId);
@@ -2212,7 +2244,7 @@ async function reapDerivedHooks(
 }
 
 /** The seams `down`'s listener check runs on (#155). */
-function portSurvivorSeams(deps: CommandDeps): PortSurvivorSeams {
+function portSurvivorSeams(deps: CommandEnv): PortSurvivorSeams {
   return {
     accepts: deps.portAccepts ?? acceptsConnections,
     identify:
@@ -2228,23 +2260,33 @@ function portSurvivorSeams(deps: CommandDeps): PortSurvivorSeams {
  * the named namespaces' shared services, through the shared instance module.
  */
 export async function runSharedNamespaceDown(
-  deps: CommandDeps,
-  options: SharedNamespaceDownOptions,
+  deps: CommandEnv,
+  options: SharedNamespaceDownOptions & CommandOptions,
 ): Promise<SharedNamespaceDownResult> {
-  const { anchor } = resolve(deps);
+  const { anchor } = resolve(deps, options);
   return await sharedInstanceOf(deps, anchor.anchor).downNamespaces(options);
 }
 
 /** Preview `down --shared -n` (#239): the same reads, no lock, nothing stopped or written. */
 export async function runSharedNamespaceDownDryRun(
-  deps: CommandDeps,
-  options: SharedNamespaceDownOptions,
+  deps: CommandEnv,
+  options: SharedNamespaceDownOptions & CommandOptions,
 ): Promise<SharedNamespaceDownPreview> {
-  const { anchor } = resolve(deps);
+  const { anchor } = resolve(deps, options);
   return await sharedInstanceOf(deps, anchor.anchor).previewDownNamespaces(options);
 }
 
 // --- restart (ADR-0009, #222) -----------------------------------------------
+
+/** Options of `runRestart`: the `restart` arguments and flags (ADR-0009). */
+export interface RestartOptions extends CommandOptions {
+  /** The services to restart, by name. */
+  readonly services: ReadonlyArray<string>;
+  /** `-n` namespaces, expanded to their isolated services (#224). */
+  readonly namespaces?: ReadonlyArray<string>;
+  /** One health-wait budget for every restarted service (`--wait-timeout`). Default: 120s. */
+  readonly waitTimeoutMs?: number;
+}
 
 export interface RestartResult {
   readonly worktreeId: string;
@@ -2292,21 +2334,20 @@ export interface RestartResult {
  * dies, fails `HEALTH_TIMEOUT` and is left running so `logs` and
  * `ls --json` still work.
  *
- * `namespaces` (`-n`, #224) adds every isolated service of each namespace to
- * `names` (`resolveNamedServices`); shared services in them are skipped and
+ * `options.namespaces` (`-n`, #224) adds every isolated service of each namespace
+ * to `options.services` (`resolveNamedServices`); shared services in them are skipped and
  * reported in `skippedShared`.
  */
 export async function runRestart(
-  deps: CommandDeps,
-  names: ReadonlyArray<string>,
-  namespaces: ReadonlyArray<string> = [],
+  deps: CommandEnv,
+  options: RestartOptions,
 ): Promise<RestartResult> {
-  const { anchor } = resolve(deps);
+  const { anchor } = resolve(deps, options);
   const lifecycleLock = deps.withLifecycleLock ?? defaultWithLifecycleLock;
   const driver = driverOf(deps);
   const warn = deps.warn ?? defaultWarn;
   // One health-wait budget for every service; the stops and starts do not spend it.
-  let budget = deps.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS;
+  let budget = options.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS;
   const done: Array<{ name: string; row: Service | undefined }> = [];
   const forceKilled: ForceKilled[] = [];
   let order: string[] | undefined;
@@ -2314,7 +2355,7 @@ export async function runRestart(
   for (let i = 0; order === undefined || i < order.length; i++) {
     const step = await lifecycleLock(anchor.anchor, anchor.worktreeId, async () => {
       const restarted = done.map((d) => d.name);
-      const target = await resolveRestartStep(deps, names, restarted, namespaces);
+      const target = await resolveRestartStep(deps, options, restarted);
       if (order === undefined) {
         order = [...target.services];
         skippedShared = target.skippedShared;
@@ -2367,14 +2408,13 @@ export async function runRestart(
  * windows) says which ones.
  */
 async function resolveRestartStep(
-  deps: CommandDeps,
-  names: ReadonlyArray<string>,
+  deps: CommandEnv,
+  options: RestartOptions,
   done: ReadonlyArray<string>,
-  namespaces: ReadonlyArray<string>,
 ): Promise<NamedServices> {
-  const { anchor } = resolve(deps);
+  const { anchor } = resolve(deps, options);
   try {
-    return await resolveNamedServices(deps, names, "restart", namespaces);
+    return await resolveNamedServices(deps, options, "restart");
   } catch (err) {
     const code = (err as { code?: unknown }).code;
     if (code === "INSTANCE_NOT_FOUND" && done.length > 0) {
@@ -2417,7 +2457,7 @@ function assertRestartKeepsInstance(
 async function restartOne(
   target: NamedServices,
   name: string,
-  deps: CommandDeps,
+  deps: CommandEnv,
   done: ReadonlyArray<string>,
 ): Promise<{
   restarted: RestartedService;
@@ -2492,10 +2532,13 @@ export interface BareRestartRemedy {
  * could drop a booted namespace, or select nothing at all
  * (`NO_SERVICES_SELECTED`) in a stack without a `default` one.
  */
-export async function bareRestartRemedy(deps: CommandDeps = {}): Promise<BareRestartRemedy> {
+export async function bareRestartRemedy(
+  deps: CommandEnv = {},
+  options: CommandOptions = {},
+): Promise<BareRestartRemedy> {
   let declared: ReadonlyArray<Pick<ResolvedService, "namespace">> = [];
   try {
-    const { anchor } = resolve(deps);
+    const { anchor } = resolve(deps, options);
     const paths = instancePaths(anchor.anchor, anchor.worktreeId);
     const configText = existsSync(paths.configPath)
       ? readFileSync(paths.configPath, "utf8")
@@ -2527,7 +2570,7 @@ function everyNamespace(
 
 /** The isolated services `devtrees.yaml` declares; none when it cannot be read. */
 function declaredIsolated(
-  deps: CommandDeps,
+  deps: CommandEnv,
   worktreeRoot: string,
 ): ReadonlyArray<Pick<ResolvedService, "namespace">> {
   try {
@@ -2585,9 +2628,7 @@ function restartFailedError(
 
 /** Inputs unique to `runLs` — same anchor resolution as the other commands. */
 export interface LsDeps {
-  /** Working directory to resolve the anchor from. Default: process.cwd(). */
-  readonly cwd?: string;
-  /** Inject git. Default: runs the real `git` in `cwd`. */
+  /** Inject git. Default: runs the real `git` in the command's `cwd`. */
   readonly git?: GitProbe;
   /**
    * Discover instances at the anchor. Default: real socket enumeration via
@@ -2642,8 +2683,8 @@ export interface LsResult {
  * (#226): one that does not answer in time lists the instance as
  * `unresponsive` instead of hanging `ls`.
  */
-export async function runLs(deps: LsDeps = {}): Promise<LsResult> {
-  const { anchor } = resolve(deps);
+export async function runLs(deps: LsDeps = {}, options: CommandOptions = {}): Promise<LsResult> {
+  const { anchor } = resolve(deps, options);
   const discover = deps.discover ?? discoverInstances;
   const driver = driverOf(deps);
   const budgetMs = deps.readTimeoutMs ?? READ_TIMEOUT_MS;
@@ -2664,10 +2705,8 @@ export async function runLs(deps: LsDeps = {}): Promise<LsResult> {
 
 /** Inputs unique to `runPrune` — same anchor resolution as the other commands. */
 export interface PruneDeps {
-  /** Working directory to resolve the anchor from. Default: process.cwd(). */
-  readonly cwd?: string;
   /**
-   * Inject git. Default: runs the real `git` in `cwd`. Prune additionally
+   * Inject git. Default: runs the real `git` in the command's `cwd`. Prune additionally
    * calls `git worktree list --porcelain` to enumerate live worktrees —
    * devtrees does not manage git, so this is the authoritative liveness
    * signal (#9 acceptance).
@@ -2715,7 +2754,7 @@ export interface PruneDeps {
    * observe the reap surface without spawning a shell.
    */
   readonly reap?: Reaper;
-  /** Seams and budgets for the bounded orphan stop (#190); see `CommandDeps.stop`. */
+  /** Seams and budgets for the bounded orphan stop (#190); see `CommandEnv.stop`. */
   readonly stop?: StopSeams;
 }
 
@@ -2802,7 +2841,7 @@ export interface UnreclaimedOrphan {
 }
 
 /** Options of `prune --shared-ports`. */
-export interface PruneSharedPortsOptions {
+export interface PruneSharedPortsOptions extends CommandOptions {
   /** Report what would be dropped: no lock, no write, no refusal (#244 follow-up). */
   readonly dryRun?: boolean;
 }
@@ -2841,10 +2880,10 @@ export interface PruneSharedPortsOptions {
  * are listed in `blockedBy`.
  */
 export async function runPruneSharedPorts(
-  deps: CommandDeps = {},
+  deps: CommandEnv = {},
   options: PruneSharedPortsOptions = {},
 ): Promise<PruneSharedPortsResult> {
-  const { anchor } = resolve(deps);
+  const { anchor } = resolve(deps, options);
   return await sharedInstanceOf(deps, anchor.anchor).prunePorts({
     dryRun: options.dryRun,
     sharedBlock: () => currentSharedBlock(deps, anchor),
@@ -2858,7 +2897,7 @@ export async function runPruneSharedPorts(
  * counts as outside it.
  */
 function currentSharedBlock(
-  deps: CommandDeps,
+  deps: CommandEnv,
   anchor: { readonly anchor: string; readonly worktreeRoot: string },
 ): SharedBlock | undefined {
   const base = (deps.readRegistry ?? readRegistry)(anchor.anchor)[SHARED_REGISTRY_KEY];
@@ -2898,8 +2937,11 @@ function currentSharedBlock(
  * dir, not at any single worktree, and its lifecycle is decoupled from any
  * worktree's `down` (ADR-0001). Tear it down explicitly with `down --shared`.
  */
-export async function runPrune(deps: PruneDeps = {}): Promise<PruneResult> {
-  const cwd = deps.cwd ?? process.cwd();
+export async function runPrune(
+  deps: PruneDeps = {},
+  options: CommandOptions = {},
+): Promise<PruneResult> {
+  const cwd = options.cwd ?? process.cwd();
   const git = deps.git ?? defaultGit(cwd);
   const anchor = resolveAnchor(cwd, git);
   const discover = deps.discover ?? discoverInstances;
@@ -3145,28 +3187,31 @@ export interface EnvResult {
  * same answer a follow-up `up` would persist, barring a concurrent allocation
  * (the racy edge case the spec explicitly accepts).
  */
-export async function runEnv(deps: CommandDeps = {}): Promise<EnvResult> {
-  const { anchor } = resolve(deps);
+export async function runEnv(
+  deps: CommandEnv = {},
+  options: CommandOptions = {},
+): Promise<EnvResult> {
+  const { anchor } = resolve(deps, options);
   const readStack = deps.readStack ?? loadStack;
   const isPortFree = deps.isPortFree ?? defaultIsPortFree;
   const readReg = deps.readRegistry ?? readRegistry;
 
   const stack = readStack(anchor.worktreeRoot);
-  const options = resolveAllocatorOptions(stack, deps.allocator ?? DEFAULT_ALLOCATOR);
+  const allocator = resolveAllocatorOptions(stack, deps.allocator ?? DEFAULT_ALLOCATOR);
   const sharedNeeded = hasTier(stack, "shared");
 
   // Pure read — no lock. If the registry has no entry for this worktree (or
   // shared), `allocateBlock` returns what a future `up` would pick against
   // this snapshot. No write happens here.
   const snapshot = readReg(anchor.anchor);
-  const block = await allocateBlock(anchor.worktreeId, snapshot, options, isPortFree);
+  const block = await allocateBlock(anchor.worktreeId, snapshot, allocator, isPortFree);
   const sharedBlock = sharedNeeded
-    ? await allocateBlock(SHARED_REGISTRY_KEY, snapshot, options, isPortFree)
+    ? await allocateBlock(SHARED_REGISTRY_KEY, snapshot, allocator, isPortFree)
     : undefined;
 
   const { portFor, sharedPortFor } = namedPortResolvers(
     stack,
-    options,
+    allocator,
     block.base,
     sharedBlock?.base,
   );
@@ -3177,7 +3222,7 @@ export async function runEnv(deps: CommandDeps = {}): Promise<EnvResult> {
   const shared = await sharedInstanceOf(deps, anchor.anchor).ports({
     stack,
     worktreeId: anchor.worktreeId,
-    seed: { positional: sharedPortFor, block: sharedBlockOf(sharedBlock?.base, options) },
+    seed: { positional: sharedPortFor, block: sharedBlockOf(sharedBlock?.base, allocator) },
   });
 
   const derived = deriveWorktreeConfig(stack, {
@@ -3195,15 +3240,20 @@ export async function runEnv(deps: CommandDeps = {}): Promise<EnvResult> {
   };
 }
 
-/** Inputs unique to `runInit` — just the directory to write the block into. */
-export interface InitDeps {
-  /**
-   * Directory of the consuming repo to write the agent-instructions file into.
-   * Default: `process.cwd()`. `init --agents` writes into the project the agent
-   * is driving — no anchor / git resolution, since the block is repo-agnostic.
-   */
-  readonly cwd?: string;
-}
+/**
+ * `runInit` reaches nothing it needs a seam for: it writes one file under its
+ * `cwd`. Its env is empty, so it takes the same `(env, options)` as every
+ * other command.
+ */
+export type InitEnv = Readonly<Record<string, never>>;
+
+/**
+ * Options of `runInit`. `cwd` is the directory of the consuming repo to write
+ * the agent-instructions file into (default `process.cwd()`): `init --agents`
+ * writes into the project the agent is driving — no anchor / git resolution,
+ * since the block is repo-agnostic.
+ */
+export type InitOptions = CommandOptions;
 
 /**
  * Result of `runInit` — what file the block landed in and whether it already
@@ -3237,8 +3287,8 @@ export interface InitResult {
  * and that doc cannot drift (pinned by `onboarding.test.ts`). Pure I/O: no
  * anchor, no lock, no spawn.
  */
-export async function runInit(deps: InitDeps = {}): Promise<InitResult> {
-  const cwd = deps.cwd ?? process.cwd();
+export async function runInit(_env: InitEnv = {}, options: InitOptions = {}): Promise<InitResult> {
+  const cwd = options.cwd ?? process.cwd();
 
   // Prefer the first candidate that already exists; otherwise create the first
   // candidate (AGENTS.md). `action` reflects whether we created or updated it.
@@ -3260,7 +3310,7 @@ export async function runInit(deps: InitDeps = {}): Promise<InitResult> {
  * one. `follow` and `tail` thread straight through to the driver; `sinceMs`
  * is applied as a client-side filter on the merged event stream (issue #88).
  */
-export interface LogsOptions {
+export interface LogsOptions extends CommandOptions {
   /** Name of one service to stream. Mutually exclusive with `all`. */
   readonly service?: string;
   /** Interleave every service in the target instance. Reads the derived config to enumerate. */
@@ -3307,7 +3357,7 @@ export interface LogsResult {
  * merged into a single async iterable.
  */
 export async function runLogs(
-  deps: CommandDeps = {},
+  deps: CommandEnv = {},
   options: LogsOptions = {},
 ): Promise<LogsResult> {
   if (options.sinceMs !== undefined && (!Number.isFinite(options.sinceMs) || options.sinceMs < 0)) {
@@ -3317,7 +3367,7 @@ export async function runLogs(
     );
   }
 
-  const paths = logsTarget(deps, options.shared === true);
+  const paths = logsTarget(deps, options);
   const known = readDerivedServices(paths.configPath);
   if (!options.all && options.service !== undefined && !known.includes(options.service)) {
     // Fail fast before spawning: `process-compose process logs <unknown>`
@@ -3356,9 +3406,9 @@ export async function runLogs(
  * module) or this worktree's. Either is reachable only while its socket file
  * is there; without it, fail with the hint `INSTANCE_NOT_FOUND` carries.
  */
-function logsTarget(deps: CommandDeps, shared: boolean): InstanceRef {
-  const { anchor } = resolve(deps);
-  if (shared) {
+function logsTarget(deps: CommandEnv, options: LogsOptions): InstanceRef {
+  const { anchor } = resolve(deps, options);
+  if (options.shared === true) {
     const target = sharedInstanceOf(deps, anchor.anchor).endpoint();
     if (target !== undefined) return target;
     throw new Error(
@@ -3442,12 +3492,12 @@ interface NamedServices {
  * action, so a concurrent `down` cannot stop the instance in between.
  */
 async function resolveNamedServices(
-  deps: CommandDeps,
-  named: ReadonlyArray<string>,
+  deps: CommandEnv,
+  options: RestartOptions,
   command: NamedServiceCommand,
-  namespaces: ReadonlyArray<string> = [],
 ): Promise<NamedServices> {
-  const { anchor } = resolve(deps);
+  const { anchor } = resolve(deps, options);
+  const { services: named, namespaces = [] } = options;
   const retry = namedServicesInvocation(command, named, namespaces);
   const own = await openOwnInstance(deps, anchor, { command, retry });
   if (own === undefined) throw instanceNotRunningError(command, anchor.worktreeId);
@@ -3465,7 +3515,7 @@ async function resolveNamedServices(
   // A process-compose that never answers is INSTANCE_UNRESPONSIVE: nothing
   // was touched, so it is not a health wait.
   const rows = await own.rows(
-    Math.min(deps.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS, READ_TIMEOUT_MS),
+    Math.min(options.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS, READ_TIMEOUT_MS),
     { notify: deps.warn ?? defaultWarn, unresponsive: true },
   );
   own.assertNoPendingReload({
@@ -3508,7 +3558,7 @@ function namedServicesInvocation(
  * command on a running instance.
  */
 function sharedServices(
-  deps: CommandDeps,
+  deps: CommandEnv,
   anchor: { readonly anchor: string; readonly worktreeRoot: string },
 ): Array<Pick<ResolvedService, "name" | "namespace">> {
   const fromConfig = sharedInstanceOf(deps, anchor.anchor).services();
@@ -3598,7 +3648,9 @@ async function reconcileRunning(args: {
   readonly derived: ReturnType<typeof deriveWorktreeConfig>;
   readonly inst: { readonly configPath: string; readonly socketPath: string };
   readonly driver: Driver;
-  readonly deps: CommandDeps;
+  readonly deps: CommandEnv;
+  /** The `-n` selection of this `up` (`UpOptions.namespaces`). */
+  readonly namespaces: ReadonlyArray<string> | undefined;
   readonly readHash: (anchor: string, id: string) => string | undefined;
   readonly writeHash: (anchor: string, id: string, hash: string) => void;
 }): Promise<void> {
@@ -3624,7 +3676,7 @@ async function reconcileRunning(args: {
     rows,
     previous: derivedProcesses(previousConfig),
     isolated: args.stack.services.filter((s) => s.tier === "isolated"),
-    requested: args.deps.namespaces ?? [],
+    requested: args.namespaces ?? [],
     isAlive: args.deps.isProcessAlive ?? isProcessAlive,
   });
   if (converged) clearPendingReload(anchor.anchor, anchor.worktreeId);
@@ -3644,7 +3696,7 @@ async function applyReload(args: {
   readonly derived: ReturnType<typeof deriveWorktreeConfig>;
   readonly inst: { readonly configPath: string; readonly socketPath: string };
   readonly driver: Driver;
-  readonly deps: CommandDeps;
+  readonly deps: CommandEnv;
   readonly previousConfig: string | undefined;
   readonly rows: ServiceStatus[] | undefined;
   readonly writeHash: (anchor: string, id: string, hash: string) => void;
@@ -3684,7 +3736,7 @@ async function applyReload(args: {
 async function persistPendingReload(args: {
   readonly anchor: { readonly anchor: string; readonly worktreeId: string };
   readonly inst: { readonly socketPath: string };
-  readonly deps: CommandDeps;
+  readonly deps: CommandEnv;
   readonly previousConfig: string | undefined;
   readonly nextConfig: string;
   readonly rows: ServiceStatus[] | undefined;
@@ -3761,7 +3813,8 @@ async function verifyRunning(args: {
   readonly anchor: { readonly anchor: string; readonly worktreeId: string };
   /** This worktree's instance, opened live by `up` under its lifecycle lock (#259). */
   readonly own: LiveInstance;
-  readonly deps: CommandDeps;
+  readonly deps: CommandEnv;
+  readonly options: UpOptions;
   readonly driver: Driver;
   readonly warn: (message: string) => void;
 }): Promise<{
@@ -3769,15 +3822,15 @@ async function verifyRunning(args: {
   readonly droppedNamespaceEdges: ReadonlyArray<DroppedNamespaceEdge>;
   readonly restarted: string[];
 }> {
-  const { stack, own, deps, driver } = args;
+  const { stack, own, deps, options, driver } = args;
   const { socketPath } = own;
-  const timeoutMs = deps.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS;
+  const timeoutMs = options.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS;
 
   // The boot-time selection only exists in the live project, so `up` needs
   // one successful read before it can say anything; a read that keeps
   // failing is HEALTH_TIMEOUT, never a success over an unknown selection.
   const rows = await own.rows(timeoutMs, { notify: args.warn });
-  const selection = own.planUp(stack, rows, deps.namespaces);
+  const selection = own.planUp(stack, rows, options.namespaces);
   const nsEdges = selection.droppedNamespaceEdges;
   warnDroppedNamespaceEdges(nsEdges, args.warn);
 
@@ -3791,11 +3844,13 @@ async function verifyRunning(args: {
     rows,
     names: selection.services.map((s) => s.name),
     remedy,
+    timeoutMs,
   });
   // Outside the lifecycle lock, like the fresh path's wait.
   const lastRows = await waitForSelectedHealth(selection.services, socketPath, deps, driver, {
     remedy,
     warn: args.warn,
+    timeoutMs,
     ...(restarted.length === 0 ? { firstRead } : { restarted }),
   });
   return {
@@ -3828,10 +3883,12 @@ async function restartDeadServices(args: {
   readonly anchor: { readonly anchor: string; readonly worktreeId: string };
   readonly rows: ServiceStatus[];
   readonly names: ReadonlyArray<string>;
-  readonly deps: CommandDeps;
+  readonly deps: CommandEnv;
   readonly driver: Driver;
   readonly remedy: string;
   readonly warn: (message: string) => void;
+  /** The health-wait window of this `up`; caps the re-read. */
+  readonly timeoutMs: number;
 }): Promise<{ restarted: RestartedService[]; firstRead: ServiceStatus[] }> {
   if (findDeadServices(args.rows, args.names).length === 0) {
     return { restarted: [], firstRead: args.rows };
@@ -3845,10 +3902,10 @@ async function restartDeadServices(args: {
     if (own === undefined) {
       throw new InstanceGoneError({ worktree_id: args.anchor.worktreeId });
     }
-    const fresh = await own.rows(
-      Math.min(args.deps.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS, RESTART_READ_TIMEOUT_MS),
-      { notify: args.warn, probe: false },
-    );
+    const fresh = await own.rows(Math.min(args.timeoutMs, RESTART_READ_TIMEOUT_MS), {
+      notify: args.warn,
+      probe: false,
+    });
     const restarted = await own.restartDead({
       rows: fresh,
       names: args.names,
@@ -3932,7 +3989,8 @@ async function waitForWorktreeHealth(
     readonly namespaces: ReadonlyArray<string>;
   },
   socketPath: string,
-  deps: CommandDeps,
+  deps: CommandEnv,
+  options: UpOptions,
   driver: {
     getServiceStatuses(
       socketPath: string,
@@ -3947,6 +4005,7 @@ async function waitForWorktreeHealth(
   await waitForSelectedHealth(fresh.selected, socketPath, deps, driver, {
     remedy: `devtrees down && ${formatUpCommand(stack.services, fresh.namespaces)}`,
     warn,
+    timeoutMs: options.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS,
   });
 }
 
@@ -3960,7 +4019,7 @@ async function waitForWorktreeHealth(
 async function waitForSelectedHealth(
   services: ReadonlyArray<Pick<ResolvedService, "name" | "readinessProbe">>,
   socketPath: string,
-  deps: CommandDeps,
+  deps: CommandEnv,
   driver: {
     getServiceStatuses(
       socketPath: string,
@@ -3981,8 +4040,8 @@ async function waitForSelectedHealth(
     readonly restarted?: ReadonlyArray<RestartedService>;
     /** The waiting command, for its messages (default `up`). */
     readonly command?: WaitingCommand;
-    /** The wait window. Default: `deps.waitTimeoutMs`, else 120s. */
-    readonly timeoutMs?: number;
+    /** The wait window: the command's `--wait-timeout`, else 120s. */
+    readonly timeoutMs: number;
   },
 ): Promise<ServiceStatus[] | undefined> {
   const read = statusReader(driver);
@@ -4009,7 +4068,7 @@ async function waitForSelectedHealth(
     socketPath,
     serviceNames: services.map((s) => s.name),
     probedServiceNames: probedNames(services),
-    timeoutMs: opts.timeoutMs ?? deps.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS,
+    timeoutMs: opts.timeoutMs,
     remedy: opts.remedy,
     ...(opts.restarted !== undefined ? { restarted: opts.restarted } : {}),
     ...(opts.command !== undefined ? { command: opts.command } : {}),
@@ -4022,9 +4081,11 @@ async function waitForSelectedHealth(
  * injected one, else the module's over this command's seams (#257).
  */
 function sharedInstanceOf(
-  deps: CommandDeps,
+  deps: CommandEnv,
   anchor: string,
   driver: Driver = driverOf(deps),
+  /** The `--wait-timeout` of an `up` (or its dry run), the only commands that wait on shared. */
+  waitTimeoutMs?: number,
 ): SharedInstance {
   return (
     deps.sharedInstance ??
@@ -4035,8 +4096,8 @@ function sharedInstanceOf(
       liveness: resolveProbe(deps),
       probeSocket: probeOf(deps),
       warn: deps.warn ?? defaultWarn,
-      waitTimeoutMs: deps.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS,
-      previewReadTimeoutMs: deps.waitTimeoutMs ?? DRY_RUN_READ_TIMEOUT_MS,
+      waitTimeoutMs: waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS,
+      previewReadTimeoutMs: waitTimeoutMs ?? DRY_RUN_READ_TIMEOUT_MS,
       socketTimeoutMs: deps.sharedSocketTimeoutMs,
       waitForSharedReady: deps.waitForSharedReady,
       waitForSharedHealth: deps.waitForSharedHealth,
@@ -4055,7 +4116,7 @@ function sharedInstanceOf(
  * liveness stays unknown.
  */
 async function openOwnInstance(
-  deps: CommandDeps,
+  deps: CommandEnv,
   anchor: { readonly anchor: string; readonly worktreeId: string },
   context: OpenContext,
   options: OpenOptions = {},
@@ -4071,7 +4132,7 @@ async function openOwnInstance(
 }
 
 /** The live instance handle's seams over this command's (#259). */
-function liveSeams(deps: CommandDeps, driver: Driver = driverOf(deps)): LiveInstanceSeams {
+function liveSeams(deps: CommandEnv, driver: Driver = driverOf(deps)): LiveInstanceSeams {
   return { driver, liveness: resolveProbe(deps), probeSocket: probeOf(deps) };
 }
 
@@ -4084,7 +4145,7 @@ function driverOf(deps: {
 }
 
 /** The control-socket probe the health waits use after a failed read (#205): the injected seam, else `probeSocket`. */
-function probeOf(deps: CommandDeps): (socketPath: string) => Promise<InstanceStatus> {
+function probeOf(deps: CommandEnv): (socketPath: string) => Promise<InstanceStatus> {
   return deps.probeSocket ?? defaultProbeSocket;
 }
 
@@ -4099,6 +4160,6 @@ function statusReader(driver: {
 }
 
 /** Explicit `attach`/`no-attach` override wins; otherwise consult `isTTY()`. */
-function shouldAttachAfterUp(deps: CommandDeps): boolean {
-  return deps.attach ?? (deps.isTTY ?? defaultIsTTY)();
+function shouldAttachAfterUp(deps: CommandEnv, options: UpOptions): boolean {
+  return options.attach ?? (deps.isTTY ?? defaultIsTTY)();
 }
