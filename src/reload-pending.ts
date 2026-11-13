@@ -47,8 +47,13 @@ import type { ProcessRow } from "./bounded-down.js";
 import type { ServiceStatus } from "./driver.js";
 import { stateDir } from "./paths.js";
 import { writeAtomic } from "./registry.js";
-import { namespaceSelected, serviceNamespaces } from "./selection.js";
-import type { Namespace } from "./stack.js";
+import {
+  namespaceOf,
+  namespaceSelected,
+  provenNamespaces,
+  serviceNamespaces,
+  type DerivedProcesses,
+} from "./selection.js";
 
 /**
  * The old run's process-table identity when the reload timed out (#206):
@@ -99,35 +104,6 @@ export interface StuckReload {
    * update has not brought the service back yet.
    */
   readonly pids: ReadonlyArray<number>;
-}
-
-/** A derived config's `processes` map, as read back from disk (unvalidated). */
-type DerivedProcesses = Readonly<Record<string, Readonly<Record<string, unknown>>>>;
-
-/** A derived process entry's `namespace`, when it is a well-formed one. */
-export function namespaceOf(entry: Readonly<Record<string, unknown>> | undefined): {
-  readonly namespace?: Namespace;
-} {
-  const ns = entry?.namespace;
-  if (typeof ns === "string") return { namespace: ns };
-  if (Array.isArray(ns) && ns.every((n) => typeof n === "string")) return { namespace: ns };
-  return {};
-}
-
-/**
- * The namespaces `rows` proves booted against the derived config `declared`:
- * those a present service declares as its only namespace.
- */
-export function provenNamespaces(
-  declared: DerivedProcesses,
-  rows: ReadonlyArray<ServiceStatus>,
-): string[] {
-  const present = new Set(rows.map((r) => r.name));
-  const proven = Object.keys(declared).flatMap((name) => {
-    const ns = serviceNamespaces(namespaceOf(declared[name]));
-    return present.has(name) && ns.length === 1 ? ns : [];
-  });
-  return [...new Set(proven)].sort();
 }
 
 function markerFile(anchor: string, worktreeId: string): string {
