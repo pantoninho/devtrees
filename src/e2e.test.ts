@@ -13,7 +13,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 import { deriveWorktreeId } from "./anchor.js";
-import { runAttach, runDown, runLs, runPrune, runUp } from "./commands.js";
+import { runAttach, runDown, runLs, runPrune, runRestart, runUp } from "./commands.js";
 import { instancePaths, runDir, sharedInstancePaths } from "./paths.js";
 
 // Unix domain socket paths are capped (~104 bytes on macOS, ~108 on Linux).
@@ -1603,4 +1603,370 @@ describe("e2e — prune reaps out-of-band resources via the shutdown hook from a
     expect(await waitForFile(downMarker)).toBe(true);
     expect(existsSync(loginSocket)).toBe(false);
   }, 30000);
+});
+
+/**
+ * `devtrees restart` (ADR-0009, #222, #224) against the stub, asserting
+ * outcomes only (#265): each run's own pid and start time, HTTP liveness,
+ * the result fields and the error codes, never the order or argv of the
+ * process-compose calls. They pin today's behaviour as the safety net for the
+ * service-state refactor (#251) and the Skipped/Disabled change (#263).
+ *
+ * Every service is `restart-server.mjs <name> <PORT_VAR>`: once it serves,
+ * it records its run (`runs/<name>.json`: pid, start time), answers its own
+ * name, and exits 3 on `GET /crash`. The stub's `process stop` SIGTERMs the
+ * run's process group and `process start` spawns a new run, so a restart is
+ * a real new process on the same port.
+ */
+describe("e2e — restart <service...> (#222, #265)", () => {
+  interface Run {
+    readonly pid: number;
+    readonly startedAt: number;
+  }
+  type Coded = Error & { code?: string; details?: Record<string, unknown> };
+
+  const RESTART_SERVER = [
+    "import { createServer } from 'node:http';",
+    "import { mkdirSync, writeFileSync } from 'node:fs';",
+    "const [name, portVar] = process.argv.slice(2);",
+    "const server = createServer((req, res) => {",
+    "  if (req.url === '/crash') return res.end('bye', () => process.exit(3));",
+    "  res.end(name);",
+    "});",
+    "server.listen(Number(process.env[portVar]), '127.0.0.1', () => {",
+    "  mkdirSync('runs', { recursive: true });",
+    "  writeFileSync(`runs/${name}.json`, JSON.stringify({ pid: process.pid, startedAt: Date.now() }));",
+    "});",
+  ].join("\n");
+
+  /** `api` and `web` (on `api`) in `default`; `worker` alone in `jobs`. */
+  function writeRestartStack(worktreeRoot: string): void {
+    writeFileSync(join(worktreeRoot, "restart-server.mjs"), RESTART_SERVER);
+    const service = (name: string, port: string, extra: string[] = []): string[] => [
+      `  ${name}:`,
+      "    tier: isolated",
+      `    command: "node restart-server.mjs ${name} ${port}"`,
+      `    ports: [${port}]`,
+      ...extra,
+    ];
+    writeFileSync(
+      join(worktreeRoot, "devtrees.yaml"),
+      [
+        "services:",
+        ...service("api", "API_PORT"),
+        ...service("web", "WEB_PORT", [
+          "    depends_on:",
+          "      api:",
+          "        condition: process_started",
+        ]),
+        ...service("worker", "WORKER_PORT", ["    namespace: jobs"]),
+        "",
+      ].join("\n"),
+    );
+  }
+
+  /** The stub's env knob for services it reports `Skipped` (a dependency failed). */
+  const skippedEnv = (names: string): NodeJS.ProcessEnv => ({
+    ...process.env,
+    DEVTREES_STUB_SKIPPED: names,
+  });
+
+  /**
+   * A booted restart stack. `skipped` names services the stub reports
+   * `Skipped`, from `up` on. `restartDeps` uses the real status reads and
+   * health wait, as the CLI does.
+   */
+  async function bootRestartStack(
+    prefix: string,
+    opts: { readonly namespaces?: ReadonlyArray<string>; readonly skipped?: string } = {},
+  ): Promise<{
+    worktree: string;
+    socketPath: string;
+    stateDir: string;
+    worktreeId: string;
+    env: Record<string, string>;
+    restartDeps: Record<string, unknown>;
+  }> {
+    const repo = makeRepo(prefix, ["login"]);
+    cleanups.push(() => rmSync(repo.root, { recursive: true, force: true }));
+    const worktree = repo.worktrees.login;
+    if (worktree === undefined) throw new Error("expected login worktree");
+    writeRestartStack(worktree);
+    const driver =
+      opts.skipped === undefined
+        ? { binary: process.execPath, prefixArgs: [STUB] }
+        : {
+            binary: "/usr/bin/env",
+            prefixArgs: [`DEVTREES_STUB_SKIPPED=${opts.skipped}`, process.execPath, STUB],
+          };
+    const restartDeps = { cwd: worktree, driver, attach: false, waitTimeoutMs: 10_000 };
+    const upDeps = {
+      ...stubDriverDeps(worktree),
+      driver,
+      ...(opts.namespaces === undefined ? {} : { namespaces: opts.namespaces }),
+    };
+    const up = await runUp(upDeps as never);
+    cleanups.push(() => runDown(upDeps as never));
+    const commonDir = git(worktree, "rev-parse", "--git-common-dir");
+    const absCommon = commonDir.startsWith("/") ? commonDir : join(worktree, commonDir);
+    return {
+      worktree,
+      socketPath: join(runDir(absCommon), `${up.worktreeId}.sock`),
+      stateDir: join(absCommon, "devtrees"),
+      worktreeId: up.worktreeId,
+      env: up.env,
+      restartDeps,
+    };
+  }
+
+  /** The run `name` last recorded, if it ever served. */
+  function runOf(worktree: string, name: string): Run | undefined {
+    try {
+      return JSON.parse(readFileSync(join(worktree, "runs", `${name}.json`), "utf8")) as Run;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** The service's live run once it serves; with `not`, a run other than that one. */
+  async function waitForRun(worktree: string, name: string, not?: Run): Promise<Run> {
+    const deadline = Date.now() + 8000;
+    while (Date.now() < deadline) {
+      const run = runOf(worktree, name);
+      if (run !== undefined && run.pid !== not?.pid && pidAlive(run.pid)) return run;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    throw new Error(`no ${not === undefined ? "" : "new "}run of ${name} within 8s`);
+  }
+
+  /** What the service on `port` answers with, or undefined when nothing answers. */
+  async function served(port: string | undefined): Promise<string | undefined> {
+    try {
+      return await (await fetch(`http://127.0.0.1:${Number(port)}/`)).text();
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** The row process-compose (the stub) lists for `name`. */
+  function listed(
+    socketPath: string,
+    name: string,
+    env: NodeJS.ProcessEnv = process.env,
+  ): Record<string, unknown> | undefined {
+    const out = execFileSync(
+      process.execPath,
+      [STUB, "process", "list", "-U", "-u", socketPath, "-o", "json"],
+      { encoding: "utf8", env },
+    );
+    return (JSON.parse(out) as Array<Record<string, unknown>>).find((r) => r.name === name);
+  }
+
+  /** Poll `listed` until `done` holds (or 4s pass); returns the last row. */
+  async function waitForRow(
+    socketPath: string,
+    name: string,
+    done: (row: Record<string, unknown> | undefined) => boolean,
+  ): Promise<Record<string, unknown> | undefined> {
+    const deadline = Date.now() + 4000;
+    let row = listed(socketPath, name);
+    while (!done(row) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50));
+      row = listed(socketPath, name);
+    }
+    return row;
+  }
+
+  async function restartError(run: Promise<unknown>): Promise<Coded> {
+    const err = await run.then(
+      () => undefined,
+      (e: unknown) => e as Coded,
+    );
+    if (err === undefined) throw new Error("expected restart to fail");
+    return err;
+  }
+
+  it("restarts one running service: a new run serving on the same port; its sibling keeps its run", async () => {
+    const stack = await bootRestartStack("dt-rs1-");
+    const api = await waitForRun(stack.worktree, "api");
+    const web = await waitForRun(stack.worktree, "web");
+
+    const result = await runRestart(stack.restartDeps as never, ["web"]);
+
+    expect(result).toMatchObject({
+      worktreeId: stack.worktreeId,
+      restarted: ["web"],
+      forceKilled: [],
+      skippedShared: [],
+    });
+    expect(result.services).toMatchObject([
+      { name: "web", status: "Running", ports: { WEB_PORT: Number(stack.env.WEB_PORT) } },
+    ]);
+    const after = await waitForRun(stack.worktree, "web", web);
+    expect(pidAlive(web.pid)).toBe(false);
+    expect(after.startedAt).toBeGreaterThan(web.startedAt);
+    expect(await served(stack.env.WEB_PORT)).toBe("web");
+    // The sibling was not touched.
+    expect(runOf(stack.worktree, "api")).toEqual(api);
+    expect(pidAlive(api.pid)).toBe(true);
+    expect(await served(stack.env.API_PORT)).toBe("api");
+  }, 30_000);
+
+  it("restarts several services in depends_on order, whatever order they are named in", async () => {
+    const stack = await bootRestartStack("dt-rs2-", { namespaces: ["default", "jobs"] });
+    const api = await waitForRun(stack.worktree, "api");
+    const web = await waitForRun(stack.worktree, "web");
+    const worker = await waitForRun(stack.worktree, "worker");
+
+    const result = await runRestart(stack.restartDeps as never, ["web", "api"]);
+
+    expect(result.restarted).toEqual(["api", "web"]);
+    expect(result.services.map((s) => s.name)).toEqual(["api", "web"]);
+    const newApi = await waitForRun(stack.worktree, "api", api);
+    const newWeb = await waitForRun(stack.worktree, "web", web);
+    // `api`, the dependency, was serving again before `web`'s new run started.
+    expect(newApi.startedAt).toBeLessThan(newWeb.startedAt);
+    expect(pidAlive(api.pid)).toBe(false);
+    expect(pidAlive(web.pid)).toBe(false);
+    expect(await served(stack.env.API_PORT)).toBe("api");
+    expect(await served(stack.env.WEB_PORT)).toBe("web");
+    expect(runOf(stack.worktree, "worker")).toEqual(worker);
+    expect(pidAlive(worker.pid)).toBe(true);
+  }, 30_000);
+
+  it("restart -n <namespace> restarts that namespace's isolated services only", async () => {
+    const stack = await bootRestartStack("dt-rs3-", { namespaces: ["default", "jobs"] });
+    const api = await waitForRun(stack.worktree, "api");
+    const web = await waitForRun(stack.worktree, "web");
+    const worker = await waitForRun(stack.worktree, "worker");
+
+    const result = await runRestart(stack.restartDeps as never, [], ["jobs"]);
+
+    expect(result).toMatchObject({ restarted: ["worker"], skippedShared: [] });
+    await waitForRun(stack.worktree, "worker", worker);
+    expect(pidAlive(worker.pid)).toBe(false);
+    expect(await served(stack.env.WORKER_PORT)).toBe("worker");
+    expect(runOf(stack.worktree, "api")).toEqual(api);
+    expect(runOf(stack.worktree, "web")).toEqual(web);
+    expect(pidAlive(api.pid)).toBe(true);
+    expect(pidAlive(web.pid)).toBe(true);
+  }, 30_000);
+
+  it("a stopped service (Completed, exit -1) is started again", async () => {
+    const stack = await bootRestartStack("dt-rs4-");
+    const api = await waitForRun(stack.worktree, "api");
+    const web = await waitForRun(stack.worktree, "web");
+    // Stopped behind devtrees' back, as `process-compose process stop web` does.
+    execFileSync(process.execPath, [STUB, "process", "stop", "web", "-U", "-u", stack.socketPath]);
+    expect(await waitForReaped([web.pid], 4000)).toEqual([]);
+    expect(
+      await waitForRow(stack.socketPath, "web", (r) => r?.status === "Completed"),
+    ).toMatchObject({ status: "Completed", exit_code: -1 });
+    expect(await served(stack.env.WEB_PORT)).toBeUndefined();
+
+    const result = await runRestart(stack.restartDeps as never, ["web"]);
+
+    expect(result).toMatchObject({ restarted: ["web"], forceKilled: [] });
+    await waitForRun(stack.worktree, "web", web);
+    expect(await served(stack.env.WEB_PORT)).toBe("web");
+    expect(runOf(stack.worktree, "api")).toEqual(api);
+    expect(pidAlive(api.pid)).toBe(true);
+  }, 30_000);
+
+  it("a dead service (crashed, exit 3) is started again", async () => {
+    const stack = await bootRestartStack("dt-rs5-");
+    const api = await waitForRun(stack.worktree, "api");
+    const web = await waitForRun(stack.worktree, "web");
+    await fetch(`http://127.0.0.1:${Number(stack.env.WEB_PORT)}/crash`).catch(() => {});
+    expect(await waitForReaped([web.pid], 4000)).toEqual([]);
+    expect(
+      await waitForRow(stack.socketPath, "web", (r) => r?.status === "Completed"),
+    ).toMatchObject({ status: "Completed", exit_code: 3 });
+
+    const result = await runRestart(stack.restartDeps as never, ["web"]);
+
+    expect(result).toMatchObject({ restarted: ["web"], forceKilled: [] });
+    await waitForRun(stack.worktree, "web", web);
+    expect(await served(stack.env.WEB_PORT)).toBe("web");
+    expect(runOf(stack.worktree, "api")).toEqual(api);
+    expect(pidAlive(api.pid)).toBe(true);
+  }, 30_000);
+
+  it("an unknown service fails SERVICE_NOT_FOUND and an unbooted one NAMESPACE_NOT_RUNNING; nothing is touched", async () => {
+    const stack = await bootRestartStack("dt-rs6-");
+    const api = await waitForRun(stack.worktree, "api");
+    const web = await waitForRun(stack.worktree, "web");
+
+    const unknown = await restartError(runRestart(stack.restartDeps as never, ["web", "nope"]));
+    expect(unknown.code).toBe("SERVICE_NOT_FOUND");
+    expect(unknown.details).toMatchObject({
+      service: "nope",
+      valid_services: ["api", "web", "worker"],
+    });
+
+    // `worker` is declared, but its namespace (`jobs`) was not booted.
+    const unbooted = await restartError(runRestart(stack.restartDeps as never, ["worker"]));
+    expect(unbooted.code).toBe("NAMESPACE_NOT_RUNNING");
+    const unbootedNs = await restartError(runRestart(stack.restartDeps as never, [], ["jobs"]));
+    expect(unbootedNs.code).toBe("NAMESPACE_NOT_RUNNING");
+
+    expect(runOf(stack.worktree, "api")).toEqual(api);
+    expect(runOf(stack.worktree, "web")).toEqual(web);
+    expect(pidAlive(api.pid)).toBe(true);
+    expect(pidAlive(web.pid)).toBe(true);
+    expect(runOf(stack.worktree, "worker")).toBeUndefined();
+  }, 30_000);
+
+  it("a pending hot-reload fails CONFIG_DRIFT reload_pending; nothing is touched", async () => {
+    const stack = await bootRestartStack("dt-rs7-");
+    const api = await waitForRun(stack.worktree, "api");
+    const web = await waitForRun(stack.worktree, "web");
+    // What a timed-out reload leaves behind (#191); this test process stands
+    // in for the old `web` run that has not exited. Removed before the
+    // teardown's `down`, which would otherwise wait on it.
+    const marker = join(stack.stateDir, `${stack.worktreeId}.reload-pending.json`);
+    writeFileSync(
+      marker,
+      JSON.stringify({ services: ["web"], oldRuns: [{ name: "web", pid: process.pid }] }),
+    );
+    cleanups.push(() => rmSync(marker, { force: true }));
+
+    const err = await restartError(runRestart(stack.restartDeps as never, ["web"]));
+
+    expect(err.code).toBe("CONFIG_DRIFT");
+    expect(err.details).toMatchObject({ reason: "reload_pending" });
+    expect(runOf(stack.worktree, "web")).toEqual(web);
+    expect(runOf(stack.worktree, "api")).toEqual(api);
+    expect(pidAlive(api.pid)).toBe(true);
+    expect(pidAlive(web.pid)).toBe(true);
+    expect(await served(stack.env.WEB_PORT)).toBe("web");
+  }, 30_000);
+
+  it("a Skipped service (its dependency failed): today the restart fails HEALTH_TIMEOUT and it stays Skipped", async () => {
+    // TODAY'S BEHAVIOUR, pinned on purpose: #263 changes how restart treats a
+    // Skipped/Disabled service, and this test is expected to change with it.
+    // `Skipped` classifies as active, so restart takes the stop-then-start
+    // path: process-compose refuses the stop (nothing runs), answers the
+    // start, and the service stays Skipped (its dependency still failed), so
+    // the health wait times out. The same as process-compose v1.122.0 does
+    // through the built CLI.
+    const stack = await bootRestartStack("dt-rs8-", { skipped: "web" });
+    const api = await waitForRun(stack.worktree, "api");
+    expect(listed(stack.socketPath, "web", skippedEnv("web"))).toMatchObject({
+      status: "Skipped",
+      is_running: false,
+    });
+
+    const deps = { ...stack.restartDeps, waitTimeoutMs: 1500 };
+    const err = await restartError(runRestart(deps as never, ["web"]));
+
+    expect(err.code).toBe("HEALTH_TIMEOUT");
+    expect(listed(stack.socketPath, "web", skippedEnv("web"))).toMatchObject({
+      status: "Skipped",
+    });
+    expect(runOf(stack.worktree, "web")).toBeUndefined();
+    expect(await served(stack.env.WEB_PORT)).toBeUndefined();
+    expect(runOf(stack.worktree, "api")).toEqual(api);
+    expect(pidAlive(api.pid)).toBe(true);
+  }, 30_000);
 });

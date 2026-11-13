@@ -15,10 +15,20 @@
  *        Signals the running instance to stop and removes the control socket.
  *   process start <name> -U -u <socket>
  *        Records <name> as restarted, so `process list` reports it running
- *        again (issue #178). See the `process list` notes for the env knobs.
+ *        again (issue #178), and asks the `up` parent over the control socket
+ *        to spawn a new run when its current one has exited (#265). See the
+ *        `process list` notes for the env knobs. Unlike the real binary, a
+ *        start while the current run is alive answers OK: the real one refuses
+ *        ("process X is already running", exit 1). Kept for the
+ *        DEVTREES_STUB_DEAD tests, whose "dead" process still runs.
  *   process stop <name...> -U -u <socket>
  *        Records the names as stopped, so `process list` reports them
- *        `Completed` until a reload drops them from the config (#239).
+ *        `Completed` until a reload drops them from the config (#239), and
+ *        asks the `up` parent to SIGTERM each one's process group (#265).
+ *        A stop naming a Skipped process exits 1 like the real binary, but a
+ *        mixed `process stop f b` prints only "Failed to stop: 'b'" where the
+ *        real one says "Successfully stopped 'f' but encountered failures
+ *        for: 'b'".
  *   version
  *        Prints a version (`$STUB_PC_VERSION`, default v1.122.0; `--short`
  *        prints it bare) so the presence and minimum-version probes work.
@@ -39,7 +49,7 @@
  */
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { createServer } from "node:http";
+import { createServer, request } from "node:http";
 import { dirname } from "node:path";
 import { parse as parseYaml } from "yaml";
 
@@ -124,6 +134,43 @@ function reportedNamespace(proc) {
   return proc?.namespace ?? "default";
 }
 
+/** The names listed in a comma-separated env knob. */
+function namesFromEnv(key) {
+  return new Set((process.env[key] ?? "").split(",").filter((n) => n !== ""));
+}
+
+/**
+ * `DEVTREES_STUB_SKIPPED=a,b` models processes process-compose skipped
+ * because a dependency failed (#265). Checked against process-compose
+ * v1.122.0 (a `process_completed_successfully` dependency that exits 1): the
+ * row reads `Skipped`, exit_code 1, pid 0, is_running false; it has no
+ * process; `process stop` refuses it ("Failed to stop: 'b'", exit 1); and
+ * `process start` answers "Process b started" (exit 0) yet it stays Skipped,
+ * since its dependency still failed. Set it on `up` and on every later call.
+ */
+function skippedNames() {
+  return namesFromEnv("DEVTREES_STUB_SKIPPED");
+}
+
+/**
+ * Ask the running `up` parent to act on one process (#265): `POST
+ * /process/<verb>/<name>` over the control socket, as the real client calls
+ * the server. Resolves with the HTTP status, or undefined when nothing answers.
+ */
+function control(verb, name) {
+  return new Promise((resolve) => {
+    const req = request(
+      { socketPath, method: "POST", path: `/process/${verb}/${encodeURIComponent(name)}` },
+      (res) => {
+        res.resume();
+        res.on("end", () => resolve(res.statusCode));
+      },
+    );
+    req.on("error", () => resolve(undefined));
+    req.end();
+  });
+}
+
 function killChild(pid) {
   // detached children are process-group leaders; -pid kills the group.
   try {
@@ -162,6 +209,33 @@ if (cmd === "up") {
   // selected subset is spawned, and `process list` reports only that subset.
   const namespaces = flagAll("--namespace", "-n");
   const pids = [];
+  // Each process's latest run (#265): its pid, and its exit code once it has
+  // exited (-1 when a signal ended it, as process-compose reports a killed
+  // process). Persisted to `<socket>.procs` so `process list` reports a run
+  // that exited (killed behind devtrees' back, crashed, or stopped) as
+  // `Completed`, and a stopped run still exiting as `Terminating`.
+  const procs = {};
+  const skipped = skippedNames();
+  const writeProcs = () => {
+    if (!reaped) writeFileSync(`${socketPath}.procs`, JSON.stringify(procs));
+  };
+  const spawnProc = (name, proc) => {
+    const child = spawn("/bin/sh", ["-c", proc.command], {
+      cwd: proc.working_dir,
+      env: envFromLines(proc.environment),
+      stdio: "ignore",
+      detached: true,
+    });
+    child.unref();
+    pids.push(child.pid);
+    procs[name] = { pid: child.pid };
+    child.on("exit", (code) => {
+      if (procs[name]?.pid !== child.pid) return;
+      procs[name] = { pid: child.pid, exitCode: code ?? -1 };
+      writeProcs();
+    });
+  };
+  const alive = (name) => procs[name] !== undefined && procs[name].exitCode === undefined;
 
   // Synchronous reaper: kills every recorded child. Safe to call from
   // signal handlers and the `exit` event (which only runs sync code).
@@ -193,6 +267,7 @@ if (cmd === "up") {
     }
     try {
       rmSync(`${socketPath}.namespaces`, { force: true });
+      rmSync(`${socketPath}.procs`, { force: true });
     } catch {
       // ignore
     }
@@ -229,45 +304,81 @@ if (cmd === "up") {
   // a child can become observable before discovery can find this instance via
   // its socket on disk, and `runLs` races the bind.
   mkdirSync(dirname(socketPath), { recursive: true });
+  /** JSON answer from the control socket. */
+  const answer = (res, status, body = {}) => {
+    res.writeHead(status, { "content-type": "application/json" });
+    res.end(JSON.stringify(body));
+  };
+  // Hot-reload: persist the re-read config alongside the socket so a
+  // follow-up `process list` reflects the new service set.
+  const reload = () => {
+    const reread = readFileSync(configPath, "utf8");
+    writeFileSync(`${socketPath}.config`, reread);
+    // A process the reload removed is forgotten, its stopped state and its
+    // last run with it (#239): re-added later, it starts as a new process.
+    try {
+      const kept = Object.keys(parseYaml(reread)?.processes ?? {});
+      for (const name of Object.keys(procs)) if (!kept.includes(name)) delete procs[name];
+      writeProcs();
+      const stopped = JSON.parse(readFileSync(`${socketPath}.stopped`, "utf8"));
+      writeFileSync(
+        `${socketPath}.stopped`,
+        JSON.stringify(stopped.filter((n) => kept.includes(n))),
+      );
+    } catch {
+      // nothing stopped
+    }
+  };
+  /** The process's definition in the current (possibly reloaded) config. */
+  const definition = (name) => {
+    try {
+      return parseYaml(readFileSync(`${socketPath}.config`, "utf8"))?.processes?.[name];
+    } catch {
+      return config.processes?.[name];
+    }
+  };
+  // `process stop` / `process start` (#265): the client asks the server,
+  // which owns the processes. A stop SIGTERMs the run's process group; a
+  // start spawns a new run, unless the current run is still alive (or the
+  // process is skipped). Resolves with the HTTP status to answer.
+  const act = (verb, name) => {
+    if (verb === "stop") {
+      if (alive(name)) killChild(procs[name].pid);
+      return 200;
+    }
+    if (alive(name) || skipped.has(name)) return 200;
+    const proc = definition(name);
+    if (proc === undefined) return 400;
+    spawnProc(name, proc);
+    writeFileSync(`${socketPath}.pids`, JSON.stringify(pids));
+    writeProcs();
+    return 200;
+  };
   const server = createServer((req, res) => {
     if (req.method === "POST" && req.url === "/project/configuration") {
-      // Hot-reload: persist the re-read config alongside the socket so a
-      // follow-up `process list` reflects the new service set.
-      const reread = readFileSync(configPath, "utf8");
-      writeFileSync(`${socketPath}.config`, reread);
-      // A process the reload removed is forgotten, its stopped state with it
-      // (#239): re-added later, it starts as a new process.
-      try {
-        const kept = Object.keys(parseYaml(reread)?.processes ?? {});
-        const stopped = JSON.parse(readFileSync(`${socketPath}.stopped`, "utf8"));
-        writeFileSync(
-          `${socketPath}.stopped`,
-          JSON.stringify(stopped.filter((n) => kept.includes(n))),
-        );
-      } catch {
-        // nothing stopped
-      }
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end("{}");
+      reload();
+      answer(res, 200);
+      return;
+    }
+    const action = /^\/process\/(stop|start)\/(.+)$/.exec(req.url ?? "");
+    if (req.method === "POST" && action !== null) {
+      const name = decodeURIComponent(action[2]);
+      const status = act(action[1], name);
+      answer(res, status, status === 200 ? {} : { error: `no such process: ${name}` });
       return;
     }
     res.writeHead(404);
     res.end();
   });
   server.listen(socketPath, () => {
-    for (const proc of Object.values(config.processes ?? {})) {
+    for (const [name, proc] of Object.entries(config.processes ?? {})) {
       if (!selectedByNamespace(proc, namespaces)) continue;
-      const env = envFromLines(proc.environment);
-      const child = spawn("/bin/sh", ["-c", proc.command], {
-        cwd: proc.working_dir,
-        env,
-        stdio: "ignore",
-        detached: true,
-      });
-      child.unref();
-      pids.push(child.pid);
+      // A skipped process (its dependency failed) never runs.
+      if (skipped.has(name)) continue;
+      spawnProc(name, proc);
     }
     writeFileSync(`${socketPath}.pids`, JSON.stringify(pids));
+    writeProcs();
     // Remember the derived config alongside the socket so `process list` can
     // recover the service set without re-resolving the original path.
     writeFileSync(`${socketPath}.config`, readFileSync(configPath, "utf8"));
@@ -386,10 +497,26 @@ if (cmd === "up") {
     //
     // Dead rows carry pid 1000 — the run that died — so the restarted run is
     // told apart by pid, as on the real binary.
-    const namesFrom = (v) => new Set((v ?? "").split(",").filter((n) => n !== ""));
-    const deadNames = namesFrom(process.env.DEVTREES_STUB_DEAD);
-    const doneNames = namesFrom(process.env.DEVTREES_STUB_DONE);
-    const diesAgain = namesFrom(process.env.DEVTREES_STUB_DIES_AGAIN);
+    //
+    // Without a knob, a row reports its real run (#265, from `<socket>.procs`):
+    // `Running` while it runs, or, once it exited, `Completed` with its exit
+    // code (-1 when a signal ended it) and the pid of the run that exited. A
+    // stopped name whose run is still exiting reads `Terminating` (exit_code
+    // 0, the old pid, is_running false, as the real binary reports). Running
+    // rows still carry no pid, unlike the real binary: tests that stand in for
+    // an old run with their own pid (the #191 pending-reload marker) rely on
+    // it, so a test reads a run's pid from the process itself instead.
+    // DEVTREES_STUB_SKIPPED (see `skippedNames`) rows read `Skipped`.
+    const deadNames = namesFromEnv("DEVTREES_STUB_DEAD");
+    const doneNames = namesFromEnv("DEVTREES_STUB_DONE");
+    const diesAgain = namesFromEnv("DEVTREES_STUB_DIES_AGAIN");
+    const skipped = skippedNames();
+    let runs = {};
+    try {
+      runs = JSON.parse(readFileSync(`${socketPath}.procs`, "utf8"));
+    } catch {
+      runs = {};
+    }
     // `process stop` (#239) records names in `<socket>.stopped`.
     let stoppedNames = new Set();
     try {
@@ -414,11 +541,32 @@ if (cmd === "up") {
         pid,
         is_running: false,
       });
-      if (stoppedNames.has(name)) return stopped(-1, 1000);
+      const run = runs[name];
+      if (skipped.has(name)) return { ...stopped(1, 0), status: "Skipped" };
+      if (stoppedNames.has(name)) return stoppedRun(run, stopped);
+      const knob = knobRow(name, stopped);
+      if (knob !== undefined) return knob;
+      return run?.exitCode === undefined ? undefined : stopped(run.exitCode, run.pid);
+    };
+    /** The row the DEAD / DONE / DIES_AGAIN knobs model for `name`, else undefined. */
+    const knobRow = (name, stopped) => {
       if (started.has(name)) return diesAgain.has(name) ? stopped(1, 2000) : undefined;
       if (deadNames.has(name)) return stopped(-1, 1000);
       if (doneNames.has(name)) return stopped(0, 1000);
       return undefined;
+    };
+    /**
+     * A stopped process: `Terminating` while its run is still exiting. As on
+     * process-compose v1.122.0 (a SIGTERM-ignoring run with a 4s shutdown
+     * timeout), that row carries exit_code 0, the old run's pid and
+     * is_running false; it reads `Completed`, -1 once the run exited.
+     */
+    const stoppedRun = (run, stopped) => {
+      if (run === undefined) return stopped(-1, 1000);
+      if (run.exitCode === undefined) {
+        return { ...stopped(0, run.pid), status: "Terminating" };
+      }
+      return stopped(-1, run.pid);
     };
     const procs = Object.entries(config.processes ?? {})
       .filter(([, proc]) => selectedByNamespace(proc, namespaces))
@@ -473,6 +621,9 @@ if (cmd === "up") {
     }
     if (!started.includes(service)) started.push(service);
     writeFileSync(`${socketPath}.started`, JSON.stringify(started));
+    // The server spawns the new run (#265). A Skipped process is "started"
+    // and stays Skipped, as on the real binary.
+    await control("start", service);
     // A started process is no longer the stopped run `process stop` left (#239).
     try {
       const stopped = JSON.parse(readFileSync(`${socketPath}.stopped`, "utf8"));
@@ -486,10 +637,15 @@ if (cmd === "up") {
   if (sub === "stop") {
     // `process stop <name...> -U -u <socket>` (#239): record the names in
     // `<socket>.stopped`, so `process list` reports them as a stopped run
-    // ("Completed", exit_code -1, not running). The children are left to the
-    // instance's `down`, which reaps every pid it spawned.
+    // ("Completed", exit_code -1, not running), and have the server SIGTERM
+    // each run's process group (#265). A Skipped process has no run: the
+    // real binary refuses it ("Failed to stop: 'b'", exit 1).
     const end = process.argv.indexOf("-U");
-    const names = process.argv.slice(4, end < 0 ? undefined : end);
+    const skipped = skippedNames();
+    const refusedStops = process.argv
+      .slice(4, end < 0 ? undefined : end)
+      .filter((n) => skipped.has(n));
+    const names = process.argv.slice(4, end < 0 ? undefined : end).filter((n) => !skipped.has(n));
     if (!existsSync(`${socketPath}.config`)) {
       process.stderr.write(`stub-process-compose: no instance at ${socketPath}\n`);
       process.exit(1);
@@ -502,6 +658,11 @@ if (cmd === "up") {
     }
     for (const name of names) if (!stopped.includes(name)) stopped.push(name);
     writeFileSync(`${socketPath}.stopped`, JSON.stringify(stopped));
+    for (const name of names) await control("stop", name);
+    if (refusedStops.length > 0) {
+      process.stderr.write(`Failed to stop: ${refusedStops.map((n) => `'${n}'`).join(", ")}\n`);
+      process.exit(1);
+    }
     process.exit(0);
   }
   process.stderr.write(`stub-process-compose: unknown subcommand 'process ${sub}'\n`);
@@ -552,6 +713,7 @@ if (cmd === "up") {
   rmSync(`${socketPath}.parent-pid`, { force: true });
   rmSync(`${socketPath}.config`, { force: true });
   rmSync(`${socketPath}.namespaces`, { force: true });
+  rmSync(`${socketPath}.procs`, { force: true });
   rmSync(`${socketPath}.started`, { force: true });
   rmSync(`${socketPath}.stopped`, { force: true });
   rmSync(socketPath, { force: true });
