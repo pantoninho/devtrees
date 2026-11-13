@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.6.1](https://github.com/pantoninho/devtrees/compare/v0.6.0...v0.6.1) (2026-11-13)
+
+
+### Bug Fixes
+
+* fail up when a lazy-started shared service exits at once ([#268](https://github.com/pantoninho/devtrees/issues/268)) ([146e0c1](https://github.com/pantoninho/devtrees/commit/146e0c14a731221642e1dc68359e0cc97e13906a))
+* logs -f streams output, and SIGTERM/SIGHUP stop its process-compose child ([#283](https://github.com/pantoninho/devtrees/issues/283)) ([af22765](https://github.com/pantoninho/devtrees/commit/af22765dd03cac89c1ac593218685f3e5b927fd4))
+* restart of a Skipped or Disabled service starts it, or fails fast with SERVICE_SKIPPED ([#276](https://github.com/pantoninho/devtrees/issues/276)) ([297d4dc](https://github.com/pantoninho/devtrees/commit/297d4dccebf5552dc3e1786c6540614372943514))
+
 ## [0.6.0](https://github.com/pantoninho/devtrees/compare/v0.5.0...v0.6.0) (2026-10-20)
 
 
