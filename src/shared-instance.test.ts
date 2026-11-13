@@ -11,7 +11,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { deriveWorktreeId } from "./anchor.js";
-import { runUp, type CommandDeps } from "./commands.js";
+import { runUp, type CommandEnv, type UpOptions } from "./commands.js";
 import { createInMemoryProcessCompose, type PcRequest } from "./in-memory-driver.js";
 import { classifyError } from "./output.js";
 import { runDir, sharedInstancePaths } from "./paths.js";
@@ -470,8 +470,8 @@ describe("worktree up with a substituted shared instance (#257)", () => {
     mkdirSync(top, { recursive: true });
     cleanups.push(() => rmSync(runDir(anchor), { recursive: true, force: true }));
     const pc = createInMemoryProcessCompose({ firstPid: 11 });
-    const deps: CommandDeps = {
-      cwd: top,
+    const options: UpOptions = { cwd: top, attach: false };
+    const deps: CommandEnv = {
       git: (args) => (args[1] === "--git-common-dir" ? anchor : top),
       readStack: () => stack,
       processCompose: pc.driver,
@@ -480,11 +480,10 @@ describe("worktree up with a substituted shared instance (#257)", () => {
       isPortFree: () => true,
       portHolder: () => ({ free: true }),
       waitForHealth: async () => {},
-      attach: false,
       warn: () => {},
       sharedInstance,
     };
-    return { deps, pc, anchor, id: deriveWorktreeId(top) };
+    return { deps, options, pc, anchor, id: deriveWorktreeId(top) };
   }
 
   it("injects the shared ports the shared instance hands out and never touches the shared socket", async () => {
@@ -518,8 +517,8 @@ describe("worktree up with a substituted shared instance (#257)", () => {
       endpoint: () => undefined,
       services: () => [],
     };
-    const { deps, pc, anchor, id } = worktreeUp(fake);
-    const result = await runUp(deps);
+    const { deps, options, pc, anchor, id } = worktreeUp(fake);
+    const result = await runUp(deps, options);
     expect(result).toMatchObject({ worktreeId: id, sharedStarted: true });
     expect(result.env["PG_PORT"]).toBe("41000");
     // The fresh `up` hands the module its selection's shared closure and waits now.

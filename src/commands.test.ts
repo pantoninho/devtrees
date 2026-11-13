@@ -33,7 +33,9 @@ import {
   runPruneSharedPorts,
   runUp,
   runUpDryRun,
-  type CommandDeps,
+  type CommandEnv,
+  type UpDryRunOptions,
+  type UpOptions,
   type WithLifecycleLock,
   type WithSharedLock,
 } from "./commands.js";
@@ -146,13 +148,13 @@ function idFor(root: string, basename: string): string {
 }
 
 /**
- * `CommandDeps` plus the worktree id the stubbed git probe will resolve to,
+ * `CommandEnv` plus the worktree id the stubbed git probe will resolve to,
  * so tests can assert on ids/paths without re-deriving them by hand.
  */
-type StubbedDeps = CommandDeps & { readonly expectedWorktreeId: string };
+type StubbedDeps = CommandEnv & { readonly expectedWorktreeId: string };
 
 /**
- * The neutral `CommandDeps`: a fake git, a stack, an in-memory registry, and
+ * The neutral `CommandEnv`: a fake git, a stack, an in-memory registry, and
  * stubs for the seams that would touch real ports, a TTY or a health poll.
  * It wires no process-compose: tests that drive one put the in-memory Driver
  * in with `onInMemoryPc` or `pcDeps`.
@@ -187,7 +189,6 @@ function stubDeps(opts: {
 
   return {
     expectedWorktreeId,
-    cwd: join(worktreeRoot, worktreeId),
     git,
     readStack: () => opts.stack,
     withRegistryLock: async (_anchor, mutate) => {
@@ -207,7 +208,8 @@ function stubDeps(opts: {
     portAccepts: async () => false,
     portSettleMs: 0,
     warn: opts.warn,
-    attach: false,
+    // Never attach after `up` unless a test passes `attach` (the TTY default).
+    isTTY: () => false,
     // Tests that don't care about the worktree health-wait (#28) get a no-op
     // stub — the default polls a real `process-compose` over the UDS, which
     // would hang the unit test. Tests that *do* care override this field.
@@ -232,11 +234,11 @@ function inMemoryPcDeps(pc: InMemoryProcessCompose) {
       pollMs: 1,
       treeGraceMs: 1,
     },
-  } satisfies CommandDeps;
+  } satisfies CommandEnv;
 }
 
 /** `deps` on a fresh in-memory process-compose. */
-function onInMemoryPc<D extends CommandDeps>(
+function onInMemoryPc<D extends CommandEnv>(
   deps: D,
   opts: InMemoryProcessComposeOptions = {},
 ): { deps: D; pc: InMemoryProcessCompose } {
@@ -760,10 +762,9 @@ describe("runUp — a lazy-started shared service that exits at once (#262)", ()
       ...base,
       // The real wait on the shared services, not the suite's no-op.
       waitForSharedReady: undefined,
-      waitTimeoutMs: 5_000,
     };
 
-    const err = await runUp(deps).then(
+    const err = await runUp(deps, { waitTimeoutMs: 5_000 }).then(
       () => undefined,
       (e: unknown) => e as Error & { code?: string; details?: Record<string, unknown> },
     );
@@ -788,9 +789,9 @@ describe("runUp — a lazy-started shared service that exits at once (#262)", ()
       ],
     };
     const base = pcDeps({ stack, onBoot: diesAtBoot(isSharedSocket) });
-    const deps = { ...base, waitForSharedReady: undefined, waitTimeoutMs: 5_000 };
+    const deps = { ...base, waitForSharedReady: undefined };
 
-    const err = await runUp(deps).then(
+    const err = await runUp(deps, { waitTimeoutMs: 5_000 }).then(
       () => undefined,
       (e: unknown) => e as Error & { code?: string; details?: Record<string, unknown> },
     );
@@ -827,7 +828,7 @@ describe("runUp — worktree instance dies before binding its socket (#157)", ()
   };
 
   /** The real socket wait, with a deadline short enough for a unit test. */
-  function withRealSocketWait<D extends CommandDeps>(base: D): D {
+  function withRealSocketWait<D extends CommandEnv>(base: D): D {
     return { ...base, worktreeSocketTimeoutMs: 50 };
   }
 
@@ -1114,7 +1115,7 @@ describe("runUp — wait-for-healthy (worktree instance, #28)", () => {
   it("passes the worktree's own socket path to the wait — not the shared one", async () => {
     const seen: string[] = [];
     const base = pcDeps({ stack: twoIsolated });
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...base,
       waitForHealth: async ({ socketPath }) => {
         seen.push(socketPath);
@@ -1135,7 +1136,7 @@ describe("runUp — wait-for-healthy (worktree instance, #28)", () => {
       ],
     };
     let observed: { serviceNames: string[]; probedServiceNames: string[] } | undefined;
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...pcDeps({ stack: probedStack }),
       waitForHealth: async ({ serviceNames, probedServiceNames }) => {
         observed = {
@@ -1167,7 +1168,7 @@ describe("runUp — wait-for-healthy (worktree instance, #28)", () => {
       ],
     };
     let observed: { sharedServiceNames: string[]; probedServiceNames: string[] } | undefined;
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...pcDeps({ stack: probedCrossTier }),
       waitForSharedHealth: async ({ sharedServiceNames, probedServiceNames }) => {
         observed = {
@@ -1185,20 +1186,19 @@ describe("runUp — wait-for-healthy (worktree instance, #28)", () => {
 
   it("threads the timeout from deps to the wait", async () => {
     let observed: number | undefined;
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...pcDeps({ stack: twoIsolated }),
-      waitTimeoutMs: 7777,
       waitForHealth: async ({ timeoutMs }) => {
         observed = timeoutMs;
       },
     };
-    await runUp(deps);
+    await runUp(deps, { waitTimeoutMs: 7777 });
     expect(observed).toBe(7777);
   });
 
   it("defaults the wait timeout to 120s when deps don't override it", async () => {
     let observed: number | undefined;
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...pcDeps({ stack: twoIsolated }),
       waitForHealth: async ({ timeoutMs }) => {
         observed = timeoutMs;
@@ -1215,9 +1215,8 @@ describe("runUp — wait-for-healthy (worktree instance, #28)", () => {
     // stack running, agent can then call `devtrees logs <service>` to inspect, so
     // the worktree's `process-compose down` must NOT be invoked from this path.
     const base = pcDeps({ stack: twoIsolated });
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...base,
-      attach: false, // headless: the path the silent health-wait gates
       waitForHealth: async () => {
         const err = new Error(
           "timed out waiting for services to be healthy [web, worker] after 120000ms",
@@ -1227,7 +1226,8 @@ describe("runUp — wait-for-healthy (worktree instance, #28)", () => {
       },
     };
 
-    const err = await runUp(deps).then(
+    // headless: the path the silent health-wait gates
+    const err = await runUp(deps, { attach: false }).then(
       () => undefined,
       (e: unknown) => e as Error & { code?: string },
     );
@@ -1245,15 +1245,15 @@ describe("runUp — wait-for-healthy (worktree instance, #28)", () => {
 
   it("does not attach when deps.attach is false even if the wait succeeds", async () => {
     const base = pcDeps({ stack: twoIsolated });
-    const deps: CommandDeps = { ...base, attach: false, waitForHealth: async () => {} };
-    await runUp(deps);
+    const deps: CommandEnv = { ...base, waitForHealth: async () => {} };
+    await runUp(deps, { attach: false });
     expect(attaches(base.pc)).toEqual([]);
   });
 
   it("auto-detect: attaches when isTTY()===true and deps.attach is unset", async () => {
     const base = pcDeps({ stack: twoIsolated });
-    const deps: CommandDeps = { ...base, attach: undefined, isTTY: () => true };
-    await runUp(deps);
+    const deps: CommandEnv = { ...base, isTTY: () => true };
+    await runUp(deps, { attach: undefined });
     expect(attaches(base.pc)).toEqual([{ op: "attach", socketPath: base.inst.socketPath }]);
   });
 
@@ -1262,22 +1262,22 @@ describe("runUp — wait-for-healthy (worktree instance, #28)", () => {
     // not be hijacked into a TUI. With no explicit override and a non-TTY
     // environment, the TUI stays off and `up` returns after the health-wait.
     const base = pcDeps({ stack: twoIsolated });
-    const deps: CommandDeps = { ...base, attach: undefined, isTTY: () => false };
-    await runUp(deps);
+    const deps: CommandEnv = { ...base, isTTY: () => false };
+    await runUp(deps, { attach: undefined });
     expect(attaches(base.pc)).toEqual([]);
   });
 
   it("explicit deps.attach=true overrides isTTY()===false", async () => {
     const base = pcDeps({ stack: twoIsolated });
-    const deps: CommandDeps = { ...base, attach: true, isTTY: () => false };
-    await runUp(deps);
+    const deps: CommandEnv = { ...base, isTTY: () => false };
+    await runUp(deps, { attach: true });
     expect(attaches(base.pc)).toEqual([{ op: "attach", socketPath: base.inst.socketPath }]);
   });
 
   it("explicit deps.attach=false overrides isTTY()===true", async () => {
     const base = pcDeps({ stack: twoIsolated });
-    const deps: CommandDeps = { ...base, attach: false, isTTY: () => true };
-    await runUp(deps);
+    const deps: CommandEnv = { ...base, isTTY: () => true };
+    await runUp(deps, { attach: false });
     expect(attaches(base.pc)).toEqual([]);
   });
 
@@ -1289,14 +1289,13 @@ describe("runUp — wait-for-healthy (worktree instance, #28)", () => {
     // the headless paths only, so it must NOT run here.
     const base = pcDeps({ stack: twoIsolated });
     let waited = false;
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...base,
-      attach: true,
       waitForHealth: async () => {
         waited = true;
       },
     };
-    await runUp(deps);
+    await runUp(deps, { attach: true });
     expect(attaches(base.pc)).toEqual([{ op: "attach", socketPath: base.inst.socketPath }]);
     expect(waited).toBe(false);
   });
@@ -1339,7 +1338,7 @@ describe("runUp — namespace selection (#128)", () => {
     const stack: ResolvedStack = {
       services: [isolated("web", "serve ${WEB_PORT} $WEB_PORT", ["WEB_PORT"])],
     };
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...pcDeps({ stack }),
       warn: (m) => warnings.push(m),
       waitForHealth: async () => {},
@@ -1353,15 +1352,14 @@ describe("runUp — namespace selection (#128)", () => {
     let waited: string[] | undefined;
     const warnings: string[] = [];
     const base = pcDeps({ stack: listNamespaces });
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...base,
-      namespaces: ["two"],
       warn: (m) => warnings.push(m),
       waitForHealth: async ({ serviceNames }) => {
         waited = [...serviceNames];
       },
     };
-    const result = await runUp(deps);
+    const result = await runUp(deps, { namespaces: ["two"] });
     expect(waited).toEqual(["db", "api"]);
     // process-compose booted exactly them.
     expect(base.pc.rows(base.inst.socketPath).map((r) => r.name)).toEqual(["db", "api"]);
@@ -1371,13 +1369,12 @@ describe("runUp — namespace selection (#128)", () => {
 
   it("#179: warns once per depends_on edge whose target no selected namespace covers", async () => {
     const warnings: string[] = [];
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...pcDeps({ stack: listNamespaces }),
-      namespaces: ["one"],
       warn: (m) => warnings.push(m),
       waitForHealth: async () => {},
     };
-    const result = await runUp(deps);
+    const result = await runUp(deps, { namespaces: ["one"] });
     expect(result.droppedNamespaceEdges).toEqual([
       { from: "web", to: "api", toNamespaces: ["two"] },
     ]);
@@ -1389,7 +1386,7 @@ describe("runUp — namespace selection (#128)", () => {
 
   it("starts the worktree instance with exactly the requested namespace", async () => {
     const base = pcDeps({ stack: mixedNamespaces });
-    await runUp({ ...base, namespaces: ["default"] });
+    await runUp({ ...base }, { namespaces: ["default"] });
     expect(upsOn(base.pc, base.inst.socketPath)).toEqual([
       { op: "up", socketPath: base.inst.socketPath, namespaces: ["default"] },
     ]);
@@ -1402,9 +1399,8 @@ describe("runUp — namespace selection (#128)", () => {
     // local-backend api (a probed service) — otherwise it HEALTH_TIMEOUTs on a
     // service it never asked process-compose to start.
     let observed: { serviceNames: string[]; probedServiceNames: string[] } | undefined;
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...pcDeps({ stack: mixedNamespaces }),
-      namespaces: ["default"],
       waitForHealth: async ({ serviceNames, probedServiceNames }) => {
         observed = {
           serviceNames: [...serviceNames].sort(),
@@ -1412,16 +1408,15 @@ describe("runUp — namespace selection (#128)", () => {
         };
       },
     };
-    await runUp(deps);
+    await runUp(deps, { namespaces: ["default"] });
     expect(observed).toEqual({ serviceNames: ["web"], probedServiceNames: [] });
   });
 
   it("still waits on probed services WITHIN the selected namespace (no #108 regression)", async () => {
     // Selecting local-backend keeps the probed api in the expected set.
     let observed: { serviceNames: string[]; probedServiceNames: string[] } | undefined;
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...pcDeps({ stack: mixedNamespaces }),
-      namespaces: ["local-backend"],
       waitForHealth: async ({ serviceNames, probedServiceNames }) => {
         observed = {
           serviceNames: [...serviceNames].sort(),
@@ -1429,14 +1424,14 @@ describe("runUp — namespace selection (#128)", () => {
         };
       },
     };
-    await runUp(deps);
+    await runUp(deps, { namespaces: ["local-backend"] });
     expect(observed).toEqual({ serviceNames: ["api"], probedServiceNames: ["api"] });
   });
 
   it("a bare fresh up selects only `default`: starts and waits only on default services (#176)", async () => {
     let observed: string[] | undefined;
     const base = pcDeps({ stack: mixedNamespaces });
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...base,
       waitForHealth: async ({ serviceNames }) => {
         observed = [...serviceNames].sort();
@@ -1452,7 +1447,7 @@ describe("runUp — namespace selection (#128)", () => {
 
   it("`-n <ns>` stays exact: it never adds `default` on top (#176)", async () => {
     const base = pcDeps({ stack: mixedNamespaces });
-    await runUp({ ...base, namespaces: ["local-backend"], waitForHealth: async () => {} });
+    await runUp({ ...base, waitForHealth: async () => {} }, { namespaces: ["local-backend"] });
     expect(upsOn(base.pc, base.inst.socketPath).map((r) => r.namespaces)).toEqual([
       ["local-backend"],
     ]);
@@ -1489,7 +1484,7 @@ describe("runUp — namespace selection (#128)", () => {
   it("`-n` naming only a namespace with NO services fails NO_SERVICES_SELECTED before any state is written (#203)", async () => {
     const registryRef = { snapshot: {} as RegistrySnapshot };
     const deps = pcDeps({ stack: allNamespaced, registryRef });
-    const err = await runUp({ ...deps, namespaces: ["nope"] }).then(
+    const err = await runUp(deps, { namespaces: ["nope"] }).then(
       () => undefined,
       (e: unknown) => e as Error & { code?: string; details?: Record<string, unknown> },
     );
@@ -1509,20 +1504,22 @@ describe("runUp — namespace selection (#128)", () => {
   it("`-n app -n nope` still starts: only an overall empty selection is an error (#203)", async () => {
     let observed: string[] | undefined;
     const base = pcDeps({ stack: allNamespaced });
-    await runUp({
-      ...base,
-      namespaces: ["app", "nope"],
-      waitForHealth: async ({ serviceNames }) => {
-        observed = [...serviceNames].sort();
+    await runUp(
+      {
+        ...base,
+        waitForHealth: async ({ serviceNames }) => {
+          observed = [...serviceNames].sort();
+        },
       },
-    });
+      { namespaces: ["app", "nope"] },
+    );
     expect(observed).toEqual(["web", "worker"]);
     expect(base.pc.rows(base.inst.socketPath).map((r) => r.name)).toEqual(["web", "worker"]);
   });
 
   it("a bare up on a RUNNING instance is not a fresh start: no NO_SERVICES_SELECTED, no spawn (#177's scope)", async () => {
     const baseDeps = pcDeps({ stack: allNamespaced });
-    await runUp({ ...baseDeps, namespaces: ["app"], waitForHealth: async () => {} });
+    await runUp({ ...baseDeps, waitForHealth: async () => {} }, { namespaces: ["app"] });
     const upsAfterBoot = requestsOf(baseDeps.pc, "up").length;
     const webPid = baseDeps.pc.pidOf(baseDeps.inst.socketPath, "web");
     // Bare re-up against the live instance takes the reconcile path unchanged.
@@ -1596,7 +1593,7 @@ describe("runUp — state envelope on success (#30)", () => {
 
   it("services[] is the empty array (not undefined) when process-compose lists no processes", async () => {
     const base = pcDeps({ stack: twoIsolated });
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...base,
       // A process-compose whose `process list` answers with no rows.
       processCompose: { ...base.pc.driver, getServiceStatuses: async () => [] },
@@ -1611,7 +1608,7 @@ describe("runUp — state envelope on success (#30)", () => {
     // stack is running; the envelope just gets the partial answer. Here
     // process-compose stops answering once the health-wait is done.
     const base = pcDeps({ stack: twoIsolated });
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...base,
       waitForHealth: async ({ socketPath }) => base.pc.freeze(socketPath),
     };
@@ -1633,7 +1630,7 @@ describe("runUp — state envelope on success (#30)", () => {
         if (r.op === "list") order.push("statuses");
       },
     });
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...pcDeps({ stack: twoIsolated, pc }),
       waitForHealth: async () => {
         order.push("wait");
@@ -1648,7 +1645,7 @@ describe("runUp — state envelope on success (#30)", () => {
     // `HEALTH_TIMEOUT` error envelope, not the success envelope — so the
     // success-only `services[]` fetch must be skipped.
     const base = pcDeps({ stack: twoIsolated });
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...base,
       waitForHealth: async () => {
         const err = new Error("timed out") as Error & { code: string };
@@ -2094,10 +2091,12 @@ describe("runUpDryRun — namespace selection preview (#176)", () => {
   });
 
   it("`-n` is previewed verbatim and exactly", async () => {
-    const result = await runUpDryRun({
-      ...pcDeps({ stack: mixed }),
-      namespaces: ["local-backend"],
-    });
+    const result = await runUpDryRun(
+      {
+        ...pcDeps({ stack: mixed }),
+      },
+      { namespaces: ["local-backend"] },
+    );
     expect(result.namespaces).toEqual(["local-backend"]);
     expect(result.selectedServices).toEqual(["api"]);
   });
@@ -2121,7 +2120,7 @@ describe("runUpDryRun — namespace selection preview (#176)", () => {
       stack: { services: [{ ...isolated("api", "node api.js", ["API_PORT"]), namespace: "app" }] },
       registryRef,
     });
-    await expect(runUpDryRun({ ...deps, namespaces: ["nope"] })).rejects.toMatchObject({
+    await expect(runUpDryRun({ ...deps }, { namespaces: ["nope"] })).rejects.toMatchObject({
       code: "NO_SERVICES_SELECTED",
       details: { selected_namespaces: ["nope"], namespaces: ["app"] },
     });
@@ -2172,7 +2171,7 @@ describe("runUpDryRun — a running instance (#210)", () => {
           from?: ResolvedStack;
         }
       | false,
-    extra: Partial<CommandDeps> = {},
+    extra: Partial<CommandEnv> = {},
   ) {
     const registryRef = { snapshot: {} as RegistrySnapshot };
     const pc = createInMemoryProcessCompose(
@@ -2209,8 +2208,8 @@ describe("runUpDryRun — a running instance (#210)", () => {
     return { deps, effects, since, pc, paths: inst, id, anchor, registryRef };
   }
 
-  async function dryFailure(deps: CommandDeps) {
-    return runUpDryRun(deps).then(
+  async function dryFailure(deps: CommandEnv, options: UpDryRunOptions = {}) {
+    return runUpDryRun(deps, options).then(
       () => undefined,
       (e: unknown) => e as Error & { code?: string; details?: Record<string, unknown> },
     );
@@ -2240,7 +2239,7 @@ describe("runUpDryRun — a running instance (#210)", () => {
 
   it("-n naming a namespace the instance was not booted with fails NAMESPACE_NOT_RUNNING, registry untouched", async () => {
     const { deps, id, registryRef } = await live(noDefault, { namespaces: ["local-backend"] });
-    const err = await dryFailure({ ...deps, namespaces: ["local-backend", "jobs"] });
+    const err = await dryFailure(deps, { namespaces: ["local-backend", "jobs"] });
     expect(err?.code).toBe("NAMESPACE_NOT_RUNNING");
     expect(err?.details).toEqual({
       worktree_id: id,
@@ -2253,7 +2252,7 @@ describe("runUpDryRun — a running instance (#210)", () => {
 
   it("-n naming only a namespace with no services still fails NO_SERVICES_SELECTED (#203)", async () => {
     const { deps } = await live(noDefault, { namespaces: ["local-backend"] });
-    const err = await dryFailure({ ...deps, namespaces: ["nope"] });
+    const err = await dryFailure(deps, { namespaces: ["nope"] });
     expect(err?.code).toBe("NO_SERVICES_SELECTED");
   });
 
@@ -2330,7 +2329,7 @@ describe("runUpDryRun — a running instance (#210)", () => {
     // process-compose died without cleaning up: its socket file stays, nothing answers.
     const { deps, paths, since, pc } = await live(noDefault, { namespaces: ["jobs"] });
     pc.crash(paths.socketPath);
-    const dry = await runUpDryRun({ ...deps, namespaces: ["jobs"] });
+    const dry = await runUpDryRun({ ...deps }, { namespaces: ["jobs"] });
     expect(dry.instance).toBe("fresh");
     expect(dry.selectedServices).toEqual(["worker"]);
     expect(existsSync(paths.socketPath)).toBe(true);
@@ -2364,14 +2363,20 @@ describe("runUpDryRun — a running instance (#210)", () => {
       return { deps: fixture.deps, project: () => fixture.pc.rows(fixture.paths.socketPath) };
     }
 
-    async function realChecks(deps: CommandDeps): Promise<string[] | string> {
+    async function realChecks(
+      deps: CommandEnv,
+      options: UpOptions = {},
+    ): Promise<string[] | string> {
       const waited: string[][] = [];
-      return runUp({
-        ...deps,
-        waitForHealth: async ({ serviceNames }) => {
-          waited.push([...serviceNames]);
+      return runUp(
+        {
+          ...deps,
+          waitForHealth: async ({ serviceNames }) => {
+            waited.push([...serviceNames]);
+          },
         },
-      }).then(
+        options,
+      ).then(
         () => waited.flat(),
         (e: { code?: string }) => e.code ?? "error",
       );
@@ -2382,10 +2387,10 @@ describe("runUpDryRun — a running instance (#210)", () => {
         services: [lb("api"), lb("db"), lb("cache"), jobs("worker")],
       };
       const scoped = await drifted(after);
-      const dryScoped = await runUpDryRun({ ...scoped.deps, namespaces: ["local-backend"] });
+      const dryScoped = await runUpDryRun(scoped.deps, { namespaces: ["local-backend"] });
       expect(dryScoped.wouldReload).toBe(true);
       expect(dryScoped.selectedServices).toEqual(["api", "db", "cache"]);
-      expect(await realChecks({ ...scoped.deps, namespaces: ["local-backend"] })).toEqual(
+      expect(await realChecks(scoped.deps, { namespaces: ["local-backend"] })).toEqual(
         dryScoped.selectedServices,
       );
       expect(scoped.project().map((r) => r.name)).toEqual(["api", "db", "cache"]);
@@ -2417,12 +2422,10 @@ describe("runUpDryRun — a running instance (#210)", () => {
       expect(bare.project().map((r) => r.name)).toEqual(["db"]);
 
       const scoped = await drifted(after);
-      const err = await dryFailure({ ...scoped.deps, namespaces: ["jobs"] });
+      const err = await dryFailure(scoped.deps, { namespaces: ["jobs"] });
       expect(err?.code).toBe("NAMESPACE_NOT_RUNNING");
       expect(err?.details?.["services"]).toEqual(["api", "worker"]);
-      expect(await realChecks({ ...scoped.deps, namespaces: ["jobs"] })).toBe(
-        "NAMESPACE_NOT_RUNNING",
-      );
+      expect(await realChecks(scoped.deps, { namespaces: ["jobs"] })).toBe("NAMESPACE_NOT_RUNNING");
     });
 
     it("a dead service the reload edits is started by the reload, so it is not in would_restart", async () => {
@@ -2459,7 +2462,7 @@ describe("runUpDryRun — a running instance (#210)", () => {
     );
     // process-compose fails its first `process list`, then answers.
     let reads = 0;
-    const flaky: CommandDeps = {
+    const flaky: CommandEnv = {
       ...deps,
       processCompose: {
         ...pc.driver,
@@ -2494,7 +2497,7 @@ describe("runUpDryRun — a running instance (#210)", () => {
     } finally {
       vi.useRealTimers();
     }
-    const err = await dryFailure({ ...deps, waitTimeoutMs: 50 });
+    const err = await dryFailure(deps, { waitTimeoutMs: 50 });
     expect(err?.code).toBe("HEALTH_TIMEOUT");
     expect(err?.message).toContain("within 50ms");
   });
@@ -2610,11 +2613,11 @@ describe("runUpDryRun — derive the config(s) with no side effects (#124)", () 
         { ...isolated("api", "node api.js"), namespace: "two", dependsOn: [{ name: "db" }] },
       ],
     };
-    const result = await runUpDryRun({ ...pcDeps({ stack }), namespaces: ["two"] });
+    const result = await runUpDryRun({ ...pcDeps({ stack }) }, { namespaces: ["two"] });
     expect(result.droppedNamespaceEdges).toEqual([
       { from: "api", to: "db", toNamespaces: ["one", "three"] },
     ]);
-    const kept = await runUpDryRun({ ...pcDeps({ stack }), namespaces: ["two", "three"] });
+    const kept = await runUpDryRun({ ...pcDeps({ stack }) }, { namespaces: ["two", "three"] });
     expect(kept.droppedNamespaceEdges).toEqual([]);
   });
 
@@ -2641,7 +2644,7 @@ describe("runUpDryRun — derive the config(s) with no side effects (#124)", () 
     let sharedLockTaken = false;
     let hashWritten = false;
     let healthWaited = false;
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...pcDeps({ stack }),
       withLifecycleLock: async (_a, _i, fn) => {
         lifecycleLockTaken = true;
@@ -2676,7 +2679,7 @@ describe("runUpDryRun — derive the config(s) with no side effects (#124)", () 
     };
     let registryLockTaken = false;
     const base = pcDeps({ stack });
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...base,
       withRegistryLock: async (anchor, mutate) => {
         registryLockTaken = true;
@@ -2722,7 +2725,7 @@ describe("runLs — instance enumeration", () => {
   it("resolves the anchor from cwd and returns the discovered instances", async () => {
     const tmp = tmpAnchor();
     // No instances written yet — discovery should return an empty list.
-    const git: CommandDeps["git"] = (args) => {
+    const git: CommandEnv["git"] = (args) => {
       const flag = args[1];
       if (flag === "--git-common-dir") return tmp.anchor;
       if (flag === "--show-toplevel") return join(tmp.worktreeRoot, "login");
@@ -2730,14 +2733,14 @@ describe("runLs — instance enumeration", () => {
       throw new Error("unexpected");
     };
     const { runLs } = await import("./commands.js");
-    const result = await runLs({ cwd: join(tmp.worktreeRoot, "login"), git });
+    const result = await runLs({ git }, { cwd: join(tmp.worktreeRoot, "login") });
     expect(result.anchor).toBe(tmp.anchor);
     expect(result.instances).toEqual([]);
   });
 
   it("delegates enumeration to an injected discoverer for testability", async () => {
     const tmp = tmpAnchor();
-    const git: CommandDeps["git"] = (args) => {
+    const git: CommandEnv["git"] = (args) => {
       const flag = args[1];
       if (flag === "--git-common-dir") return tmp.anchor;
       if (flag === "--show-toplevel") return join(tmp.worktreeRoot, "login");
@@ -2756,11 +2759,13 @@ describe("runLs — instance enumeration", () => {
       },
     ];
     const { runLs } = await import("./commands.js");
-    const result = await runLs({
-      cwd: join(tmp.worktreeRoot, "login"),
-      git,
-      discover: async () => stub,
-    });
+    const result = await runLs(
+      {
+        git,
+        discover: async () => stub,
+      },
+      { cwd: join(tmp.worktreeRoot, "login") },
+    );
     expect(result.instances).toEqual(stub);
   });
 
@@ -2775,7 +2780,7 @@ describe("runLs — instance enumeration", () => {
     // Seed a baseline lockfile so we can compare its mtime.
     writeFileSync(lockPath, "", "utf8");
     const before = statSync(lockPath).mtimeMs;
-    const git: CommandDeps["git"] = (args) => {
+    const git: CommandEnv["git"] = (args) => {
       const flag = args[1];
       if (flag === "--git-common-dir") return tmp.anchor;
       if (flag === "--show-toplevel") return join(tmp.worktreeRoot, "login");
@@ -2783,13 +2788,13 @@ describe("runLs — instance enumeration", () => {
       throw new Error("unexpected");
     };
     const { runLs } = await import("./commands.js");
-    await runLs({ cwd: join(tmp.worktreeRoot, "login"), git });
+    await runLs({ git }, { cwd: join(tmp.worktreeRoot, "login") });
     expect(statSync(lockPath).mtimeMs).toBe(before);
   });
 
   it("threads the driver's getServiceStatuses into the discoverer (issue #29 plumbing)", async () => {
     const tmp = tmpAnchor();
-    const git: CommandDeps["git"] = (args) => {
+    const git: CommandEnv["git"] = (args) => {
       const flag = args[1];
       if (flag === "--git-common-dir") return tmp.anchor;
       if (flag === "--show-toplevel") return join(tmp.worktreeRoot, "login");
@@ -2805,16 +2810,18 @@ describe("runLs — instance enumeration", () => {
     await pc.driver.up(inst);
     let received: ServiceStatus[] | undefined;
     const { runLs } = await import("./commands.js");
-    await runLs({
-      cwd: join(tmp.worktreeRoot, "login"),
-      git,
-      processCompose: pc.driver,
-      probeSocket: (path) => pc.probeSocket(path),
-      discover: async (_anchor, deps) => {
-        received = await deps.getServiceStatuses?.(inst.socketPath);
-        return [];
+    await runLs(
+      {
+        git,
+        processCompose: pc.driver,
+        probeSocket: (path) => pc.probeSocket(path),
+        discover: async (_anchor, deps) => {
+          received = await deps.getServiceStatuses?.(inst.socketPath);
+          return [];
+        },
       },
-    });
+      { cwd: join(tmp.worktreeRoot, "login") },
+    );
     // The read the discoverer was handed answers with the instance's rows.
     expect(received?.map((r) => [r.name, r.status, r.pid])).toEqual([
       ["web", "Running", pc.pidOf(inst.socketPath, "web")],
@@ -2823,7 +2830,7 @@ describe("runLs — instance enumeration", () => {
 
   it("bounds each instance's service read: a wedged instance fails within the budget, in parallel with the rest (#226)", async () => {
     const tmp = tmpAnchor();
-    const git: CommandDeps["git"] = (args) => {
+    const git: CommandEnv["git"] = (args) => {
       const flag = args[1];
       if (flag === "--git-common-dir") return tmp.anchor;
       if (flag === "--show-toplevel") return join(tmp.worktreeRoot, "login");
@@ -2850,26 +2857,28 @@ describe("runLs — instance enumeration", () => {
     const reads: Array<{ socket: string; ms: number; ok: boolean }> = [];
     const { runLs } = await import("./commands.js");
     const started = Date.now();
-    await runLs({
-      cwd: join(tmp.worktreeRoot, "login"),
-      git,
-      processCompose: pc.driver,
-      readTimeoutMs: 300,
-      probeSocket: (path) => pc.probeSocket(path),
-      discover: async (_anchor, deps) => {
-        await Promise.all(
-          [wedged.socketPath, login.socketPath].map(async (socket) => {
-            const t0 = Date.now();
-            const ok = await deps.getServiceStatuses!(socket).then(
-              () => true,
-              () => false,
-            );
-            reads.push({ socket, ms: Date.now() - t0, ok });
-          }),
-        );
-        return [];
+    await runLs(
+      {
+        git,
+        processCompose: pc.driver,
+        readTimeoutMs: 300,
+        probeSocket: (path) => pc.probeSocket(path),
+        discover: async (_anchor, deps) => {
+          await Promise.all(
+            [wedged.socketPath, login.socketPath].map(async (socket) => {
+              const t0 = Date.now();
+              const ok = await deps.getServiceStatuses!(socket).then(
+                () => true,
+                () => false,
+              );
+              reads.push({ socket, ms: Date.now() - t0, ok });
+            }),
+          );
+          return [];
+        },
       },
-    });
+      { cwd: join(tmp.worktreeRoot, "login") },
+    );
     const wedgedRead = reads.find((r) => r.socket === wedged.socketPath);
     expect(reads.find((r) => r.socket === login.socketPath)?.ok).toBe(true);
     expect(wedgedRead?.ok).toBe(false);
@@ -2881,7 +2890,7 @@ describe("runLs — instance enumeration", () => {
 });
 
 /**
- * A `CommandDeps` for `runAttach` on the in-memory process-compose; unlike
+ * A `CommandEnv` for `runAttach` on the in-memory process-compose; unlike
  * `pcDeps`, this skips the allocator/lock plumbing because `runAttach` does
  * not allocate ports or read the stack. `boot` starts an instance (one
  * `web` process) the way `up` leaves it running.
@@ -2896,8 +2905,7 @@ function attachFixture(worktreeId = "login") {
     throw new Error(`unexpected git invocation: ${args.join(" ")}`);
   };
   const pc = createInMemoryProcessCompose();
-  const deps: CommandDeps = {
-    cwd: join(tmp.worktreeRoot, worktreeId),
+  const deps: CommandEnv = {
     git,
     processCompose: pc.driver,
     probeSocket: (path) => pc.probeSocket(path),
@@ -2960,7 +2968,7 @@ describe("runPrune — reconcile instances against git worktree list", () => {
     worktreeRoot: string;
     worktreeId: string;
     porcelain: string;
-  }): CommandDeps["git"] {
+  }): CommandEnv["git"] {
     return (args) => {
       const [verb, ...rest] = args;
       if (verb === "rev-parse") {
@@ -3011,14 +3019,16 @@ describe("runPrune — reconcile instances against git worktree list", () => {
       ].join("\n"),
     });
     const { runPrune } = await import("./commands.js");
-    const result = await runPrune({
-      cwd: join(tmp.worktreeRoot, "login"),
-      git,
-      discover: async () => [
-        instance(idFor(tmp.worktreeRoot, "login")),
-        instance(idFor(tmp.worktreeRoot, "billing")),
-      ],
-    });
+    const result = await runPrune(
+      {
+        git,
+        discover: async () => [
+          instance(idFor(tmp.worktreeRoot, "login")),
+          instance(idFor(tmp.worktreeRoot, "billing")),
+        ],
+      },
+      { cwd: join(tmp.worktreeRoot, "login") },
+    );
     expect(result.pruned).toEqual([]);
   });
 
@@ -3034,11 +3044,13 @@ describe("runPrune — reconcile instances against git worktree list", () => {
       porcelain: "",
     });
     const { runPrune } = await import("./commands.js");
-    const result = await runPrune({
-      cwd: join(tmp.worktreeRoot, "login"),
-      git,
-      discover: async () => [instance("shared", { kind: "shared" })],
-    });
+    const result = await runPrune(
+      {
+        git,
+        discover: async () => [instance("shared", { kind: "shared" })],
+      },
+      { cwd: join(tmp.worktreeRoot, "login") },
+    );
     expect(result.pruned).toEqual([]);
   });
 
@@ -3067,26 +3079,28 @@ describe("runPrune — reconcile instances against git worktree list", () => {
     const registryRef = { snapshot: { login: 20000, removed: 20032 } as RegistrySnapshot };
 
     const { runPrune } = await import("./commands.js");
-    const result = await runPrune({
-      cwd: join(tmp.worktreeRoot, "login"),
-      git,
-      discover: async () => [
-        instance(idFor(tmp.worktreeRoot, "login"), {
-          status: "running",
-          socketPath: "/x/login.sock",
-        }),
-        instance("removed", {
-          status: "running",
-          socketPath: orphanSocket,
-        }),
-      ],
-      withRegistryLock: async (_anchor, mutate) => {
-        const after = await mutate(registryRef.snapshot);
-        registryRef.snapshot = after;
-        return after;
+    const result = await runPrune(
+      {
+        git,
+        discover: async () => [
+          instance(idFor(tmp.worktreeRoot, "login"), {
+            status: "running",
+            socketPath: "/x/login.sock",
+          }),
+          instance("removed", {
+            status: "running",
+            socketPath: orphanSocket,
+          }),
+        ],
+        withRegistryLock: async (_anchor, mutate) => {
+          const after = await mutate(registryRef.snapshot);
+          registryRef.snapshot = after;
+          return after;
+        },
+        ...inMemoryPcDeps(pc),
       },
-      ...inMemoryPcDeps(pc),
-    });
+      { cwd: join(tmp.worktreeRoot, "login") },
+    );
 
     // Acceptance: orphan is reported in the result.
     expect(result.pruned.map((p) => p.id)).toEqual(["removed"]);
@@ -3118,18 +3132,22 @@ describe("runPrune — reconcile instances against git worktree list", () => {
     const pc = createInMemoryProcessCompose();
     await pc.driver.up(orphan);
     const { runPrune } = await import("./commands.js");
-    const result = await runPrune({
-      cwd: join(tmp.worktreeRoot, "login"),
-      git: pruneGit({
-        anchor: tmp.anchor,
-        worktreeRoot: tmp.worktreeRoot,
-        worktreeId: "login",
-        porcelain: [`worktree ${join(tmp.worktreeRoot, "login")}`, "HEAD x", ""].join("\n"),
-      }),
-      discover: async () => [instance("removed", { status: "unknown", socketPath: orphanSocket })],
-      withRegistryLock: async (_anchor, mutate) => mutate({}),
-      ...inMemoryPcDeps(pc),
-    });
+    const result = await runPrune(
+      {
+        git: pruneGit({
+          anchor: tmp.anchor,
+          worktreeRoot: tmp.worktreeRoot,
+          worktreeId: "login",
+          porcelain: [`worktree ${join(tmp.worktreeRoot, "login")}`, "HEAD x", ""].join("\n"),
+        }),
+        discover: async () => [
+          instance("removed", { status: "unknown", socketPath: orphanSocket }),
+        ],
+        withRegistryLock: async (_anchor, mutate) => mutate({}),
+        ...inMemoryPcDeps(pc),
+      },
+      { cwd: join(tmp.worktreeRoot, "login") },
+    );
     expect(result.pruned.map((p) => p.id)).toEqual(["removed"]);
     expect(requestsOf(pc, "down").map((r) => r.socketPath)).toEqual([orphanSocket]);
     expect(pc.isUp(orphanSocket)).toBe(false);
@@ -3152,7 +3170,6 @@ describe("runPrune — reconcile instances against git worktree list", () => {
     };
     const { runPrune } = await import("./commands.js");
     const result = await runPrune({
-      cwd: join(tmp.worktreeRoot, "login"),
       git: pruneGit({
         anchor: tmp.anchor,
         worktreeRoot: tmp.worktreeRoot,
@@ -3185,19 +3202,23 @@ describe("runPrune — reconcile instances against git worktree list", () => {
     writeFileSync(orphanSocket, "");
     const pc = createInMemoryProcessCompose();
     const { runPrune } = await import("./commands.js");
-    const result = await runPrune({
-      cwd: join(tmp.worktreeRoot, "login"),
-      git: pruneGit({
-        anchor: tmp.anchor,
-        worktreeRoot: tmp.worktreeRoot,
-        worktreeId: "login",
-        porcelain: [`worktree ${join(tmp.worktreeRoot, "login")}`, "HEAD x", ""].join("\n"),
-      }),
-      discover: async () => [instance("removed", { status: "running", socketPath: orphanSocket })],
-      withRegistryLock: async (_anchor, mutate) => mutate({}),
-      // No server answers on the orphan's socket, so its `down` fails.
-      ...inMemoryPcDeps(pc),
-    });
+    const result = await runPrune(
+      {
+        git: pruneGit({
+          anchor: tmp.anchor,
+          worktreeRoot: tmp.worktreeRoot,
+          worktreeId: "login",
+          porcelain: [`worktree ${join(tmp.worktreeRoot, "login")}`, "HEAD x", ""].join("\n"),
+        }),
+        discover: async () => [
+          instance("removed", { status: "running", socketPath: orphanSocket }),
+        ],
+        withRegistryLock: async (_anchor, mutate) => mutate({}),
+        // No server answers on the orphan's socket, so its `down` fails.
+        ...inMemoryPcDeps(pc),
+      },
+      { cwd: join(tmp.worktreeRoot, "login") },
+    );
     expect(requestsOf(pc, "down").map((r) => r.socketPath)).toEqual([orphanSocket]);
     expect(result.pruned.map((p) => p.id)).toEqual(["removed"]);
     expect(result.unreclaimed).toEqual([]);
@@ -3224,17 +3245,19 @@ describe("runPrune — reconcile instances against git worktree list", () => {
     const registryRef = { snapshot: { removed: 20000 } as RegistrySnapshot };
 
     const { runPrune } = await import("./commands.js");
-    const result = await runPrune({
-      cwd: join(tmp.worktreeRoot, "login"),
-      git,
-      discover: async () => [instance("removed", { status: "stale", socketPath: orphanSocket })],
-      withRegistryLock: async (_anchor, mutate) => {
-        const after = await mutate(registryRef.snapshot);
-        registryRef.snapshot = after;
-        return after;
+    const result = await runPrune(
+      {
+        git,
+        discover: async () => [instance("removed", { status: "stale", socketPath: orphanSocket })],
+        withRegistryLock: async (_anchor, mutate) => {
+          const after = await mutate(registryRef.snapshot);
+          registryRef.snapshot = after;
+          return after;
+        },
+        ...inMemoryPcDeps(pc),
       },
-      ...inMemoryPcDeps(pc),
-    });
+      { cwd: join(tmp.worktreeRoot, "login") },
+    );
 
     expect(result.pruned.map((p) => p.id)).toEqual(["removed"]);
     // Acceptance: no driver.down for a stale instance — nothing is listening.
@@ -3257,11 +3280,13 @@ describe("runPrune — reconcile instances against git worktree list", () => {
       porcelain: [`worktree ${join(tmp.worktreeRoot, "login")}`, "HEAD x", ""].join("\n"),
     });
     const { runPrune } = await import("./commands.js");
-    const result = await runPrune({
-      cwd: join(tmp.worktreeRoot, "login"),
-      git,
-      discover: async () => [instance(idFor(tmp.worktreeRoot, "login"), { status: "stale" })],
-    });
+    const result = await runPrune(
+      {
+        git,
+        discover: async () => [instance(idFor(tmp.worktreeRoot, "login"), { status: "stale" })],
+      },
+      { cwd: join(tmp.worktreeRoot, "login") },
+    );
     expect(result.pruned).toEqual([]);
   });
 
@@ -3292,20 +3317,22 @@ describe("runPrune — reconcile instances against git worktree list", () => {
     });
     const registryRef = { snapshot: { alpha: 20000, beta: 20032 } as RegistrySnapshot };
     const { runPrune } = await import("./commands.js");
-    const result = await runPrune({
-      cwd: join(tmp.worktreeRoot, "live"),
-      git,
-      discover: async () => [
-        instance("alpha", { status: "running", socketPath: a }),
-        instance("beta", { status: "running", socketPath: b }),
-      ],
-      withRegistryLock: async (_anchor, mutate) => {
-        const after = await mutate(registryRef.snapshot);
-        registryRef.snapshot = after;
-        return after;
+    const result = await runPrune(
+      {
+        git,
+        discover: async () => [
+          instance("alpha", { status: "running", socketPath: a }),
+          instance("beta", { status: "running", socketPath: b }),
+        ],
+        withRegistryLock: async (_anchor, mutate) => {
+          const after = await mutate(registryRef.snapshot);
+          registryRef.snapshot = after;
+          return after;
+        },
+        ...inMemoryPcDeps(pc),
       },
-      ...inMemoryPcDeps(pc),
-    });
+      { cwd: join(tmp.worktreeRoot, "live") },
+    );
 
     expect(result.pruned.map((p) => p.id).sort()).toEqual(["alpha", "beta"]);
     // alpha's down failed; beta's still ran and stopped it.
@@ -3352,18 +3379,20 @@ describe("runPrune — reconcile instances against git worktree list", () => {
     };
 
     const { runPrune } = await import("./commands.js");
-    const result = await runPrune({
-      cwd: join(tmp.worktreeRoot, "main"),
-      git,
-      // No socket survives: discovery finds nothing.
-      discover: async () => [],
-      readRegistry: () => registryRef.snapshot,
-      withRegistryLock: async (_anchor, mutate) => {
-        const after = await mutate(registryRef.snapshot);
-        registryRef.snapshot = after;
-        return after;
+    const result = await runPrune(
+      {
+        git,
+        // No socket survives: discovery finds nothing.
+        discover: async () => [],
+        readRegistry: () => registryRef.snapshot,
+        withRegistryLock: async (_anchor, mutate) => {
+          const after = await mutate(registryRef.snapshot);
+          registryRef.snapshot = after;
+          return after;
+        },
       },
-    });
+      { cwd: join(tmp.worktreeRoot, "main") },
+    );
 
     // Acceptance: the dead reservation is reported in pruned[] with its path.
     expect(result.pruned.map((p) => p.id)).toEqual([deadId]);
@@ -3433,20 +3462,22 @@ describe("runPrune — reconcile instances against git worktree list", () => {
       const reapCalls: Array<{ cwd: string; config: DerivedConfig }> = [];
 
       const { runPrune } = await import("./commands.js");
-      await runPrune({
-        cwd: join(fx.tmp.worktreeRoot, "live"),
-        git: fx.git,
-        discover: async () => [instance("removed", { status, socketPath: fx.orphanSocket })],
-        withRegistryLock: async (_anchor, mutate) => {
-          fx.registryRef.snapshot = await mutate(fx.registryRef.snapshot);
-          return fx.registryRef.snapshot;
+      await runPrune(
+        {
+          git: fx.git,
+          discover: async () => [instance("removed", { status, socketPath: fx.orphanSocket })],
+          withRegistryLock: async (_anchor, mutate) => {
+            fx.registryRef.snapshot = await mutate(fx.registryRef.snapshot);
+            return fx.registryRef.snapshot;
+          },
+          ...inMemoryPcDeps(fx.pc),
+          reap: async (config, deps) => {
+            reapCalls.push({ cwd: deps.cwd, config });
+            return { ranCount: 1, failures: [] };
+          },
         },
-        ...inMemoryPcDeps(fx.pc),
-        reap: async (config, deps) => {
-          reapCalls.push({ cwd: deps.cwd, config });
-          return { ranCount: 1, failures: [] };
-        },
-      });
+        { cwd: join(fx.tmp.worktreeRoot, "live") },
+      );
 
       // Acceptance #1/#2: the hook reap fired regardless of supervisor liveness.
       expect(reapCalls).toHaveLength(1);
@@ -3473,29 +3504,31 @@ describe("runPrune — reconcile instances against git worktree list", () => {
     await fx.pc.driver.up({ configPath: fx.orphanConfig, socketPath: fx.orphanSocket });
 
     const { runPrune } = await import("./commands.js");
-    const result = await runPrune({
-      cwd: join(fx.tmp.worktreeRoot, "live"),
-      git: fx.git,
-      discover: async () => [
-        instance("removed", { status: "running", socketPath: fx.orphanSocket }),
-      ],
-      withRegistryLock: async (_anchor, mutate) => {
-        fx.registryRef.snapshot = await mutate(fx.registryRef.snapshot);
-        return fx.registryRef.snapshot;
-      },
-      ...inMemoryPcDeps(fx.pc),
-      reap: async () => ({
-        ranCount: 1,
-        failures: [
-          {
-            process: "db",
-            command: "reap-stack.sh",
-            reason: "exit",
-            message: "exited with code 1",
-          },
+    const result = await runPrune(
+      {
+        git: fx.git,
+        discover: async () => [
+          instance("removed", { status: "running", socketPath: fx.orphanSocket }),
         ],
-      }),
-    });
+        withRegistryLock: async (_anchor, mutate) => {
+          fx.registryRef.snapshot = await mutate(fx.registryRef.snapshot);
+          return fx.registryRef.snapshot;
+        },
+        ...inMemoryPcDeps(fx.pc),
+        reap: async () => ({
+          ranCount: 1,
+          failures: [
+            {
+              process: "db",
+              command: "reap-stack.sh",
+              reason: "exit",
+              message: "exited with code 1",
+            },
+          ],
+        }),
+      },
+      { cwd: join(fx.tmp.worktreeRoot, "live") },
+    );
 
     // Acceptance #5: the failure is reflected in the structured result so the
     // CLI formatter can warn; the sweep does NOT report a clean teardown.
@@ -3577,7 +3610,7 @@ describe("runEnv — pure read of injected env", () => {
       snapshot: { [idFor("/wt", "login")]: 20064 } as RegistrySnapshot,
     };
     let lockCalls = 0;
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...stubDeps({ stack, worktreeRootOverride: "/wt", registryRef }),
       // Sentinel lock that records and rejects any acquire — runEnv must not call it.
       withRegistryLock: () => {
@@ -3639,7 +3672,7 @@ describe("runEnv — pure read of injected env", () => {
  */
 
 /**
- * A `CommandDeps` for `runLogs` on the in-memory process-compose — no
+ * A `CommandEnv` for `runLogs` on the in-memory process-compose — no
  * allocator/lock plumbing needed. `boot` writes an instance's derived config
  * (`--all` enumerates services from it) and starts the instance from it;
  * `pc.log` makes a process write a line.
@@ -3654,8 +3687,7 @@ function logsFixture(worktreeId = "login") {
     throw new Error(`unexpected git invocation: ${args.join(" ")}`);
   };
   const pc = createInMemoryProcessCompose();
-  const deps: CommandDeps = {
-    cwd: join(tmp.worktreeRoot, worktreeId),
+  const deps: CommandEnv = {
     git,
     processCompose: pc.driver,
     probeSocket: (path) => pc.probeSocket(path),
@@ -3834,7 +3866,7 @@ describe("runLogs — stream service logs without locking", () => {
     await boot(inst, ["web"], { web: ["a"] });
 
     let lockCalls = 0;
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...base,
       withRegistryLock: () => {
         lockCalls++;
@@ -3962,7 +3994,7 @@ describe("runUp — idempotency + drift detection (#31)", () => {
   it("writes the stack hash to the hash store after a successful first up", async () => {
     const hashes = hashStore();
     const base = pcDeps({ stack: stackA });
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...base,
       readStoredHash: hashes.read,
       writeStoredHash: hashes.write,
@@ -3982,7 +4014,7 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     const registryRef = { snapshot: {} as RegistrySnapshot };
     let writeCalls = 0;
     const base = pcDeps({ stack: stackA, registryRef });
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...base,
       readStoredHash: hashes.read,
       writeStoredHash: (anchor, id, h) => {
@@ -4012,7 +4044,7 @@ describe("runUp — idempotency + drift detection (#31)", () => {
       services: [{ ...isolated("web", "node a.js", ["WEB_PORT"]), readinessProbe: { exec: {} } }],
     };
     const hashes = hashStore();
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...pcDeps({ stack: probed }),
       readStoredHash: hashes.read,
       writeStoredHash: hashes.write,
@@ -4030,7 +4062,7 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     // Seed the hash store with the OLD stack's hash so the second up sees drift.
     const baseDeps = pcDeps({ stack: stackA });
     const { pc, inst } = baseDeps;
-    const firstDeps: CommandDeps = {
+    const firstDeps: CommandEnv = {
       ...baseDeps,
       readStoredHash: hashes.read,
       writeStoredHash: hashes.write,
@@ -4041,7 +4073,7 @@ describe("runUp — idempotency + drift detection (#31)", () => {
 
     // Now swap to a different stack — same worktree/anchor/registry deps —
     // so the second up sees drift relative to the stored hash.
-    const secondDeps: CommandDeps = { ...firstDeps, readStack: () => stackB };
+    const secondDeps: CommandEnv = { ...firstDeps, readStack: () => stackB };
     const result = await runUp(secondDeps);
 
     // The reload asks the worktree's own instance to re-read its config.
@@ -4063,7 +4095,7 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     const hashes = hashStore();
 
     const baseDeps = pcDeps({ stack: stackA });
-    const firstDeps: CommandDeps = {
+    const firstDeps: CommandEnv = {
       ...baseDeps,
       readStoredHash: hashes.read,
       writeStoredHash: hashes.write,
@@ -4081,7 +4113,7 @@ describe("runUp — idempotency + drift detection (#31)", () => {
         },
       ],
     };
-    const secondDeps: CommandDeps = { ...firstDeps, readStack: () => probed };
+    const secondDeps: CommandEnv = { ...firstDeps, readStack: () => probed };
     const result = await runUp(secondDeps);
 
     // Drift was detected: reload ran instead of the noop branch.
@@ -4099,7 +4131,7 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     // `api` stays in `default`, so the instance keeps running once `web` leaves it.
     const api = isolated("api", "node api.js");
     const baseDeps = pcDeps({ stack: { services: [...stackA.services, api] } });
-    const firstDeps: CommandDeps = {
+    const firstDeps: CommandEnv = {
       ...baseDeps,
       readStoredHash: hashes.read,
       writeStoredHash: hashes.write,
@@ -4125,7 +4157,7 @@ describe("runUp — idempotency + drift detection (#31)", () => {
 
     const baseDeps = pcDeps({ stack: stackA });
     // A process-compose build without the reload route.
-    const firstDeps: CommandDeps = {
+    const firstDeps: CommandEnv = {
       ...baseDeps,
       processCompose: reloadFailing(baseDeps.pc, { ok: false, reason: "not_supported" }),
       readStoredHash: hashes.read,
@@ -4137,7 +4169,7 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     if (storedAfterFirst === undefined) throw new Error("expected a stored hash after first up");
     const webPid = baseDeps.pc.pidOf(baseDeps.inst.socketPath, "web");
 
-    const secondDeps: CommandDeps = { ...firstDeps, readStack: () => stackB };
+    const secondDeps: CommandEnv = { ...firstDeps, readStack: () => stackB };
     const err = await runUp(secondDeps).then(
       () => undefined,
       (e: unknown) => e as Error & { code?: string },
@@ -4162,7 +4194,7 @@ describe("runUp — idempotency + drift detection (#31)", () => {
 
     const baseDeps = pcDeps({ stack: stackA });
     // process-compose refuses the reload.
-    const firstDeps: CommandDeps = {
+    const firstDeps: CommandEnv = {
       ...baseDeps,
       processCompose: reloadFailing(baseDeps.pc, {
         ok: false,
@@ -4177,7 +4209,7 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     const { configPath } = baseDeps.inst;
     const configBefore = readFileSync(configPath, "utf8");
 
-    const secondDeps: CommandDeps = { ...firstDeps, readStack: () => stackB };
+    const secondDeps: CommandEnv = { ...firstDeps, readStack: () => stackB };
     await expect(runUp(secondDeps)).rejects.toThrow(/drift/i);
 
     // The on-disk derived config still describes what the instance is
@@ -4197,7 +4229,7 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     // covered in src/driver.test.ts).
     const hashes = hashStore();
     const baseDeps = pcDeps({ stack: stackA });
-    const firstDeps: CommandDeps = {
+    const firstDeps: CommandEnv = {
       ...baseDeps,
       processCompose: reloadFailing(baseDeps.pc, {
         ok: false,
@@ -4236,7 +4268,7 @@ describe("runUp — idempotency + drift detection (#31)", () => {
     const hashes = hashStore();
 
     const baseDeps = pcDeps({ stack: stackA });
-    const firstDeps: CommandDeps = {
+    const firstDeps: CommandEnv = {
       ...baseDeps,
       readStoredHash: hashes.read,
       writeStoredHash: hashes.write,
@@ -4244,7 +4276,7 @@ describe("runUp — idempotency + drift detection (#31)", () => {
 
     await runUp(firstDeps);
 
-    const secondDeps: CommandDeps = { ...firstDeps, readStack: () => stackB };
+    const secondDeps: CommandEnv = { ...firstDeps, readStack: () => stackB };
     await runUp(secondDeps);
 
     const parsed = parseYaml(readFileSync(baseDeps.inst.configPath, "utf8")) as {
@@ -4256,7 +4288,7 @@ describe("runUp — idempotency + drift detection (#31)", () => {
   it("noop path does NOT call driver.reloadConfig (no process-compose churn when the config matches)", async () => {
     const hashes = hashStore();
     const baseDeps = pcDeps({ stack: stackA });
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...baseDeps,
       readStoredHash: hashes.read,
       writeStoredHash: hashes.write,
@@ -4387,7 +4419,7 @@ describe("runUp — pending-reload guard (#191)", () => {
       },
     };
 
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...base,
       readStack: () => state.stack,
       processCompose: driver,
@@ -4424,8 +4456,11 @@ describe("runUp — pending-reload guard (#191)", () => {
     return { state, deps, marker, where, pendingUpdate, pc, inst, pidOf };
   }
 
-  async function upError(deps: CommandDeps): Promise<Error & { code?: string; details?: unknown }> {
-    return runUp(deps).then(
+  async function upError(
+    deps: CommandEnv,
+    options: UpOptions = {},
+  ): Promise<Error & { code?: string; details?: unknown }> {
+    return runUp(deps, options).then(
       () => {
         throw new Error("expected runUp to reject");
       },
@@ -4651,16 +4686,16 @@ describe("runUp — pending-reload guard (#191)", () => {
       services: [svc("web", "node a.js", "one"), svc("worker", "node w.js", "two")],
     };
     const { state, deps, pendingUpdate } = fixture(wide);
-    await runUp({ ...deps, namespaces: ["one", "two"] });
+    await runUp(deps, { namespaces: ["one", "two"] });
     state.stack = {
       services: [svc("web", "node b.js", "one"), svc("worker", "node w.js", "two")],
     };
     state.reload = "hang";
-    await upError({ ...deps, namespaces: ["one"] });
+    await upError(deps, { namespaces: ["one"] });
     // The old `web` exited; process-compose has not started the new one yet.
     await pendingUpdate.begin();
     state.stuck.delete(100);
-    const err = await upError({ ...deps, namespaces: ["one"] });
+    const err = await upError(deps, { namespaces: ["one"] });
     expect(err.details).toEqual({ reason: "reload_pending", services: ["web"], pids: [] });
     expect(err.message).toContain("`devtrees down && devtrees up -n one -n two`");
   });
@@ -4669,7 +4704,7 @@ describe("runUp — pending-reload guard (#191)", () => {
     // process-compose exits after reloading an empty project, so `up -n nope`
     // never boots one (it used to, #176).
     const { state, deps, pc } = fixture(stackA);
-    await expect(upError({ ...deps, namespaces: ["nope"] })).resolves.toMatchObject({
+    await expect(upError(deps, { namespaces: ["nope"] })).resolves.toMatchObject({
       code: "NO_SERVICES_SELECTED",
     });
     expect(state.reloads).toBe(0);
@@ -4687,7 +4722,7 @@ describe("runUp — pending-reload guard (#191)", () => {
     // Booted `-n two`: `db` is present through `two`, `web` (only `one`) is
     // legitimately absent.
     const { state, deps, pc, inst } = fixture(stack);
-    await runUp({ ...deps, namespaces: ["two"] });
+    await runUp(deps, { namespaces: ["two"] });
     expect(pc.rows(inst.socketPath).map((r) => r.name)).toEqual(["db", "worker"]);
     state.stack = {
       services: [
@@ -4705,11 +4740,11 @@ describe("runUp — pending-reload guard (#191)", () => {
       services: [svc("web", "node a.js", "one"), svc("worker", "node w.js", "two")],
     };
     const { state, deps } = fixture(wide);
-    await runUp({ ...deps, namespaces: ["one", "two"] });
+    await runUp(deps, { namespaces: ["one", "two"] });
     state.stack = {
       services: [svc("web", "node b.js", "one"), svc("worker", "node w.js", "two")],
     };
-    await runUp({ ...deps, namespaces: ["one"] });
+    await runUp(deps, { namespaces: ["one"] });
     expect(state.reloads).toBe(1);
   });
 });
@@ -4746,7 +4781,7 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
   async function liveInstance(
     stack: ResolvedStack,
     boot: { namespaces?: string[]; worktree?: boolean } = {},
-    extra: Partial<CommandDeps> = {},
+    extra: Partial<CommandEnv> = {},
   ) {
     const hooks: Array<{ op: PcRequest["op"]; fn: (r: PcRequest) => void }> = [];
     const others = new Set<PcRequest>();
@@ -4774,7 +4809,7 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
       await pc.driver.up(inst, boot.namespaces ?? ["default"]);
     }
     const booted = pc.requests.length;
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...base,
       waitForHealth: undefined,
       readStoredHash: () => stackHash(stack),
@@ -4809,8 +4844,8 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
     };
   }
 
-  async function failure(deps: CommandDeps) {
-    return runUp(deps).then(
+  async function failure(deps: CommandEnv, options: UpOptions = {}) {
+    return runUp(deps, options).then(
       () => undefined,
       (e: unknown) => e as Error & { code?: string; details?: Record<string, unknown> },
     );
@@ -4853,7 +4888,7 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
 
   it("#203: -n naming only a namespace with no services fails NO_SERVICES_SELECTED, not NAMESPACE_NOT_RUNNING", async () => {
     const { deps, ours, id } = await liveInstance(twoNamespaces, { namespaces: ["one"] });
-    const err = await failure({ ...deps, namespaces: ["nope"] });
+    const err = await failure(deps, { namespaces: ["nope"] });
     expect(err?.code).toBe("NO_SERVICES_SELECTED");
     expect(err?.details).toEqual({
       worktree_id: id,
@@ -4874,13 +4909,13 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
         },
       },
     );
-    await runUp({ ...deps, namespaces: ["one", "nope"] });
+    await runUp(deps, { namespaces: ["one", "nope"] });
     expect(waited).toEqual([["a"]]);
   });
 
   it("#170: -n naming a namespace the instance was not booted with fails with NAMESPACE_NOT_RUNNING", async () => {
     const { deps, ours, id } = await liveInstance(twoNamespaces, { namespaces: ["one"] });
-    const err = await failure({ ...deps, namespaces: ["one", "two"] });
+    const err = await failure(deps, { namespaces: ["one", "two"] });
     expect(err?.code).toBe("NAMESPACE_NOT_RUNNING");
     expect(err?.message).toContain("'two'");
     expect(err?.message).toContain("devtrees down && devtrees up -n one -n two");
@@ -4900,14 +4935,13 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
       twoNamespaces,
       { namespaces: ["one", "two"] },
       {
-        namespaces: ["one"],
         waitForHealth: async ({ serviceNames }) => {
           waited.push([...serviceNames]);
         },
       },
     );
     pc.exit(wtSocket, "b", -1);
-    await expect(runUp(deps)).resolves.toBeDefined();
+    await expect(runUp(deps, { namespaces: ["one"] })).resolves.toBeDefined();
     // Only `one` is checked — `b` being dead in `two` is not this call's
     // business, so it is not restarted either (#178).
     expect(waited).toEqual([["a"]]);
@@ -4924,14 +4958,10 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
     };
 
     it("#162: a killed service is started again over the control socket, then up succeeds", async () => {
-      const { deps, ours, pc, wtSocket } = await liveInstance(
-        toyStack,
-        { namespaces: ["test"] },
-        { namespaces: ["test"], waitTimeoutMs: 10_000 },
-      );
+      const { deps, ours, pc, wtSocket } = await liveInstance(toyStack, { namespaces: ["test"] });
       pc.exit(wtSocket, "toy", -1);
       const deadPid = pc.pidOf(wtSocket, "toy");
-      const result = await runUp(deps);
+      const result = await runUp(deps, { waitTimeoutMs: 10_000, namespaces: ["test"] });
       expect(ours("start")).toEqual([{ op: "start", socketPath: wtSocket, services: ["toy"] }]);
       expect(result.restarted).toEqual(["toy"]);
       expect(pc.rows(wtSocket).find((r) => r.name === "toy")).toMatchObject({ status: "Running" });
@@ -4943,14 +4973,10 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
     it("the stale pre-restart row read right after `process start` does not fail-fast", async () => {
       // process-compose accepts the start but lists the old corpse (same pid:
       // not a new death) for three more reads before the new run shows up.
-      const { deps, pc, wtSocket, on } = await liveInstance(
-        toyStack,
-        { namespaces: ["test"] },
-        { namespaces: ["test"], waitTimeoutMs: 10_000 },
-      );
+      const { deps, pc, wtSocket, on } = await liveInstance(toyStack, { namespaces: ["test"] });
       pc.exit(wtSocket, "toy", -1);
       let staleReads: number | undefined;
-      const lagging: CommandDeps = {
+      const lagging: CommandEnv = {
         ...deps,
         processCompose: {
           ...pc.driver,
@@ -4964,22 +4990,20 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
         if (staleReads !== undefined && staleReads-- === 0)
           void pc.driver.startProcess(wtSocket, "toy");
       });
-      const result = await runUp(lagging);
+      const result = await runUp(lagging, { namespaces: ["test"], waitTimeoutMs: 10_000 });
       expect(result.restarted).toEqual(["toy"]);
       expect(pc.rows(wtSocket).find((r) => r.name === "toy")).toMatchObject({ status: "Running" });
     });
 
     it("a restarted service that dies again (new pid) fails fast with HEALTH_TIMEOUT naming it", async () => {
-      const { deps, ours, pc, wtSocket, on } = await liveInstance(
-        toyStack,
-        { namespaces: ["test"] },
-        { namespaces: ["test"], waitTimeoutMs: 60_000 },
-      );
+      const { deps, ours, pc, wtSocket, on } = await liveInstance(toyStack, {
+        namespaces: ["test"],
+      });
       pc.exit(wtSocket, "toy", -1);
       // The new run exits 1 at once.
       on("start", () => queueMicrotask(() => pc.exit(wtSocket, "toy", 1)));
       const started = Date.now();
-      const err = await failure(deps);
+      const err = await failure(deps, { waitTimeoutMs: 60_000, namespaces: ["test"] });
       expect(Date.now() - started).toBeLessThan(10_000);
       expect(err?.code).toBe("HEALTH_TIMEOUT");
       expect(err?.message).toContain("toy (Completed, exit 1)");
@@ -4999,11 +5023,7 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
           s.name === "toy" ? { ...s, readinessProbe: { exec: { command: "x" } } } : s,
         ),
       };
-      const { deps, pc, wtSocket, on } = await liveInstance(
-        probedToy,
-        { namespaces: ["test"] },
-        { namespaces: ["test"], waitTimeoutMs: 60_000 },
-      );
+      const { deps, pc, wtSocket, on } = await liveInstance(probedToy, { namespaces: ["test"] });
       pc.exit(wtSocket, "toy", -1);
       let readsSinceStart: number | undefined;
       on("start", () => {
@@ -5014,7 +5034,7 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
         if (readsSinceStart !== undefined && ++readsSinceStart === 2) pc.exit(wtSocket, "toy", -1);
       });
       const started = Date.now();
-      const err = await failure(deps);
+      const err = await failure(deps, { waitTimeoutMs: 60_000, namespaces: ["test"] });
       expect(readsSinceStart).toBeGreaterThanOrEqual(2);
       expect(Date.now() - started).toBeLessThan(10_000);
       expect(err?.code).toBe("HEALTH_TIMEOUT");
@@ -5024,20 +5044,19 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
     it("a restarted service process-compose never runs (its old row stays) is reported dead at the deadline, not before", async () => {
       // process-compose accepts the start, but the row keeps the old run's
       // pid: never read alive, never a new death, so dead only at the deadline.
-      const { deps, pc, wtSocket } = await liveInstance(
-        toyStack,
-        { namespaces: ["test"] },
-        { namespaces: ["test"], waitTimeoutMs: 600 },
-      );
+      const { deps, pc, wtSocket } = await liveInstance(toyStack, { namespaces: ["test"] });
       pc.exit(wtSocket, "toy", -1);
       const started = Date.now();
-      const err = await failure({
-        ...deps,
-        processCompose: {
-          ...pc.driver,
-          startProcess: async () => ({ ok: true, alreadyRunning: false }),
+      const err = await failure(
+        {
+          ...deps,
+          processCompose: {
+            ...pc.driver,
+            startProcess: async () => ({ ok: true, alreadyRunning: false }),
+          },
         },
-      });
+        { namespaces: ["test"], waitTimeoutMs: 600 },
+      );
       expect(Date.now() - started).toBeGreaterThanOrEqual(550);
       expect(err?.code).toBe("HEALTH_TIMEOUT");
       expect(err?.details).toMatchObject({ dead_services: [{ name: "toy", exit_code: -1 }] });
@@ -5050,15 +5069,11 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
           isolated("keeper", "sleep 100000"),
         ],
       };
-      const { deps, ours, pc, wtSocket, on } = await liveInstance(
-        stack,
-        {},
-        { waitTimeoutMs: 400 },
-      );
+      const { deps, ours, pc, wtSocket, on } = await liveInstance(stack, {});
       pc.exit(wtSocket, "toy", -1);
       // The new run fails its readiness probe.
       on("start", () => queueMicrotask(() => pc.setReady(wtSocket, "toy", false)));
-      const err = await failure(deps);
+      const err = await failure(deps, { waitTimeoutMs: 400 });
       expect(err?.code).toBe("HEALTH_TIMEOUT");
       expect(err?.message).toContain("healthy [toy] after 400ms");
       expect(ours("start")).toHaveLength(1);
@@ -5082,23 +5097,21 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
       const { deps, ours, pc, wtSocket } = await liveInstance(
         toyStack,
         { namespaces: ["test"] },
-        { namespaces: ["test"], waitForHealth: async () => {} },
+        { waitForHealth: async () => {} },
       );
       pc.backoff(wtSocket, "toy");
-      const result = await runUp(deps);
+      const result = await runUp(deps, { namespaces: ["test"] });
       expect(ours("start")).toEqual([]);
       expect(result.restarted).toEqual([]);
     });
 
     it("a refused start fails with SERVICE_START_FAILED naming the service and the down + up remedy", async () => {
-      const { deps, ours, pc, wtSocket, id } = await liveInstance(
-        toyStack,
-        { namespaces: ["test"] },
-        { namespaces: ["test"] },
-      );
+      const { deps, ours, pc, wtSocket, id } = await liveInstance(toyStack, {
+        namespaces: ["test"],
+      });
       pc.exit(wtSocket, "toy", -1);
       pc.refuse("start", "toy", 'FTL failed to start process toy error="no such process"');
-      const err = await failure(deps);
+      const err = await failure(deps, { namespaces: ["test"] });
       expect(err?.code).toBe("SERVICE_START_FAILED");
       expect(err?.message).toContain("toy");
       expect(err?.message).toContain("devtrees down && devtrees up -n test");
@@ -5113,11 +5126,9 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
     });
 
     it("process-compose refusing because the service is already running is not a failure", async () => {
-      const { deps, ours, pc, wtSocket, on, byOthers } = await liveInstance(
-        toyStack,
-        { namespaces: ["test"] },
-        { namespaces: ["test"] },
-      );
+      const { deps, ours, pc, wtSocket, on, byOthers } = await liveInstance(toyStack, {
+        namespaces: ["test"],
+      });
       pc.exit(wtSocket, "toy", -1);
       // Someone else starts toy just before up's start reaches process-compose.
       let beaten = false;
@@ -5126,7 +5137,7 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
         beaten = true;
         byOthers(() => void pc.driver.startProcess(wtSocket, "toy"));
       });
-      const result = await runUp(deps);
+      const result = await runUp(deps, { namespaces: ["test"] });
       // Someone else started it: not reported as restarted by this `up`.
       expect(result.restarted).toEqual([]);
       expect(ours("start")).toHaveLength(1);
@@ -5159,7 +5170,6 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
         toyStack,
         { namespaces: ["test"] },
         {
-          namespaces: ["test"],
           // Up's own spawn-window lock passes. Right after it is released, a
           // `down` takes the lifecycle lock, before up's restart: the
           // restart's lock is held and only retried briefly.
@@ -5178,7 +5188,7 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
         },
       );
       pc.exit(wtSocket, "toy", -1);
-      const err = await failure(deps);
+      const err = await failure(deps, { namespaces: ["test"] });
       release();
       await down;
       expect(locks).toBe(2);
@@ -5193,7 +5203,6 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
         toyStack,
         { namespaces: ["test"] },
         {
-          namespaces: ["test"],
           // Live for up's own spawn-window gate; the instance dies before the
           // restart's lock is taken, so its re-probe finds the socket stale.
           withLifecycleLock: async (a, i, fn) => {
@@ -5205,7 +5214,7 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
       crash = () => pc.crash(wtSocket);
       locks = 0;
       pc.exit(wtSocket, "toy", -1);
-      const err = await failure(deps);
+      const err = await failure(deps, { namespaces: ["test"] });
       expect(err?.code).toBe("INSTANCE_NOT_FOUND");
       expect(err?.message).toContain("Nothing was started");
       expect(err?.details).toEqual({ worktree_id: id });
@@ -5213,18 +5222,16 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
     });
 
     it("re-reads under the lock: a service no longer dead there is not started", async () => {
-      const { deps, ours, pc, wtSocket, on, byOthers } = await liveInstance(
-        toyStack,
-        { namespaces: ["test"] },
-        { namespaces: ["test"] },
-      );
+      const { deps, ours, pc, wtSocket, on, byOthers } = await liveInstance(toyStack, {
+        namespaces: ["test"],
+      });
       pc.exit(wtSocket, "toy", -1);
       // Someone else starts toy between up's first read and its re-read.
       let reads = 0;
       on("list", () => {
         if (++reads === 2) byOthers(() => void pc.driver.startProcess(wtSocket, "toy"));
       });
-      const result = await runUp(deps);
+      const result = await runUp(deps, { namespaces: ["test"] });
       expect(ours("start")).toEqual([]);
       expect(result.restarted).toEqual([]);
     });
@@ -5243,9 +5250,9 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
     const stack: ResolvedStack = {
       services: [{ ...isolated("web", "node a.js"), readinessProbe: { exec: { command: "x" } } }],
     };
-    const { deps, pc, wtSocket } = await liveInstance(stack, {}, { waitTimeoutMs: 300 });
+    const { deps, pc, wtSocket } = await liveInstance(stack, {});
     pc.setReady(wtSocket, "web", false);
-    const err = await failure(deps);
+    const err = await failure(deps, { waitTimeoutMs: 300 });
     expect(err?.code).toBe("HEALTH_TIMEOUT");
     expect(err?.message).toContain("after 300ms");
   });
@@ -5286,13 +5293,11 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
         { ...isolated("web", "node a.js"), namespace: "test" },
       ],
     };
-    const { deps, ours, pc, sharedSocket, wtSocket } = await liveInstance(
-      stack,
-      { worktree: false },
-      { namespaces: ["test"] },
-    );
+    const { deps, ours, pc, sharedSocket, wtSocket } = await liveInstance(stack, {
+      worktree: false,
+    });
     pc.exit(sharedSocket, "db", -1);
-    const err = await failure(deps);
+    const err = await failure(deps, { namespaces: ["test"] });
     expect(err?.code).toBe("SHARED_SERVICE_DEAD");
     expect(err?.details).toMatchObject({ remedy: "devtrees down --shared && devtrees up" });
     // Nothing started: neither the worktree instance nor a shared restart.
@@ -5302,22 +5307,22 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
 
   it("a selection read that keeps failing is HEALTH_TIMEOUT, never a success over an unknown selection", async () => {
     const stack: ResolvedStack = { services: [isolated("web", "node a.js")] };
-    const { deps, pc, wtSocket } = await liveInstance(stack, {}, { waitTimeoutMs: 300 });
+    const { deps, pc, wtSocket } = await liveInstance(stack, {});
     // process-compose stops answering.
     pc.freeze(wtSocket);
-    await expect(runUp(deps)).rejects.toMatchObject({ code: "HEALTH_TIMEOUT" });
+    await expect(runUp(deps, { waitTimeoutMs: 300 })).rejects.toMatchObject({
+      code: "HEALTH_TIMEOUT",
+    });
   });
 
   it("#192: a status read that keeps failing prints one retry notice through warn", async () => {
     const stack: ResolvedStack = { services: [isolated("web", "node a.js")] };
     const warnings: string[] = [];
-    const { deps, pc, wtSocket } = await liveInstance(
-      stack,
-      {},
-      { waitTimeoutMs: 300, warn: (m) => warnings.push(m) },
-    );
+    const { deps, pc, wtSocket } = await liveInstance(stack, {}, { warn: (m) => warnings.push(m) });
     pc.freeze(wtSocket);
-    await expect(runUp(deps)).rejects.toMatchObject({ code: "HEALTH_TIMEOUT" });
+    await expect(runUp(deps, { waitTimeoutMs: 300 })).rejects.toMatchObject({
+      code: "HEALTH_TIMEOUT",
+    });
     const notices = warnings.filter((w) => /service status failed/.test(w));
     expect(notices).toHaveLength(1);
     expect(notices[0]).toContain("did not answer within");
@@ -5326,14 +5331,12 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
   it("#192: a status read that hangs is cut off at the wait budget, not waited on forever", async () => {
     const stack: ResolvedStack = { services: [isolated("web", "node a.js")] };
     const warnings: string[] = [];
-    const { deps, pc, wtSocket } = await liveInstance(
-      stack,
-      {},
-      { waitTimeoutMs: 150, warn: (m) => warnings.push(m) },
-    );
+    const { deps, pc, wtSocket } = await liveInstance(stack, {}, { warn: (m) => warnings.push(m) });
     pc.freeze(wtSocket);
     const started = Date.now();
-    await expect(runUp(deps)).rejects.toMatchObject({ code: "HEALTH_TIMEOUT" });
+    await expect(runUp(deps, { waitTimeoutMs: 150 })).rejects.toMatchObject({
+      code: "HEALTH_TIMEOUT",
+    });
     expect(Date.now() - started).toBeLessThan(1500);
     // The read was bounded by the 150ms wait budget, not the 5s default.
     const notice = warnings.find((w) => /service status failed/.test(w));
@@ -5360,8 +5363,8 @@ describe("runUp — verifying a running instance (ADR-0008, #177)", () => {
 
   it("never attaches on the running path, even when a TTY is present", async () => {
     const stack: ResolvedStack = { services: [isolated("web", "node a.js")] };
-    const { deps, ours } = await liveInstance(stack, {}, { attach: true });
-    await runUp(deps);
+    const { deps, ours } = await liveInstance(stack, {});
+    await runUp(deps, { attach: true });
     expect(ours("attach")).toEqual([]);
   });
 });
@@ -5402,7 +5405,7 @@ describe("runUp — stale port block detection (#58)", () => {
       worktreeRootOverride: "/wt",
       initialRegistry: { [loginId]: blockBase },
     });
-    const deps: CommandDeps = { ...base, portHolder, portAccepts: async () => true };
+    const deps: CommandEnv = { ...base, portHolder, portAccepts: async () => true };
 
     const err = await runUp(deps).then(
       () => undefined,
@@ -5443,7 +5446,7 @@ describe("runUp — stale port block detection (#58)", () => {
       pid: port, // pid = port for easy assertion
       command: `proc@${port}`,
     });
-    const deps: CommandDeps = { ...pcDeps({ stack }), portHolder, portAccepts: async () => true };
+    const deps: CommandEnv = { ...pcDeps({ stack }), portHolder, portAccepts: async () => true };
     const err = await runUp(deps).then(
       () => undefined,
       (e: unknown) => e as Error & { details?: unknown },
@@ -5456,7 +5459,7 @@ describe("runUp — stale port block detection (#58)", () => {
 
   it("reports collision even when the holder probe can't identify the pid/command (lsof missing / degraded)", async () => {
     const portHolder = async () => ({ free: false as const, pid: null, command: null }) as const;
-    const deps: CommandDeps = { ...pcDeps({ stack }), portHolder, portAccepts: async () => true };
+    const deps: CommandEnv = { ...pcDeps({ stack }), portHolder, portAccepts: async () => true };
     const err = await runUp(deps).then(
       () => undefined,
       (e: unknown) => e as Error & { code?: string; details?: unknown },
@@ -5481,14 +5484,14 @@ describe("runUp — stale port block detection (#58)", () => {
     };
     // First up uses a non-tripping holder to get us into the running state.
     const base = pcDeps({ stack });
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...base,
       portHolder: async () => ({ free: true as const }),
     };
     await runUp(deps);
     // Second up: instance running → idempotent path. Swap in the tripping
     // holder; if the check ran, this call would reject.
-    const drifted: CommandDeps = { ...deps, portHolder };
+    const drifted: CommandEnv = { ...deps, portHolder };
     const result = await runUp(drifted);
     expect(result.worktreeId).toBe(base.expectedWorktreeId);
     expect(holderCalls).toBe(0);
@@ -5497,7 +5500,7 @@ describe("runUp — stale port block detection (#58)", () => {
 
   it("clean start (no holder reports a collision) does not throw — the happy path is unchanged", async () => {
     const base = pcDeps({ stack });
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...base,
       portHolder: async () => ({ free: true as const }),
     };
@@ -5513,7 +5516,7 @@ describe("runUp — stale port block detection (#58)", () => {
       probed.push(port);
       return { free: true as const };
     };
-    const deps: CommandDeps = { ...pcDeps({ stack }), portHolder, portAccepts: async () => true };
+    const deps: CommandEnv = { ...pcDeps({ stack }), portHolder, portAccepts: async () => true };
     const result = await runUp(deps);
     // The stack declares 2 named ports; the block holds 32. The check must
     // touch only the two.
@@ -5581,7 +5584,7 @@ describe("runUp — crash recovery: stale control socket (#80)", () => {
   it("a stale socket does not disable the STALE_PORT_BLOCK pre-flight (#58)", async () => {
     const base = pcDeps({ stack });
     await crashedInstance(base, base.inst);
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...base,
       // An orphaned process still squats this worktree's block.
       portHolder: async () => ({ free: false as const, pid: 4242, command: "node orphan.mjs" }),
@@ -5796,7 +5799,7 @@ describe("liveness unknown — retry, then fail without touching the socket (#18
     await pc.driver.up(wt);
     const booted = pc.requests.length;
     const reaped: string[] = [];
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...onPc.deps,
       probeSocket,
       probeRetryDelaysMs: [0, 0, 0],
@@ -6240,7 +6243,7 @@ describe("runUp — per-worktree lifecycle lock (issue #91)", () => {
     });
     const base = pcDeps({ stack: oneIsolated, pc });
 
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...base,
       withLifecycleLock: makeSpyLock(events),
       waitForSocketFile: async () => {
@@ -6275,7 +6278,7 @@ describe("runUp — per-worktree lifecycle lock (issue #91)", () => {
     const before = pc.requests.length;
 
     const currentHashStore: Record<string, string> = {};
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...base,
       withLifecycleLock: makeSpyLock(events),
       readStoredHash: (_a, id) => currentHashStore[id],
@@ -6299,7 +6302,7 @@ describe("runUp — per-worktree lifecycle lock (issue #91)", () => {
     const store: Record<string, string> = {};
     // No `withLifecycleLock` injection: the REAL per-worktree lockfile under
     // the temp anchor is the mechanism under test here.
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...base,
       readStoredHash: (_a, id) => store[id],
       writeStoredHash: (_a, id, h) => {
@@ -6319,7 +6322,7 @@ describe("runUp — per-worktree lifecycle lock (issue #91)", () => {
 
   it("releases the lock when the spawn throws, so a follow-up up is not bricked", async () => {
     const base = pcDeps({ stack: oneIsolated });
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...base,
       processCompose: {
         ...base.pc.driver,
@@ -6346,7 +6349,7 @@ describe("runUp — per-worktree lifecycle lock (issue #91)", () => {
       `${process.pid}\n`,
       { flag: "wx" },
     );
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...base,
       // Zero retries: exercise the budget-exhausted path without the default wait.
       withLifecycleLock: (anchor, id, fn) => withLifecycleLock(anchor, id, fn, { retries: 0 }),
@@ -6410,7 +6413,7 @@ describe("bounded down — force-kill and DOWN_TIMEOUT (#190)", () => {
     const pcGone = (): boolean =>
       (opts.pcExits && killed.has(servicePid)) ||
       (opts.pcExitsOnKill !== undefined && killed.has(opts.pcExitsOnKill));
-    const seams: NonNullable<CommandDeps["stop"]> = {
+    const seams: NonNullable<CommandEnv["stop"]> = {
       readProcessTable: async () => [
         {
           pid: PC_PID,
@@ -6644,7 +6647,6 @@ describe("bounded down — force-kill and DOWN_TIMEOUT (#190)", () => {
     const { pc, pcDeps } = stuckPc();
     await pc.driver.up(orphan);
     const inputs = {
-      cwd: join(tmp.worktreeRoot, "login"),
       git: (args: ReadonlyArray<string>): string => {
         if (args[1] === "--git-common-dir") return tmp.anchor;
         if (args[1] === "--show-toplevel") return join(tmp.worktreeRoot, "login");
@@ -6824,7 +6826,7 @@ describe("runDown after process-compose stops (#155)", () => {
       getServiceStatuses: async () => parseServiceStatuses(JSON.stringify(listed)),
     };
     const reaped: string[][] = [];
-    const reap: CommandDeps["reap"] = async (config) => {
+    const reap: CommandEnv["reap"] = async (config) => {
       reaped.push(Object.keys(config.processes));
       return { ranCount: Object.keys(config.processes).length, failures: [] };
     };
@@ -6844,7 +6846,7 @@ describe("runDown after process-compose stops (#155)", () => {
     const up = await runUp(base);
     const socket = socketsOf(onPc.deps).worktree;
     const reaped: string[][] = [];
-    const reap: CommandDeps["reap"] = async (config) => {
+    const reap: CommandEnv["reap"] = async (config) => {
       reaped.push(Object.keys(config.processes));
       return { ranCount: Object.keys(config.processes).length, failures: [] };
     };
@@ -6998,7 +7000,7 @@ describe("STALE_PORT_BLOCK holders that refuse connections (#155)", () => {
   it("does not fail up when every holder refuses connections; it warns instead", async () => {
     const warnings: string[] = [];
     const base = pcDeps({ stack, warn: (m) => warnings.push(m) });
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...base,
       portHolder: async () => ({ free: false as const, pid: 77, command: "OrbStack Helper" }),
       portAccepts: async () => false,
@@ -7014,7 +7016,7 @@ describe("STALE_PORT_BLOCK holders that refuse connections (#155)", () => {
   it("fails when one holder accepts, labelling the refusing one and a port forwarder not to kill", async () => {
     const holders: Record<string, { pid: number; command: string }> = {};
     const base = pcDeps({ stack });
-    const deps: CommandDeps = {
+    const deps: CommandEnv = {
       ...base,
       portHolder: async (port) => {
         const h = holders[String(port)] ?? { pid: port, command: "OrbStack Helper" };
@@ -7103,10 +7105,7 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
     fixture: Fixture,
     stack: ResolvedStack,
     worktreeId: string,
-    opts: {
-      reloadFailure?: Extract<ReloadResult, { ok: false }>;
-      namespaces?: string[];
-    } = {},
+    opts: { reloadFailure?: Extract<ReloadResult, { ok: false }> } = {},
   ) {
     const deps = pcDeps({
       stack,
@@ -7119,9 +7118,8 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
     const since = fixture.pc.requests.length;
     const sinceThen = (op: PcRequest["op"]) =>
       fixture.pc.requests.slice(since).filter((r) => r.op === op);
-    const withDriver: CommandDeps = {
+    const withDriver: CommandEnv = {
       ...deps,
-      ...(opts.namespaces !== undefined ? { namespaces: opts.namespaces } : {}),
       ...(opts.reloadFailure !== undefined
         ? { processCompose: reloadFailing(fixture.pc, opts.reloadFailure) }
         : {}),
@@ -7156,7 +7154,7 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
 
   it("an up that does not select a namespaced shared service does not start it", async () => {
     const fixture = nsFixture("dt-nss-unselected-");
-    const result = await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+    const result = await runUp(wt(fixture, base, "login").deps, { namespaces: ["app", "db"] });
 
     expect(result.sharedStarted).toBe(true);
     expect(Object.keys(sharedConfigOf(fixture))).toEqual(["postgres"]);
@@ -7169,9 +7167,9 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
 
   it("a fresh up selecting the namespace starts the shared service with the shared instance", async () => {
     const fixture = nsFixture("dt-nss-fresh-");
-    const result = await runUp(
-      wt(fixture, base, "login", { namespaces: ["app", "db-shared"] }).deps,
-    );
+    const result = await runUp(wt(fixture, base, "login").deps, {
+      namespaces: ["app", "db-shared"],
+    });
     expect(result.sharedStarted).toBe(true);
     expect(result.sharedActivated).toEqual([]);
     expect(Object.keys(sharedConfigOf(fixture))).toEqual(["postgres", "db-shared"]);
@@ -7182,8 +7180,8 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
     const onlyNamespaced: ResolvedStack = {
       services: base.services.filter((s) => s.name !== "postgres"),
     };
-    const login = wt(fixture, onlyNamespaced, "login", { namespaces: ["app", "db"] });
-    const result = await runUp(login.deps);
+    const login = wt(fixture, onlyNamespaced, "login");
+    const result = await runUp(login.deps, { namespaces: ["app", "db"] });
     expect(result.sharedStarted).toBe(false);
     expect(login.ups.filter((r) => r.socketPath === login.sharedSock)).toEqual([]);
     expect(fixture.pc.isUp(login.sharedSock)).toBe(false);
@@ -7191,13 +7189,13 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
 
   it("a later up selecting it adds it to the running shared instance, leaving the others as they were", async () => {
     const fixture = nsFixture("dt-nss-activate-");
-    const first = await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+    const first = await runUp(wt(fixture, base, "login").deps, { namespaces: ["app", "db"] });
     const postgresBefore = sharedConfigOf(fixture).postgres;
     const sharedSock = sharedInstancePaths(fixture.sharedAnchor).socketPath;
     const postgresPid = fixture.pc.pidOf(sharedSock, "postgres");
 
-    const second = wt(fixture, base, "billing", { namespaces: ["app", "db-shared"] });
-    const result = await runUp(second.deps);
+    const second = wt(fixture, base, "billing");
+    const result = await runUp(second.deps, { namespaces: ["app", "db-shared"] });
 
     expect(result.sharedStarted).toBe(false);
     expect(result.sharedActivated).toEqual(["db-shared"]);
@@ -7229,18 +7227,18 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
 
   it("an up that already finds it running adds nothing", async () => {
     const fixture = nsFixture("dt-nss-noop-");
-    await runUp(wt(fixture, base, "login", { namespaces: ["app", "db-shared"] }).deps);
-    const second = wt(fixture, base, "billing", { namespaces: ["app", "db-shared"] });
-    const result = await runUp(second.deps);
+    await runUp(wt(fixture, base, "login").deps, { namespaces: ["app", "db-shared"] });
+    const second = wt(fixture, base, "billing");
+    const result = await runUp(second.deps, { namespaces: ["app", "db-shared"] });
     expect(result.sharedActivated).toEqual([]);
     expect(second.reloads).toEqual([]);
   });
 
   it("drift in a namespaced shared service does not block an up that does not select it", async () => {
     const fixture = nsFixture("dt-nss-drift-scoped-");
-    await runUp(wt(fixture, base, "login", { namespaces: ["app", "db-shared"] }).deps);
+    await runUp(wt(fixture, base, "login").deps, { namespaces: ["app", "db-shared"] });
 
-    const result = await runUp(wt(fixture, drifted, "billing", { namespaces: ["app", "db"] }).deps);
+    const result = await runUp(wt(fixture, drifted, "billing").deps, { namespaces: ["app", "db"] });
     expect(result.sharedStarted).toBe(false);
 
     const env = await runEnv(wt(fixture, drifted, "billing").deps);
@@ -7249,10 +7247,10 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
 
   it("drift in a namespaced shared service fails an up that selects it, naming only that service", async () => {
     const fixture = nsFixture("dt-nss-drift-selected-");
-    await runUp(wt(fixture, base, "login", { namespaces: ["app", "db-shared"] }).deps);
+    await runUp(wt(fixture, base, "login").deps, { namespaces: ["app", "db-shared"] });
 
-    const billing = wt(fixture, drifted, "billing", { namespaces: ["app", "db-shared"] });
-    const err = await failure(runUp(billing.deps));
+    const billing = wt(fixture, drifted, "billing");
+    const err = await failure(runUp(billing.deps, { namespaces: ["app", "db-shared"] }));
     expect(err?.code).toBe("SHARED_DRIFT");
     expect(err?.message).toMatch(
       /'db-shared' \(running [0-9a-f]{12}, this worktree [0-9a-f]{12}\)/,
@@ -7287,11 +7285,11 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
         isolated("web", "node web.js", ["WEB_PORT"]),
       ],
     });
-    await runUp(wt(fixture, appShared("supabase start"), "login", { namespaces: ["app"] }).deps);
+    await runUp(wt(fixture, appShared("supabase start"), "login").deps, { namespaces: ["app"] });
 
     // A worktree booted with `-n app`, now on a branch that edited `db-shared`:
     // its bare re-up reads `app` back and so checks `db-shared`.
-    await runUp(wt(fixture, appShared("supabase start"), "billing", { namespaces: ["app"] }).deps);
+    await runUp(wt(fixture, appShared("supabase start"), "billing").deps, { namespaces: ["app"] });
     const bare = wt(fixture, appShared("supabase start --debug"), "billing");
     const err = await failure(runUp(bare.deps));
     expect(err?.code).toBe("SHARED_DRIFT");
@@ -7315,22 +7313,22 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
         inNs(isolated("api", "node api.js", ["API_PORT"]), "app"),
       ],
     };
-    await runUp(wt(fixture, withDep, "login", { namespaces: ["app", "db-shared"] }).deps);
+    await runUp(wt(fixture, withDep, "login").deps, { namespaces: ["app", "db-shared"] });
     expect(Object.keys(sharedConfigOf(fixture))).toEqual(["auth-shared", "db-shared"]);
   });
 
   it("a refused reload fails SHARED_ACTIVATION_FAILED, restores the shared config and records nothing", async () => {
     const fixture = nsFixture("dt-nss-refused-");
-    await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+    await runUp(wt(fixture, base, "login").deps, { namespaces: ["app", "db"] });
     const configPath = sharedInstancePaths(fixture.sharedAnchor).configPath;
     const before = readFileSync(configPath, "utf8");
 
     const err = await failure(
       runUp(
         wt(fixture, base, "billing", {
-          namespaces: ["app", "db-shared"],
           reloadFailure: { ok: false, reason: "error", message: "HTTP 500" },
         }).deps,
+        { namespaces: ["app", "db-shared"] },
       ),
     );
     expect(err?.code).toBe("SHARED_ACTIVATION_FAILED");
@@ -7342,13 +7340,13 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
 
   it("a not-yet-running service whose port a running shared service owns is SHARED_DRIFT", async () => {
     const fixture = nsFixture("dt-nss-port-");
-    await runUp(wt(fixture, base, "login", { namespaces: ["app", "db-shared"] }).deps);
+    await runUp(wt(fixture, base, "login").deps, { namespaces: ["app", "db-shared"] });
     // A branch that renamed `db-shared` but kept its port name.
     const renamed: ResolvedStack = {
       services: base.services.map((s) => (s.name === "db-shared" ? { ...s, name: "supabase" } : s)),
     };
     const err = await failure(
-      runUp(wt(fixture, renamed, "billing", { namespaces: ["app", "db-shared"] }).deps),
+      runUp(wt(fixture, renamed, "billing").deps, { namespaces: ["app", "db-shared"] }),
     );
     expect(err?.code).toBe("SHARED_DRIFT");
     expect(err?.details?.port_conflicts).toEqual([
@@ -7358,14 +7356,14 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
 
   it("drift in an always-on shared service still fails every up and env", async () => {
     const fixture = nsFixture("dt-nss-always-on-");
-    await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+    await runUp(wt(fixture, base, "login").deps, { namespaces: ["app", "db"] });
     const edited: ResolvedStack = {
       services: base.services.map((s) =>
         s.name === "postgres" ? { ...s, command: "postgres -D ./other" } : s,
       ),
     };
     const err = await failure(
-      runUp(wt(fixture, edited, "billing", { namespaces: ["app", "db"] }).deps),
+      runUp(wt(fixture, edited, "billing").deps, { namespaces: ["app", "db"] }),
     );
     expect(err?.code).toBe("SHARED_DRIFT");
     expect((await failure(runEnv(wt(fixture, edited, "billing").deps)))?.code).toBe("SHARED_DRIFT");
@@ -7384,12 +7382,12 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
 
     it("is attributed to this worktree's definitions when they match it, so adding a service works", async () => {
       const fixture = nsFixture("dt-nss-legacy-");
-      await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+      await runUp(wt(fixture, base, "login").deps, { namespaces: ["app", "db"] });
       legacy(fixture, sharedStackHash({ services: [base.services[0] as ResolvedService] }));
 
-      const result = await runUp(
-        wt(fixture, base, "billing", { namespaces: ["app", "db-shared"] }).deps,
-      );
+      const result = await runUp(wt(fixture, base, "billing").deps, {
+        namespaces: ["app", "db-shared"],
+      });
       expect(result.sharedActivated).toEqual(["db-shared"]);
       expect(Object.keys(readSharedState(fixture.sharedAnchor)?.services ?? {})).toEqual([
         "postgres",
@@ -7399,11 +7397,11 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
 
     it("drifts with an unknown revision when they do not match it", async () => {
       const fixture = nsFixture("dt-nss-legacy-drift-");
-      await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+      await runUp(wt(fixture, base, "login").deps, { namespaces: ["app", "db"] });
       legacy(fixture, "not-this-stack");
 
       const err = await failure(
-        runUp(wt(fixture, base, "billing", { namespaces: ["app", "db"] }).deps),
+        runUp(wt(fixture, base, "billing").deps, { namespaces: ["app", "db"] }),
       );
       expect(err?.code).toBe("SHARED_DRIFT");
       expect(err?.message).toMatch(/'postgres' \(running unknown/);
@@ -7412,15 +7410,15 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
 
   it("up --dry-run reports the shared services the selection includes and previews only those", async () => {
     const fixture = nsFixture("dt-nss-dry-");
-    const without = await runUpDryRun(
-      wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps,
-    );
+    const without = await runUpDryRun(wt(fixture, base, "login").deps, {
+      namespaces: ["app", "db"],
+    });
     expect(without.selectedSharedServices).toEqual(["postgres"]);
     expect(Object.keys(without.sharedConfig?.processes ?? {})).toEqual(["postgres"]);
 
-    const withShared = await runUpDryRun(
-      wt(fixture, base, "login", { namespaces: ["app", "db-shared"] }).deps,
-    );
+    const withShared = await runUpDryRun(wt(fixture, base, "login").deps, {
+      namespaces: ["app", "db-shared"],
+    });
     expect(withShared.selectedSharedServices).toEqual(["postgres", "db-shared"]);
     expect(Object.keys(withShared.sharedConfig?.processes ?? {})).toEqual([
       "postgres",
@@ -7430,11 +7428,10 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
 
   it("a timed-out add is recorded and fails SHARED_ACTIVATION_FAILED; the retried up re-sends the reload", async () => {
     const fixture = nsFixture("dt-nss-timeout-");
-    await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+    await runUp(wt(fixture, base, "login").deps, { namespaces: ["app", "db"] });
 
     // process-compose never answers the reload within its budget.
     const hanging = wt(fixture, base, "billing", {
-      namespaces: ["app", "db-shared"],
       reloadFailure: {
         ok: false,
         reason: "timeout",
@@ -7442,7 +7439,7 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
           "process-compose config reload did not finish within 0s; a changed service's old process has not stopped",
       },
     });
-    const err = await failure(runUp(hanging.deps));
+    const err = await failure(runUp(hanging.deps, { namespaces: ["app", "db-shared"] }));
     expect(err?.code).toBe("SHARED_ACTIVATION_FAILED");
     expect(err?.details).toMatchObject({
       services: ["db-shared"],
@@ -7456,8 +7453,8 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
     // The reload never landed: the instance still runs postgres alone. The
     // retry must not trust the record — it re-sends the reload.
     expect(fixture.pc.rows(hanging.sharedSock).map((r) => r.name)).toEqual(["postgres"]);
-    const retry = wt(fixture, base, "billing", { namespaces: ["app", "db-shared"] });
-    const result = await runUp(retry.deps);
+    const retry = wt(fixture, base, "billing");
+    const result = await runUp(retry.deps, { namespaces: ["app", "db-shared"] });
     expect(result.sharedActivated).toEqual(["db-shared"]);
     expect(retry.reloads).toHaveLength(1);
     expect(fixture.pc.rows(retry.sharedSock).map((r) => r.name)).toEqual(["postgres", "db-shared"]);
@@ -7466,9 +7463,9 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
 
   it("a recorded service the instance runs is not re-added", async () => {
     const fixture = nsFixture("dt-nss-present-");
-    await runUp(wt(fixture, base, "login", { namespaces: ["app", "db-shared"] }).deps);
-    const again = wt(fixture, base, "billing", { namespaces: ["app", "db-shared"] });
-    const result = await runUp(again.deps);
+    await runUp(wt(fixture, base, "login").deps, { namespaces: ["app", "db-shared"] });
+    const again = wt(fixture, base, "billing");
+    const result = await runUp(again.deps, { namespaces: ["app", "db-shared"] });
     expect(result.sharedActivated).toEqual([]);
     expect(again.reloads).toEqual([]);
   });
@@ -7480,7 +7477,7 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
    */
   it("the namespaced remedy names the namespace the RUNNING definition is in, not this branch's (#244 follow-up)", async () => {
     const fixture = nsFixture("dt-nss-drift-running-ns-");
-    await runUp(wt(fixture, base, "login", { namespaces: ["app", "db-shared"] }).deps);
+    await runUp(wt(fixture, base, "login").deps, { namespaces: ["app", "db-shared"] });
     // This branch moved db-shared to namespace `db2` (and changed it): the
     // running instance still runs it in `db-shared`, which is what the
     // teardown selects its targets by.
@@ -7488,7 +7485,7 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
       services: drifted.services.map((s) => (s.name === "db-shared" ? inNs(s, "db2") : s)),
     };
     const err = await failure(
-      runUp(wt(fixture, moved, "billing", { namespaces: ["app", "db2"] }).deps),
+      runUp(wt(fixture, moved, "billing").deps, { namespaces: ["app", "db2"] }),
     );
     expect(err?.code).toBe("SHARED_DRIFT");
     expect(err?.details?.remedy).toBe(
@@ -7498,7 +7495,7 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
 
   describe("shared-step markers (#244 follow-up)", () => {
     /** Run `fn` with `deps`, observing the in-flight worktrees right after each shared step. */
-    function observingSharedStep(deps: CommandDeps) {
+    function observingSharedStep(deps: CommandEnv) {
       const seen: InFlightWorktree[][] = [];
       return {
         seen,
@@ -7509,17 +7506,15 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
             seen.push(inFlightWorktrees(anchor));
             return result;
           },
-        } as CommandDeps,
+        } as CommandEnv,
       };
     }
 
     it("an up's shared step names the shared services it selected and the shared ports it injects", async () => {
       const fixture = nsFixture("dt-marker-up-");
       const id = idFor(fixture.wtRoot, "login");
-      const { deps, seen } = observingSharedStep(
-        wt(fixture, base, "login", { namespaces: ["app", "db-shared"] }).deps,
-      );
-      await runUp(deps);
+      const { deps, seen } = observingSharedStep(wt(fixture, base, "login").deps);
+      await runUp(deps, { namespaces: ["app", "db-shared"] });
       expect(seen[0]).toEqual([
         {
           id,
@@ -7552,15 +7547,13 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
         ],
       };
       const fixture = nsFixture("dt-marker-edge-");
-      const fresh = observingSharedStep(wt(fixture, edged, "login", { namespaces: ["app"] }).deps);
-      await runUp(fresh.deps);
+      const fresh = observingSharedStep(wt(fixture, edged, "login").deps);
+      await runUp(fresh.deps, { namespaces: ["app"] });
       expect(fresh.seen[0]?.[0]?.marker?.services).toEqual(["postgres", "sa"]);
       // The running path: a hot-reload may start any isolated service, so
       // every cross-tier edge of the stack counts.
-      const running = observingSharedStep(
-        wt(fixture, edged, "login", { namespaces: ["app"] }).deps,
-      );
-      await runUp(running.deps);
+      const running = observingSharedStep(wt(fixture, edged, "login").deps);
+      await runUp(running.deps, { namespaces: ["app"] });
       expect(running.seen[0]?.[0]?.marker?.services).toEqual(["postgres", "sa", "sw"]);
     });
 
@@ -7615,19 +7608,19 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
                 { stack: branchB, id: "billing", ns: ["app", "ys"] },
                 { stack: branchA, id: "login", ns: ["app"] },
               ];
-        const one = await runUp(wt(fixture, first.stack, first.id, { namespaces: first.ns }).deps);
-        const two = await runUp(
-          wt(fixture, second.stack, second.id, { namespaces: second.ns }).deps,
-        );
+        const one = await runUp(wt(fixture, first.stack, first.id).deps, { namespaces: first.ns });
+        const two = await runUp(wt(fixture, second.stack, second.id).deps, {
+          namespaces: second.ns,
+        });
         const [envA, envB] = order === "A then B" ? [one.env, two.env] : [two.env, one.env];
         expect(envA.X_PORT).toBe(envB.X_PORT);
         expect(envA.DB_PORT).toBe(envB.DB_PORT);
         expect(new Set([envB.DB_PORT, envB.X_PORT, envB.Y_PORT]).size).toBe(3);
 
         // Activating x from either branch binds the number both were told.
-        const activate = await runUp(
-          wt(fixture, branchA, "login", { namespaces: ["app", "xs"] }).deps,
-        );
+        const activate = await runUp(wt(fixture, branchA, "login").deps, {
+          namespaces: ["app", "xs"],
+        });
         expect(activate.sharedActivated).toEqual(["x"]);
         expect(activate.env.X_PORT).toBe(envB.X_PORT);
         expect(readSharedState(fixture.sharedAnchor)?.ports.X_PORT).toBe(Number(envA.X_PORT));
@@ -7641,13 +7634,13 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
 
     it("env and up --dry-run read the map and never write it; their origins say so", async () => {
       const fixture = nsFixture("dt-238-readonly-");
-      const deps = wt(fixture, branchA, "login", { namespaces: ["app"] }).deps;
+      const deps = wt(fixture, branchA, "login").deps;
       const before = await runEnv(deps);
-      await runUpDryRun(deps);
+      await runUpDryRun(deps, { namespaces: ["app"] });
       expect(mapOf(fixture)).toBeUndefined();
       expect(before.sharedPorts?.X_PORT?.origin).toBe("predicted");
 
-      const up = await runUp(deps);
+      const up = await runUp(deps, { namespaces: ["app"] });
       expect(Number(up.env.X_PORT)).toBe(before.sharedPorts?.X_PORT?.port);
       const after = await runEnv(deps);
       expect(after.sharedPorts).toEqual({
@@ -7658,10 +7651,10 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
 
     it("the map survives down --shared, so the next shared start binds the same numbers", async () => {
       const fixture = nsFixture("dt-238-down-");
-      const a = await runUp(wt(fixture, branchA, "login", { namespaces: ["app"] }).deps);
+      const a = await runUp(wt(fixture, branchA, "login").deps, { namespaces: ["app"] });
       await runDown(wt(fixture, branchA, "login").deps, { shared: true });
       expect(existsSync(sharedInstancePaths(fixture.sharedAnchor).socketPath)).toBe(false);
-      const b = await runUp(wt(fixture, branchB, "billing", { namespaces: ["app", "ys"] }).deps);
+      const b = await runUp(wt(fixture, branchB, "billing").deps, { namespaces: ["app", "ys"] });
       expect(b.sharedStarted).toBe(true);
       expect(b.env.X_PORT).toBe(a.env.X_PORT);
       expect(b.env.Y_PORT).not.toBe(a.env.X_PORT);
@@ -7669,12 +7662,12 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
 
     it("a 0.4.0 shared instance (no map) is seeded from its live numbers: no reload, no drift", async () => {
       const fixture = nsFixture("dt-238-migrate-");
-      const first = await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+      const first = await runUp(wt(fixture, base, "login").deps, { namespaces: ["app", "db"] });
       rmSync(sharedPortMapFile(fixture.sharedAnchor));
       const configBefore = sharedConfigOf(fixture);
 
-      const second = wt(fixture, base, "billing", { namespaces: ["app", "db"] });
-      const result = await runUp(second.deps);
+      const second = wt(fixture, base, "billing");
+      const result = await runUp(second.deps, { namespaces: ["app", "db"] });
       expect(result.sharedStarted).toBe(false);
       expect(second.reloads).toEqual([]);
       expect(sharedConfigOf(fixture)).toEqual(configBefore);
@@ -7690,12 +7683,12 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
       // 0.4.0 started postgres from a branch that predicted SB_PORT one slot
       // further on; that number is in postgres's env, so it is the one kept.
       const fixture = nsFixture("dt-238-migrate-env-");
-      const first = await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+      const first = await runUp(wt(fixture, base, "login").deps, { namespaces: ["app", "db"] });
       const predicted = Number(first.env.SB_PORT) + 5;
       rewriteSharedEnv(fixture, "postgres", "SB_PORT", predicted);
       rmSync(sharedPortMapFile(fixture.sharedAnchor));
 
-      const result = await runUp(wt(fixture, base, "billing", { namespaces: ["app", "db"] }).deps);
+      const result = await runUp(wt(fixture, base, "billing").deps, { namespaces: ["app", "db"] });
       expect(Number(result.env.SB_PORT)).toBe(predicted);
       expect(mapOf(fixture)?.SB_PORT).toBe(predicted);
     });
@@ -7704,15 +7697,15 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
       // An older devtrees beside this one bound DB_PORT on SB_PORT's
       // recorded number: handing it out would give one port to two names.
       const fixture = nsFixture("dt-238-conflict-");
-      const first = await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+      const first = await runUp(wt(fixture, base, "login").deps, { namespaces: ["app", "db"] });
       writeSharedPortMap(fixture.sharedAnchor, {
         DB_PORT: Number(first.env.SB_PORT),
         SB_PORT: Number(first.env.SB_PORT),
       });
       const mapBefore = readFileSync(sharedPortMapFile(fixture.sharedAnchor), "utf8");
 
-      const blocked = wt(fixture, base, "billing", { namespaces: ["app", "db-shared"] });
-      const err = await failure(runUp(blocked.deps));
+      const blocked = wt(fixture, base, "billing");
+      const err = await failure(runUp(blocked.deps, { namespaces: ["app", "db-shared"] }));
       expect(err?.code).toBe("SHARED_PORT_CONFLICT");
       expect(err?.details?.conflicts).toContainEqual({
         reason: "port_taken",
@@ -7730,17 +7723,20 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
     it("a running process holding a stale number blocks only the up that would add its service", async () => {
       // 0.4.0 left postgres with SB_PORT=<DB_PORT>: a number another name holds.
       const fixture = nsFixture("dt-238-stale-");
-      const first = await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+      const first = await runUp(wt(fixture, base, "login").deps, { namespaces: ["app", "db"] });
       rewriteSharedEnv(fixture, "postgres", "SB_PORT", Number(first.env.DB_PORT));
       rmSync(sharedPortMapFile(fixture.sharedAnchor));
 
       const warnings: string[] = [];
-      const unaffected = wt(fixture, base, "billing", { namespaces: ["app", "db"] });
-      await runUp({ ...unaffected.deps, warn: (m) => warnings.push(m) });
+      const unaffected = wt(fixture, base, "billing");
+      await runUp(
+        { ...unaffected.deps, warn: (m) => warnings.push(m) },
+        { namespaces: ["app", "db"] },
+      );
       expect(warnings.some((w) => w.includes("'postgres'") && w.includes("SB_PORT"))).toBe(true);
 
-      const adding = wt(fixture, base, "billing", { namespaces: ["app", "db-shared"] });
-      const err = await failure(runUp(adding.deps));
+      const adding = wt(fixture, base, "billing");
+      const err = await failure(runUp(adding.deps, { namespaces: ["app", "db-shared"] }));
       expect(err?.code).toBe("SHARED_PORT_CONFLICT");
       expect(err?.details?.conflicts).toEqual([
         expect.objectContaining({ reason: "stale_env", port_name: "SB_PORT", process: "postgres" }),
@@ -7752,7 +7748,7 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
     it("a full shared block fails SHARED_PORT_CONFLICT block_full; prune --shared-ports frees it", async () => {
       // Names no branch uses any more hold every number of the shared block.
       const fixture = nsFixture("dt-238-full-");
-      const first = await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+      const first = await runUp(wt(fixture, base, "login").deps, { namespaces: ["app", "db"] });
       const used = { DB_PORT: Number(first.env.DB_PORT), SB_PORT: Number(first.env.SB_PORT) };
       const sharedBase = fixture.registryRef.snapshot.__shared__ ?? 0;
       const stale: Record<string, number> = {};
@@ -7764,8 +7760,8 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
       const grown: ResolvedStack = {
         services: [...base.services, shared("cache", "redis-server", ["CACHE_PORT"])],
       };
-      const blocked = wt(fixture, grown, "billing", { namespaces: ["app", "db"] });
-      const err = await failure(runUp(blocked.deps));
+      const blocked = wt(fixture, grown, "billing");
+      const err = await failure(runUp(blocked.deps, { namespaces: ["app", "db"] }));
       expect(err?.code).toBe("SHARED_PORT_CONFLICT");
       expect(err?.details?.conflicts).toEqual([{ reason: "block_full", port_name: "CACHE_PORT" }]);
       expect(err?.details?.remedy).toBe("devtrees prune --shared-ports");
@@ -7774,14 +7770,14 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
       const pruned = await runPruneSharedPorts(blocked.deps);
       expect(pruned.kept).toEqual(["DB_PORT", "SB_PORT"]);
       expect(pruned.dropped).toHaveLength(Object.keys(stale).length);
-      const result = await runUp(blocked.deps);
+      const result = await runUp(blocked.deps, { namespaces: ["app", "db"] });
       expect(result.env.DB_PORT).toBe(first.env.DB_PORT);
       expect(Number(result.env.CACHE_PORT)).toBeGreaterThanOrEqual(sharedBase);
     });
 
     it("prune --shared-ports keeps a name only a worktree's derived config holds", async () => {
       const fixture = nsFixture("dt-238-prune-wt-");
-      await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+      await runUp(wt(fixture, base, "login").deps, { namespaces: ["app", "db"] });
       const map = readSharedPortMap(fixture.sharedAnchor) ?? {};
       writeSharedPortMap(fixture.sharedAnchor, { ...map, GONE_PORT: 1 });
       // SB_PORT is no running service's, but the worktree's env carries it.
@@ -7799,7 +7795,7 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
 
     it("prune --shared-ports refuses while a worktree's up holds its lifecycle lock", async () => {
       const fixture = nsFixture("dt-238-prune-lock-");
-      await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+      await runUp(wt(fixture, base, "login").deps, { namespaces: ["app", "db"] });
       const before = readFileSync(sharedPortMapFile(fixture.sharedAnchor), "utf8");
       writeFileSync(join(fixture.sharedAnchor, "devtrees", "billing.lock"), String(process.pid));
       const err = await failure(runPruneSharedPorts(wt(fixture, base, "login").deps));
@@ -7809,7 +7805,7 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
 
     it("prune --shared-ports goes ahead beside an up past its shared step, and keeps the ports it injects", async () => {
       const fixture = nsFixture("dt-238-prune-marked-");
-      await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+      await runUp(wt(fixture, base, "login").deps, { namespaces: ["app", "db"] });
       const map = readSharedPortMap(fixture.sharedAnchor) ?? {};
       writeSharedPortMap(fixture.sharedAnchor, {
         ...map,
@@ -7828,7 +7824,7 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
 
     it("prune --shared-ports --dry-run reports what it would drop, writes nothing, and never refuses", async () => {
       const fixture = nsFixture("dt-238-prune-dry-");
-      await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+      await runUp(wt(fixture, base, "login").deps, { namespaces: ["app", "db"] });
       const map = readSharedPortMap(fixture.sharedAnchor) ?? {};
       writeSharedPortMap(fixture.sharedAnchor, { ...map, GONE_PORT: map.DB_PORT! + 7 });
       const before = readFileSync(sharedPortMapFile(fixture.sharedAnchor), "utf8");
@@ -7858,7 +7854,7 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
 
     it("prune --shared-ports drops a name recorded outside the block once nothing running holds it", async () => {
       const fixture = nsFixture("dt-238-prune-outside-");
-      await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+      await runUp(wt(fixture, base, "login").deps, { namespaces: ["app", "db"] });
       const map = readSharedPortMap(fixture.sharedAnchor) ?? {};
       writeSharedPortMap(fixture.sharedAnchor, {
         ...map,
@@ -7902,17 +7898,20 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
       expect(readSharedPortMap(fixture.sharedAnchor)?.OLD_PORT).toBeUndefined();
       // The warning `up` printed for it is gone, and the next `up` keeps every other number.
       const warnings: string[] = [];
-      const again = await runUp({
-        ...wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps,
-        warn: (m) => warnings.push(m),
-      });
+      const again = await runUp(
+        {
+          ...wt(fixture, base, "login").deps,
+          warn: (m) => warnings.push(m),
+        },
+        { namespaces: ["app", "db"] },
+      );
       expect(again.env.DB_PORT).toBe(String(map.DB_PORT));
       expect(warnings.filter((w) => w.includes("outside the shared block"))).toEqual([]);
     });
 
     it("an up rewrites a map with an invalid entry, so its warning is printed once", async () => {
       const fixture = nsFixture("dt-238-repair-");
-      await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+      await runUp(wt(fixture, base, "login").deps, { namespaces: ["app", "db"] });
       const map = readSharedPortMap(fixture.sharedAnchor) ?? {};
       writeFileSync(
         sharedPortMapFile(fixture.sharedAnchor),
@@ -7920,23 +7919,23 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
       );
       const warnings: string[] = [];
       const deps = {
-        ...wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps,
+        ...wt(fixture, base, "login").deps,
         warn: (m: string) => warnings.push(m),
       };
       // `env` only reads: it warns and leaves the file as it is.
       await runEnv(deps);
       expect(warnings.filter((w) => w.includes("BAD_PORT"))).toHaveLength(1);
-      await runUp(deps);
+      await runUp(deps, { namespaces: ["app", "db"] });
       expect(warnings.filter((w) => w.includes("BAD_PORT"))).toHaveLength(2);
       expect(readSharedPortMap(fixture.sharedAnchor)).toEqual(map);
       await runEnv(deps);
-      await runUp(deps);
+      await runUp(deps, { namespaces: ["app", "db"] });
       expect(warnings.filter((w) => w.includes("BAD_PORT"))).toHaveLength(2);
     });
 
     it("prune --shared-ports rewrites a map with an invalid entry even when it drops nothing", async () => {
       const fixture = nsFixture("dt-238-prune-repair-");
-      await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+      await runUp(wt(fixture, base, "login").deps, { namespaces: ["app", "db"] });
       const map = readSharedPortMap(fixture.sharedAnchor) ?? {};
       writeFileSync(
         sharedPortMapFile(fixture.sharedAnchor),
@@ -7955,12 +7954,12 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
 
     it("SHARED_PORT_CONFLICT's remedy is one runnable command; 'every worktree' is in the message", async () => {
       const fixture = nsFixture("dt-238-remedy-");
-      const first = await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+      const first = await runUp(wt(fixture, base, "login").deps, { namespaces: ["app", "db"] });
       writeSharedPortMap(fixture.sharedAnchor, {
         DB_PORT: Number(first.env.DB_PORT),
         SB_PORT: Number(first.env.DB_PORT),
       });
-      const err = await failure(runUp(wt(fixture, base, "billing", { namespaces: ["app"] }).deps));
+      const err = await failure(runUp(wt(fixture, base, "billing").deps, { namespaces: ["app"] }));
       expect(err?.details?.remedy).toBe("devtrees down --shared && devtrees up");
       expect(err?.message).toContain("for every worktree");
       expect(err?.message).toContain("surface it to a human");
@@ -7968,8 +7967,8 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
 
     it("env reports no port active for a leftover socket nothing listens on", async () => {
       const fixture = nsFixture("dt-238-stale-sock-");
-      const deps = wt(fixture, branchA, "login", { namespaces: ["app"] }).deps;
-      await runUp(deps);
+      const deps = wt(fixture, branchA, "login").deps;
+      await runUp(deps, { namespaces: ["app"] });
       const sharedSock = sharedInstancePaths(fixture.sharedAnchor).socketPath;
       // The shared process-compose was killed: its socket file stays, nothing listens.
       fixture.pc.crash(sharedSock);
@@ -8018,11 +8017,12 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
       worktreeId: string,
       opts: { readonly namespaces: string[] },
     ) {
-      const w = wt(fixture, stack, worktreeId, { namespaces: opts.namespaces });
+      const w = wt(fixture, stack, worktreeId);
       const since = fixture.pc.requests.length;
-      const deps: CommandDeps = { ...w.deps, waitForSharedReady: undefined };
+      const deps: CommandEnv = { ...w.deps, waitForSharedReady: undefined };
       return {
         deps,
+        options: { namespaces: opts.namespaces } satisfies UpOptions,
         get reloads() {
           return w.reloads;
         },
@@ -8042,7 +8042,7 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
     /** Start the shared instance (postgres, db-shared) from a first worktree. */
     async function sharedRunning(prefix: string, stack: ResolvedStack = base) {
       const fixture = nsFixture(prefix);
-      await runUp(wt(fixture, stack, "login", { namespaces: ["app", "db-shared"] }).deps);
+      await runUp(wt(fixture, stack, "login").deps, { namespaces: ["app", "db-shared"] });
       return fixture;
     }
 
@@ -8055,7 +8055,7 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
       const billing = againstDead(fixture, base, "billing", { namespaces: ["app", "db-shared"] });
       const dbSharedPid = fixture.pc.pidOf(billing.sharedSock, "db-shared");
       kill(fixture, "postgres");
-      const result = await runUp(billing.deps);
+      const result = await runUp(billing.deps, billing.options);
 
       expect(billing.starts).toEqual(["postgres"]);
       expect(fixture.pc.rows(billing.sharedSock).map((r) => [r.name, r.status])).toEqual([
@@ -8077,10 +8077,10 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
 
     it("restarts on the running-instance path too (the worktree instance is already up)", async () => {
       const fixture = await sharedRunning("dt-rds-running-");
-      await runUp(wt(fixture, base, "billing", { namespaces: ["app", "db-shared"] }).deps);
+      await runUp(wt(fixture, base, "billing").deps, { namespaces: ["app", "db-shared"] });
       const again = againstDead(fixture, base, "billing", { namespaces: ["app", "db-shared"] });
       kill(fixture, "db-shared");
-      const result = await runUp(again.deps);
+      const result = await runUp(again.deps, again.options);
       expect(again.starts).toEqual(["db-shared"]);
       expect(result.sharedRestarted).toEqual(["db-shared"]);
       expect(result.restarted).toEqual([]);
@@ -8096,7 +8096,7 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
         namespaces: ["app", "db-shared"],
       });
       kill(fixture, "postgres", "db-shared");
-      const err = await failure(runUp(billing.deps));
+      const err = await failure(runUp(billing.deps, billing.options));
       expect(err?.code).toBe("SHARED_DRIFT");
       expect(billing.starts).toEqual([]);
       const statusOf = (name: string) =>
@@ -8109,7 +8109,7 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
       const fixture = await sharedRunning("dt-rds-unselected-");
       const billing = againstDead(fixture, base, "billing", { namespaces: ["app", "db"] });
       kill(fixture, "db-shared");
-      const result = await runUp(billing.deps);
+      const result = await runUp(billing.deps, billing.options);
       expect(billing.starts).toEqual([]);
       expect(result.sharedRestarted).toEqual([]);
       expect(fixture.pc.rows(billing.sharedSock).find((r) => r.name === "db-shared")?.status).toBe(
@@ -8124,7 +8124,7 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
       fixture.pc.backoff(billing.sharedSock, "db-shared");
       // Nothing is started; up still waits for the Restarting service, and
       // fails not_healthy when it never comes back.
-      const err = await failure(runUp({ ...billing.deps, waitTimeoutMs: 300 }));
+      const err = await failure(runUp(billing.deps, { ...billing.options, waitTimeoutMs: 300 }));
       expect(billing.starts).toEqual([]);
       expect(err?.code).toBe("SHARED_SERVICE_DEAD");
       expect(err?.details).toMatchObject({
@@ -8150,7 +8150,7 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
         sharedReads += 1;
         if (sharedReads === 4) fixture.pc.setReady(billing.sharedSock, "db-shared", true);
       });
-      const result = await runUp(billing.deps);
+      const result = await runUp(billing.deps, billing.options);
       expect(billing.starts).toEqual([]);
       expect(result.sharedRestarted).toEqual([]);
       // It returned only once the probe passed.
@@ -8160,24 +8160,35 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
     it("on the running path the shared wait runs outside the worktree lifecycle lock; on the fresh path inside it", async () => {
       const fixture = await sharedRunning("dt-rds-lock-");
       // A `down` of the same worktree must get the lock while up waits on shared.
-      const lockFreeDuringWait = async (deps: CommandDeps, id: string): Promise<boolean> => {
+      const lockFreeDuringWait = async (
+        deps: CommandEnv,
+        id: string,
+        options: UpOptions,
+      ): Promise<boolean> => {
         let free: boolean | undefined;
-        await runUp({
-          ...deps,
-          waitForSharedReady: async () => {
-            free = await withLifecycleLock(fixture.sharedAnchor, id, async () => true, {
-              retries: 0,
-            }).catch(() => false);
+        await runUp(
+          {
+            ...deps,
+            waitForSharedReady: async () => {
+              free = await withLifecycleLock(fixture.sharedAnchor, id, async () => true, {
+                retries: 0,
+              }).catch(() => false);
+            },
           },
-        });
+          options,
+        );
         if (free === undefined) throw new Error("the shared wait did not run");
         return free;
       };
-      const fresh = wt(fixture, base, "billing", { namespaces: ["app", "db-shared"] });
+      const fresh = wt(fixture, base, "billing");
       const id = idFor(fixture.wtRoot, "billing");
-      expect(await lockFreeDuringWait(fresh.deps, id)).toBe(false);
-      const running = wt(fixture, base, "billing", { namespaces: ["app", "db-shared"] });
-      expect(await lockFreeDuringWait(running.deps, id)).toBe(true);
+      expect(await lockFreeDuringWait(fresh.deps, id, { namespaces: ["app", "db-shared"] })).toBe(
+        false,
+      );
+      const running = wt(fixture, base, "billing");
+      expect(await lockFreeDuringWait(running.deps, id, { namespaces: ["app", "db-shared"] })).toBe(
+        true,
+      );
     });
 
     it("dead shared services are started in depends_on order", async () => {
@@ -8193,7 +8204,7 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
       const fixture = await sharedRunning("dt-rds-order-", chain);
       const billing = againstDead(fixture, chain, "billing", { namespaces: ["app"] });
       kill(fixture, "api-shared", "pg");
-      const result = await runUp(billing.deps);
+      const result = await runUp(billing.deps, billing.options);
       expect(billing.starts).toEqual(["pg", "api-shared"]);
       expect(result.sharedRestarted).toEqual(["pg", "api-shared"]);
     });
@@ -8203,7 +8214,7 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
       const billing = againstDead(fixture, base, "billing", { namespaces: ["app", "db-shared"] });
       kill(fixture, "postgres");
       fixture.pc.refuse("start", "postgres", 'FTL failed to start process postgres error="boom"');
-      const err = await failure(runUp(billing.deps));
+      const err = await failure(runUp(billing.deps, billing.options));
       expect(err?.code).toBe("SHARED_SERVICE_DEAD");
       expect(err?.message).toContain("process-compose refused to start it again");
       expect(err?.details).toEqual({
@@ -8223,7 +8234,7 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
       kill(fixture, "postgres");
       // Another client starts postgres between this up's read and its start.
       let rivalStarted = false;
-      const raced: CommandDeps = {
+      const raced: CommandEnv = {
         ...billing.deps,
         processCompose: {
           ...fixture.pc.driver,
@@ -8236,7 +8247,7 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
           },
         },
       };
-      const result = await runUp(raced);
+      const result = await runUp(raced, billing.options);
       // The rival's start, then this up's one start, answered "already running".
       expect(billing.starts).toEqual(["postgres", "postgres"]);
       expect(result.sharedRestarted).toEqual([]);
@@ -8250,7 +8261,7 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
       const billing = againstDead(fixture, base, "billing", { namespaces: ["app", "db-shared"] });
       kill(fixture, "postgres");
       // The restarted postgres exits 1 at once.
-      const dying: CommandDeps = {
+      const dying: CommandEnv = {
         ...billing.deps,
         processCompose: {
           ...fixture.pc.driver,
@@ -8262,7 +8273,7 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
         },
       };
       const started = Date.now();
-      const err = await failure(runUp({ ...dying, waitTimeoutMs: 60_000 }));
+      const err = await failure(runUp(dying, { ...billing.options, waitTimeoutMs: 60_000 }));
       expect(Date.now() - started).toBeLessThan(10_000);
       expect(err?.code).toBe("SHARED_SERVICE_DEAD");
       expect(err?.message).toContain("devtrees restarted postgres, and it died again");
@@ -8284,8 +8295,8 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
       const two = againstDead(fixture, base, "orders", opts);
       kill(fixture, "postgres");
       const results = await Promise.all([
-        runUp({ ...one.deps, withSharedLock: realLock }),
-        runUp({ ...two.deps, withSharedLock: realLock }),
+        runUp({ ...one.deps, withSharedLock: realLock }, one.options),
+        runUp({ ...two.deps, withSharedLock: realLock }, two.options),
       ]);
       expect(one.starts).toEqual(["postgres"]);
       expect(results.flatMap((r) => r.sharedRestarted)).toEqual(["postgres"]);
@@ -8297,12 +8308,12 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
         services: [...base.services, shared("cache", "redis-server", ["CACHE_PORT"])],
       };
       const fixture = nsFixture("dt-rds-add-");
-      await runUp(wt(fixture, withCache, "login", { namespaces: ["app", "db"] }).deps);
+      await runUp(wt(fixture, withCache, "login").deps, { namespaces: ["app", "db"] });
       const billing = againstDead(fixture, withCache, "billing", {
         namespaces: ["app", "db-shared"],
       });
       kill(fixture, "postgres");
-      const result = await runUp(billing.deps);
+      const result = await runUp(billing.deps, billing.options);
       expect(result.sharedRestarted).toEqual(["postgres"]);
       expect(result.sharedActivated).toEqual(["db-shared"]);
       expect(billing.starts).toEqual(["postgres"]);
@@ -8312,7 +8323,7 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
       const fixture = await sharedRunning("dt-rds-dry-");
       const billing = againstDead(fixture, base, "billing", { namespaces: ["app", "db-shared"] });
       kill(fixture, "postgres");
-      const preview = await runUpDryRun(billing.deps);
+      const preview = await runUpDryRun(billing.deps, billing.options);
       expect(preview.wouldRestartShared).toEqual(["postgres"]);
       expect(billing.starts).toEqual([]);
 
@@ -8321,11 +8332,11 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
       await fixture.pc.driver.startProcess(billing.sharedSock, "postgres");
       kill(fixture, "db-shared");
       const narrow = againstDead(fixture, base, "billing", { namespaces: ["app", "db"] });
-      expect((await runUpDryRun(narrow.deps)).wouldRestartShared).toEqual([]);
+      expect((await runUpDryRun(narrow.deps, narrow.options)).wouldRestartShared).toEqual([]);
 
       // Drifted: the real up would fail SHARED_DRIFT and restart nothing.
       const drift = againstDead(fixture, drifted, "billing", { namespaces: ["app", "db-shared"] });
-      expect((await runUpDryRun(drift.deps)).wouldRestartShared).toEqual([]);
+      expect((await runUpDryRun(drift.deps, drift.options)).wouldRestartShared).toEqual([]);
       expect(drift.starts).toEqual([]);
     });
   });
@@ -8335,17 +8346,17 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
     // A shared instance an older devtrees started: it runs postgres, but
     // there is no shared-state.json, no shared port map and no derived
     // shared config to read its ports back from.
-    await runUp(wt(fixture, base, "orders", { namespaces: ["app", "db"] }).deps);
+    await runUp(wt(fixture, base, "orders").deps, { namespaces: ["app", "db"] });
     rmSync(join(fixture.sharedAnchor, "devtrees", "shared-state.json"));
     rmSync(sharedPortMapFile(fixture.sharedAnchor));
     rmSync(sharedInstancePaths(fixture.sharedAnchor).configPath);
 
     // Always-on only: the old positional fallback still applies.
-    const ok = await runUp(wt(fixture, base, "login", { namespaces: ["app", "db"] }).deps);
+    const ok = await runUp(wt(fixture, base, "login").deps, { namespaces: ["app", "db"] });
     expect(ok.sharedStarted).toBe(false);
 
     const err = await failure(
-      runUp(wt(fixture, base, "billing", { namespaces: ["app", "db-shared"] }).deps),
+      runUp(wt(fixture, base, "billing").deps, { namespaces: ["app", "db-shared"] }),
     );
     expect(err?.code).toBe("SHARED_ACTIVATION_FAILED");
     expect(err?.details).toMatchObject({ services: ["db-shared"], reason: "not_supported" });
@@ -8353,9 +8364,9 @@ describe("runUp / runEnv / runUpDryRun — namespaced shared services (#236)", (
 
   it("SHARED_DRIFT keeps running_hash/local_hash as the always-on whole-subset hashes", async () => {
     const fixture = nsFixture("dt-nss-hashes-");
-    await runUp(wt(fixture, base, "login", { namespaces: ["app", "db-shared"] }).deps);
+    await runUp(wt(fixture, base, "login").deps, { namespaces: ["app", "db-shared"] });
     const err = await failure(
-      runUp(wt(fixture, drifted, "billing", { namespaces: ["app", "db-shared"] }).deps),
+      runUp(wt(fixture, drifted, "billing").deps, { namespaces: ["app", "db-shared"] }),
     );
     const alwaysOn = { services: [base.services[0] as ResolvedService] };
     expect(err?.details).toMatchObject({

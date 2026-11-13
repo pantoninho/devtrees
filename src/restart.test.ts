@@ -14,7 +14,7 @@ import { join } from "node:path";
 import { stringify as stringifyYaml } from "yaml";
 import { deriveWorktreeId } from "./anchor.js";
 import type { ProcessRow } from "./bounded-down.js";
-import { bareRestartRemedy, runRestart, type CommandDeps } from "./commands.js";
+import { bareRestartRemedy, runRestart, type CommandEnv } from "./commands.js";
 import type { WaitForHealth } from "./health.js";
 import { createInMemoryProcessCompose, type PcRequest } from "./in-memory-driver.js";
 import type { InstanceStatus } from "./instances.js";
@@ -97,8 +97,9 @@ async function instance(
   writeFileSync(inst.configPath, stringifyYaml({ processes: opts.project ?? processes }));
   if (opts.live !== false) await pc.driver.up(inst, opts.namespaces ?? ["default", "ios"]);
   writeFileSync(inst.configPath, stringifyYaml({ processes }));
-  const deps: CommandDeps = {
-    cwd: top,
+  /** Where every command of this test runs: the options' `cwd`. */
+  const at = { cwd: top };
+  const deps: CommandEnv = {
     git: (args) => {
       if (args[1] === "--git-common-dir") return anchor;
       if (args[1] === "--show-toplevel") return top;
@@ -131,7 +132,7 @@ async function instance(
   };
   /** The service's row as process-compose lists it now. */
   const row = (name: string) => pc.rows(socketPath).find((r) => r.name === name);
-  return { deps, log, waits, id, inst, socketPath, anchor, pc, row };
+  return { deps, at, log, waits, id, inst, socketPath, anchor, pc, row };
 }
 
 async function failure(p: Promise<unknown>) {
@@ -147,10 +148,10 @@ const touched = (log: ReadonlyArray<string>) => log.filter((l) => l.startsWith("
 
 describe("runRestart (#222)", () => {
   it("stops then starts each service in depends_on order, one lock window each, waiting for health before its dependent", async () => {
-    const { deps, log, waits, id, socketPath, pc, row } = await instance();
+    const { deps, at, log, waits, id, socketPath, pc, row } = await instance();
     const apiPid = pc.pidOf(socketPath, "api");
     const mobilePid = pc.pidOf(socketPath, "mobile");
-    const result = await runRestart(deps, ["mobile", "api"]);
+    const result = await runRestart(deps, { ...at, services: ["mobile", "api"] });
     expect(log).toEqual([
       `lock ${id}`,
       "process stop api",
@@ -182,9 +183,9 @@ describe("runRestart (#222)", () => {
   it("a Pending service is refused with SERVICE_PENDING: nothing touched", async () => {
     // mobile waits on api (process_healthy): it has not started, so its stop
     // would leave it Terminating with no process for good.
-    const { deps, log, id, pc, socketPath } = await instance();
+    const { deps, at, log, id, pc, socketPath } = await instance();
     pc.hold(socketPath, "mobile");
-    const err = await failure(runRestart(deps, ["worker", "mobile"]));
+    const err = await failure(runRestart(deps, { ...at, services: ["worker", "mobile"] }));
     expect(err).toEqual({
       code: "SERVICE_PENDING",
       message:
@@ -205,10 +206,10 @@ describe("runRestart (#222)", () => {
   it("a Skipped service whose dependency is still dead is refused with SERVICE_SKIPPED: nothing touched (#263)", async () => {
     // mobile was skipped because api (its process_healthy dependency) died;
     // api has not recovered, so a start would leave mobile Skipped.
-    const { deps, log, id, pc, socketPath, row } = await instance();
+    const { deps, at, log, id, pc, socketPath, row } = await instance();
     pc.exit(socketPath, "api", 3);
     pc.idle(socketPath, "mobile", "Skipped");
-    const err = await failure(runRestart(deps, ["worker", "mobile"]));
+    const err = await failure(runRestart(deps, { ...at, services: ["worker", "mobile"] }));
     const remedy =
       "Restart api first, and mobile after it: `devtrees restart api worker mobile`. If api " +
       "fails again, fix it first (`devtrees logs api`).";
@@ -229,10 +230,10 @@ describe("runRestart (#222)", () => {
   });
 
   it("a Skipped service is restarted together with its dead dependency: api first, then mobile (#263)", async () => {
-    const { deps, log, id, pc, socketPath, row } = await instance();
+    const { deps, at, log, id, pc, socketPath, row } = await instance();
     pc.exit(socketPath, "api", 3);
     pc.idle(socketPath, "mobile", "Skipped");
-    const result = await runRestart(deps, ["mobile", "api"]);
+    const result = await runRestart(deps, { ...at, services: ["mobile", "api"] });
     expect(result).toMatchObject({ restarted: ["api", "mobile"] });
     expect(log).toEqual([
       `lock ${id}`,
@@ -250,9 +251,9 @@ describe("runRestart (#222)", () => {
   it.each(["Skipped", "Disabled"] as const)(
     "a %s service with no failed dependency is simply started: no stop (#263)",
     async (state) => {
-      const { deps, log, id, pc, socketPath, row } = await instance();
+      const { deps, at, log, id, pc, socketPath, row } = await instance();
       pc.idle(socketPath, "mobile", state);
-      const result = await runRestart(deps, ["mobile"]);
+      const result = await runRestart(deps, { ...at, services: ["mobile"] });
       expect(result).toMatchObject({ restarted: ["mobile"] });
       expect(log).toEqual([`lock ${id}`, "process start mobile", "unlock", "wait mobile"]);
       expect(row("mobile")).toMatchObject({ status: "Running", running: true });
@@ -261,10 +262,10 @@ describe("runRestart (#222)", () => {
 
   it("an idle service never counts as the last running process (#263)", async () => {
     // api is the only running process; restarting the idle mobile stops nothing.
-    const { deps, log, pc, socketPath } = await instance();
+    const { deps, at, log, pc, socketPath } = await instance();
     pc.exit(socketPath, "worker", 0);
     pc.idle(socketPath, "mobile", "Disabled");
-    await runRestart(deps, ["mobile"]);
+    await runRestart(deps, { ...at, services: ["mobile"] });
     expect(touched(log)).toEqual(["process start mobile"]);
   });
 
@@ -273,7 +274,7 @@ describe("runRestart (#222)", () => {
     // then seed finishes and mobile dies, leaving worker the last one.
     let socket = "";
     let pcRef: ReturnType<typeof createInMemoryProcessCompose> | undefined;
-    const { deps, log, id, pc, socketPath } = await instance({
+    const { deps, at, log, id, pc, socketPath } = await instance({
       processes: { ...derived, seed: proc() },
       health: async () => {
         pcRef?.exit(socket, "seed", 0);
@@ -284,7 +285,7 @@ describe("runRestart (#222)", () => {
     pcRef = pc;
     pc.exit(socketPath, "api", 0);
     pc.exit(socketPath, "mobile", -1);
-    const err = await failure(runRestart(deps, ["mobile", "worker"]));
+    const err = await failure(runRestart(deps, { ...at, services: ["mobile", "worker"] }));
     expect(err).toMatchObject({
       code: "LAST_SERVICES_RUNNING",
       message:
@@ -299,14 +300,14 @@ describe("runRestart (#222)", () => {
 
   it("a refused start re-probes the instance: gone means process-compose exited, not a refusal", async () => {
     let crash = () => {};
-    const { deps, id, pc, socketPath } = await instance({
+    const { deps, at, id, pc, socketPath } = await instance({
       // process-compose exits as the start reaches it, so the start fails.
       onRequest: (r) => {
         if (r.op === "start") crash();
       },
     });
     crash = () => pc.crash(socketPath);
-    const err = await failure(runRestart(deps, ["worker"]));
+    const err = await failure(runRestart(deps, { ...at, services: ["worker"] }));
     expect(err).toMatchObject({
       code: "INSTANCE_NOT_FOUND",
       message: expect.stringMatching(
@@ -318,9 +319,9 @@ describe("runRestart (#222)", () => {
   });
 
   it("a refused start with the instance still up is SERVICE_START_FAILED", async () => {
-    const { deps, pc } = await instance();
+    const { deps, at, pc } = await instance();
     pc.refuse("start", "worker");
-    const err = await failure(runRestart(deps, ["worker"]));
+    const err = await failure(runRestart(deps, { ...at, services: ["worker"] }));
     expect(err.code).toBe("SERVICE_START_FAILED");
     expect(err.message).toContain(
       "FTL failed to start process worker. The services after it were not touched",
@@ -330,7 +331,7 @@ describe("runRestart (#222)", () => {
   it("process-compose exiting during a later service's stop names what was already restarted", async () => {
     let finishOthers = () => {};
     let started = 0;
-    const { deps, id, pc, socketPath } = await instance({
+    const { deps, at, id, pc, socketPath } = await instance({
       onRequest: (r) => {
         if (r.op === "start") started++;
         // mobile's stop, after api restarted: everything else finishes
@@ -342,7 +343,7 @@ describe("runRestart (#222)", () => {
       pc.exit(socketPath, "api", 0);
       pc.exit(socketPath, "worker", 0);
     };
-    const err = await failure(runRestart(deps, ["mobile", "api"]));
+    const err = await failure(runRestart(deps, { ...at, services: ["mobile", "api"] }));
     expect(err).toEqual({
       code: "INSTANCE_NOT_FOUND",
       message:
@@ -355,8 +356,8 @@ describe("runRestart (#222)", () => {
   });
 
   it("reports the restarted services' rows, in restart order and only those", async () => {
-    const { deps } = await instance({ health: null });
-    const result = await runRestart(deps, ["worker", "api"]);
+    const { deps, at } = await instance({ health: null });
+    const result = await runRestart(deps, { ...at, services: ["worker", "api"] });
     expect(result.restarted).toEqual(["worker", "api"]);
     expect(result.services.map((s) => [s.name, s.status])).toEqual([
       ["worker", "Running"],
@@ -366,10 +367,10 @@ describe("runRestart (#222)", () => {
 
   it("the instance's last running process is refused with LAST_SERVICES_RUNNING, before anything is touched", async () => {
     // worker is a finished one-shot: it does not keep the instance alive.
-    const { deps, log, id, pc, socketPath, row } = await instance({ namespaces: ["default"] });
+    const { deps, at, log, id, pc, socketPath, row } = await instance({ namespaces: ["default"] });
     pc.exit(socketPath, "worker", 0);
     const apiPid = pc.pidOf(socketPath, "api");
-    const err = await failure(runRestart(deps, ["api"]));
+    const err = await failure(runRestart(deps, { ...at, services: ["api"] }));
     expect(err).toEqual({
       code: "LAST_SERVICES_RUNNING",
       message:
@@ -383,18 +384,18 @@ describe("runRestart (#222)", () => {
   });
 
   it("only a process running now keeps the instance alive: not one in its restart backoff, not a Pending dependent", async () => {
-    const { deps, log, pc, socketPath } = await instance();
+    const { deps, at, log, pc, socketPath } = await instance();
     pc.backoff(socketPath, "worker");
     pc.hold(socketPath, "mobile");
-    const err = await failure(runRestart(deps, ["api", "worker"]));
+    const err = await failure(runRestart(deps, { ...at, services: ["api", "worker"] }));
     expect(err.code).toBe("LAST_SERVICES_RUNNING");
     expect(err.details).toMatchObject({ services: ["api"] });
     expect(touched(log)).toEqual([]);
   });
 
   it("several named services that keep each other alive restart one at a time", async () => {
-    const { deps, log } = await instance({ namespaces: ["default"] });
-    await runRestart(deps, ["api", "worker"]);
+    const { deps, at, log } = await instance({ namespaces: ["default"] });
+    await runRestart(deps, { ...at, services: ["api", "worker"] });
     expect(touched(log)).toEqual([
       "process stop api",
       "process start api",
@@ -405,7 +406,7 @@ describe("runRestart (#222)", () => {
 
   it("process-compose exiting during a stop (a one-shot finished meanwhile) is INSTANCE_NOT_FOUND, not a refusal", async () => {
     let finishOthers = () => {};
-    const { deps, id, pc, socketPath } = await instance({
+    const { deps, at, id, pc, socketPath } = await instance({
       onRequest: (r) => {
         if (r.op === "stop") finishOthers();
       },
@@ -414,7 +415,7 @@ describe("runRestart (#222)", () => {
       pc.exit(socketPath, "api", 0);
       pc.exit(socketPath, "mobile", 0);
     };
-    const err = await failure(runRestart(deps, ["worker"]));
+    const err = await failure(runRestart(deps, { ...at, services: ["worker"] }));
     expect(err).toEqual({
       code: "INSTANCE_NOT_FOUND",
       message:
@@ -427,11 +428,11 @@ describe("runRestart (#222)", () => {
 
   it("a down between two steps names what was already restarted", async () => {
     let down = async () => {};
-    const { deps, id, pc, inst } = await instance({ health: async () => down() });
+    const { deps, at, id, pc, inst } = await instance({ health: async () => down() });
     down = async () => {
       await pc.driver.down(inst);
     };
-    const err = await failure(runRestart(deps, ["mobile", "api"]));
+    const err = await failure(runRestart(deps, { ...at, services: ["mobile", "api"] }));
     expect(err).toEqual({
       code: "INSTANCE_NOT_FOUND",
       message:
@@ -444,20 +445,20 @@ describe("runRestart (#222)", () => {
 
   it("one --wait-timeout budget is shared by every service's health wait", async () => {
     const budgets: number[] = [];
-    const { deps } = await instance({
+    const { deps, at } = await instance({
       health: async (args) => {
         budgets.push(args.timeoutMs);
         await new Promise((r) => setTimeout(r, 60));
       },
     });
-    await runRestart({ ...deps, waitTimeoutMs: 1_000 }, ["mobile", "api"]);
+    await runRestart(deps, { ...at, services: ["mobile", "api"], waitTimeoutMs: 1_000 });
     expect(budgets[0]).toBeLessThanOrEqual(1_000);
     expect(budgets[1]).toBeLessThanOrEqual(1_000 - 60);
   });
 
   it("no running instance fails INSTANCE_NOT_FOUND, naming restart", async () => {
-    const { deps, log, id } = await instance({ live: false });
-    const err = await failure(runRestart(deps, ["mobile"]));
+    const { deps, at, log, id } = await instance({ live: false });
+    const err = await failure(runRestart(deps, { ...at, services: ["mobile"] }));
     expect(err.code).toBe("INSTANCE_NOT_FOUND");
     expect(err.message).toBe(
       `devtrees restart: no worktree instance is running for '${id}'. Nothing was touched. ` +
@@ -467,8 +468,8 @@ describe("runRestart (#222)", () => {
   });
 
   it("a shared service fails SHARED_SERVICE_REFUSED, before an unknown name", async () => {
-    const { deps, log } = await instance();
-    const err = await failure(runRestart(deps, ["nope", "db", "db"]));
+    const { deps, at, log } = await instance();
+    const err = await failure(runRestart(deps, { ...at, services: ["nope", "db", "db"] }));
     expect(err.code).toBe("SHARED_SERVICE_REFUSED");
     expect(err.message).toContain("devtrees restart: 'db' is a shared service");
     expect(err.details).toEqual({
@@ -479,7 +480,7 @@ describe("runRestart (#222)", () => {
   });
 
   it("a broken devtrees.yaml still refuses a service the shared instance runs", async () => {
-    const { deps, anchor } = await instance({
+    const { deps, at, anchor } = await instance({
       stack: () => {
         throw new Error("devtrees.yaml: bad");
       },
@@ -488,12 +489,14 @@ describe("runRestart (#222)", () => {
       sharedInstancePaths(anchor).configPath,
       stringifyYaml({ processes: { db: proc() } }),
     );
-    expect((await failure(runRestart(deps, ["db"]))).code).toBe("SHARED_SERVICE_REFUSED");
+    expect((await failure(runRestart(deps, { ...at, services: ["db"] }))).code).toBe(
+      "SHARED_SERVICE_REFUSED",
+    );
   });
 
   it("an unknown name fails SERVICE_NOT_FOUND, valid_services from the running instance's derived config", async () => {
-    const { deps, log } = await instance();
-    const err = await failure(runRestart(deps, ["mobile", "nope"]));
+    const { deps, at, log } = await instance();
+    const err = await failure(runRestart(deps, { ...at, services: ["mobile", "nope"] }));
     expect(err).toEqual({
       code: "SERVICE_NOT_FOUND",
       message:
@@ -504,8 +507,8 @@ describe("runRestart (#222)", () => {
   });
 
   it("a service whose namespace was not booted fails NAMESPACE_NOT_RUNNING, booting it in the remedy", async () => {
-    const { deps, log, id } = await instance({ namespaces: ["default"] });
-    const err = await failure(runRestart(deps, ["api", "mobile"]));
+    const { deps, at, log, id } = await instance({ namespaces: ["default"] });
+    const err = await failure(runRestart(deps, { ...at, services: ["api", "mobile"] }));
     expect(err.code).toBe("NAMESPACE_NOT_RUNNING");
     expect(err.message).toContain("devtrees restart: namespace 'ios' is not running");
     expect(err.details).toEqual({
@@ -519,11 +522,13 @@ describe("runRestart (#222)", () => {
 
   it("a pending hot-reload refuses as up does: CONFIG_DRIFT reload_pending, nothing touched", async () => {
     // The pending update dropped worker from the project and waits on its old run.
-    const { deps, log, anchor, id } = await instance({
+    const { deps, at, log, anchor, id } = await instance({
       project: { mobile: derived.mobile, api: derived.api },
     });
     writePendingReload(anchor, id, { services: ["worker"], oldRuns: [{ name: "worker", pid: 9 }] });
-    const err = await failure(runRestart({ ...deps, isProcessAlive: () => true }, ["mobile"]));
+    const err = await failure(
+      runRestart({ ...deps, isProcessAlive: () => true }, { ...at, services: ["mobile"] }),
+    );
     expect(err.code).toBe("CONFIG_DRIFT");
     expect(err.message).toMatch(/^devtrees restart: a previous hot-reload/);
     expect(err.message).toContain("so nothing was restarted and the instance is unchanged");
@@ -534,18 +539,18 @@ describe("runRestart (#222)", () => {
   });
 
   it("a process-compose that never answers fails INSTANCE_UNRESPONSIVE, not HEALTH_TIMEOUT", async () => {
-    const { deps, log, pc, socketPath } = await instance();
+    const { deps, at, log, pc, socketPath } = await instance();
     pc.freeze(socketPath);
-    const err = await failure(runRestart({ ...deps, waitTimeoutMs: 30 }, ["mobile"]));
+    const err = await failure(runRestart(deps, { ...at, services: ["mobile"], waitTimeoutMs: 30 }));
     expect(err.code).toBe("INSTANCE_UNRESPONSIVE");
     expect(touched(log)).toEqual([]);
   });
 
   it("a refused stop fails SERVICE_START_FAILED, naming what was restarted; the rest is untouched", async () => {
-    const { deps, log, id, pc, socketPath, row } = await instance();
+    const { deps, at, log, id, pc, socketPath, row } = await instance();
     pc.refuse("stop", "mobile");
     const mobilePid = pc.pidOf(socketPath, "mobile");
-    const err = await failure(runRestart(deps, ["mobile", "api", "worker"]));
+    const err = await failure(runRestart(deps, { ...at, services: ["mobile", "api", "worker"] }));
     expect(err.code).toBe("SERVICE_START_FAILED");
     expect(err.message).toContain("api was restarted before it");
     expect(err.details).toEqual({
@@ -559,7 +564,7 @@ describe("runRestart (#222)", () => {
   });
 
   it("warns on stderr about an old-run process SIGKILL could not stop, and reports what it signalled", async () => {
-    const { deps, socketPath, pc } = await instance();
+    const { deps, at, socketPath, pc } = await instance();
     const apiPid = pc.pidOf(socketPath, "api") ?? 0;
     const supervisor: ProcessRow = {
       pid: 1,
@@ -581,7 +586,7 @@ describe("runRestart (#222)", () => {
           treeGraceMs: 1,
         },
       },
-      ["api"],
+      { ...at, services: ["api"] },
     );
     expect(result.forceKilled).toEqual([{ service: "api", pid: apiPid }]);
     expect(warnings).toEqual([
@@ -593,14 +598,16 @@ describe("runRestart (#222)", () => {
     const health: WaitForHealth = async () => {
       throw Object.assign(new Error("service(s) not running: mobile"), { code: "HEALTH_TIMEOUT" });
     };
-    const { deps } = await instance({ health });
-    expect((await failure(runRestart(deps, ["mobile"]))).code).toBe("HEALTH_TIMEOUT");
+    const { deps, at } = await instance({ health });
+    expect((await failure(runRestart(deps, { ...at, services: ["mobile"] }))).code).toBe(
+      "HEALTH_TIMEOUT",
+    );
   });
 
   it("an instance stopped during the health wait fails INSTANCE_NOT_FOUND naming restart", async () => {
     let started = false;
     let down = () => {};
-    const { deps, pc, inst, socketPath } = await instance({
+    const { deps, at, pc, inst, socketPath } = await instance({
       health: null,
       // The instance is downed right after the start, as the health wait reads it.
       onRequest: (r) => {
@@ -610,7 +617,7 @@ describe("runRestart (#222)", () => {
     });
     down = () => void pc.driver.down(inst);
     await pc.driver.stopProcesses(socketPath, ["worker"]);
-    const err = await failure(runRestart(deps, ["worker"]));
+    const err = await failure(runRestart(deps, { ...at, services: ["worker"] }));
     expect(err.code).toBe("INSTANCE_NOT_FOUND");
     expect(err.message).toContain("while `restart` was waiting");
   });
@@ -619,8 +626,12 @@ describe("runRestart (#222)", () => {
 describe("runRestart -n <namespace> (#224)", () => {
   it("expands to the namespace's isolated services, unions with names, and skips and reports shared ones", async () => {
     // The shared `db` declares no namespace, so it is in `default`.
-    const { deps, log, id } = await instance();
-    const result = await runRestart(deps, ["mobile", "api"], ["default"]);
+    const { deps, at, log, id } = await instance();
+    const result = await runRestart(deps, {
+      ...at,
+      services: ["mobile", "api"],
+      namespaces: ["default"],
+    });
     expect(touched(log)).toEqual([
       "process stop api",
       "process start api",
@@ -637,15 +648,17 @@ describe("runRestart -n <namespace> (#224)", () => {
   });
 
   it("a namespace alone restarts only its services; shared skipped is empty when there are none", async () => {
-    const { deps, log } = await instance();
-    const result = await runRestart(deps, [], ["ios"]);
+    const { deps, at, log } = await instance();
+    const result = await runRestart(deps, { ...at, services: [], namespaces: ["ios"] });
     expect(touched(log)).toEqual(["process stop mobile", "process start mobile"]);
     expect(result).toMatchObject({ restarted: ["mobile"], skippedShared: [] });
   });
 
   it("a namespace the instance did not boot fails NAMESPACE_NOT_RUNNING, touching nothing", async () => {
-    const { deps, log, id } = await instance({ namespaces: ["default"] });
-    const err = await failure(runRestart(deps, ["worker"], ["ios"]));
+    const { deps, at, log, id } = await instance({ namespaces: ["default"] });
+    const err = await failure(
+      runRestart(deps, { ...at, services: ["worker"], namespaces: ["ios"] }),
+    );
     expect(err).toMatchObject({
       code: "NAMESPACE_NOT_RUNNING",
       details: {
@@ -659,8 +672,10 @@ describe("runRestart -n <namespace> (#224)", () => {
   });
 
   it("a namespace with no isolated service fails NO_SERVICES_SELECTED, touching nothing", async () => {
-    const { deps, log, id } = await instance();
-    const err = await failure(runRestart(deps, ["worker"], ["ios", "nope"]));
+    const { deps, at, log, id } = await instance();
+    const err = await failure(
+      runRestart(deps, { ...at, services: ["worker"], namespaces: ["ios", "nope"] }),
+    );
     expect(err).toMatchObject({
       code: "NO_SERVICES_SELECTED",
       details: { worktree_id: id, selected_namespaces: ["nope"], namespaces: ["default", "ios"] },
@@ -671,12 +686,15 @@ describe("runRestart -n <namespace> (#224)", () => {
 
   it("a pending hot-reload refuses with CONFIG_DRIFT reload_pending, its retry spelling the -n flags", async () => {
     // worker's new copy is not in the project yet: the reload is still pending.
-    const { deps, log, anchor, id } = await instance({
+    const { deps, at, log, anchor, id } = await instance({
       project: { mobile: derived.mobile, api: derived.api },
     });
     writePendingReload(anchor, id, { services: ["worker"], oldRuns: [{ name: "worker", pid: 9 }] });
     const err = await failure(
-      runRestart({ ...deps, isProcessAlive: () => true }, ["api"], ["ios", "ios"]),
+      runRestart(
+        { ...deps, isProcessAlive: () => true },
+        { ...at, services: ["api"], namespaces: ["ios", "ios"] },
+      ),
     );
     expect(err.code).toBe("CONFIG_DRIFT");
     expect(err.message).toContain("then run `devtrees restart api -n ios` again");
@@ -685,18 +703,22 @@ describe("runRestart -n <namespace> (#224)", () => {
   });
 
   it("an unresponsive instance's retry spells the -n flags", async () => {
-    const { deps, log, pc, socketPath } = await instance();
+    const { deps, at, log, pc, socketPath } = await instance();
     pc.freeze(socketPath);
-    const err = await failure(runRestart({ ...deps, waitTimeoutMs: 30 }, [], ["ios", "default"]));
+    const err = await failure(
+      runRestart(deps, { ...at, services: [], namespaces: ["ios", "default"], waitTimeoutMs: 30 }),
+    );
     expect(err.code).toBe("INSTANCE_UNRESPONSIVE");
     expect(err.message).toContain("devtrees restart -n ios -n default");
     expect(touched(log)).toEqual([]);
   });
 
   it("a Pending service in the expansion is refused with SERVICE_PENDING, touching nothing", async () => {
-    const { deps, log, pc, socketPath } = await instance();
+    const { deps, at, log, pc, socketPath } = await instance();
     pc.hold(socketPath, "mobile");
-    const err = await failure(runRestart(deps, ["worker"], ["ios"]));
+    const err = await failure(
+      runRestart(deps, { ...at, services: ["worker"], namespaces: ["ios"] }),
+    );
     expect(err).toMatchObject({
       code: "SERVICE_PENDING",
       details: { services: ["mobile"], waiting_on: ["api"] },
@@ -705,8 +727,10 @@ describe("runRestart -n <namespace> (#224)", () => {
   });
 
   it("naming a shared service explicitly is still refused alongside -n", async () => {
-    const { deps, log } = await instance();
-    const err = await failure(runRestart(deps, ["db"], ["default"]));
+    const { deps, at, log } = await instance();
+    const err = await failure(
+      runRestart(deps, { ...at, services: ["db"], namespaces: ["default"] }),
+    );
     expect(err.code).toBe("SHARED_SERVICE_REFUSED");
     expect(touched(log)).toEqual([]);
   });
@@ -718,42 +742,42 @@ describe("bareRestartRemedy (#225)", () => {
   const unread = (remedy: string) => ({ remedy, namespacesRead: false });
 
   it("a multi-service instance: the down + up that boots the namespaces running now, touching nothing", async () => {
-    const { deps, log } = await instance();
-    expect(await bareRestartRemedy(deps)).toEqual(
+    const { deps, at, log } = await instance();
+    expect(await bareRestartRemedy(deps, at)).toEqual(
       read("devtrees down && devtrees up -n default -n ios"),
     );
     expect(log).toEqual([]);
   });
 
   it("a one-service instance keeps its one namespace", async () => {
-    const { deps, log } = await instance({
+    const { deps, at, log } = await instance({
       processes: { web: proc({ namespace: "app" }) },
       namespaces: ["app"],
     });
-    expect(await bareRestartRemedy(deps)).toEqual(read("devtrees down && devtrees up -n app"));
+    expect(await bareRestartRemedy(deps, at)).toEqual(read("devtrees down && devtrees up -n app"));
     expect(log).toEqual([]);
   });
 
   it("only booted namespaces count: an unbooted one stays out of the remedy", async () => {
     // mobile (ios) is not in the project: the instance booted `-n default` only.
-    const { deps } = await instance({ namespaces: ["default"] });
-    expect(await bareRestartRemedy(deps)).toEqual(read("devtrees down && devtrees up"));
+    const { deps, at } = await instance({ namespaces: ["default"] });
+    expect(await bareRestartRemedy(deps, at)).toEqual(read("devtrees down && devtrees up"));
   });
 
   it("no running instance: every namespace the derived config declares, and a stale socket file is left in place", async () => {
-    const { deps, socketPath, pc } = await instance();
+    const { deps, at, socketPath, pc } = await instance();
     // process-compose was killed: its socket file stays behind.
     pc.crash(socketPath);
-    expect(await bareRestartRemedy(deps)).toEqual(
+    expect(await bareRestartRemedy(deps, at)).toEqual(
       unread("devtrees down && devtrees up -n default -n ios"),
     );
     expect(existsSync(socketPath)).toBe(true);
   });
 
   it("a stack whose services all declare a namespace, with no instance: every one, never a bare `up` that selects nothing", async () => {
-    const { deps, inst } = await instance({ live: false });
+    const { deps, at, inst } = await instance({ live: false });
     rmSync(inst.configPath);
-    const namespaced: CommandDeps = {
+    const namespaced: CommandEnv = {
       ...deps,
       readStack: () => ({
         services: [
@@ -763,25 +787,25 @@ describe("bareRestartRemedy (#225)", () => {
         ],
       }),
     };
-    expect(await bareRestartRemedy(namespaced)).toEqual(
+    expect(await bareRestartRemedy(namespaced, at)).toEqual(
       unread("devtrees down && devtrees up -n app -n ios"),
     );
   });
 
   it("a frozen instance booted `-n app -n default`: its status read times out, and the remedy keeps app", async () => {
-    const { deps, pc, socketPath } = await instance({
+    const { deps, at, pc, socketPath } = await instance({
       processes: { web: proc({ namespace: "app" }), api: proc() },
       namespaces: ["app", "default"],
     });
     pc.freeze(socketPath);
-    expect(await bareRestartRemedy(deps)).toEqual(
+    expect(await bareRestartRemedy(deps, at)).toEqual(
       unread("devtrees down && devtrees up -n app -n default"),
     );
   }, 20_000);
 
   it("an instance gone between the probe and the status read falls back the same way", async () => {
-    const { deps, pc } = await instance();
-    const gone: CommandDeps = {
+    const { deps, at, pc } = await instance();
+    const gone: CommandEnv = {
       ...deps,
       // process-compose dies right after it answers the probe.
       probeSocket: async (path): Promise<InstanceStatus> => {
@@ -790,7 +814,7 @@ describe("bareRestartRemedy (#225)", () => {
         return status;
       },
     };
-    expect(await bareRestartRemedy(gone)).toEqual(
+    expect(await bareRestartRemedy(gone, at)).toEqual(
       unread("devtrees down && devtrees up -n default -n ios"),
     );
   });

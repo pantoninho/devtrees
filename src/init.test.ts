@@ -28,7 +28,7 @@ afterEach(() => {
 describe("runInit target detection", () => {
   it("creates AGENTS.md when neither file exists", async () => {
     const cwd = tmp();
-    const result = await runInit({ cwd });
+    const result = await runInit({}, { cwd });
     expect(result.target).toBe("AGENTS.md");
     expect(result.action).toBe("created");
     expect(result.path).toBe(join(cwd, "AGENTS.md"));
@@ -43,7 +43,7 @@ describe("runInit target detection", () => {
   it("prefers an existing AGENTS.md", async () => {
     const cwd = tmp();
     writeFileSync(join(cwd, "AGENTS.md"), "# Existing\n");
-    const result = await runInit({ cwd });
+    const result = await runInit({}, { cwd });
     expect(result.target).toBe("AGENTS.md");
     expect(result.action).toBe("updated");
     const body = readFileSync(join(cwd, "AGENTS.md"), "utf8");
@@ -54,7 +54,7 @@ describe("runInit target detection", () => {
   it("falls back to an existing CLAUDE.md when AGENTS.md is absent", async () => {
     const cwd = tmp();
     writeFileSync(join(cwd, "CLAUDE.md"), "# Claude rules\n");
-    const result = await runInit({ cwd });
+    const result = await runInit({}, { cwd });
     expect(result.target).toBe("CLAUDE.md");
     expect(result.action).toBe("updated");
     expect(existsSync(join(cwd, "AGENTS.md"))).toBe(false);
@@ -67,7 +67,7 @@ describe("runInit target detection", () => {
     const cwd = tmp();
     writeFileSync(join(cwd, "AGENTS.md"), "# Agents\n");
     writeFileSync(join(cwd, "CLAUDE.md"), "# Claude\n");
-    const result = await runInit({ cwd });
+    const result = await runInit({}, { cwd });
     expect(result.target).toBe("AGENTS.md");
     const claude = readFileSync(join(cwd, "CLAUDE.md"), "utf8");
     expect(claude).toBe("# Claude\n"); // untouched
@@ -77,11 +77,11 @@ describe("runInit target detection", () => {
 describe("runInit idempotency", () => {
   it("replaces the block in place on re-run — no duplication", async () => {
     const cwd = tmp();
-    const first = await runInit({ cwd });
+    const first = await runInit({}, { cwd });
     expect(first.action).toBe("created");
     const afterFirst = readFileSync(join(cwd, "AGENTS.md"), "utf8");
 
-    const second = await runInit({ cwd });
+    const second = await runInit({}, { cwd });
     expect(second.action).toBe("updated");
     const afterSecond = readFileSync(join(cwd, "AGENTS.md"), "utf8");
 
@@ -92,10 +92,10 @@ describe("runInit idempotency", () => {
 
   it("keeps surrounding content when re-running against an edited file", async () => {
     const cwd = tmp();
-    await runInit({ cwd });
+    await runInit({}, { cwd });
     const path = join(cwd, "AGENTS.md");
     writeFileSync(path, `# House rules\n\n${readFileSync(path, "utf8")}\n## Footer\n`);
-    await runInit({ cwd });
+    await runInit({}, { cwd });
     const body = readFileSync(path, "utf8");
     expect(body.startsWith("# House rules\n")).toBe(true);
     expect(body.includes("## Footer")).toBe(true);
