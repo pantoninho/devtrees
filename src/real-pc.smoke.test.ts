@@ -3273,6 +3273,17 @@ describe.skipIf(!ENABLED)("real-pc smoke — bare restart (#225)", () => {
     });
   }
 
+  /**
+   * The installed process-compose's version as `[major, minor, patch]`, read
+   * from `process-compose version` (`Version: vX.Y.Z`).
+   */
+  function processComposeVersion(): [number, number, number] {
+    const out = spawnSync("process-compose", ["version"], { encoding: "utf8" });
+    const match = /v(\d+)\.(\d+)\.(\d+)/.exec(out.stdout ?? "");
+    if (!match) throw new Error(`cannot parse \`process-compose version\`: ${out.stdout}`);
+    return [Number(match[1]), Number(match[2]), Number(match[3])];
+  }
+
   it("scenario 105: a bare restart of a multi-service instance fails INVALID_ARGS naming the booted namespaces' down + up, and touches nothing", async () => {
     const { wt, root, server } = drainingRepo("dt-rpc105-", {
       webNamespace: "app",
@@ -3346,13 +3357,16 @@ describe.skipIf(!ENABLED)("real-pc smoke — bare restart (#225)", () => {
     expect(orphanedServices(root)).toEqual([]);
   }, 180_000);
 
-  // Scenarios 107-109 pin the process-compose v1.122.0 behaviour that rules
-  // out restarting an instance's last running process in place (#225,
-  // ADR-0009). They assert on process-compose, not devtrees, and on timing:
-  // the old run drains for 6s so the new run reliably starts while it still
-  // holds the port. A failure means process-compose changed (revisit #225: a
-  // bare restart may have become possible) or the machine is so overloaded
-  // that the drain no longer outlasts the new run's start.
+  // Scenarios 107-109 pin the process-compose behaviour that rules out
+  // restarting an instance's last running process in place (#225, ADR-0009),
+  // checked on v1.122.0 and v1.124.0. 107 and 108 hold on both; 109 branches
+  // on the version, because v1.124.0 fixed the JSON round trip that made an
+  // identical `POST /process` restart once (#273). They assert on
+  // process-compose, not devtrees, and on timing: the old run drains for 6s
+  // so the new run reliably starts while it still holds the port. A failure
+  // means process-compose changed (revisit #225: a bare restart may have
+  // become possible) or the machine is so overloaded that the drain no
+  // longer outlasts the new run's start.
   it("scenario 107: process-compose `process restart` of a one-service instance starts the new run while the old one drains, and the instance dies", async () => {
     const { wt, server } = drainingRepo("dt-rpc107-", { drainSeconds: 6 });
     const port = await boot(wt);
@@ -3377,8 +3391,13 @@ describe.skipIf(!ENABLED)("real-pc smoke — bare restart (#225)", () => {
     const info = await pcApi(socket, "GET", "/process/info/web");
     expect(info.status, info.body).toBe(200);
 
-    // The update waits for the shell it started, not for the server under it.
-    const update = await pcApi(socket, "POST", "/process", info.body);
+    // A real but harmless config change (an added env entry), so the update
+    // restarts web on every process-compose version rather than relying on a
+    // round-trip quirk (#273). The update waits for the shell it started, not
+    // for the server under it.
+    const config = JSON.parse(info.body) as { environment?: string[] | null };
+    config.environment = [...(config.environment ?? []), "DT_PROBE=1"];
+    const update = await pcApi(socket, "POST", "/process", JSON.stringify(config));
     expect(update.status, update.body).toBe(200);
     expect(await waitForNoPids(socket, 20_000), "process-compose should exit").toEqual([]);
     // No run survives it: the old server finishes draining, and no new one serves.
@@ -3386,7 +3405,7 @@ describe.skipIf(!ENABLED)("real-pc smoke — bare restart (#225)", () => {
     expect(await httpStatus(port)).toBe(0);
   }, 120_000);
 
-  it("scenario 109: process-compose `POST /process` restarts an exec'd server only because the JSON round trip changes its config, so the same request a second time restarts nothing", async () => {
+  it("scenario 109: an identical process-compose `POST /process` is no restart verb: it restarts an exec'd server at most once (v1.122.0's round trip), and never a second time", async () => {
     const { wt, server } = drainingRepo("dt-rpc109-");
     const port = await boot(wt);
     const socket = socketOf(wt);
@@ -3398,16 +3417,29 @@ describe.skipIf(!ENABLED)("real-pc smoke — bare restart (#225)", () => {
       expect(posted.status, posted.body).toBe(200);
     };
 
-    // The first update restarts web after the drain, on its port.
+    // Before v1.124.0 the JSON round trip turned `vars.PC_REPLICA_NUM` from an
+    // int into a float64, so the first identical update was a config change
+    // and restarted web after the drain, on its port. v1.124.0 fixed the round
+    // trip: the first identical update already restarts nothing (#273).
+    const [major, minor] = processComposeVersion();
+    const roundTripFixed = major > 1 || (major === 1 && minor >= 124);
     await update();
-    expect(await waitForPid(server, 10_000)).toBe(true);
-    const first = pidsMatching(server);
-    expect(first.some((pid) => old.includes(pid))).toBe(false);
+    let first: number[];
+    if (roundTripFixed) {
+      await new Promise((r) => setTimeout(r, 1000));
+      first = pidsMatching(server);
+      expect(first).toEqual(old);
+    } else {
+      expect(await waitForPid(server, 10_000)).toBe(true);
+      first = pidsMatching(server);
+      expect(first.some((pid) => old.includes(pid))).toBe(false);
+    }
     const ls = devtrees(wt, ["ls", "--json"]);
     expect((ls.doc as LsDoc).ls.instances.some((i) => i.id === wtId(wt))).toBe(true);
     expect(await httpStatus(port)).toBe(200);
 
-    // The server now holds the round-tripped config: an identical update is a no-op.
+    // On every version the server now holds the round-tripped config: an
+    // identical update is a no-op.
     await update();
     await new Promise((r) => setTimeout(r, 1000));
     expect(pidsMatching(server)).toEqual(first);
